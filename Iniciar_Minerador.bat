@@ -4,15 +4,15 @@ title BRN Minerador Automatico - Cliente
 color 0A
 
 :: ==================================================================
-:: CONFIGURACOES DA REDE (Dono do Origem deve alterar se necessario)
+:: CONFIGURACOES DA REDE
 :: ==================================================================
 :: IP Tailscale do Ubuntu (Origem)
 set ORIGIN_IP=100.84.11.48
 
-:: O Segredo da sua rede. Se voce mudou no Ubuntu, mude aqui tambem!
+:: O Segredo da sua rede.
 set NETWORK_SECRET=9226edea8ba62bc1c6ae36883c0536c95b4c85642195465d6c4d9456abef20f9
 
-:: Senhas locais do amigo (pode deixar assim)
+:: Senhas locais (para a carteira e para a GUI)
 set NODE_PASS=senha-no-temp-123
 set WALLET_PASS=senha-forte-da-carteira-2026
 set WEB_PASS=senha-temp-123
@@ -114,15 +114,16 @@ if not exist "current_wallet.enc" (
     echo [OK] Carteira ja existe.
 )
 
-:: 6. Inicia o minerador em loop (se cair, reinicia)
+:: 6. Inicia o programa COM A JANELA GRAFICA ABERTA (removeu --headless)
 :loop
 echo.
 echo ========================================================
-echo   INICIANDO MINERACAO... (Nao feche esta janela)
+echo   ABRINDO A CARTEIRA GRAFICA E MINERANDO...
+echo   Nao feche a janela preta (ela mantem o minerador vivo).
 echo ========================================================
-:: --headless (sem GUI) e --no-pool (nao roda servidor, so o minerador)
-python main.py --headless --no-pool
+:: --no-pool (nao roda servidor local) e SEM --headless (abre a GUI)
+python main.py --no-pool
 echo.
-echo [AVISO] O minerador parou (ou caiu). Reiniciando em 10 segundos...
+echo [AVISO] A carteira foi fechada ou caiu. Reiniciando em 10 segundos...
 timeout /t 10 >nul
 goto loop
