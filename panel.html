@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>BRN Node — Painel de Controle</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0d1117; color: #e6edf3; padding: 20px;
+    font-size: 14px; line-height: 1.5;
+  }
+  .container { max-width: 1200px; margin: 0 auto; }
+  header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding-bottom: 16px; border-bottom: 1px solid #30363d; margin-bottom: 20px;
+    flex-wrap: wrap; gap: 10px;
+  }
+  h1 { font-size: 1.4rem; }
+  h1 span { color: #58a6ff; }
+  .conn { display: flex; align-items: center; gap: 10px; font-size: 0.85rem; color: #8b949e; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #8b949e; animation: pulse 2s infinite; }
+  .dot.online  { background: #3fb950; animation: pulse 2s infinite; }
+  .dot.offline { background: #f85149; animation: none; }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.3 } }
+  .btn {
+    background: #21262d; border: 1px solid #30363d; color: #e6edf3;
+    padding: 6px 14px; border-radius: 6px; cursor: pointer;
+    font-size: 0.85rem; font-family: inherit; transition: all 0.15s;
+  }
+  .btn:hover:not(:disabled) { background: #30363d; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn.primary { background: #238636; border-color: #2ea043; }
+  .btn.primary:hover:not(:disabled) { background: #2ea043; }
+  .btn.danger { background: #da3633; border-color: #f85149; }
+  .btn.danger:hover:not(:disabled) { background: #f85149; }
+  .grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px; margin-bottom: 20px;
+  }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px 16px; }
+  .card .label { font-size: 0.72rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; }
+  .card .value { font-size: 1.6rem; font-weight: 600; color: #58a6ff; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .card .sub { font-size: 0.75rem; color: #8b949e; margin-top: 2px; word-break: break-all; }
+  .section { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; }
+  .section h2 { font-size: 1rem; margin-bottom: 12px; color: #e6edf3; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
+  .section h2 .actions { display: flex; gap: 8px; }
+  .progress-wrap { background: #21262d; border-radius: 6px; height: 24px; overflow: hidden; position: relative; margin: 8px 0; }
+  .progress-fill { height: 100%; background: linear-gradient(90deg, #238636, #2ea043); transition: width 0.4s ease; border-radius: 6px; }
+  .progress-text { position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: 600; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.5); }
+  .progress-fill.forking { background: linear-gradient(90deg, #da3633, #f85149); animation: pulse-fork 1s infinite; }
+  @keyframes pulse-fork { 0%,100% { opacity: 1 } 50% { opacity: 0.6 } }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #21262d; }
+  th { color: #8b949e; font-weight: 500; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.5px; }
+  tr:hover { background: #1c2128; }
+  code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.78rem; background: #0d1117; padding: 2px 6px; border-radius: 4px; color: #79c0ff; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.72rem; font-weight: 600; }
+  .tag.ok    { background: rgba(63,185,80,0.15); color: #3fb950; }
+  .tag.warn  { background: rgba(210,153,34,0.15); color: #d29922; }
+  .tag.err   { background: rgba(248,81,73,0.15); color: #f85149; }
+  .tag.info  { background: rgba(88,166,255,0.15); color: #58a6ff; }
+  .row { display: flex; gap: 20px; margin-bottom: 8px; flex-wrap: wrap; }
+  .row .k { color: #8b949e; min-width: 120px; }
+  .row .v { color: #e6edf3; font-variant-numeric: tabular-nums; word-break: break-all; }
+  .footer { text-align: center; margin-top: 32px; padding-top: 16px; border-top: 1px solid #30363d; color: #8b949e; font-size: 0.8rem; }
+  .footer a { color: #58a6ff; text-decoration: none; }
+  .alert { padding: 10px 14px; border-radius: 6px; margin-bottom: 12px; font-size: 0.85rem; }
+  .alert.err { background: rgba(248,81,73,0.1); border: 1px solid rgba(248,81,73,0.4); color: #f85149; }
+  .alert.warn { background: rgba(210,153,34,0.1); border: 1px solid rgba(210,153,34,0.4); color: #d29922; }
+  .pagination { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; gap: 10px; }
+  @media (max-width: 600px) {
+    .card .value { font-size: 1.3rem; }
+    .row { flex-direction: column; gap: 4px; }
+    h1 { font-size: 1.1rem; }
+    .pagination { flex-direction: column; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <header>
+    <h1>🔷 <span>BRN</span> Node — Painel de Controle</h1>
+    <div class="conn">
+      <span class="dot" id="connDot"></span>
+      <span id="connText">Conectando...</span>
+      <button class="btn" onclick="loadAll()">🔄 Atualizar</button>
+      <label style="display:flex;align-items:center;gap:5px;cursor:pointer;">
+        <input type="checkbox" id="autoRefresh" checked> Auto
+      </label>
+    </div>
+  </header>
+
+  <div id="alerts"></div>
+
+  <div class="grid">
+    <div class="card"><div class="label">Altura</div><div class="value" id="cHeight">—</div><div class="sub" id="cTipHash">—</div></div>
+    <div class="card"><div class="label">Peers</div><div class="value" id="cPeers">—</div><div class="sub" id="cPeersActive">—</div></div>
+    <div class="card"><div class="label">Mempool</div><div class="value" id="cMempool">—</div><div class="sub">transações pendentes</div></div>
+    <div class="card"><div class="label">Dificuldade</div><div class="value" id="cDifficulty">—</div><div class="sub">atual</div></div>
+    <div class="card"><div class="label">UTXOs</div><div class="value" id="cUtxos">—</div><div class="sub">saídas não gastas</div></div>
+    <div class="card"><div class="label">Recompensa</div><div class="value" id="cReward">—</div><div class="sub">por bloco</div></div>
+  </div>
+
+  <div class="section">
+    <h2>Sincronização</h2>
+    <div class="progress-wrap">
+      <div class="progress-fill" id="syncBar" style="width: 0%"></div>
+      <div class="progress-text" id="syncText">0%</div>
+    </div>
+    <div class="row">
+      <span class="k">Local:</span><span class="v" id="syncLocal">—</span>
+      <span class="k">Alvo:</span><span class="v" id="syncTarget">—</span>
+      <span class="k">Peer ativo:</span><span class="v" id="syncPeer">—</span>
+    </div>
+    <div class="row">
+      <span class="k">Status:</span><span class="v" id="syncStatus"><span class="tag info">—</span></span>
+      <span class="k">Reorgs:</span><span class="v" id="syncReorgs">—</span>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>
+      Minerador
+      <div class="actions">
+        <button class="btn primary" onclick="startMiner()">▶ Iniciar</button>
+        <button class="btn danger" onclick="stopMiner()">■ Parar</button>
+      </div>
+    </h2>
+    <div class="row">
+      <span class="k">Estado:</span><span class="v" id="minerStatus">—</span>
+      <span class="k">Endereço:</span><span class="v" id="minerAddress">—</span>
+    </div>
+    <div class="row">
+      <span class="k">Blocos minerados:</span><span class="v" id="minerBlocks">—</span>
+      <span class="k">Uptime:</span><span class="v" id="minerUptime">—</span>
+    </div>
+    <div class="row">
+      <span class="k">Último erro:</span><span class="v" id="minerError">—</span>
+      <span class="k">Abortos por fork:</span><span class="v" id="minerForkAborts">—</span>
+    </div>
+    <div class="row">
+      <span class="k">Status de Rede:</span><span class="v" id="minerBootstrapStatus">—</span>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Peers conectados</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Endereço</th><th>Node ID</th><th>Altura</th><th>Score</th><th>Última vez</th>
+        </tr>
+      </thead>
+      <tbody id="peersTable">
+        <tr><td colspan="5" style="color:#8b949e">—</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="section">
+    <h2>Blocos Minerados</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th><th>Hash</th><th>Timestamp</th><th>Dificuldade</th><th>Transações</th>
+        </tr>
+      </thead>
+      <tbody id="blocksTable">
+        <tr><td colspan="5" style="color:#8b949e">—</td></tr>
+      </tbody>
+    </table>
+    <div class="pagination">
+      <button class="btn" id="btnPrevBlocks" onclick="changeBlockPage(1)">⬅️ Mais Novos</button>
+      <span id="pageInfo" style="color:#8b949e; font-size:0.85rem;">Página 1</span>
+      <button class="btn" id="btnNextBlocks" onclick="changeBlockPage(-1)">Mais Antigos ➡️</button>
+    </div>
+  </div>
+
+  <div class="footer">
+    BRN Node Panel · <a href="http://127.0.0.1:8080/">Explorer</a> ·
+    <a href="http://127.0.0.1:5000/">API</a>
+  </div>
+
+</div>
+
+<script>
+const API = "";
+let autoTimer = null;
+let lastStatusOk = false;
+let blockPage = 0;
+const BLOCKS_PER_PAGE = 50;
+
+async function fetchJSON(path, options = {}) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 200000);
+  try {
+    const r = await fetch(API + path, { ...options, signal: ctrl.signal });
+    clearTimeout(t);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return await r.json();
+  } catch (e) {
+    clearTimeout(t);
+    throw e;
+  }
+}
+
+function setConn(online, msg) {
+  const dot = document.getElementById("connDot");
+  const txt = document.getElementById("connText");
+  if (online) {
+    dot.classList.remove("offline"); dot.classList.add("online");
+    txt.textContent = "Online"; txt.style.color = "#3fb950";
+  } else {
+    dot.classList.remove("online"); dot.classList.add("offline");
+    txt.textContent = msg || "Offline"; txt.style.color = "#f85149";
+  }
+}
+
+function showAlert(type, msg) {
+  const el = document.getElementById("alerts");
+  if (!msg) { el.innerHTML = ""; return; }
+  el.innerHTML = `<div class="alert ${type}">${msg}</div>`;
+}
+
+function shortHash(h) { return h ? h.slice(0, 20) + "…" : "—"; }
+function formatUptime(s) {
+  if (!s) return "—";
+  const h = Math.floor(s / 3600); const m = Math.floor((s % 3600) / 60); const sec = s % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${sec}s`;
+  return `${sec}s`;
+}
+function formatAgo(s) {
+  if (s == null) return "—";
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  return `${Math.floor(s / 3600)}h`;
+}
+function formatNum(n) { return n == null ? "—" : Number(n).toLocaleString("pt-BR"); }
+function escapeHtml(s) {
+  if (s == null) return "";
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+async function loadStatus() {
+  try {
+    const [status, chain] = await Promise.all([
+      fetchJSON("/api/status-proxy"),
+      fetchJSON("/api/chain-info-proxy"),
+    ]);
+    if (status.error) {
+      setConn(false, "server offline");
+      showAlert("err", "⚠ server.py (:5000) não está respondendo.");
+      return;
+    }
+    document.getElementById("cHeight").textContent = formatNum(status.height);
+    document.getElementById("cTipHash").textContent = shortHash(chain.tip_hash);
+    document.getElementById("cPeers").textContent = formatNum(status.peers ?? 0);
+    document.getElementById("cPeersActive").textContent = `${formatNum(status.peers ?? 0)} conectados`;
+    document.getElementById("cMempool").textContent = formatNum(status.mempool ?? 0);
+    document.getElementById("cDifficulty").textContent = status.difficulty ?? "—";
+    document.getElementById("cUtxos").textContent = formatNum(status.utxos ?? 0);
+    const reward = status.reward ?? 0;
+    document.getElementById("cReward").textContent = (reward / 1e8).toFixed(0) + " BRN";
+    setConn(true); showAlert(null, null); lastStatusOk = true;
+  } catch (e) {
+    setConn(false, "offline");
+    if (lastStatusOk) showAlert("err", "⚠ Não consegui falar com o explorer (:8080).");
+    lastStatusOk = false;
+  }
+}
+
+async function loadSync() {
+  try {
+    const s = await fetchJSON("/api/sync-status-proxy");
+    if (s.error) return;
+    const progress = Math.min(100, s.progress ?? 0);
+    const bar = document.getElementById("syncBar");
+    bar.style.width = progress + "%";
+    if (s.forking) {
+      bar.classList.add("forking");
+      document.getElementById("syncText").textContent = `⚠ FORK — reorg em andamento`;
+    } else {
+      bar.classList.remove("forking");
+      document.getElementById("syncText").textContent = `${progress.toFixed(1)}% — ${s.eta_legivel || ""}`;
+    }
+    document.getElementById("syncLocal").textContent = s.local_height ?? "—";
+    document.getElementById("syncTarget").textContent = s.target_height ?? "—";
+    document.getElementById("syncPeer").textContent = s.active_peer || "—";
+    document.getElementById("syncReorgs").textContent = `${s.reorgs_total ?? 0} (último: #${s.last_reorg_height ?? "—"})`;
+    let tag = '<span class="tag info">sincronizando</span>';
+    if (s.forking) tag = '<span class="tag err">reorg</span>';
+    else if (s.synced) tag = '<span class="tag ok">sincronizado</span>';
+    document.getElementById("syncStatus").innerHTML = tag;
+  } catch (e) {}
+}
+
+async function loadMiner() {
+  try {
+    const m = await fetchJSON("/api/miner-status-proxy");
+    if (m.error) return;
+    const badge = m.running ? '<span class="tag ok">● Rodando</span>' : '<span class="tag warn">○ Parado</span>';
+    document.getElementById("minerStatus").innerHTML = badge;
+    document.getElementById("minerAddress").innerHTML = m.address ? `<code>${m.address}</code>` : "—";
+    document.getElementById("minerBlocks").textContent = m.blocks_mined ?? 0;
+    document.getElementById("minerUptime").textContent = formatUptime(m.uptime ?? 0);
+    document.getElementById("minerError").textContent = m.last_error || "—";
+    document.getElementById("minerForkAborts").textContent = m.fork_aborts ?? 0;
+    const filaTamanho = m.fila_tamanho || 0;
+    document.getElementById("minerBootstrapStatus").innerHTML = m.rede_descentralizada
+      ? '<span class="tag ok">Descentralizada</span>'
+      : `<span class="tag warn">Bootstrap: ${filaTamanho}/20 na fila</span>`;
+  } catch (e) {}
+}
+
+async function loadPeers() {
+  try {
+    const data = await fetchJSON("/api/peers-score-proxy");
+    if (!data || !data.peers) return;
+    const tbody = document.getElementById("peersTable");
+    const peers = data.peers || [];
+    if (peers.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" style="color:#8b949e">Nenhum peer conectado</td></tr>';
+      return;
+    }
+    tbody.innerHTML = "";
+    const now = Date.now() / 1000;
+    for (const p of peers) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td><code>${p.address || "—"}</code></td>
+        <td><code>${(p.node_id || "").slice(0, 16)}…</code></td>
+        <td>${p.height || 0}</td>
+        <td>${p.score ?? 0}</td>
+        <td>${p.last_seen ? formatAgo(Math.floor(now - p.last_seen)) : "—"}</td>
+      `;
+      tbody.appendChild(tr);
+    }
+  } catch (e) {}
+}
+
+async function loadBlocks() {
+  try {
+    const info = await fetchJSON("/api/chain-info-proxy");
+    const topHeight = info.height || 0;
+
+    let start = Math.max(0, topHeight - (blockPage + 1) * BLOCKS_PER_PAGE + 1);
+    let end = Math.min(topHeight, start + BLOCKS_PER_PAGE - 1);
+    if (start > end) start = end;
+
+    const r = await fetchJSON(`/api/blocks?start=${start}&limit=${BLOCKS_PER_PAGE}`);
+    if (r.error) throw new Error(r.error);
+
+    let blocks = (r.blocks || []).sort((a, b) => b.height - a.height);
+    const tbody = document.getElementById("blocksTable");
+
+    document.getElementById("pageInfo").textContent = `Blocos ${start} até ${end} (de ${topHeight})`;
+    document.getElementById("btnPrevBlocks").disabled = (blockPage === 0);
+    document.getElementById("btnNextBlocks").disabled = (start === 0);
+
+    if (blocks.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" style="color:#8b949e">Nenhum bloco nesta faixa</td></tr>';
+      return;
+    }
+    tbody.innerHTML = "";
+    for (const b of blocks) {
+      const ts = b.timestamp ? new Date(b.timestamp * 1000).toLocaleString("pt-BR") : "—";
+      const txs = b.transactions ? b.transactions.length : (b.txs || 0);
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td><strong>${b.height}</strong></td>
+        <td><code>${shortHash(b.hash)}</code></td>
+        <td>${ts}</td>
+        <td>${b.difficulty ?? "—"}</td>
+        <td>${txs}</td>
+      `;
+      tbody.appendChild(tr);
+    }
+  } catch (e) {
+    console.error("blocks:", e);
+    document.getElementById("blocksTable").innerHTML =
+      '<tr><td colspan="5" style="color:#ffa198">Erro: ' + escapeHtml(e.message) + '</td></tr>';
+  }
+}
+
+function changeBlockPage(dir) {
+  blockPage -= dir;
+  if (blockPage < 0) blockPage = 0;
+  loadBlocks();
+}
+
+async function startMiner() {
+  if (!confirm("Iniciar mineração com a carteira atual?")) return;
+  try {
+    const r = await fetch(API + "/api/miner/start-proxy", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}),
+    });
+    const data = await r.json();
+    if (data.ok) { showAlert("warn", "✅ Miner iniciado"); setTimeout(() => showAlert(null, null), 3000); }
+    else { showAlert("err", "❌ " + (data.msg || "falha ao iniciar")); }
+    loadMiner();
+  } catch (e) { showAlert("err", "❌ Erro: " + e.message); }
+}
+
+async function stopMiner() {
+  if (!confirm("Parar a mineração?")) return;
+  try {
+    const r = await fetch(API + "/api/miner/stop-proxy", { method: "POST" });
+    const data = await r.json();
+    if (data.ok) { showAlert("warn", "✅ Miner parado"); setTimeout(() => showAlert(null, null), 3000); }
+    else { showAlert("err", "❌ " + (data.msg || "falha ao parar")); }
+    loadMiner();
+  } catch (e) { showAlert("err", "❌ Erro: " + e.message); }
+}
+
+async function loadAll(includeBlocks = true) {
+  const promessas = [loadStatus(), loadSync(), loadMiner(), loadPeers()];
+  if (includeBlocks) promessas.push(loadBlocks());
+  await Promise.all(promessas);
+}
+
+function startAuto() {
+  if (autoTimer) clearInterval(autoTimer);
+  autoTimer = setInterval(() => loadAll(false), 3000);
+}
+function stopAuto() {
+  if (autoTimer) clearInterval(autoTimer);
+  autoTimer = null;
+}
+
+document.getElementById("autoRefresh").addEventListener("change", (e) => {
+  if (e.target.checked) startAuto();
+  else stopAuto();
+});
+
+loadAll();
+startAuto();
+</script>
+</body>
+</html>
