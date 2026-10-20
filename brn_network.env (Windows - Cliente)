@@ -1,0 +1,110 @@
+# ============================================================
+# brn_network.env — Config do nó BRN (Máquina B - Windows/Cliente)
+# ============================================================
+# INSTRUÇÕES:
+# 1. Rode "tailscale ip -4" no UBUNTU e copie o IP (ex: 100.111.253.8).
+# 2. Substitua os "100.111.253.8" abaixo pelo IP real do Ubuntu.
+# 3. Certifique-se de que os segredos (SECRET, TOKEN) são EXATAMENTE os mesmos do Ubuntu.
+# ============================================================
+
+# ============================================================
+# 1) SEGREDOS COMPARTILHADOS (IGUAIS NA MÁQUINA A E B)
+# ============================================================
+BRN_NETWORK_SECRET=9226edea8ba62bc1c6ae36883c0536c95b4c85642195465d6c4d9456abef20f9
+BRN_NODE_PASSWORD=senha-no-temp-123
+BRN_WALLET_SESSION_PASS=senha-forte-da-carteira-2026
+BRN_WEB_PASS=senha-temp-123
+
+# ============================================================
+# 2) ADMIN TOKEN (IGUAL NA MÁQUINA A E B)
+# ============================================================
+BRN_ADMIN_TOKEN=c745d36d524ea92148d8139731ad663f929fbbe08fb7f9b2234f9109fe1d2b24
+
+# ============================================================
+# 3) DESCOBERTA DE PEERS E CONEXÃO COM O POOL
+# ============================================================
+# ⚠️ ATENÇÃO: Coloque o IP TAILSCALE DO UBUNTU aqui.
+BRN_BOOTSTRAP_PEERS=100.111.253.8:6001
+
+# ⚠️ CRÍTICO: É para onde o Windows envia o trabalho de mineração.
+# Deve apontar para o servidor (porta 5000) do Ubuntu.
+BRN_API_BASE=http://100.111.253.8:5000
+
+# Tracker desligado (Tailscale resolve a descoberta)
+BRN_TRACKER=
+BRN_RENDEZVOUS_URL=
+
+# ============================================================
+# 4) MODO DE OPERAÇÃO
+# ============================================================
+# MÁQUINA WINDOWS = 0 (Cliente)
+BRN_IS_ORIGIN=0
+BRN_ALL_MINERS=0
+BRN_AUTO_MINE=0
+
+# O Windows NÃO é o servidor de pool, ele apenas se liga ao Ubuntu.
+BRN_POOL_ENABLED=0
+
+# ============================================================
+# 5) CONSENSO
+# ============================================================
+BRN_SYNC_BATCH=50
+BRN_SYNC_BATCH_DELAY=0.06
+BRN_SYNC_INTERVAL=5
+
+# ============================================================
+# 6) P2P
+# ============================================================
+BRN_P2P_PORT=6001
+BRN_P2P_AUTH=optional
+BRN_P2P_AUTH_WINDOW=30
+BRN_P2P_NONCE_CACHE=10000
+BRN_RATE_LIMIT=200
+BRN_UPNP=0
+BRN_TCP_TIMEOUT=10.0
+
+# ============================================================
+# 7) MINERAÇÃO
+# ============================================================
+BRN_MINER_INTERVAL=30
+BRN_ALLOW_SOLO_MINING=0
+BRN_MIN_PEER_STABLE=1
+
+# ============================================================
+# 8) HTTP / API (No Windows, serve apenas a interface local)
+# ============================================================
+BRN_WEB_HOST=127.0.0.1
+BRN_WEB_PORT=5000
+BRN_EXPLORER_PORT=8080
+BRN_EXPLORER_HOST=127.0.0.1
+BRN_HTTP_THREADS=16
+BRN_CORS_ORIGIN=*
+BRN_TRUSTED_PROXIES=
+BRN_BEHIND_PROXY=0
+BRN_HTTPS=0
+
+# ============================================================
+# 9) AUDIT
+# ============================================================
+BRN_AUDIT_ENABLED=1
+BRN_AUDIT_LOG=audit.log
+BRN_AUDIT_MAX_BYTES=52428800
+
+# ============================================================
+# 10) VERIFY
+# ============================================================
+BRN_SKIP_VERIFY=0
+BRN_VERIFY_STRICT=0
+BRN_LOG_LEVEL=INFO
+
+# ============================================================
+# 11) TAILSCALE
+# ============================================================
+# No Windows, se você já logou no app do Tailscale, pode deixar vazio.
+# Se quiser autenticar via script, cole a chave abaixo.
+TS_AUTH_KEY=
+
+# ============================================================
+# 12) PYTHON
+# ============================================================
+PYTHONUNBUFFERED=1
