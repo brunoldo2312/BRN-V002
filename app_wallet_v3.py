@@ -268,7 +268,7 @@ class WalletApi:
     def minhas_txs(self, address: str) -> dict:
         """[FIX v3.7] Pede apenas 50 transações para aliviar o banco."""
         try:
-            return _get(f"/api/minhas-txs/{address}?limit=50", timeout=30.0)
+            return _get(f"/api/minhas-txs/{address}?limit=50", timeout=60.0)
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 

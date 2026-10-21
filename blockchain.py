@@ -1,18 +1,14 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.2.6 | Data: 20/10/2026
+Versão: 9.2.5 | Data: 18/10/2026
 ================================================================
-v9.2.6 (2026-10-20):
-  [CRITICAL] accept_block() NÃO seta mais _fork_signal. Antes, toda
-             aceitação de bloco setava o signal, e o miner_loop lia
-             isso como "reorg em andamento" e abortava 60s depois de
-             CADA bloco minerado. O _fork_signal deve ser controlado
-             APENAS por sync_manager._resolve_fork.
 v9.2.5:
-  [OPT] cumulative_work() faz SELECT apenas da coluna 'difficulty'.
+  [OPT] cumulative_work() agora faz SELECT apenas da coluna 'difficulty'
+        em vez de descomprimir o bloco inteiro (raw). Isso evita
+        gargalos de CPU/Memória em cadeias grandes e acelera o boot.
 v9.2.4:
-  [FIX] MTP alterado de <= para <.
+  [FIX] MTP alterado de <= para < para aceitar blocos no mesmo segundo.
 v9.2.3:
-  [FIX] accept_block() reativa self._fork_signal. <- REVERTIDO no v9.2.6
+  [FIX] accept_block() reativa self._fork_signal.
 v9.2.2:
   [NEW] Modo Bootstrap: fila de mineradores.
 ================================================================
@@ -34,6 +30,9 @@ from db import ChainDB
 
 log = logging.getLogger("blockchain")
 
+# ============================================================
+# METADADOS DA MOEDA
+# ============================================================
 COIN_NAME       = "BrunoCoin"
 TICKER          = "BRN"
 DECIMALS        = 8
@@ -42,6 +41,10 @@ MAX_SUPPLY      = 21_000_000 * UNIT
 INITIAL_REWARD  = 50 * UNIT
 HALVING_INTERVAL = 210_000
 
+
+# ============================================================
+# CONSENSO / DIFICULDADE
+# ============================================================
 BLOCK_TIME          = int(os.environ.get("BRN_BLOCK_TIME",       "30"))
 DIFFICULTY_INTERVAL = int(os.environ.get("BRN_DIFF_INTERVAL",    "50"))
 MAX_DIFFICULTY      = int(os.environ.get("BRN_MAX_DIFFICULTY",   "7"))
@@ -57,17 +60,26 @@ CHECKPOINT_INTERVAL   = 1000
 MTP_WINDOW            = 11
 FILA_MAX_MINERADORES  = 20
 
+# ============================================================
+# GÊNESE
+# ============================================================
 GENESIS_PREV      = "0" * 64
 GENESIS_TIMESTAMP = 1700000000
 GENESIS_REWARD    = INITIAL_REWARD
 GENESIS_ADDRESS   = "brn1qxyzk7y0v2j4g0a8d9n5t2k7h4s6w8c9p2e"
 GENESIS_PUBKEY    = ""
 
+# ============================================================
+# DOMÍNIOS DE ASSINATURA
+# ============================================================
 SIGNING_DOMAIN   = b"BRN-TX-v1|"
 AUTH_TAG_DOMAIN  = b"BRN-BLOCK-AUTH-v1|"
 _CORE_V          = 1
 NETWORK_SECRET = os.environ.get("BRN_NETWORK_SECRET", "").strip()
 
+# ============================================================
+# ACELERAÇÃO PoW EM C (opcional)
+# ============================================================
 try:
     import brn_miner as _brn_miner_c
     _HAS_C_MINER = _brn_miner_c.is_available()
@@ -85,6 +97,9 @@ def miner_info() -> dict:
         return {"c_available": True, "path": str(_brn_miner_c.library_path()), "python_fallback": True}
     return {"c_available": False, "path": None, "python_fallback": True}
 
+# ============================================================
+# CHECKPOINTS
+# ============================================================
 _checkpoints: dict = {}
 _checkpoint_priv = None
 
@@ -124,6 +139,9 @@ def _maybe_sign_checkpoint(block) -> None:
         print(f"[CHECKPOINT] #{h} assinado e salvo")
     except Exception: pass
 
+# ============================================================
+# AUTH TAG
+# ============================================================
 def compute_auth_tag(height: int, block_hash_hex: str, secret: str = None) -> str:
     sec = secret if secret is not None else NETWORK_SECRET
     if not sec: return ""
@@ -135,6 +153,9 @@ def verify_auth_tag(height: int, block_hash_hex: str, tag: str, secret: str = No
     if not expected or not tag: return False
     return hmac.compare_digest(expected, tag)
 
+# ============================================================
+# PoW / DIFICULDADE / HELPERS
+# ============================================================
 def block_hash(prev_hash, merkle, timestamp, nonce, difficulty) -> str:
     header = f"{prev_hash}{merkle}{timestamp}{nonce}{difficulty}"
     return double_sha256(header.encode()).hex()
@@ -174,6 +195,9 @@ def txid(tx: dict) -> str:
 def signing_hash(tx: dict) -> bytes:
     return double_sha256(SIGNING_DOMAIN + _serialize_core(tx))
 
+# ============================================================
+# POW SEARCH
+# ============================================================
 def _pow_search_py(prev_hash, merkle, ts, diff, nonce_start=0, should_continue=None, progress_cb=None):
     prefix = f"{prev_hash}{merkle}{ts}".encode()
     diff_bytes = str(diff).encode()
@@ -219,6 +243,9 @@ def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0, should_continue=None
         return _pow_search_c(prev_hash, merkle, ts, diff, nonce_start, should_continue, progress_cb)
     return _pow_search_py(prev_hash, merkle, ts, diff, nonce_start, should_continue, progress_cb)
 
+# ============================================================
+# COINBASE
+# ============================================================
 def make_coinbase(address: str, pubkey_hex: str, height: int, reward: int, fila_mineracao: dict = None) -> dict:
     if not pubkey_hex: raise ValueError("make_coinbase: pubkey_hex é obrigatória")
     outputs = []
@@ -253,6 +280,9 @@ def build_genesis() -> dict:
 
 GENESIS_BLOCK = build_genesis()
 
+# ============================================================
+# BLOCKCHAIN
+# ============================================================
 class Blockchain:
     def __init__(self, db_path="brn_v2_chain.db", genesis_address=None, genesis_pubkey=None, auto_genesis=True, network_secret=None, require_auth_tag=None):
         self.db = ChainDB(db_path)
@@ -308,11 +338,7 @@ class Blockchain:
 
     def set_network_secret(self, secret: str) -> None:
         self.network_secret = (secret or "").strip()
-        # [FIX v9.2.8] Não reseta require_auth_tag se foi explicitamente
-        # desativado por BRN_REQUIRE_AUTH_TAG=0 no .env.
-        if os.environ.get("BRN_REQUIRE_AUTH_TAG", "1") == "1":
-            if self.require_auth_tag is False:
-                self.require_auth_tag = bool(self.network_secret)
+        if self.require_auth_tag is False: self.require_auth_tag = bool(self.network_secret)
 
     def current_reward(self, height: int) -> int:
         halvings = height // HALVING_INTERVAL
@@ -336,12 +362,17 @@ class Blockchain:
         new = max(prev // 4, min(prev * 4, new))
         return max(1, min(MAX_DIFFICULTY, new))
 
+    # ============================================================
+    # [FIX v9.2.5] cumulative_work otimizado
+    # ============================================================
     def cumulative_work(self) -> int:
         total = 0
+        # [FIX] Otimização: busca apenas a coluna 'difficulty', sem descomprimir o bloco!
         with self.db.lock:
             rows = self.db.conn.execute("SELECT difficulty FROM blocks").fetchall()
             for r in rows:
                 try:
+                    # 'difficulty' já vem como int direto do SQLite
                     total += work_from_difficulty(r["difficulty"])
                 except Exception:
                     continue
@@ -484,6 +515,9 @@ class Blockchain:
         timestamps.sort()
         return timestamps[len(timestamps) // 2]
 
+    # ============================================================
+    # VALIDAÇÃO DE BLOCO [FIX v9.2.4 — MTP < em vez de <=]
+    # ============================================================
     def validate_block(self, block: dict, prev_block=None) -> tuple:
         if block["height"] == 0 and prev_block is None:
             if (self.genesis_expected_hash and block["hash"] != self.genesis_expected_hash):
@@ -513,10 +547,10 @@ class Blockchain:
                 if not verify_auth_tag(block["height"], block["hash"], tag, self.network_secret):
                     return False, "auth_tag invalido (segredo errado?)"
             else:
-                # [FIX v9.2.7] Ignora auth_tag em blocos legados (<= 6000).
-                # Evita quebrar o sync se o nó local foi inicializado com um
-                # BRN_NETWORK_SECRET diferente do peer.
-                pass
+                tag = block.get("auth_tag")
+                if tag:
+                    if not verify_auth_tag(block["height"], block["hash"], tag, self.network_secret):
+                        return False, "auth_tag invalido em bloco legado"
         cb = block["transactions"][0]
         if cb["inputs"][0]["txid"] != "0" * 64: return False, "primeira tx nao e coinbase"
         if cb.get("txid") != txid(cb): return False, "coinbase txid invalido"
@@ -552,7 +586,10 @@ class Blockchain:
                 if (isinstance(tx_data, dict) and tx_data.get("type") in ("deploy", "call")):
                     try: self._apply_contract_tx(t)
                     except Exception as e: print(f"[CONTRACT] tx {t['txid'][:16]}... falhou: {e}")
-        # [FIX v9.2.6] _fork_signal gerenciado APENAS por sync_manager.
+        sig = getattr(self, "_fork_signal", None)
+        if sig is not None:
+            try: sig.set()
+            except Exception: pass
         return True, block["hash"]
 
     def _attach_auth_tag(self, block: dict) -> dict:

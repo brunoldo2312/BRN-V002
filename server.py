@@ -648,7 +648,12 @@ def minhas_txs(address):
                 "transactions": [],
                 "msg": "Endpoint de histórico precisa do db.py v6.4+",
             })
-        raw_list = chain.db.get_txs_for_address(address, limit=10000)
+        try:
+            _limit = int(request.args.get('limit', 200))
+        except (ValueError, TypeError):
+            _limit = 200
+        _limit = max(1, min(_limit, 500))
+        raw_list = chain.db.get_txs_for_address(address, limit=_limit)
         transactions = []
         for item in raw_list:
             tx = item["tx"]

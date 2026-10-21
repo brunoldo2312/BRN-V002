@@ -843,11 +843,23 @@ function syncStop() {
 // ============================================================
 // EXPLORADOR
 // ============================================================
-async function carregarBlocos() {
+async function carregarBlocos(reset) {
   const tb = $("tbodyBlocks");
   tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Carregando…</td></tr>';
   try {
-    const r = await api("list_blocks", 0, 15);
+    const _st = await api("node_status");
+  if (!_st.ok) throw new Error(_st.msg || "node offline");
+  const _currentHeight = _st.height;
+  let _start, _end;
+  if (reset || _blockCursor === null) {
+    _end = _currentHeight + 1;
+    _start = Math.max(0, _end - 50);
+  } else {
+    _end = _blockCursor;
+    _start = Math.max(0, _end - 50);
+  }
+  if (_start >= _end) { _allBlocksLoaded = true; _renderBlockButtons(); return; }
+  const r = await api("list_blocks", _start, _end - _start);
     if (r.erro) throw new Error(r.erro);
     const blocos = (r.blocks || []).slice().sort((a,b) => b.height - a.height);
     if (!blocos.length) {
@@ -867,10 +879,84 @@ async function carregarBlocos() {
       tr.onclick = function() { detalharBloco(b.height); };
       tb.appendChild(tr);
     }
+    _blockCursor = _start;
+    _renderBlockButtons();
     clearMsg("mExp");
   } catch (e) {
     tb.innerHTML = '<tr><td colspan="5" style="color:#ffa198;">' + e.message + '</td></tr>';
   }
+}
+
+
+let _blockCursor = null;
+let _allBlocksLoaded = false;
+let _blocksLoading = false;
+
+function _renderBlockButtons() {
+  let divBtns = document.getElementById("divBtnsBlocos");
+  if (!divBtns) {
+    const card = document.getElementById("tbodyBlocks").closest(".card");
+    if (!card) return;
+    divBtns = document.createElement("div");
+    divBtns.id = "divBtnsBlocos";
+    divBtns.className = "row";
+    divBtns.style.marginTop = "10px";
+    divBtns.innerHTML =
+      "<button class=\"btn\" id=\"bVerMaisBlocos\">Carregar mais 50 blocos</button>" +
+      "<button class=\"btn p\" id=\"bVerTodosBlocos\">Carregar TODOS os blocos</button>";
+    card.appendChild(divBtns);
+    document.getElementById("bVerMaisBlocos").onclick = () => carregarBlocos(false);
+    document.getElementById("bVerTodosBlocos").onclick = () => carregarTodosBlocos();
+  }
+  const bm = document.getElementById("bVerMaisBlocos");
+  const ba = document.getElementById("bVerTodosBlocos");
+  if (_allBlocksLoaded) {
+    if (bm) { bm.disabled = true; bm.textContent = "Todos carregados"; }
+    if (ba) { ba.disabled = true; ba.textContent = "Todos carregados"; }
+  } else {
+    if (bm) { bm.disabled = false; bm.textContent = "Carregar mais 50 blocos"; }
+    if (ba) { ba.disabled = false; ba.textContent = "Carregar TODOS os blocos"; }
+  }
+}
+
+async function carregarTodosBlocos() {
+  const tb = document.getElementById("tbodyBlocks");
+  const BATCH = 1000;
+  const st = await api("node_status");
+  if (!st.ok) { alert("Node offline"); return; }
+  const total = st.height + 1;
+  if (total > 5000) {
+    if (!confirm("Carregar TODOS os " + total + " blocos? Pode demorar. Continuar?")) return;
+  }
+  tb.innerHTML = '<tr id="loadingRow"><td colspan="5" style="color:#8b949e;">Preparando...</td></tr>';
+  let loaded = 0;
+  for (let start = st.height; start >= 0; start -= BATCH) {
+    const s = Math.max(0, start - BATCH + 1);
+    const r = await api("list_blocks", s, start + 1 - s);
+    if (r.erro) break;
+    const blocos = (r.blocks || []).slice().sort((a,b) => b.height - a.height);
+    for (const b of blocos) {
+      const tr = document.createElement("tr");
+      const ts = b.timestamp ? new Date(b.timestamp * 1000).toLocaleString("pt-BR") : "-";
+      const txs = Array.isArray(b.transactions) ? b.transactions.length : (b.txs || 0);
+      tr.innerHTML = "<td><b>" + b.height + "</b></td>" +
+                     "<td><code>" + shortHash(b.hash, 16) + "</code></td>" +
+                     "<td>" + ts + "</td>" +
+                     "<td>" + txs + "</td>" +
+                     "<td>" + (b.difficulty != null ? b.difficulty : "-") + "</td>";
+      tr.onclick = function() { detalharBloco(b.height); };
+      tb.appendChild(tr);
+    }
+    loaded += blocos.length;
+    const lr = document.getElementById("loadingRow");
+    if (lr) lr.cells[0].textContent = "Carregando... " + loaded + "/" + total;
+    if (blocos.length < BATCH) break;
+  }
+  const lr = document.getElementById("loadingRow");
+  if (lr) lr.remove();
+  _allBlocksLoaded = true;
+  _blockCursor = 0;
+  _renderBlockButtons();
 }
 
 async function detalharBloco(height) {
@@ -1553,7 +1639,7 @@ async function boot() {
   } catch (e) { /* primeira vez */ }
 
   await refreshStatus();
-  await carregarBlocos();
+  await carregarBlocos(true);
   await listarWallets();
   await refreshSyncInfo();
   await updateMiningUI();
