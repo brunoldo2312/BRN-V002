@@ -1,4 +1,7 @@
 https://diagnostic-work-596.notion.site/BRN-BrunoCoin-Documenta-o-do-Projeto-3fef4e870c4a81f3acfbe4d4f77e0dda
+
+https://alguma-coisa-aleatoria.trycloudflare.com
+
 🔷 BRN (BrunoCoin) — Manual Oficial do Projeto
 O BRN é uma blockchain P2P completa e autónoma, escrita em Python. Ela suporta mineração local, mineração em pool, sincronização de rede (com reorg automático), ponte L2 com Bitcoin e um sistema inovador de Fila de Bootstrap (recompensa partilhada).
 
