@@ -755,10 +755,15 @@ def main():
     log.info("Nó ID: " + node_pub[:16] + "...")
 
     from blockchain import Blockchain
+    # [FIX v13.6.3] auth_tag configurável via BRN_REQUIRE_AUTH_TAG.
+    # Default = 1 (mantém comportamento original). Usar 0 quando o
+    # secret local for diferente dos peers (caso de sync público).
+    require_auth_tag = (os.environ.get("BRN_REQUIRE_AUTH_TAG", "1") == "1")
     chain = Blockchain(
         cfg["db_path"],
         auto_genesis=is_origin,
         network_secret=cfg["network_secret"],
+        require_auth_tag=require_auth_tag,
     )
     chain._fork_signal = threading.Event()
     chain.is_origin = is_origin
