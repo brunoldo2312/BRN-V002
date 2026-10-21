@@ -153,7 +153,7 @@ def _carregar_bootstrap() -> set[str]:
     return peers
 
 
-def _registrar_peer_no_db(blockchain, ip: str, port: int, peer_id: Optional[str] = None) -> None:
+def _registrar_peer_no_db(blockchain, ip: str, port: int, peer_id: Optional[str] = None, height: int = 0) -> None:
     if blockchain is None: return
     try:
         addr = f"{ip}:{port}"
@@ -161,7 +161,7 @@ def _registrar_peer_no_db(blockchain, ip: str, port: int, peer_id: Optional[str]
         node_id = peer_id or f"peer-{ip}:{port}"
         blockchain.db.upsert_peer(
             node_id=node_id, address=addr, genesis_hash=genesis,
-            version=PROTOCOL_VERSION, height=0, is_miner=False,
+            version=PROTOCOL_VERSION, height=int(height), is_miner=False,
             public_key=peer_id or "",
         )
     except Exception: pass
@@ -765,7 +765,7 @@ class PeerDiscovery:
                         ip, port = p.split(":")
                         resp, lat = P2PClient.get_chain_height(ip, int(port))
                         if not resp: continue
-                        try: _registrar_peer_no_db(self.bc, ip, int(port), resp.get("_uuid"))
+                        try: _registrar_peer_no_db(self.bc, ip, int(port), resp.get("_uuid"), height=resp.get("height", 0))
                         except Exception: pass
                         with self._height_cache_lock:
                             self._height_cache[p] = (time.time(), resp.get("height", 0), resp.get("work", 0), lat)
