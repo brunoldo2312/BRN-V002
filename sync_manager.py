@@ -1,16 +1,14 @@
-cd C:\Users\laban\Music\BRN-V002-main\BRN-V002-main
-
-$content = @'
 """
 sync_manager.py — Sincronização + Reorg automático (v8.4.2)
 ================================================================
-v8.4.2 (2026-10-20):
-  [NEW] Imutabilidade por checkpoint. Se há checkpoint, reorg
-        que tentaria reverter bloco <= checkpoint é BLOQUEADO.
+v8.4.2 (2026-10-22):
+  [NEW] Imutabilidade por checkpoint. Reorg que tenta reverter
+        bloco <= último checkpoint é BLOQUEADO.
   [FIX] _detect_fork retorna None se DB vazio (local_h < 1).
         Evita loop "sem ancestral comum" em primeiro sync.
 v8.4.1:
   [FIX] _fetch_chain_from aceita lotes menores que o pedido.
+        Antes, pedia 200, recebia 50, e falhava com "download falhou".
 ================================================================
 """
 from __future__ import annotations
@@ -192,11 +190,14 @@ class ChainSyncManager:
         for blk in blocks:
             if not isinstance(blk, dict):
                 return False, f"bloco em #{expected_h} não é dict"
+
             h = int(blk.get("height", -1))
             if h != expected_h:
                 return False, f"height {h} != esperado {expected_h}"
+
             if blk.get("prev_hash") != prev:
                 return False, f"prev_hash diverge em #{expected_h}"
+
             try:
                 h_calc = _block_hash_fn(
                     blk["prev_hash"], blk["merkle"], blk["timestamp"],
@@ -206,15 +207,19 @@ class ChainSyncManager:
                 return False, f"campo ausente em #{expected_h}: {e}"
             except Exception as e:
                 return False, f"block_hash falhou em #{expected_h}: {e}"
+
             if h_calc != blk.get("hash"):
                 return False, f"hash inválido em #{expected_h}"
+
             try:
                 if not _meets_diff_fn(blk["hash"], blk["difficulty"]):
                     return False, f"PoW insuficiente em #{expected_h}"
             except Exception as e:
                 return False, f"meets_difficulty falhou em #{expected_h}: {e}"
+
             prev = blk["hash"]
             expected_h += 1
+
         return True, ""
 
     def _peer_is_blocked(self, peer_id: str) -> bool:
@@ -247,8 +252,6 @@ class ChainSyncManager:
         local_work = self._local_work()
         local_h = self._safe_height()
 
-        # [FIX v8.4.2] DB vazio (altura -1) ou só genesis (altura 0)
-        # NÃO é fork. Usar sync_with_peer (baixa do bloco 0).
         if local_h < 1:
             return None
 
@@ -309,7 +312,6 @@ class ChainSyncManager:
                     break
                 continue
 
-            # [FIX v8.4.1] Aceita lote menor que o pedido.
             all_blocks.extend(batch)
             cursor += len(batch)
             empties = 0
@@ -397,7 +399,6 @@ class ChainSyncManager:
                     self._peer_record_fail(peer_id)
                     return False
 
-                # [NEW v8.4.2] Bloqueio por checkpoint
                 try:
                     from blockchain import (
                         get_highest_checkpoint_height,
@@ -718,10 +719,3 @@ class ChainSyncManager:
     def __exit__(self, exc_type, exc, tb):
         self.stop()
         return False
-'@
-
-[System.IO.File]::WriteAllText((Join-Path (Get-Location) "sync_manager.py"), $content, (New-Object System.Text.UTF8Encoding($false)))
-Write-Host "OK - sync_manager.py v8.4.2 salvo" -ForegroundColor Green
-python -c "import ast; ast.parse(open('sync_manager.py', encoding='utf-8').read()); print('SINTAXE OK')"
-Select-String -Path sync_manager.py -Pattern 'v8.4.2' -SimpleMatch | Select -First 1
-(Get-Item sync_manager.py).Length
