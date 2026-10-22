@@ -43,6 +43,11 @@ MAX_SUPPLY      = 21_000_000 * UNIT
 INITIAL_REWARD  = 50 * UNIT
 HALVING_INTERVAL = 210_000
 
+# Atualização de consenso: a partir do bloco 5000, o subsídio fixo será 1 BRN.
+# Não altere GENESIS_REWARD: o bloco gênese histórico precisa permanecer idêntico.
+REWARD_UPGRADE_HEIGHT = 5000
+POST_UPGRADE_REWARD = 1 * UNIT
+
 BLOCK_TIME          = int(os.environ.get("BRN_BLOCK_TIME",       "30"))
 DIFFICULTY_INTERVAL = int(os.environ.get("BRN_DIFF_INTERVAL",    "50"))
 MAX_DIFFICULTY      = int(os.environ.get("BRN_MAX_DIFFICULTY",   "7"))
@@ -379,6 +384,16 @@ class Blockchain:
                 self.require_auth_tag = bool(self.network_secret)
 
     def current_reward(self, height: int) -> int:
+        """Retorna o subsídio de mineração conforme as regras de consenso por altura.
+
+        Até o bloco 4999, preserva a regra histórica de 50 BRN com halving.
+        No bloco 5000 e nos seguintes, o subsídio é fixo em 1 BRN.
+        As taxas de transação continuam sendo tratadas separadamente.
+        """
+        if not isinstance(height, int) or isinstance(height, bool) or height < 0:
+            raise ValueError("altura do bloco inválida")
+        if height >= REWARD_UPGRADE_HEIGHT:
+            return POST_UPGRADE_REWARD
         halvings = height // HALVING_INTERVAL
         if halvings >= 64:
             return 0
