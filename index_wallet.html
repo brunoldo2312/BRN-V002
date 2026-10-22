@@ -2,7 +2,7 @@
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
-<title>BRN Wallet</title>
+<title>BRN Wallet v3.11</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -32,6 +32,8 @@
          background:#8b949e; transition: background .3s; }
   .dot.on  { background:#3fb950; animation: pulse 2s infinite; }
   .dot.off { background:#f85149; }
+  .dot.fork { background:#f85149; animation: pulse 1s infinite; }
+  .dot.sync { background:#d29922; animation: pulse 1.5s infinite; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
 
   .sync-bar {
@@ -43,8 +45,26 @@
     transition: width .4s, background .4s;
   }
 
+  .mode-badge {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: .68rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .05em;
+  }
+  .mode-badge.origin { background:#1f2d1f; color:#7ee787; border:1px solid #238636; }
+  .mode-badge.client { background:#2d2200; color:#e3b341; border:1px solid #9e6a03; }
+  .mode-badge.unknown { background:#21262d; color:#8b949e; }
+
+  .fork-banner {
+    display: none; padding: 12px 16px; margin-bottom: 14px;
+    background: linear-gradient(90deg, #8b2424 0%, #a52a2a 100%);
+    border: 2px solid #f85149; border-radius: 8px;
+    font-size: .9rem; font-weight: 600; color: #fff;
+    animation: pulse 1.5s infinite;
+  }
+  .fork-banner.show { display: block; }
+
   .tabs { display:flex; gap:4px; margin-bottom:14px;
-          border-bottom:1px solid #30363d; }
+          border-bottom:1px solid #30363d; flex-wrap: wrap; }
   .tab { background:transparent; border:none; color:#8b949e; padding:8px 14px;
          cursor:pointer; font-family:inherit; font-size:.9rem;
          border-bottom:2px solid transparent; }
@@ -57,9 +77,11 @@
   .card { background:#161b22; border:1px solid #30363d; border-radius:8px;
           padding:16px; margin-bottom:12px; }
   .card h2 { font-size:.82rem; color:#8b949e; text-transform:uppercase;
-             letter-spacing:.05em; margin-bottom:10px; }
+             letter-spacing:.05em; margin-bottom:10px;
+             display: flex; justify-content: space-between; align-items: center; }
 
   .grid3 { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
+  @media (max-width: 640px) { .grid3 { grid-template-columns:1fr; } }
   .stat { background:#0d1117; border:1px solid #21262d; border-radius:6px;
           padding:10px 12px; }
   .stat .lbl { font-size:.7rem; color:#8b949e; text-transform:uppercase; }
@@ -85,6 +107,7 @@
   .btn.danger { background:#8b2424; border-color:#a52a2a; color:#fff; }
   .btn.danger:hover { background:#a52a2a; }
   .btn.big { font-size:1rem; padding:12px 24px; font-weight:600; }
+  .btn.sm { padding: 4px 10px; font-size: .78rem; }
 
   .addr { display:block; padding:8px 10px; margin-top:6px;
           background:#0d1117; border:1px solid #21262d; border-radius:6px;
@@ -102,7 +125,8 @@
   table { width:100%; border-collapse:collapse; font-size:.82rem; }
   th, td { padding:7px 8px; text-align:left; border-bottom:1px solid #21262d; }
   th { color:#8b949e; font-size:.72rem; text-transform:uppercase; font-weight:500; }
-  tr:hover { background:#1c2128; cursor:pointer; }
+  tr:hover { background:#1c2128; }
+  tr.clickable { cursor:pointer; }
   code { font-family:ui-monospace,Menlo,monospace; font-size:.75rem;
          background:#0d1117; padding:2px 5px; border-radius:4px; color:#79c0ff; }
 
@@ -128,6 +152,7 @@
   .badge.self     { background:#2d2200; color:#e3b341; border:1px solid #9e6a03; }
   .badge.pending  { background:#2d2200; color:#e3b341; border:1px solid #9e6a03; }
   .badge.confirmed{ background:#0d2818; color:#7ee787; border:1px solid #238636; }
+  .badge.behind   { background:#2d2200; color:#e3b341; border:1px solid #9e6a03; }
 
   .sync-card {
     background: linear-gradient(135deg, #0d1d2f 0%, #161b22 100%);
@@ -146,6 +171,7 @@
   .sync-stats {
     display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;
   }
+  @media (max-width: 640px) { .sync-stats { grid-template-columns: 1fr; } }
   .sync-stat {
     background: #0d1117; border: 1px solid #21262d;
     border-radius: 6px; padding: 10px 12px;
@@ -160,7 +186,6 @@
   .sync-bar-big > div {
     height: 100%; width: 0%; background: #58a6ff;
     transition: width .4s, background .4s;
-    display: flex; align-items: center; justify-content: center;
   }
   .sync-status-line {
     text-align: center; margin-top: 10px;
@@ -190,6 +215,18 @@
   .sync-badge-ok .info {
     color: #8b949e; font-size: .85rem; margin-top: 8px;
   }
+
+  /* Peers mini-card no topbar */
+  .peers-summary {
+    display: flex; gap: 6px; align-items: center;
+    font-size: .75rem; color: #8b949e;
+  }
+  .peers-summary .pill {
+    padding: 1px 6px; border-radius: 8px;
+    background: #21262d;
+  }
+  .peers-summary .pill.warn { background: #2d2200; color: #e3b341; }
+  .peers-summary .pill.err { background: #2d1416; color: #ffa198; }
 </style>
 </head>
 <body>
@@ -199,12 +236,17 @@
   <div id="abBanner" style="display:none; background: linear-gradient(90deg, #238636 0%, #2ea043 100%); padding: 16px; border-radius: 8px; margin-bottom: 20px; text-align: center; border: 2px solid #3fb950; box-shadow: 0 4px 12px rgba(46,160,67,0.3);">
     <h2 style="color: #fff; margin: 0 0 10px 0;">⛏️ Ajude a rede a crescer!</h2>
     <p style="color: #e6edf3; margin: 0 0 15px 0; font-size: 0.9rem;">
-      Estamos na Fase Bootstrap (<span id="abQueueCount">1</span>/20 mineradores). 
+      Estamos na Fase Bootstrap (<span id="abQueueCount">1</span>/20 mineradores).
       Minerar em pool garante <b>50% da recompensa</b> para você enquanto a rede não descentraliza.
     </p>
     <button id="abBtnMine" class="btn p big" style="background: #fff; color: #238636; font-weight: bold; border: none; padding: 10px 24px; font-size: 1rem; cursor: pointer;">
       ▶️ Iniciar Mineração em Pool
     </button>
+  </div>
+
+  <!-- [NEW v3.11] Banner de fork -->
+  <div id="forkBanner" class="fork-banner">
+    ⚠️ FORK DETECTADO — o nó está em reorg. Miner pausado até sincronizar.
   </div>
 
   <header>
@@ -215,6 +257,9 @@
         <span id="statusTxt">Conectando…</span>
       </div>
       <div class="topbar-item">
+        <span class="mode-badge unknown" id="modeBadge">—</span>
+      </div>
+      <div class="topbar-item">
         <span class="topbar-label">Sync:</span>
         <div class="sync-bar"><div id="syncBar"></div></div>
         <span class="topbar-strong" id="syncPct" style="color:#3fb950;">100%</span>
@@ -222,6 +267,7 @@
       <div class="topbar-item">
         <span class="topbar-label">Peers:</span>
         <span class="topbar-strong" id="peerCount">0</span>
+        <span id="peerScoreSummary" class="peers-summary"></span>
       </div>
       <div class="topbar-item" title="BTC → BRN (onramp)">
         <span class="topbar-label">BTC→BRN</span>
@@ -235,7 +281,7 @@
   </header>
 
   <div class="tabs">
-    <button class="tab active" data-tab="explorer">🔍 Explorador</button>
+    <button class="tab" data-tab="explorer">🔍 Explorador</button>
     <button class="tab" data-tab="carteira">💼 Carteira</button>
     <button class="tab" data-tab="enviar">📤 Enviar</button>
     <button class="tab" data-tab="verificar">🔎 Verificar</button>
@@ -305,6 +351,27 @@
       <div class="msg" id="mExp"></div>
     </div>
 
+    <!-- [NEW v3.11] Card de Peers -->
+    <div class="card" id="peersCard" style="display:none;">
+      <h2>
+        👥 Peers conhecidos (<span id="peersTableCount">0</span>)
+        <button class="btn sm" id="bRefreshPeers">🔄</button>
+      </h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Endereço</th>
+            <th>Altura</th>
+            <th>Score</th>
+            <th>Última vez</th>
+          </tr>
+        </thead>
+        <tbody id="tbodyPeers">
+          <tr><td colspan="4" style="color:#8b949e;">—</td></tr>
+        </tbody>
+      </table>
+    </div>
+
     <div class="card">
       <h2>Últimos blocos (clique para detalhar)</h2>
       <table>
@@ -315,6 +382,10 @@
           <tr><td colspan="5" style="color:#8b949e;font-style:italic;">Carregando…</td></tr>
         </tbody>
       </table>
+      <div id="divBtnsBlocos" class="row" style="margin-top:10px;">
+        <button class="btn" id="bVerMaisBlocos">⬇ Carregar mais 50 blocos</button>
+        <button class="btn p" id="bVerTodosBlocos">Carregar TODOS os blocos</button>
+      </div>
     </div>
 
     <div class="card" id="cardDetail" style="display:none;">
@@ -369,7 +440,14 @@
     </div>
 
     <div class="card">
-      <h2>Minhas transações</h2>
+      <h2>
+        Minhas transações
+        <span style="display:flex;gap:6px;">
+          <button class="btn sm" id="bMyTxs50">50</button>
+          <button class="btn sm" id="bMyTxs200">200</button>
+          <button class="btn sm" id="bMyTxs500">500</button>
+        </span>
+      </h2>
       <table>
         <thead>
           <tr>
@@ -551,14 +629,14 @@
     </div>
   </div>
 
-  <div class="footer">BRN Wallet v3.10 · ponte pywebview · <span id="apiLbl">—</span></div>
+  <div class="footer">BRN Wallet v3.11 · ponte pywebview · <span id="apiLbl">—</span></div>
 </div>
 
 <script>
 "use strict";
 
 // ============================================================
-// ESTADO
+// ESTADO GLOBAL (antes das funções, para evitar TDZ)
 // ============================================================
 let wallet = { address:"", private_key:"", public_key:"" };
 let ready = false;
@@ -567,6 +645,20 @@ let miningBusy = false;
 let lastSentTxid = "";
 let syncTimer = null;
 let syncMode = "idle";
+let myTxsLimit = 50;
+
+// [FIX v3.11] Declarados ANTES das funções que os usam
+let _blockCursor = null;
+let _allBlocksLoaded = false;
+let _blocksLoading = false;
+
+// Cache de peers e sync
+let _lastStatus = null;
+let _lastSyncInfo = null;
+let _lastPeers = [];
+
+const TAB_KEY = "brn_wallet_last_tab";
+const DEFAULT_TAB = "explorer";
 
 // ============================================================
 // HELPERS
@@ -575,11 +667,12 @@ const $ = id => document.getElementById(id);
 
 function msg(id, text, type = "info", autoHideMs = 0) {
   const el = $(id);
+  if (!el) return;
   el.textContent = text;
   el.className = "msg show " + type;
   if (autoHideMs) setTimeout(() => { el.className = "msg"; }, autoHideMs);
 }
-function clearMsg(id) { $(id).className = "msg"; }
+function clearMsg(id) { const el = $(id); if (el) el.className = "msg"; }
 
 async function api(method, ...args) {
   if (!ready) throw new Error("Ponte pywebview ainda não pronta");
@@ -601,33 +694,37 @@ function fmtUptime(sec) {
   const m = Math.floor((sec % 3600) / 60);
   return h + "h " + m + "m";
 }
+function fmtAgo(ts) {
+  if (!ts) return "—";
+  const diff = Math.max(0, Date.now() / 1000 - ts);
+  if (diff < 60) return Math.floor(diff) + "s";
+  if (diff < 3600) return Math.floor(diff / 60) + "m";
+  if (diff < 86400) return Math.floor(diff / 3600) + "h";
+  return Math.floor(diff / 86400) + "d";
+}
 
 // ============================================================
-// LÓGICA DO TESTE A/B
+// TESTE A/B
 // ============================================================
 async function checkABTest() {
   try {
     const res = await api("get_experiment_variant");
     if (res.error) return;
-    
-    // Loga a exposição assim que a tela carrega
+
     await api("log_exposure", res.variant);
-    
+
     if (res.variant === "B") {
       const banner = $("abBanner");
       banner.style.display = "block";
-      
-      // Puxa o contador da fila real (do status da rede)
+
       const st = await api("node_status");
       if (st.ok) $("abQueueCount").textContent = st.fila_tamanho || 1;
-      
-      // Ação do botão do Banner
+
       $("abBtnMine").onclick = function() {
-        // Redireciona para a aba de mineração e clica no botão original
         document.querySelector('.tab[data-tab="enviar"]').click();
         setTimeout(() => {
           $("bMinerarPool").click();
-          banner.style.display = "none"; // Esconde após ação
+          banner.style.display = "none";
         }, 300);
       };
     }
@@ -637,44 +734,71 @@ async function checkABTest() {
 }
 
 // ============================================================
-// STATUS DO NÓ
+// STATUS DO NÓ + MODO + FORK + PEERS
 // ============================================================
+function setDotState(cls) {
+  const dot = $("dot");
+  dot.className = "dot " + cls;
+}
+
 async function refreshStatus() {
   try {
     const s = await api("node_status");
     if (!s.ok) throw new Error(s.msg || "offline");
-    $("dot").className = "dot on";
-    $("statusTxt").textContent = "Nó online";
+    _lastStatus = s;
+
+    // Modo: ORIGEM vs CLIENTE
+    const badge = $("modeBadge");
+    if (s.rede_descentralizada === true) {
+      badge.className = "mode-badge origin";
+      badge.textContent = "DESCENTRALIZADA";
+    } else if (s.pool_enabled) {
+      badge.className = "mode-badge origin";
+      badge.textContent = "ORIGEM";
+    } else {
+      badge.className = "mode-badge client";
+      badge.textContent = "CLIENTE";
+    }
+
     $("eHeight").textContent  = s.height != null ? s.height : "—";
     $("eMempool").textContent = s.mempool != null ? s.mempool : "—";
     $("eDiff").textContent    = s.difficulty != null ? s.difficulty : "—";
     $("eUtxos").textContent   = s.utxos != null ? s.utxos : "—";
     $("ePeers").textContent   = s.peers != null ? s.peers : "—";
     $("eReward").textContent  = s.reward ? fmtBRN(s.reward / 1e8) : "—";
+
+    setDotState("on");
+    $("statusTxt").textContent = "Nó online";
   } catch (e) {
-    $("dot").className = "dot off";
+    setDotState("off");
     $("statusTxt").textContent = "Nó offline";
   }
 }
 
 // ============================================================
-// SYNC INFO (topbar)
+// SYNC INFO (topbar + bridge)
 // ============================================================
 async function refreshSyncInfo() {
   try {
     const d = await api("sync_info");
     if (d.erro) throw new Error(d.erro);
+    _lastSyncInfo = d;
 
-    const pct = Number(d.sync && d.sync.percent != null ? d.sync.percent : 100);
+    const sync = d.sync || {};
+    const pct = Number(sync.percent != null ? sync.percent : 100);
+    const peers = sync.peers || 0;
+    const local_h = sync.height || 0;
+    const target_h = sync.target || local_h;
+
     $("syncBar").style.width = pct + "%";
     $("syncPct").textContent = pct.toFixed(2) + "%";
     let cor = "#3fb950";
-    if (pct < 99)  cor = "#d29922";
-    if (pct < 50)  cor = "#f85149";
+    if (pct < 99) cor = "#d29922";
+    if (pct < 50) cor = "#f95249";
     $("syncBar").style.background = cor;
     $("syncPct").style.color = cor;
 
-    $("peerCount").textContent = (d.sync && d.sync.peers) || 0;
+    $("peerCount").textContent = peers;
 
     const onramp  = d.bridge && d.bridge.onramp_ativo;
     const offramp = d.bridge && d.bridge.offramp_ativo;
@@ -701,7 +825,72 @@ async function refreshSyncInfo() {
 }
 
 // ============================================================
-// SINCRONIZAÇÃO
+// PEERS (tabela + summary no topbar)
+// ============================================================
+async function refreshPeers() {
+  try {
+    const s = await api("peers_score");
+    if (s.error) throw new Error(s.error);
+
+    const peers = s.peers || [];
+    _lastPeers = peers;
+
+    // Summary no topbar
+    const summary = $("peerScoreSummary");
+    if (peers.length === 0) {
+      summary.innerHTML = "";
+    } else {
+      let bad = 0, banned = 0;
+      for (const p of peers) {
+        const sc = p.score || 0;
+        if (sc <= -100) banned++;
+        else if (sc < 0) bad++;
+      }
+      let html = "";
+      if (banned > 0) html += `<span class="pill err">${banned} banido(s)</span>`;
+      if (bad > 0) html += `<span class="pill warn">${bad} ruim(ns)</span>`;
+      summary.innerHTML = html;
+    }
+
+    // Tabela
+    const card = $("peersCard");
+    const tbody = $("tbodyPeers");
+    $("peersTableCount").textContent = peers.length;
+
+    if (peers.length === 0) {
+      card.style.display = "none";
+      return;
+    }
+
+    const localH = _lastStatus ? (_lastStatus.height || 0) : 0;
+    tbody.innerHTML = "";
+    for (const p of peers.slice(0, 100)) {
+      const tr = document.createElement("tr");
+      const score = p.score || 0;
+      const addr = p.address || "?";
+      const h = p.height || 0;
+      const behind = localH > 0 && h < localH - 5;
+
+      let scoreHtml = String(score);
+      if (score <= -100) scoreHtml = `<span class="badge behind">${score} (BAN)</span>`;
+      else if (score < 0) scoreHtml = `<span class="badge behind">${score}</span>`;
+
+      tr.innerHTML = `
+        <td><code>${addr}</code></td>
+        <td>${h}</td>
+        <td>${scoreHtml}</td>
+        <td>${fmtAgo(p.last_seen)}</td>
+      `;
+      tbody.appendChild(tr);
+    }
+    card.style.display = "block";
+  } catch (e) {
+    $("peersCard").style.display = "none";
+  }
+}
+
+// ============================================================
+// SINCRONIZAÇÃO (ações manuais)
 // ============================================================
 async function syncCheckConnection() {
   syncMode = "checking";
@@ -756,10 +945,11 @@ async function syncUpdateProgress() {
     const d = await api("sync_info");
     if (d.erro) throw new Error(d.erro);
 
-    const height = (d.sync && d.sync.height) || 0;
-    const target = (d.sync && d.sync.target) || 0;
-    const peers  = (d.sync && d.sync.peers)  || 0;
-    const percent = (d.sync && d.sync.percent) || 0;
+    const sync = d.sync || {};
+    const height = sync.height || 0;
+    const target = sync.target || 0;
+    const peers  = sync.peers  || 0;
+    const percent = sync.percent || 0;
 
     $("syncHeight").textContent = height;
     $("syncTarget").textContent = target;
@@ -841,34 +1031,56 @@ function syncStop() {
 }
 
 // ============================================================
-// EXPLORADOR
+// EXPLORADOR — blocos paginados (v3.11: botões persistem)
 // ============================================================
 async function carregarBlocos(reset) {
+  if (_blocksLoading) return;
+  _blocksLoading = true;
+
   const tb = $("tbodyBlocks");
-  tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Carregando…</td></tr>';
+  if (reset) {
+    tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Carregando…</td></tr>';
+    _blockCursor = null;
+    _allBlocksLoaded = false;
+  }
+
   try {
     const _st = await api("node_status");
-  if (!_st.ok) throw new Error(_st.msg || "node offline");
-  const _currentHeight = _st.height;
-  let _start, _end;
-  if (reset || _blockCursor === null) {
-    _end = _currentHeight + 1;
-    _start = Math.max(0, _end - 50);
-  } else {
-    _end = _blockCursor;
-    _start = Math.max(0, _end - 50);
-  }
-  if (_start >= _end) { _allBlocksLoaded = true; _renderBlockButtons(); return; }
-  const r = await api("list_blocks", _start, _end - _start);
-    if (r.erro) throw new Error(r.erro);
-    const blocos = (r.blocks || []).slice().sort((a,b) => b.height - a.height);
-    if (!blocos.length) {
-      tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Sem blocos</td></tr>';
+    if (!_st.ok) throw new Error(_st.msg || "node offline");
+
+    const _currentHeight = _st.height;
+    let _start, _end;
+
+    if (reset || _blockCursor === null) {
+      _end = _currentHeight + 1;
+      _start = Math.max(0, _end - 50);
+    } else {
+      _end = _blockCursor;
+      _start = Math.max(0, _end - 50);
+    }
+
+    if (_start >= _end) {
+      _allBlocksLoaded = true;
+      _renderBlockButtons();
+      _blocksLoading = false;
       return;
     }
-    tb.innerHTML = "";
+
+    const r = await api("list_blocks", _start, _end - _start);
+    if (r.erro) throw new Error(r.erro);
+
+    const blocos = (r.blocks || []).slice().sort((a,b) => b.height - a.height);
+
+    if (reset) tb.innerHTML = "";
+    if (!blocos.length && reset) {
+      tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Sem blocos</td></tr>';
+      _blocksLoading = false;
+      return;
+    }
+
     for (const b of blocos) {
       const tr = document.createElement("tr");
+      tr.className = "clickable";
       const ts = b.timestamp ? new Date(b.timestamp * 1000).toLocaleString("pt-BR") : "—";
       const txs = Array.isArray(b.transactions) ? b.transactions.length : (b.txs || 0);
       tr.innerHTML = '<td><b>' + b.height + '</b></td>' +
@@ -879,48 +1091,40 @@ async function carregarBlocos(reset) {
       tr.onclick = function() { detalharBloco(b.height); };
       tb.appendChild(tr);
     }
+
     _blockCursor = _start;
+    if (_start === 0) _allBlocksLoaded = true;
     _renderBlockButtons();
     clearMsg("mExp");
   } catch (e) {
-    tb.innerHTML = '<tr><td colspan="5" style="color:#ffa198;">' + e.message + '</td></tr>';
+    if (reset) {
+      tb.innerHTML = '<tr><td colspan="5" style="color:#ffa198;">' + e.message + '</td></tr>';
+    }
+  } finally {
+    _blocksLoading = false;
   }
 }
 
-
-let _blockCursor = null;
-let _allBlocksLoaded = false;
-let _blocksLoading = false;
-
 function _renderBlockButtons() {
-  let divBtns = document.getElementById("divBtnsBlocos");
-  if (!divBtns) {
-    const card = document.getElementById("tbodyBlocks").closest(".card");
-    if (!card) return;
-    divBtns = document.createElement("div");
-    divBtns.id = "divBtnsBlocos";
-    divBtns.className = "row";
-    divBtns.style.marginTop = "10px";
-    divBtns.innerHTML =
-      "<button class=\"btn\" id=\"bVerMaisBlocos\">Carregar mais 50 blocos</button>" +
-      "<button class=\"btn p\" id=\"bVerTodosBlocos\">Carregar TODOS os blocos</button>";
-    card.appendChild(divBtns);
-    document.getElementById("bVerMaisBlocos").onclick = () => carregarBlocos(false);
-    document.getElementById("bVerTodosBlocos").onclick = () => carregarTodosBlocos();
-  }
   const bm = document.getElementById("bVerMaisBlocos");
   const ba = document.getElementById("bVerTodosBlocos");
+  if (!bm || !ba) return;
+
   if (_allBlocksLoaded) {
-    if (bm) { bm.disabled = true; bm.textContent = "Todos carregados"; }
-    if (ba) { ba.disabled = true; ba.textContent = "Todos carregados"; }
+    bm.disabled = true;
+    bm.textContent = "Todos carregados";
+    ba.disabled = true;
+    ba.textContent = "Todos carregados";
   } else {
-    if (bm) { bm.disabled = false; bm.textContent = "Carregar mais 50 blocos"; }
-    if (ba) { ba.disabled = false; ba.textContent = "Carregar TODOS os blocos"; }
+    bm.disabled = false;
+    bm.textContent = "⬇ Carregar mais 50 blocos";
+    ba.disabled = false;
+    ba.textContent = "Carregar TODOS os blocos";
   }
 }
 
 async function carregarTodosBlocos() {
-  const tb = document.getElementById("tbodyBlocks");
+  const tb = $("tbodyBlocks");
   const BATCH = 1000;
   const st = await api("node_status");
   if (!st.ok) { alert("Node offline"); return; }
@@ -937,6 +1141,7 @@ async function carregarTodosBlocos() {
     const blocos = (r.blocks || []).slice().sort((a,b) => b.height - a.height);
     for (const b of blocos) {
       const tr = document.createElement("tr");
+      tr.className = "clickable";
       const ts = b.timestamp ? new Date(b.timestamp * 1000).toLocaleString("pt-BR") : "-";
       const txs = Array.isArray(b.transactions) ? b.transactions.length : (b.txs || 0);
       tr.innerHTML = "<td><b>" + b.height + "</b></td>" +
@@ -976,10 +1181,13 @@ async function detalharBloco(height) {
     tb.innerHTML = "";
     for (const t of (b.transactions || [])) {
       const tr = document.createElement("tr");
+      const isCoinbase = t.inputs && t.inputs.length > 0 && t.inputs[0].txid === "0".repeat(64);
       const outStr = (t.outputs || []).map(function(o) {
         return ((o.address || "").slice(0,12)) + "… +" + ((o.amount / 1e8).toFixed(4));
       }).join("<br>");
-      tr.innerHTML = '<td><code>' + shortHash(t.txid, 20) + '</code></td>' +
+      tr.innerHTML = '<td><code>' + shortHash(t.txid, 20) + '</code>' +
+                     (isCoinbase ? ' <span class="badge received">COINBASE</span>' : '') +
+                     '</td>' +
                      '<td>' + (outStr || "—") + '</td>';
       tb.appendChild(tr);
     }
@@ -1027,45 +1235,28 @@ async function atualizarSaldo() {
 }
 
 // ============================================================
-// MINHAS TRANSAÇÕES (com tratamento de erro amigável)
+// MINHAS TRANSAÇÕES
 // ============================================================
-async function carregarMinhasTxs() {
+async function carregarMinhasTxs(limit) {
   if (!wallet.address) return;
+  if (limit != null) myTxsLimit = limit;
+
   const tb = $("tbodyMyTxs");
   tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Carregando…</td></tr>';
 
   let txs = [];
   let ok = false;
   try {
-    const r = await api("minhas_txs", wallet.address);
+    const r = await api("minhas_txs", wallet.address, myTxsLimit);
     if (r && r.ok) { txs = r.transactions || []; ok = true; }
   } catch (e) { /* método nao exposto ou timeout */ }
 
   if (!ok) {
-    // Fallback: tenta outro método
-    try {
-      const r = await api("list_transactions", wallet.address);
-      if (r && !r.erro) {
-        txs = (r.transactions || []).map(function(t) {
-          return {
-            txid: t.txid,
-            direction: "received",
-            amount: (t.outputs || []).reduce(function(s,o){
-              return s + (o.address === wallet.address ? o.amount : 0);
-            }, 0),
-            status: "confirmed",
-            block_height: t.block_height,
-            confirmations: null,
-            timestamp: t.timestamp || 0,
-          };
-        });
-        ok = true;
-      }
-    } catch (e) { /* nada */ }
+    tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Erro ao carregar (tente Atualizar)</td></tr>';
+    return;
   }
 
-  // Se falhou ou não tem transações, mostra mensagem amigável
-  if (!ok || txs.length === 0) {
+  if (txs.length === 0) {
     tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Nenhuma transação recente encontrada</td></tr>';
     return;
   }
@@ -1096,14 +1287,12 @@ async function carregarMinhasTxs() {
       '<td>' + statusBadge + '</td>' +
       '<td>' + bloco + '</td>';
 
+    tr.style.cursor = "pointer";
     tr.title = "Clique para verificar";
     tr.onclick = function() {
       $("verTxid").value = t.txid;
       $("verAddr").value = wallet.address;
-      document.querySelectorAll(".tab").forEach(function(x){x.classList.remove("active")});
-      document.querySelectorAll(".panel").forEach(function(x){x.classList.remove("active")});
-      document.querySelector('.tab[data-tab="verificar"]').classList.add("active");
-      $("p-verificar").classList.add("active");
+      switchTab("verificar");
       verificarTx();
     };
     tb.appendChild(tr);
@@ -1115,32 +1304,18 @@ async function carregarMinhasTxs() {
 // ============================================================
 async function enviar() {
   clearMsg("mEnviar");
-  if (!wallet.address) {
-    msg("mEnviar", "❌ Gere/carregue uma carteira.", "err");
-    return;
-  }
+  if (!wallet.address) { msg("mEnviar", "❌ Gere/carregue uma carteira.", "err"); return; }
 
   const to = $("txTo").value.trim();
   const amtStr = $("txAmount").value.trim().replace(",", ".");
 
-  if (!to) {
-    msg("mEnviar", "❌ Informe o destinatário.", "err");
-    return;
-  }
-  if (!amtStr) {
-    msg("mEnviar", "❌ Informe o valor.", "err");
-    return;
-  }
+  if (!to) { msg("mEnviar", "❌ Informe o destinatário.", "err"); return; }
+  if (!amtStr) { msg("mEnviar", "❌ Informe o valor.", "err"); return; }
 
   const amtNum = Number(amtStr);
-  if (!isFinite(amtNum) || amtNum <= 0) {
-    msg("mEnviar", "❌ Valor inválido.", "err");
-    return;
-  }
+  if (!isFinite(amtNum) || amtNum <= 0) { msg("mEnviar", "❌ Valor inválido.", "err"); return; }
   if (!/^\d+(\.\d{1,8})?$/.test(amtStr)) {
-    msg("mEnviar",
-        "❌ Formato inválido (use ponto, até 8 casas: ex 0.29).",
-        "err");
+    msg("mEnviar", "❌ Formato inválido (use ponto, até 8 casas: ex 0.29).", "err");
     return;
   }
 
@@ -1182,7 +1357,6 @@ async function minerar() {
   if (!wallet.address) { msg("mMine", "❌ Gere/carregue uma carteira.", "err"); return; }
   if (miningBusy) return;
 
-  // Se o pool está a correr, para primeiro (não misturar)
   try {
     const poolSt = await api("pool_status");
     if (poolSt && poolSt.running) {
@@ -1239,7 +1413,6 @@ async function minerarPool() {
   if (!wallet.address) { msg("mPool", "❌ Gere/carregue uma carteira.", "err"); return; }
   if (miningBusy) return;
 
-  // Se o miner local está a correr, para primeiro
   try {
     const localSt = await api("mining_status");
     if (localSt && localSt.running) {
@@ -1253,7 +1426,6 @@ async function minerarPool() {
   const btn = $("bMinerarPool");
   btn.disabled = true;
 
-  // Verifica se já está a correr
   let poolRunning = false;
   try {
     const st = await api("pool_status");
@@ -1290,7 +1462,7 @@ async function minerarPool() {
 }
 
 // ============================================================
-// ATUALIZAR UI DE MINERAÇÃO (LOCAL + POOL)
+// ATUALIZAR UI DE MINERAÇÃO
 // ============================================================
 async function updateMiningUI() {
   // ---------- MINER LOCAL ----------
@@ -1548,21 +1720,33 @@ async function carregar() {
 }
 
 // ============================================================
-// UI
+// UI / TABS
 // ============================================================
+function switchTab(tabName) {
+  document.querySelectorAll(".tab").forEach(function(x) {
+    x.classList.toggle("active", x.dataset.tab === tabName);
+  });
+  document.querySelectorAll(".panel").forEach(function(x) {
+    x.classList.toggle("active", x.id === "p-" + tabName);
+  });
+  try { localStorage.setItem(TAB_KEY, tabName); } catch (_) {}
+  if (tabName === "bridge") {
+    refreshSyncInfo();
+    $("brToBrn").value = wallet.address || "";
+  }
+}
+
 function configTabs() {
   document.querySelectorAll(".tab").forEach(function(t) {
-    t.addEventListener("click", function() {
-      document.querySelectorAll(".tab").forEach(function(x) { x.classList.remove("active"); });
-      document.querySelectorAll(".panel").forEach(function(x) { x.classList.remove("active"); });
-      t.classList.add("active");
-      $("p-" + t.dataset.tab).classList.add("active");
-      if (t.dataset.tab === "bridge") {
-        refreshSyncInfo();
-        $("brToBrn").value = wallet.address || "";
-      }
-    });
+    t.addEventListener("click", function() { switchTab(t.dataset.tab); });
   });
+
+  let initial = DEFAULT_TAB;
+  try {
+    const saved = localStorage.getItem(TAB_KEY);
+    if (saved) initial = saved;
+  } catch (_) {}
+  switchTab(initial);
 }
 
 function configEventos() {
@@ -1571,11 +1755,21 @@ function configEventos() {
   $("bSyncStart").onclick = syncStart;
   $("bSyncStop").onclick  = syncStop;
 
+  // [FIX v3.11] "Atualizar" agora reseta cursor (recarrega os últimos 50)
+  $("bRefreshExp").onclick = () => carregarBlocos(true);
+  $("bRefreshPeers").onclick = refreshPeers;
+
+  // [FIX v3.11] Botões de paginação explícitos
+  $("bVerMaisBlocos").onclick = () => carregarBlocos(false);
+  $("bVerTodosBlocos").onclick = carregarTodosBlocos;
+
   // Restante
-  $("bRefreshExp").onclick = carregarBlocos;
   $("bGerar").onclick      = gerarCarteira;
   $("bAtualizar").onclick  = atualizarSaldo;
-  $("bMyTxs").onclick      = carregarMinhasTxs;
+  $("bMyTxs").onclick      = () => carregarMinhasTxs();
+  $("bMyTxs50").onclick    = () => carregarMinhasTxs(50);
+  $("bMyTxs200").onclick   = () => carregarMinhasTxs(200);
+  $("bMyTxs500").onclick   = () => carregarMinhasTxs(500);
   $("bEnviar").onclick     = enviar;
   $("bMinerar").onclick    = minerar;
   $("bMinerarPool").onclick = minerarPool;
@@ -1622,7 +1816,7 @@ async function boot() {
   configEventos();
   $("apiLbl").textContent = "127.0.0.1:5000 · 8080";
 
-  await checkABTest(); // Teste A/B
+  await checkABTest();
 
   try {
     const w = await api("get_active_wallet");
@@ -1639,16 +1833,34 @@ async function boot() {
   } catch (e) { /* primeira vez */ }
 
   await refreshStatus();
+  await refreshSyncInfo();
+  await refreshPeers();
   await carregarBlocos(true);
   await listarWallets();
-  await refreshSyncInfo();
   await updateMiningUI();
 
+  // [FIX v3.11] Auto-refresh com reset=True (recarrega últimos 50)
   setInterval(refreshStatus,     10000);
   setInterval(refreshSyncInfo,    6000);
-  setInterval(carregarBlocos,    20000);
+  setInterval(refreshPeers,      15000);
+  setInterval(() => carregarBlocos(true), 20000);
   setInterval(updateMiningUI,     2000);
   setInterval(function() { if (wallet.address) atualizarSaldo(); }, 20000);
+  setInterval(function() { if (wallet.address) carregarMinhasTxs(); }, 30000);
+
+  // [NEW v3.11] Banner de fork global (verifica a cada 5s)
+  setInterval(async () => {
+    try {
+      const d = await api("sync_info");
+      const forking = !!(d && d.sync && d.forking) || false;
+      $("forkBanner").classList.toggle("show", forking);
+      const dot = $("dot");
+      if (forking) {
+        dot.className = "dot fork";
+        $("statusTxt").textContent = "FORK";
+      }
+    } catch (_) {}
+  }, 5000);
 }
 
 window.addEventListener("pywebviewready", boot);
