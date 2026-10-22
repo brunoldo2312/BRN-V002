@@ -1,6 +1,13 @@
 """
-p2p_unified.py — BRN P2P Network v6.6.5-Bootstrap
+p2p_unified.py — BRN P2P Network v6.6.6-Bootstrap
 ================================================================
+v6.6.6:
+  [FIX] _registrar_peer_no_db agora aceita e respeita `height`.
+        Antes sempre passava height=0, zerando a altura dos peers
+        a cada reconexão (bug detectado pelo monitor_rede.py).
+  [FIX] _refresh_heights_loop passa o height real do peer
+        (resp["height"]) para o DB após cada ping.
+  [FIX] upsert_peer usa `height=int(height)` em vez de `height=0`.
 v6.6.5:
   [FIX] P2PClient.send_message e variantes aceitam timeout.
 ================================================================
@@ -153,6 +160,9 @@ def _carregar_bootstrap() -> set[str]:
     return peers
 
 
+# ============================================================
+# [FIX v6.6.6] Aceita e respeita height
+# ============================================================
 def _registrar_peer_no_db(blockchain, ip: str, port: int, peer_id: Optional[str] = None, height: int = 0) -> None:
     if blockchain is None: return
     try:
@@ -482,7 +492,7 @@ class P2PServer(threading.Thread):
 
 
 # ============================================================
-# CLIENTE TCP [FIX v6.6.5 - timeout em todos os métodos]
+# CLIENTE TCP
 # ============================================================
 class P2PClient:
     @staticmethod
@@ -733,7 +743,7 @@ class PeerDiscovery:
                         if resp:
                             novo = self._add_peer(peer)
                             if resp.get("_uuid"): self.register_uuid(resp["_uuid"], ip, port)
-                            _registrar_peer_no_db(self.bc, ip, port, resp.get("_uuid"))
+                            _registrar_peer_no_db(self.bc, ip, port, resp.get("_uuid"), height=resp.get("height", 0))
                             if novo:
                                 log.info(f"Bootstrap conectado: {peer}")
                                 self._salvar_peers()
@@ -755,6 +765,9 @@ class PeerDiscovery:
                 self._salvar_peers()
             except Exception: pass
 
+    # ============================================================
+    # [FIX v6.6.6] Passa height real para o DB
+    # ============================================================
     def _refresh_heights_loop(self) -> None:
         while self.running:
             try:
@@ -908,6 +921,11 @@ class P2PManager:
             if not resp: return
             self.metrics.peer_update(f"{ip}:{port}", latency_ms=latency)
             if resp.get("_uuid"): self.discovery.register_uuid(resp["_uuid"], ip, port)
+
+            # [FIX v6.6.6] Passa height real ao registrar
+            try:
+                _registrar_peer_no_db(self.bc, ip, port, resp.get("_uuid"), height=resp.get("height", 0))
+            except Exception: pass
 
             if resp.get("decentralized") and not self.bc.rede_descentralizada:
                 log.warning("[P2P] Rede descentralizada detectada via peer! Iniciando mineracao.")
@@ -1098,6 +1116,7 @@ class P2PManager:
     def _on_peer_good(self, peer_ip: str, peer_id: Optional[str] = None) -> None:
         try: self.bc.db.add_peer_score(peer_ip, PEER_SCORE_REWARD_GOOD)
         except Exception: pass
+
 
 if __name__ == "__main__":
     print("Rode via main.py")
