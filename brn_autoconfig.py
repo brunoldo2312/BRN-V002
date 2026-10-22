@@ -1,14 +1,48 @@
-"""brn_autoconfig.py — Auto-configuração do nó BRN
+"""brn_autoconfig.py — Auto-configuração do nó BRN (v2)
 ================================================================
-Detecta peers, corrige bootstrap, testa conectividade e sincroniza.
+v2 (2026-10-22):
+  [FIX] CRÍTICO: NameError em `changes` quando não há peers detectados
+        nem bootstrap existente. O `if` pulava o `else` que definia
+        `changes`, mas a linha `needs_restart = (changes[...])` ainda
+        era executada → crash.
+  [FIX] CRÍTICO: `except urllib.error.HTTPError` quebrava com NameError
+        porque `urllib.error` não estava importado explicitamente
+        (dependia de import transitivo de `urllib.request`, que não
+        é garantido pelo Python spec).
+  [NEW] --version  (mostra versão e sai)
+  [NEW] --peers IP:PORT[,IP:PORT]  (adiciona peer(s) manualmente)
+  [NEW] --remove IP:PORT           (remove peer específico)
+  [NEW] --reset                    (limpa TODOS os peers)
+  [NEW] --port PORT                (override BRN_P2P_PORT para o probe)
+  [NEW] --timeout SECONDS          (timeout global para testes)
+  [NEW] --json                     (saída JSON para automação)
+  [NEW] --probe                    (só testa, não altera config)
+  [FIX] Filtra self IP da lista de peers detectados (antes poderia
+        se auto-adicionar como peer se Tailscale retornasse o self
+        por bug de parsing)
+  [FIX] Filtra Docker IPs (172.17.0.0/16, 172.18.0.0/16, etc.)
+  [FIX] Filtra loopback (127.0.0.0/8) e 0.0.0.0
+  [FIX] Detecta se `brn_network.env` não existe e avisa (antes criava
+        env file com apenas 1 chave, deletando o resto)
+  [FIX] --auto/--yes: mensagem clara "não consigo reiniciar daqui"
+        (antes fingia que reiniciava)
+  [NEW] `tailscale ping` para cada peer (probe extra no relatório)
+  [CLEAN] Removido parâmetro `env` morto de print_report()
+v1:
+  - Detecta Tailscale + LAN
+  - Atualiza brn_network.env + bootstrap_peers.json
+  - Consulta o nó via HTTP
+  - Relatório com cores
 
 Uso:
-    python brn_autoconfig.py            # modo interativo
-    python brn_autoconfig.py --auto     # aplica sem perguntar
-    python brn_autoconfig.py --check    # só mostra, não altera
-
-Funciona em Linux e Windows (apenas stdlib).
-Não requer dependências externas.
+    python brn_autoconfig.py                # interativo
+    python brn_autoconfig.py --auto         # sem perguntar (não reinicia)
+    python brn_autoconfig.py --check        # dry-run
+    python brn_autoconfig.py --probe        # só testa conectividade
+    python brn_autoconfig.py --json         # saída para automação
+    python brn_autoconfig.py --peers 1.2.3.4:6001,5.6.7.8:6001
+    python brn_autoconfig.py --remove 1.2.3.4:6001
+    python brn_autoconfig.py --reset
 ================================================================
 """
 from __future__ import annotations
@@ -22,14 +56,17 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
+
+__version__ = "2.0"
 
 
 # ============================================================
 # CONSTANTES
 # ============================================================
-BASE = Path(__file__).resolve().parent
+BASE           = Path(__file__).resolve().parent
 ENV_FILE       = BASE / "brn_network.env"
 BOOTSTRAP_FILE = BASE / "bootstrap_peers.json"
 PEERS_MANUAL   = BASE / "peers_manual.json"
@@ -41,9 +78,13 @@ EXPLORER_BASE  = "http://127.0.0.1:8080"
 IS_WINDOWS = platform.system().lower().startswith("win")
 IS_LINUX   = platform.system().lower() == "linux"
 
+# IPs que nunca devem virar peer
+_DOCKER_PREFIXES = ("172.17.", "172.18.", "172.19.", "172.20.",
+                    "172.21.", "172.22.", "172.23.", "172.24.")
+
 
 # ============================================================
-# CORES (ANSI) — funciona no Linux e Windows 10+
+# CORES ANSI (funciona no Linux e Windows 10+)
 # ============================================================
 class C:
     OK   = "\033[92m"
@@ -73,9 +114,25 @@ def title(msg): print(f"\n{C.BOLD}═══ {msg} ═══{C.RST}")
 
 
 # ============================================================
-# UTILITÁRIOS
+# HELPERS
 # ============================================================
-def run_cmd(cmd: list, timeout: int = 5) -> tuple:
+def _is_invalid_peer_ip(ip: str, self_ip: str = "") -> bool:
+    """Retorna True se o IP não deve ser adicionado como peer."""
+    if not ip:
+        return True
+    if ip in ("0.0.0.0", "127.0.0.1", "localhost"):
+        return True
+    if ip.startswith("127."):
+        return True
+    if ip == self_ip:
+        return True
+    for prefix in _DOCKER_PREFIXES:
+        if ip.startswith(prefix):
+            return True
+    return False
+
+
+def run_cmd(cmd: list, timeout: float = 5.0) -> tuple:
     """Executa comando. Retorna (rc, stdout, stderr)."""
     try:
         r = subprocess.run(
@@ -92,14 +149,12 @@ def run_cmd(cmd: list, timeout: int = 5) -> tuple:
 
 
 def find_tailscale() -> str | None:
-    """Encontra o executável do Tailscale."""
-    # tenta PATH primeiro
+    """Encontra o executável do Tailscale (PATH ou caminhos conhecidos)."""
     for name in ("tailscale", "tailscale.exe"):
-        rc, _, _ = run_cmd([name, "version"])
+        rc, _, _ = run_cmd([name, "version"], timeout=3)
         if rc == 0:
             return name
 
-    # caminhos conhecidos no Windows
     if IS_WINDOWS:
         for p in (
             r"C:\Program Files\Tailscale\tailscale.exe",
@@ -108,7 +163,6 @@ def find_tailscale() -> str | None:
             if Path(p).exists():
                 return p
 
-    # caminhos conhecidos no Linux
     if IS_LINUX:
         for p in ("/usr/bin/tailscale", "/usr/local/bin/tailscale"):
             if Path(p).exists():
@@ -120,11 +174,13 @@ def find_tailscale() -> str | None:
 def http_get_json(url: str, timeout: float = 5.0):
     """GET JSON. Retorna (ok, data_or_msg)."""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "brn-autoconfig"})
+        req = urllib.request.Request(url, headers={"User-Agent": "brn-autoconfig/2"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return True, json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         return False, f"HTTP {e.code}"
+    except urllib.error.URLError as e:
+        return False, f"url: {e.reason}"
     except Exception as e:
         return False, str(e)
 
@@ -161,11 +217,21 @@ def load_env_file() -> dict:
     return out
 
 
-def save_env_file(data: dict) -> None:
-    """Reescreve o brn_network.env preservando comentários."""
-    lines = []
-    if ENV_FILE.exists():
+def save_env_file(data: dict) -> bool:
+    """
+    Reescreve brn_network.env preservando comentários.
+    Retorna False se arquivo não existir (evita criar env mínimo
+    que deletaria todas as outras chaves críticas).
+    """
+    if not ENV_FILE.exists():
+        warn(f"{ENV_FILE.name} nao existe — pulando atualizacao do env")
+        return False
+
+    try:
         lines = ENV_FILE.read_text(encoding="utf-8").splitlines()
+    except Exception as e:
+        warn(f"falha lendo {ENV_FILE.name}: {e}")
+        return False
 
     seen = set()
     out = []
@@ -184,31 +250,41 @@ def save_env_file(data: dict) -> None:
         else:
             out.append(line)
 
-    # adiciona chaves novas
     for k, v in data.items():
         if k not in seen:
             out.append(f"{k}={v}")
 
-    ENV_FILE.write_text("\n".join(out) + "\n", encoding="utf-8")
+    try:
+        ENV_FILE.write_text("\n".join(out) + "\n", encoding="utf-8")
+        return True
+    except Exception as e:
+        warn(f"falha gravando {ENV_FILE.name}: {e}")
+        return False
 
 
-def save_bootstrap(peers: list) -> None:
+def save_bootstrap(peers: list) -> bool:
     """Escreve bootstrap_peers.json."""
-    BOOTSTRAP_FILE.write_text(
-        json.dumps(peers, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    try:
+        BOOTSTRAP_FILE.write_text(
+            json.dumps(peers, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return True
+    except Exception as e:
+        warn(f"falha gravando {BOOTSTRAP_FILE.name}: {e}")
+        return False
 
 
 # ============================================================
-# DETECÇÃO DE REDE
+# DETECÇÃO
 # ============================================================
 def detect_tailscale_ips() -> dict:
     """
-    Retorna {"self": "100.x.x.x", "peers": ["100.y.y.y", ...]}.
-    Lista vazia se Tailscale não estiver disponível.
+    Retorna {"self": "100.x.x.x", "peers": [...], "names": {...},
+             "available": bool, "ping_ok": set()}.
     """
-    out = {"self": "", "peers": [], "names": {}, "available": False}
+    out = {"self": "", "peers": [], "names": {}, "available": False,
+           "ping_ok": set()}
 
     ts = find_tailscale()
     if not ts:
@@ -216,19 +292,19 @@ def detect_tailscale_ips() -> dict:
 
     rc, stdout, _ = run_cmd([ts, "status", "--json"], timeout=5)
     if rc != 0:
-        # fallback para texto
         rc, stdout, _ = run_cmd([ts, "status"], timeout=5)
         if rc != 0:
             return out
 
     out["available"] = True
 
-    # ---- versão JSON ----
     if stdout.startswith("{"):
         try:
             data = json.loads(stdout)
             self_info = data.get("Self") or {}
-            out["self"] = (self_info.get("TailscaleIPs") or [""])[0]
+            self_ips = self_info.get("TailscaleIPs") or []
+            if self_ips:
+                out["self"] = self_ips[0]
             for _, peer in (data.get("Peer") or {}).items():
                 if peer.get("Online", False) is False:
                     continue
@@ -236,27 +312,24 @@ def detect_tailscale_ips() -> dict:
                 if not ips:
                     continue
                 ip = ips[0]
-                if ip and ip != out["self"]:
+                if ip and ip != out["self"] and not _is_invalid_peer_ip(ip, out["self"]):
                     out["peers"].append(ip)
                     out["names"][ip] = peer.get("HostName", ip)
             return out
         except Exception:
             pass
 
-    # ---- versão texto ----
     for line in stdout.splitlines():
-        # formato: "100.x.x.x   hostname    user@    os   ..."
         m = re.match(r"^(100\.\d+\.\d+\.\d+)\s+(\S+)\s+", line)
         if m:
             ip, name = m.group(1), m.group(2)
             if "self" in line.lower() or ip == out["self"]:
                 out["self"] = ip
                 continue
-            if ip not in out["peers"]:
+            if ip not in out["peers"] and not _is_invalid_peer_ip(ip, out["self"]):
                 out["peers"].append(ip)
                 out["names"][ip] = name
 
-    # tenta também "tailscale ip -4"
     if not out["self"]:
         rc, ip_stdout, _ = run_cmd([ts, "ip", "-4"], timeout=5)
         if rc == 0:
@@ -269,8 +342,18 @@ def detect_tailscale_ips() -> dict:
     return out
 
 
+def tailscale_ping(ip: str, timeout: float = 3.0) -> bool:
+    """Testa `tailscale ping <ip>`. Retorna True se responder."""
+    ts = find_tailscale()
+    if not ts:
+        return False
+    rc, out, _ = run_cmd([ts, "ping", "-c", "1", "--timeout", f"{int(timeout)}s", ip],
+                         timeout=timeout + 2)
+    return rc == 0 and "pong" in out.lower()
+
+
 def detect_lan_ips() -> list:
-    """IPs da LAN local."""
+    """IPs da LAN local (filtra docker/loopback)."""
     ips = set()
     try:
         for probe in ("10.255.255.255", "192.168.255.255", "172.16.255.255"):
@@ -286,9 +369,9 @@ def detect_lan_ips() -> list:
     except Exception:
         pass
     try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ip = info[4][0]
-            if not ip.startswith("127."):
+        for info_ in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info_[4][0]
+            if not _is_invalid_peer_ip(ip):
                 ips.add(ip)
     except Exception:
         pass
@@ -306,8 +389,8 @@ def same_subnet(ip1: str, ip2: str) -> bool:
 # CONSULTAS AO NÓ
 # ============================================================
 def node_running() -> bool:
-    ok, _ = http_get_json(f"{API_BASE}/api/status")
-    return ok
+    ok_, _ = http_get_json(f"{API_BASE}/api/status")
+    return ok_
 
 
 def get_chain_info():
@@ -323,32 +406,43 @@ def get_peers_score():
 
 
 # ============================================================
-# AÇÃO: reescrever configs
+# CONFIG HELPERS
 # ============================================================
-def update_configs(peer_ips: list, dry: bool = False) -> dict:
+def _normalize_peer(entry: str, default_port: str = "6001") -> str:
+    """Normaliza 'ip' ou 'ip:port' para 'ip:port'."""
+    entry = entry.strip()
+    if not entry:
+        return ""
+    if ":" in entry:
+        return entry
+    return f"{entry}:{default_port}"
+
+
+def update_configs(peer_ips: list, dry: bool = False,
+                   port_override: str | None = None) -> dict:
     """
     Atualiza brn_network.env e bootstrap_peers.json com os peers.
-    Retorna {"env_changed": bool, "bootstrap_changed": bool}.
+    Retorna {"env_changed": bool, "bootstrap_changed": bool,
+             "env_skipped": bool}.
     """
-    result = {"env_changed": False, "bootstrap_changed": False}
+    result = {
+        "env_changed": False,
+        "bootstrap_changed": False,
+        "env_skipped": not ENV_FILE.exists(),
+    }
 
-    # ---------- brn_network.env ----------
     env = load_env_file()
     cur_peers_str = env.get("BRN_BOOTSTRAP_PEERS", "")
     cur_peers = [p.strip() for p in cur_peers_str.split(",") if p.strip()]
 
-    # normaliza para "ip:6001"
+    p2p_port = port_override or env.get("BRN_P2P_PORT", "6001")
+
     new_peers = []
-    p2p_port = env.get("BRN_P2P_PORT", "6001")
     for ip in peer_ips:
-        if ":" in ip:
-            entry = ip
-        else:
-            entry = f"{ip}:{p2p_port}"
-        if entry not in new_peers:
+        entry = _normalize_peer(ip, p2p_port)
+        if entry and entry not in new_peers:
             new_peers.append(entry)
 
-    # conserva peers manuais já existentes que não conflitam
     for old in cur_peers:
         if old not in new_peers:
             new_peers.append(old)
@@ -357,11 +451,12 @@ def update_configs(peer_ips: list, dry: bool = False) -> dict:
 
     if new_peers_str != cur_peers_str:
         result["env_changed"] = True
-        if not dry:
+        if not dry and ENV_FILE.exists():
             env["BRN_BOOTSTRAP_PEERS"] = new_peers_str
-            save_env_file(env)
+            if not save_env_file(env):
+                result["env_changed"] = False
+                result["env_skipped"] = True
 
-    # ---------- bootstrap_peers.json ----------
     cur_json = []
     if BOOTSTRAP_FILE.exists():
         try:
@@ -379,43 +474,28 @@ def update_configs(peer_ips: list, dry: bool = False) -> dict:
     if merged != cur_json:
         result["bootstrap_changed"] = True
         if not dry:
-            save_bootstrap(merged)
+            if not save_bootstrap(merged):
+                result["bootstrap_changed"] = False
 
     return result
 
 
 # ============================================================
-# AÇÃO: reiniciar o nó
+# RELATÓRIO
 # ============================================================
-def restart_node_confirmation() -> bool:
-    print()
-    warn("Para aplicar a nova configuração, o nó precisa ser reiniciado.")
-    warn("Isso vai interromper a mineração por ~10s.")
-    print()
-    try:
-        resp = input(f"{C.BOLD}Reiniciar agora? (s/n): {C.RST}").strip().lower()
-        return resp in ("s", "sim", "y", "yes")
-    except (EOFError, KeyboardInterrupt):
-        return False
-
-
-# ============================================================
-# RELATÓRIO FINAL
-# ============================================================
-def print_report(ts: dict, lan: list, env: dict, peers_before: list,
+def print_report(ts: dict, lan: list, peers_before: list,
                  peers_after: list, node_ok: bool, chain_ok: bool,
-                 chain: dict, sync: dict, peers_db: dict):
+                 chain: dict, sync: dict, peers_db: dict,
+                 timeout: float):
     print()
     print(f"{C.BOLD}{'=' * 64}{C.RST}")
     print(f"{C.BOLD}  RELATÓRIO FINAL{C.RST}")
     print(f"{C.BOLD}{'=' * 64}{C.RST}")
 
-    # ----- Sistema -----
     title("Sistema")
     info(f"SO: {platform.system()} {platform.release()}")
     info(f"Hostname: {socket.gethostname()}")
 
-    # ----- Tailscale -----
     title("Tailscale")
     if not ts.get("available"):
         warn("Tailscale não disponível ou não instalado")
@@ -424,16 +504,17 @@ def print_report(ts: dict, lan: list, env: dict, peers_before: list,
         if ts["peers"]:
             for ip in ts["peers"]:
                 name = ts["names"].get(ip, "?")
-                ok(f"Peer: {ip} ({name})")
+                # Probe: tailscale ping
+                ping_ok = tailscale_ping(ip, timeout=timeout)
+                marker = "✓" if ping_ok else "✗"
+                print(f"  {marker} {ip} ({name})")
         else:
             warn("Nenhum peer Tailscale encontrado")
 
-    # ----- LAN -----
     title("IPs locais (LAN)")
     for ip in lan:
         info(f"  {ip}")
 
-    # ----- Config -----
     title("Configuração de peers")
     info(f"Antes:  {peers_before or '(vazio)'}")
     info(f"Depois: {peers_after or '(vazio)'}")
@@ -442,18 +523,16 @@ def print_report(ts: dict, lan: list, env: dict, peers_before: list,
     else:
         info("Bootstrap já estava correto")
 
-    # ----- Nó -----
     title("Nó")
     if not node_ok:
         err("HTTP :5000 não respondeu — o nó não está rodando?")
     else:
         ok("HTTP :5000 respondendo")
         if chain_ok:
-            info(f"Altura:    {chain.get('height')}")
-            info(f"Tip hash:  {str(chain.get('tip_hash', ''))[:32]}...")
+            info(f"Altura:      {chain.get('height')}")
+            info(f"Tip hash:    {str(chain.get('tip_hash', ''))[:32]}...")
             info(f"Dificuldade: {chain.get('difficulty')}")
 
-        # Sync
         if sync.get("ok"):
             synced = sync.get("synced")
             prog = sync.get("progress", 0)
@@ -461,12 +540,10 @@ def print_report(ts: dict, lan: list, env: dict, peers_before: list,
                 ok(f"Sync: sincronizado ({prog}%)")
             else:
                 warn(f"Sync: em andamento ({prog}%)")
-
             info(f"Local:  {sync.get('local_height')}")
             info(f"Target: {sync.get('target_height')}")
             info(f"Peers conhecidos: {sync.get('peers_known')}")
 
-        # Peers DB
         peers_list = peers_db.get("peers", [])
         if peers_list:
             ok(f"Peers no DB: {len(peers_list)}")
@@ -479,20 +556,18 @@ def print_report(ts: dict, lan: list, env: dict, peers_before: list,
         else:
             warn("Nenhum peer no DB")
 
-    # ----- Testes TCP -----
     title("Testes TCP")
     if peers_after:
         for p in peers_after:
             if ":" in p:
                 ip, port = p.rsplit(":", 1)
-                if tcp_check(ip, int(port)):
+                if tcp_check(ip, int(port), timeout=timeout):
                     ok(f"TCP {p} — alcançável")
                 else:
                     warn(f"TCP {p} — inalcançável")
     else:
         info("(nenhum peer para testar)")
 
-    # ----- Conclusão -----
     print()
     print(f"{C.BOLD}{'=' * 64}{C.RST}")
     if node_ok and chain_ok and sync.get("synced"):
@@ -506,124 +581,298 @@ def print_report(ts: dict, lan: list, env: dict, peers_before: list,
     print(f"{C.BOLD}{'=' * 64}{C.RST}")
 
 
+def build_json_output(ts, lan, peers_before, peers_after,
+                      node_ok, chain_ok, chain, sync, peers_db) -> dict:
+    """Monta o objeto JSON de saída."""
+    return {
+        "version": __version__,
+        "hostname": socket.gethostname(),
+        "platform": platform.system(),
+        "tailscale": {
+            "available": ts.get("available", False),
+            "self_ip": ts.get("self", ""),
+            "peers": ts.get("peers", []),
+            "names": ts.get("names", {}),
+        },
+        "lan_ips": lan,
+        "peers_before": peers_before,
+        "peers_after": peers_after,
+        "node": {
+            "ok": node_ok,
+            "chain_ok": chain_ok,
+            "height": chain.get("height") if chain_ok else None,
+            "tip_hash": chain.get("tip_hash") if chain_ok else None,
+            "difficulty": chain.get("difficulty") if chain_ok else None,
+        },
+        "sync": {
+            "ok": sync.get("ok", False),
+            "synced": sync.get("synced", False),
+            "progress": sync.get("progress", 0),
+            "local_height": sync.get("local_height"),
+            "target_height": sync.get("target_height"),
+            "peers_known": sync.get("peers_known", 0),
+        },
+        "peers_db": peers_db.get("peers", []),
+        "timestamp": time.time(),
+    }
+
+
+# ============================================================
+# CLI: --peers / --remove / --reset
+# ============================================================
+def _add_manual_peers(peer_args: str, port_override: str | None,
+                      dry: bool) -> int:
+    """--peers IP:PORT[,IP:PORT]"""
+    if not peer_args:
+        return 0
+    p2p_port = port_override or load_env_file().get("BRN_P2P_PORT", "6001")
+    entries = []
+    for item in peer_args.split(","):
+        entry = _normalize_peer(item, p2p_port)
+        if entry:
+            entries.append(entry)
+    if not entries:
+        err("--peers: nenhum endereço válido")
+        return 1
+
+    changes = update_configs(entries, dry=dry, port_override=port_override)
+    if dry:
+        info(f"(dry-run) adicionaria: {entries}")
+    else:
+        if changes["env_changed"]:
+            ok("brn_network.env atualizado")
+        if changes["bootstrap_changed"]:
+            ok("bootstrap_peers.json atualizado")
+        if changes["env_skipped"]:
+            warn("brn_network.env nao existe — só bootstrap_peers.json foi alterado")
+    return 0
+
+
+def _remove_peer(peer_arg: str, dry: bool) -> int:
+    """--remove IP:PORT"""
+    if not peer_arg:
+        return 1
+    env = load_env_file()
+    cur = [p.strip() for p in env.get("BRN_BOOTSTRAP_PEERS", "").split(",")
+           if p.strip()]
+    if peer_arg not in cur:
+        warn(f"{peer_arg} não está no bootstrap")
+        return 1
+    new = [p for p in cur if p != peer_arg]
+    if dry:
+        info(f"(dry-run) removeria {peer_arg}, sobrariam {new}")
+        return 0
+    env["BRN_BOOTSTRAP_PEERS"] = ",".join(new)
+    save_env_file(env)
+    # bootstrap json
+    if BOOTSTRAP_FILE.exists():
+        try:
+            cur_json = json.loads(BOOTSTRAP_FILE.read_text(encoding="utf-8"))
+            if isinstance(cur_json, list):
+                save_bootstrap([p for p in cur_json if p != peer_arg])
+        except Exception:
+            pass
+    ok(f"removido: {peer_arg}")
+    return 0
+
+
+def _reset_peers(dry: bool) -> int:
+    """--reset"""
+    if dry:
+        info("(dry-run) limparia TODOS os peers")
+        return 0
+    env = load_env_file()
+    env["BRN_BOOTSTRAP_PEERS"] = ""
+    save_env_file(env)
+    save_bootstrap([])
+    ok("bootstrap limpo (env + json)")
+    return 0
+
+
 # ============================================================
 # MAIN
 # ============================================================
 def main() -> int:
     _try_enable_windows_ansi()
 
-    parser = argparse.ArgumentParser(prog="brn_autoconfig.py")
-    parser.add_argument("--auto", action="store_true",
-                        help="Aplica mudanças sem perguntar")
-    parser.add_argument("--check", action="store_true",
-                        help="Só mostra, não altera nada")
-    parser.add_argument("--yes", action="store_true",
-                        help="Reinicia o nó automaticamente se precisar")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(prog="brn_autoconfig.py")
+    p.add_argument("--version", action="store_true",
+                   help="Mostra versão e sai")
+    p.add_argument("--auto", action="store_true",
+                   help="Aplica sem perguntar (NÃO reinicia automaticamente)")
+    p.add_argument("--check", action="store_true",
+                   help="Dry-run: só mostra, não altera")
+    p.add_argument("--yes", action="store_true",
+                   help="Equivale a --auto")
+    p.add_argument("--probe", action="store_true",
+                   help="Só testa conectividade, não altera nada")
+    p.add_argument("--json", action="store_true",
+                   help="Saída JSON (para automação)")
+    p.add_argument("--peers", metavar="LIST", default=None,
+                   help="Adiciona peers: '1.2.3.4:6001,5.6.7.8:6001'")
+    p.add_argument("--remove", metavar="ADDR", default=None,
+                   help="Remove peer específico: '1.2.3.4:6001'")
+    p.add_argument("--reset", action="store_true",
+                   help="Limpa TODOS os peers (env + json)")
+    p.add_argument("--port", metavar="PORT", default=None,
+                   help="Override BRN_P2P_PORT para probes")
+    p.add_argument("--timeout", metavar="SECONDS", type=float, default=5.0,
+                   help="Timeout de testes de rede (default 5s)")
+    args = p.parse_args()
 
-    print()
-    print(f"{C.BOLD}{'=' * 64}{C.RST}")
-    print(f"{C.BOLD}  BRN Auto-Config{C.RST}")
-    print(f"{C.BOLD}  {socket.gethostname()} — {platform.system()}{C.RST}")
-    print(f"{C.BOLD}{'=' * 64}{C.RST}")
+    if args.version:
+        print(f"brn_autoconfig.py v{__version__}")
+        return 0
 
-    # ---------- 1. Tailscale ----------
-    title("1. Detectando Tailscale")
+    dry = args.check or args.probe
+
+    # ---------- --peers / --remove / --reset (modo direto) ----------
+    if args.peers is not None:
+        return _add_manual_peers(args.peers, args.port, dry)
+    if args.remove is not None:
+        return _remove_peer(args.remove, dry)
+    if args.reset:
+        return _reset_peers(dry)
+
+    # ---------- modo padrão ----------
+    if not args.json:
+        print()
+        print(f"{C.BOLD}{'=' * 64}{C.RST}")
+        print(f"{C.BOLD}  BRN Auto-Config v{__version__}{C.RST}")
+        print(f"{C.BOLD}  {socket.gethostname()} — {platform.system()}{C.RST}")
+        print(f"{C.BOLD}{'=' * 64}{C.RST}")
+
+    # 1. Tailscale
+    if not args.json:
+        title("1. Detectando Tailscale")
     ts = detect_tailscale_ips()
-    if not ts.get("available"):
-        warn("Tailscale não encontrado no PATH")
-        warn("Instale ou continue apenas com LAN")
-    else:
-        ok(f"Tailscale instalado — meu IP: {ts['self'] or '?'}")
-        for ip in ts["peers"]:
-            info(f"  peer: {ip} ({ts['names'].get(ip, '?')})")
+    if not args.json:
+        if not ts.get("available"):
+            warn("Tailscale não encontrado")
+        else:
+            ok(f"Meu IP: {ts['self'] or '?'}")
+            for ip in ts["peers"]:
+                info(f"  peer: {ip} ({ts['names'].get(ip, '?')})")
 
-    # ---------- 2. LAN ----------
-    title("2. Detectando IPs LAN")
+    # 2. LAN
+    if not args.json:
+        title("2. Detectando IPs LAN")
     lan = detect_lan_ips()
-    for ip in lan:
-        info(f"  {ip}")
+    if not args.json:
+        for ip in lan:
+            info(f"  {ip}")
 
-    # ---------- 3. Config atual ----------
-    title("3. Configuração atual")
+    # 3. Config atual
     env = load_env_file()
     cur_str = env.get("BRN_BOOTSTRAP_PEERS", "")
     cur_peers = [p.strip() for p in cur_str.split(",") if p.strip()]
-    info(f"BRN_BOOTSTRAP_PEERS = {cur_str or '(vazio)'}")
 
-    cur_bootstrap = []
-    if BOOTSTRAP_FILE.exists():
-        try:
-            cur_bootstrap = json.loads(BOOTSTRAP_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    info(f"bootstrap_peers.json = {cur_bootstrap or '(vazio)'}")
+    if not args.json:
+        title("3. Configuração atual")
+        info(f"BRN_BOOTSTRAP_PEERS = {cur_str or '(vazio)'}")
+        if BOOTSTRAP_FILE.exists():
+            try:
+                cb = json.loads(BOOTSTRAP_FILE.read_text(encoding="utf-8"))
+                info(f"bootstrap_peers.json = {cb}")
+            except Exception:
+                pass
 
-    # ---------- 4. Determina peers ----------
-    title("4. Determinando peers corretos")
+    # 4. Determina peers
+    if not args.json:
+        title("4. Determinando peers corretos")
 
-    # Preferência: IPs Tailscale dos peers (exceto self)
     candidate_ips = []
     for ip in ts.get("peers", []):
         if ip != ts.get("self") and ip not in candidate_ips:
-            candidate_ips.append(ip)
-
-    # Fallback: IPs LAN na mesma sub-rede
-    if not candidate_ips and lan:
-        primary = lan[0]
-        for ip in lan[1:]:
-            if same_subnet(primary, ip) and ip not in candidate_ips:
+            if not _is_invalid_peer_ip(ip, ts.get("self", "")):
                 candidate_ips.append(ip)
 
-    if candidate_ips:
+    if not candidate_ips and lan:
+        primary = lan[0] if lan else ""
+        for ip in lan[1:]:
+            if same_subnet(primary, ip) and ip not in candidate_ips:
+                if not _is_invalid_peer_ip(ip):
+                    candidate_ips.append(ip)
+
+    if candidate_ips and not args.json:
         ok(f"Peers detectados: {candidate_ips}")
-    else:
+    elif not candidate_ips and not args.json:
         warn("Nenhum peer detectado automaticamente")
-        # tenta ler do arquivo brn_tailscale_peer.txt
-        if TAILSCALE_PEER.exists():
+
+    if not candidate_ips and TAILSCALE_PEER.exists():
+        try:
             content = TAILSCALE_PEER.read_text(encoding="utf-8").strip()
             for line in content.splitlines():
                 line = line.strip()
                 if line and not line.startswith("#"):
                     ip = line.split(":")[0]
-                    if ip not in candidate_ips:
+                    if ip not in candidate_ips and not _is_invalid_peer_ip(ip):
                         candidate_ips.append(ip)
-            if candidate_ips:
+            if candidate_ips and not args.json:
                 ok(f"Peers do brn_tailscale_peer.txt: {candidate_ips}")
+        except Exception:
+            pass
 
-    # ---------- 5. Aplica configs ----------
-    title("5. Aplicando configuração")
-    if not candidate_ips and not cur_peers:
-        warn("Sem peers e sem bootstrap — pulando atualização")
-        peers_after = cur_peers
+    # 5. Aplica configs
+    if not args.json:
+        title("5. Aplicando configuração")
+
+    changes = {
+        "env_changed": False,
+        "bootstrap_changed": False,
+        "env_skipped": not ENV_FILE.exists(),
+    }
+    peers_after = cur_peers
+
+    if args.probe:
+        if not args.json:
+            info("(modo --probe) NÃO altera configs")
+    elif not candidate_ips and not cur_peers:
+        if not args.json:
+            warn("Sem peers e sem bootstrap — pulando atualização")
     else:
-        changes = update_configs(
-            candidate_ips, dry=args.check
-        )
-        if changes["env_changed"]:
-            if args.check:
-                info("(modo --check) brn_network.env SERIA alterado")
-            else:
-                ok("brn_network.env atualizado")
-        else:
-            info("brn_network.env não precisou mudar")
+        changes = update_configs(candidate_ips, dry=dry,
+                                 port_override=args.port)
 
-        if changes["bootstrap_changed"]:
-            if args.check:
-                info("(modo --check) bootstrap_peers.json SERIA alterado")
+        if not args.json:
+            if changes["env_changed"]:
+                if dry:
+                    info("(dry-run) brn_network.env SERIA alterado")
+                else:
+                    ok("brn_network.env atualizado")
             else:
-                ok("bootstrap_peers.json atualizado")
-        else:
-            info("bootstrap_peers.json não precisou mudar")
+                info("brn_network.env não precisou mudar")
+
+            if changes["bootstrap_changed"]:
+                if dry:
+                    info("(dry-run) bootstrap_peers.json SERIA alterado")
+                else:
+                    ok("bootstrap_peers.json atualizado")
+            else:
+                info("bootstrap_peers.json não precisou mudar")
+
+            if changes["env_skipped"]:
+                warn("brn_network.env não existe — só bootstrap_peers.json foi alterado")
 
         # relê para o relatório
-        env = load_env_file()
-        peers_after = [p.strip() for p in
-                       env.get("BRN_BOOTSTRAP_PEERS", "").split(",")
-                       if p.strip()]
+        if not dry:
+            env = load_env_file()
+            peers_after = [p.strip() for p in
+                           env.get("BRN_BOOTSTRAP_PEERS", "").split(",")
+                           if p.strip()]
+        else:
+            # em dry-run, mostra o que SERIA
+            p2p_port = args.port or env.get("BRN_P2P_PORT", "6001")
+            peers_after = list(cur_peers)
+            for ip in candidate_ips:
+                entry = _normalize_peer(ip, p2p_port)
+                if entry and entry not in peers_after:
+                    peers_after.append(entry)
 
-    # ---------- 6. Consulta o nó ----------
-    title("6. Consultando o nó")
+    # 6. Consulta nó
+    if not args.json:
+        title("6. Consultando o nó")
+
     node_ok = node_running()
     chain_ok = False
     chain = {}
@@ -631,7 +880,8 @@ def main() -> int:
     peers_db = {}
 
     if node_ok:
-        ok("HTTP :5000 respondendo")
+        if not args.json:
+            ok("HTTP :5000 respondendo")
         ch_ok, ch = get_chain_info()
         if ch_ok and isinstance(ch, dict):
             chain_ok = True
@@ -641,37 +891,43 @@ def main() -> int:
         if s_ok and isinstance(s, dict):
             sync = s
 
-        p_ok, p = get_peers_score()
-        if p_ok and isinstance(p, dict):
-            peers_db = p
-    else:
+        p_ok, p_res = get_peers_score()
+        if p_ok and isinstance(p_res, dict):
+            peers_db = p_res
+    elif not args.json:
         err("HTTP :5000 não respondeu")
 
-    # ---------- 7. Relatório ----------
-    print_report(ts, lan, env, cur_peers, peers_after,
-                 node_ok, chain_ok, chain, sync, peers_db)
+    # 7. Relatório
+    if args.json:
+        output = build_json_output(ts, lan, cur_peers, peers_after,
+                                   node_ok, chain_ok, chain, sync, peers_db)
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+    else:
+        print_report(ts, lan, cur_peers, peers_after,
+                     node_ok, chain_ok, chain, sync, peers_db,
+                     timeout=args.timeout)
 
-    # ---------- 8. Reiniciar se necessário ----------
+    # 8. Aviso de reinício
     needs_restart = (
-        not args.check
+        not dry
+        and not args.probe
         and (changes["env_changed"] or changes["bootstrap_changed"])
         and node_ok
     )
 
-    if needs_restart:
-        if args.auto or args.yes:
-            info("Modo --auto/--yes: reiniciando o nó...")
-            warn("Reinicie manualmente: Ctrl+C na janela do nó e suba de novo")
-            info("(Não consigo reiniciar o processo do nó daqui)")
-        else:
-            if restart_node_confirmation():
-                print()
-                warn("Faça manualmente:")
-                print(f"  1. Vá na janela onde o nó está rodando")
-                print(f"  2. Aperte Ctrl+C")
-                print(f"  3. Rode: python{'3' if IS_LINUX else ''} main.py --client-mode --no-tailscale --headless")
-            else:
-                info("Reinício adiado — você pode fazer quando quiser")
+    if needs_restart and not args.json:
+        print()
+        warn("Configuração alterada — reinicie o nó para aplicar.")
+        print(f"  1. Vá na janela onde o nó está rodando")
+        print(f"  2. Aperte Ctrl+C")
+        print(f"  3. Rode novamente: python{'3' if IS_LINUX else ''} main.py --pool-client")
+        if not (args.auto or args.yes):
+            try:
+                resp = input(f"\n{C.BOLD}Ver lembrete acima? (s/N): {C.RST}").strip().lower()
+                if resp not in ("s", "sim", "y", "yes"):
+                    info("Ok, apenas anote e reinicie depois.")
+            except (EOFError, KeyboardInterrupt):
+                pass
 
     return 0
 
