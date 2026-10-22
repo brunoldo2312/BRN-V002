@@ -1,3 +1,15 @@
+[ Interface / pywebview ]
+                  │
+                  ▼
+         ┌────────────────────────┐
+         │   app_wallet_v3.py     │  ◄── Ponte principal (Bridge)
+         └──────────┬─────────────┘
+                    │
+      ┌─────────────┼──────────────┬──────────────┐
+      ▼             ▼              ▼              ▼
+[secure_store]  [ab_test.py]  [security.py]  [Nó HTTP :5000]
+(Criptografia   (Atribuição    (Logs de       (Blockchain,
+ e Wallet)       A/B 50/50)     Auditoria)     Mempool, Mineração)
 https://diagnostic-work-596.notion.site/BRN-BrunoCoin-Documenta-o-do-Projeto-3fef4e870c4a81f3acfbe4d4f77e0dda
 
 https://alguma-coisa-aleatoria.trycloudflare.com
