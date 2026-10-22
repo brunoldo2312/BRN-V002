@@ -1,194 +1,787 @@
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>BRN Explorer</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: #0d1117; color: #e6edf3; padding: 20px; line-height: 1.5;
-        }
-        .container { max-width: 1100px; margin: 0 auto; }
-        header {
-            display: flex; justify-content: space-between; align-items: center;
-            padding-bottom: 16px; border-bottom: 1px solid #30363d; margin-bottom: 24px;
-        }
-        h1 { font-size: 1.6rem; }
-        h1 span { color: #58a6ff; }
-        .status-dot {
-            display: inline-block; width: 10px; height: 10px; border-radius: 50%;
-            background: #3fb950; margin-right: 6px; animation: pulse 2s infinite;
-        }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-        .grid {
-            display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 12px; margin-bottom: 24px;
-        }
-        .card {
-            background: #161b22; border: 1px solid #30363d; border-radius: 8px;
-            padding: 16px;
-        }
-        .card .label { font-size: 0.8rem; color: #8b949e; text-transform: uppercase; }
-        .card .value { font-size: 1.5rem; font-weight: 600; color: #58a6ff; margin-top: 4px; }
-        .section {
-            background: #161b22; border: 1px solid #30363d; border-radius: 8px;
-            padding: 20px; margin-bottom: 16px;
-        }
-        .section h2 { font-size: 1.1rem; margin-bottom: 12px; }
-        table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
-        th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #21262d; }
-        th { color: #8b949e; font-weight: 500; font-size: 0.8rem; text-transform: uppercase; }
-        tr:hover { background: #1c2128; }
-        code {
-            font-family: ui-monospace, "SF Mono", Menlo, monospace;
-            font-size: 0.82rem; background: #0d1117; padding: 2px 6px;
-            border-radius: 4px; color: #79c0ff;
-        }
-        .btn {
-            background: #238636; color: white; border: none; padding: 8px 16px;
-            border-radius: 6px; cursor: pointer; font-size: 0.9rem; font-family: inherit;
-        }
-        .btn:hover { background: #2ea043; }
-        .loading { color: #8b949e; font-style: italic; }
-        .footer {
-            text-align: center; margin-top: 32px; padding-top: 16px;
-            border-top: 1px solid #30363d; color: #8b949e; font-size: 0.85rem;
-        }
-        .footer a { color: #58a6ff; text-decoration: none; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BRN Explorer</title>
+<style>
+:root {
+    --bg: #0d1117;
+    --bg-card: #161b22;
+    --bg-hover: #1c2128;
+    --border: #30363d;
+    --border-light: #21262d;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+    --purple: #a371f7;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text);
+    padding: 16px; line-height: 1.5; font-size: 14px;
+}
+.container { max-width: 1200px; margin: 0 auto; }
+
+header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding-bottom: 12px; border-bottom: 1px solid var(--border);
+    margin-bottom: 16px; flex-wrap: wrap; gap: 12px;
+}
+h1 { font-size: 1.4rem; }
+h1 span { color: var(--accent); }
+.topbar-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+.status-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 12px; border-radius: 12px;
+    font-size: 0.85rem; font-weight: 500;
+    background: var(--bg-card); border: 1px solid var(--border);
+}
+.status-dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--green); animation: pulse 2s infinite;
+}
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+.btn {
+    background: var(--bg-card); color: var(--text);
+    border: 1px solid var(--border); padding: 6px 14px;
+    border-radius: 6px; cursor: pointer; font-size: 0.85rem;
+    font-family: inherit;
+}
+.btn:hover { background: var(--border); }
+.btn.p { background: #238636; border-color: #2ea043; color: white; }
+.btn.p:hover { background: #2ea043; }
+.btn.danger { background: var(--red); border-color: var(--red); color: white; }
+
+select {
+    background: var(--bg-card); color: var(--text);
+    border: 1px solid var(--border); padding: 6px 10px;
+    border-radius: 6px; font-family: inherit; font-size: 0.85rem;
+}
+
+.grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 10px; margin-bottom: 16px;
+}
+.card {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px;
+}
+.card .label {
+    font-size: 0.7rem; color: var(--text-muted);
+    text-transform: uppercase; letter-spacing: 0.05em;
+}
+.card .value {
+    font-size: 1.4rem; font-weight: 600; color: var(--accent); margin-top: 4px;
+}
+.card.warn .value { color: var(--yellow); }
+.card.crit .value { color: var(--red); }
+
+.section {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px; margin-bottom: 12px;
+}
+.section h2 {
+    font-size: 1rem; margin-bottom: 12px;
+    display: flex; justify-content: space-between; align-items: center;
+}
+
+table {
+    width: 100%; border-collapse: collapse; font-size: 0.85rem;
+}
+th, td {
+    padding: 8px 10px; text-align: left;
+    border-bottom: 1px solid var(--border-light);
+}
+th {
+    color: var(--text-muted); font-weight: 500;
+    font-size: 0.72rem; text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+tr.clickable { cursor: pointer; }
+tr.clickable:hover { background: var(--bg-hover); }
+tr.behind td { color: var(--yellow); }
+
+code {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 0.78rem; background: var(--bg);
+    padding: 2px 6px; border-radius: 4px; color: #79c0ff;
+    word-break: break-all;
+}
+
+.sync-card { display: none; }
+.sync-card.show { display: block; }
+.sync-bar {
+    height: 8px; background: var(--border); border-radius: 4px;
+    overflow: hidden; margin: 10px 0;
+}
+.sync-bar > div {
+    height: 100%; width: 0%; background: var(--accent);
+    transition: width 0.4s;
+}
+.sync-stats {
+    display: flex; gap: 16px; flex-wrap: wrap;
+    font-size: 0.85rem; color: var(--text-muted);
+}
+.sync-stats b { color: var(--text); }
+
+.alert {
+    padding: 10px 14px; border-radius: 6px; margin-bottom: 12px;
+    font-size: 0.88rem;
+}
+.alert.warn { background: #2d2200; border: 1px solid #9e6a03; color: #e3b341; }
+.alert.err { background: #2d1416; border: 1px solid #8b2424; color: #ffa198; }
+.alert.ok { background: #0d2818; border: 1px solid #238636; color: #7ee787; }
+.alert.info { background: #0d1d2f; border: 1px solid #1f6feb; color: #79c0ff; }
+
+.modal {
+    display: none; position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0, 0, 0, 0.75); z-index: 1000;
+    padding: 20px; overflow-y: auto;
+}
+.modal.show { display: block; }
+.modal-content {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 8px; max-width: 900px;
+    margin: 0 auto; padding: 20px;
+    position: relative;
+}
+.modal-close {
+    position: absolute; top: 10px; right: 10px;
+    background: transparent; border: none; color: var(--text-muted);
+    font-size: 1.5rem; cursor: pointer; line-height: 1;
+}
+.modal-close:hover { color: var(--text); }
+.modal h2 { margin-bottom: 16px; }
+.modal h3 { margin: 16px 0 8px; font-size: 0.95rem; }
+
+.grid3 {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 10px; margin-bottom: 12px;
+}
+.stat {
+    background: var(--bg); border: 1px solid var(--border-light);
+    border-radius: 6px; padding: 10px;
+}
+.stat .lbl {
+    font-size: 0.7rem; color: var(--text-muted);
+    text-transform: uppercase; margin-bottom: 4px;
+}
+.stat .val {
+    font-family: ui-monospace, monospace;
+    font-size: 0.78rem; word-break: break-all;
+    color: var(--accent);
+}
+
+.tx-item {
+    background: var(--bg); border: 1px solid var(--border-light);
+    border-radius: 6px; padding: 10px; margin-bottom: 6px;
+    font-size: 0.8rem;
+}
+.tx-item .txid {
+    font-family: ui-monospace, monospace;
+    color: var(--accent); word-break: break-all; margin-bottom: 4px;
+}
+.tx-item .coinbase { color: var(--yellow); font-weight: bold; }
+.tx-item .outputs { color: var(--text-muted); font-size: 0.75rem; }
+
+.footer {
+    text-align: center; margin-top: 24px; padding-top: 12px;
+    border-top: 1px solid var(--border);
+    color: var(--text-muted); font-size: 0.78rem;
+}
+.footer a { color: var(--accent); text-decoration: none; }
+.footer a:hover { text-decoration: underline; }
+
+.loading { color: var(--text-muted); font-style: italic; text-align: center; padding: 20px; }
+.empty { color: var(--text-muted); text-align: center; padding: 20px; }
+
+.tag {
+    display: inline-block; padding: 1px 8px;
+    border-radius: 10px; font-size: 0.7rem; font-weight: 600;
+}
+.tag.green { background: #0d2818; color: var(--green); }
+.tag.yellow { background: #2d2200; color: var(--yellow); }
+.tag.red { background: #2d1416; color: var(--red); }
+.tag.blue { background: #0d1d2f; color: var(--accent); }
+
+@media (max-width: 640px) {
+    .hide-sm { display: none; }
+    h1 { font-size: 1.2rem; }
+    .card .value { font-size: 1.15rem; }
+}
+</style>
 </head>
 <body>
-    <div class="container">
-        <header>
-            <h1>🔷 <span>BRN</span> Explorer</h1>
-            <div>
-                <span class="status-dot"></span>
-                <span id="online">Online</span>
-                <button class="btn" onclick="carregarTudo()" style="margin-left: 12px;">🔄 Atualizar</button>
+<div class="container">
+    <header>
+        <h1>🔷 <span>BRN</span> Explorer</h1>
+        <div class="topbar-right">
+            <div class="status-badge" id="statusBadge">
+                <span class="status-dot" id="statusDot"></span>
+                <span id="statusText">Conectando…</span>
             </div>
-        </header>
-
-        <div class="grid">
-            <div class="card">
-                <div class="label">Altura</div>
-                <div class="value" id="height">—</div>
-            </div>
-            <div class="card">
-                <div class="label">UTXOs</div>
-                <div class="value" id="utxos">—</div>
-            </div>
-            <div class="card">
-                <div class="label">Mempool</div>
-                <div class="value" id="mempool">—</div>
-            </div>
-            <div class="card">
-                <div class="label">Peers</div>
-                <div class="value" id="peers">—</div>
-            </div>
-            <div class="card">
-                <div class="label">Dificuldade</div>
-                <div class="value" id="difficulty">—</div>
-            </div>
-            <div class="card">
-                <div class="label">Recompensa</div>
-                <div class="value" id="reward">—</div>
-            </div>
+            <select id="refreshSelect" title="Intervalo de auto-refresh">
+                <option value="0">Auto: off</option>
+                <option value="5" selected>Auto: 5s</option>
+                <option value="10">Auto: 10s</option>
+                <option value="30">Auto: 30s</option>
+                <option value="60">Auto: 60s</option>
+            </select>
+            <button class="btn p" onclick="carregarTudo(true)">🔄 Atualizar</button>
         </div>
+    </header>
 
-        <div class="section">
-            <h2>📦 Últimos Blocos</h2>
-            <table>
-                <thead>
-                    <tr>
-                        <th>#</th>
-                        <th>Hash</th>
-                        <th>Timestamp</th>
-                        <th>Txs</th>
-                        <th>Dificuldade</th>
-                    </tr>
-                </thead>
-                <tbody id="blocksBody">
-                    <tr><td colspan="5" class="loading">Carregando…</td></tr>
-                </tbody>
-            </table>
+    <!-- Alertas (fork/offline) -->
+    <div id="alertFork" class="alert err" style="display:none;">
+        ⚠️ <b>FORK DETECTADO</b> — a rede está dividida. Aguardando reorg.
+    </div>
+    <div id="alertOffline" class="alert warn" style="display:none;">
+        🔌 Servidor principal offline — mostrando apenas dados locais do SQLite.
+    </div>
+
+    <!-- Cards de status -->
+    <div class="grid">
+        <div class="card">
+            <div class="label">Altura</div>
+            <div class="value" id="height">—</div>
         </div>
-
-        <div class="section">
-            <h2>🔗 Tip Hash</h2>
-            <code id="tipHash" style="display: block; word-break: break-all; padding: 10px;">—</code>
+        <div class="card">
+            <div class="label">Peers</div>
+            <div class="value" id="peers">—</div>
         </div>
-
-        <div class="footer">
-            BRN Node v4 — Blockchain local · <a href="/api/status">/api/status</a> · <a href="/api/work">/api/work</a>
+        <div class="card">
+            <div class="label">UTXOs</div>
+            <div class="value" id="utxos">—</div>
+        </div>
+        <div class="card">
+            <div class="label">Mempool</div>
+            <div class="value" id="mempool">—</div>
+        </div>
+        <div class="card">
+            <div class="label">Dificuldade</div>
+            <div class="value" id="difficulty">—</div>
+        </div>
+        <div class="card">
+            <div class="label">Recompensa</div>
+            <div class="value" id="reward">—</div>
         </div>
     </div>
 
-    <script>
-        const API = "";  // mesmo host
+    <!-- Sync -->
+    <div class="section sync-card" id="syncCard">
+        <h2>
+            <span>🔄 Sincronização</span>
+            <span id="syncStatus" class="tag blue">—</span>
+        </h2>
+        <div class="sync-bar"><div id="syncBar"></div></div>
+        <div class="sync-stats">
+            <span>Local: <b id="syncLocal">—</b></span>
+            <span>Alvo: <b id="syncTarget">—</b></span>
+            <span>Progresso: <b id="syncPct">—</b></span>
+            <span id="syncPeer">—</span>
+        </div>
+    </div>
 
-        async function fetchJSON(url) {
-            const r = await fetch(url);
-            if (!r.ok) throw new Error(`HTTP ${r.status}`);
-            return r.json();
+    <!-- Peers -->
+    <div class="section" id="peersSection" style="display:none;">
+        <h2>
+            <span>👥 Peers (<span id="peersCount">0</span>)</span>
+        </h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Endereço</th>
+                    <th>Altura</th>
+                    <th>Score</th>
+                    <th class="hide-sm">Última vez</th>
+                </tr>
+            </thead>
+            <tbody id="peersBody">
+                <tr><td colspan="4" class="loading">Carregando…</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <!-- Últimos blocos -->
+    <div class="section">
+        <h2>
+            <span>📦 Últimos Blocos</span>
+            <span style="font-size:0.75rem;color:var(--text-muted);font-weight:400;">
+                clique para ver detalhes
+            </span>
+        </h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>Hash</th>
+                    <th class="hide-sm">Timestamp</th>
+                    <th>Txs</th>
+                    <th class="hide-sm">Dificuldade</th>
+                </tr>
+            </thead>
+            <tbody id="blocksBody">
+                <tr><td colspan="5" class="loading">Carregando…</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <!-- Tip Hash -->
+    <div class="section">
+        <h2>🔗 Tip Hash (bloco atual)</h2>
+        <code id="tipHash" style="display:block;padding:10px;">—</code>
+    </div>
+
+    <div class="footer">
+        BRN Explorer v2 · <span id="lastUpdate">aguardando…</span>
+        · <a href="/api/stats">/api/stats</a>
+        · <a href="/health">/health</a>
+        · <a href="javascript:carregarTudo(true)">reload</a>
+    </div>
+</div>
+
+<!-- Modal de bloco -->
+<div class="modal" id="blockModal">
+    <div class="modal-content">
+        <button class="modal-close" onclick="closeModal()">×</button>
+        <h2>Bloco #<span id="mHeight">—</span></h2>
+        <div class="grid3">
+            <div class="stat">
+                <div class="lbl">Hash</div>
+                <div class="val" id="mHash">—</div>
+            </div>
+            <div class="stat">
+                <div class="lbl">Prev Hash</div>
+                <div class="val" id="mPrev">—</div>
+            </div>
+            <div class="stat">
+                <div class="lbl">Merkle Root</div>
+                <div class="val" id="mMerkle">—</div>
+            </div>
+            <div class="stat">
+                <div class="lbl">Nonce</div>
+                <div class="val" id="mNonce">—</div>
+            </div>
+            <div class="stat">
+                <div class="lbl">Dificuldade</div>
+                <div class="val" id="mDiff">—</div>
+            </div>
+            <div class="stat">
+                <div class="lbl">Timestamp</div>
+                <div class="val" id="mTs">—</div>
+            </div>
+        </div>
+        <h3>Transações (<span id="mTxCount">0</span>)</h3>
+        <div id="mTxs"></div>
+    </div>
+</div>
+
+<script>
+"use strict";
+
+const REFRESH_KEY = "brn_explorer_refresh_s";
+
+const state = {
+    blocks: [],
+    byHeight: new Map(),
+    status: null,
+    sync: null,
+    peers: null,
+    autoTimer: null,
+    refreshing: false,
+    serverOnline: true,
+};
+
+// ============================================================
+// HELPERS
+// ============================================================
+function $(id) { return document.getElementById(id); }
+
+async function fetchJSON(url, timeoutMs = 5000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const r = await fetch(url, {signal: controller.signal});
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return await r.json();
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+function shortHash(h, n = 16) {
+    if (!h) return "—";
+    return h.slice(0, n) + "…";
+}
+
+function fmtBRN(sats) {
+    const v = Number(sats || 0) / 1e8;
+    return v.toFixed(8).replace(/\.?0+$/, "") + " BRN";
+}
+
+function fmtTs(ts) {
+    if (!ts) return "—";
+    return new Date(ts * 1000).toLocaleString("pt-BR");
+}
+
+function fmtAgo(ts) {
+    if (!ts) return "—";
+    const diff = Math.max(0, Date.now() / 1000 - ts);
+    if (diff < 60) return `${Math.floor(diff)}s`;
+    if (diff < 3600) return `${Math.floor(diff / 60)}min`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
+    return `${Math.floor(diff / 86400)}d`;
+}
+
+// ============================================================
+// STATUS
+// ============================================================
+async function refreshStatus() {
+    try {
+        const s = await fetchJSON("/api/status-proxy");
+        if (s.error || s.success === false) throw new Error(s.error || "error");
+        state.status = s;
+        state.serverOnline = true;
+
+        $("height").textContent = s.height ?? "—";
+        $("peers").textContent = s.peers ?? "—";
+        $("utxos").textContent = s.utxos ?? "—";
+        $("mempool").textContent = s.mempool ?? "—";
+        $("difficulty").textContent = s.difficulty ?? "—";
+        $("reward").textContent = s.reward ? fmtBRN(s.reward) : "—";
+        $("tipHash").textContent = s.tip_hash || "—";
+
+        $("alertOffline").style.display = "none";
+        setStatusBadge("online");
+    } catch (e) {
+        state.serverOnline = false;
+        $("alertOffline").style.display = "block";
+        setStatusBadge("offline");
+        // Fallback: pelo menos altura e tip via /api/latest (local)
+        try {
+            const blocks = await fetchJSON("/api/latest");
+            if (Array.isArray(blocks) && blocks.length > 0) {
+                const latest = blocks.reduce((a, b) => (b.height > a.height ? b : a));
+                $("height").textContent = latest.height;
+                $("tipHash").textContent = latest.hash || "—";
+            }
+        } catch (_) {}
+    }
+}
+
+function setStatusBadge(kind) {
+    const badge = $("statusBadge");
+    const dot = $("statusDot");
+    const txt = $("statusText");
+
+    if (kind === "online") {
+        dot.style.background = "var(--green)";
+        txt.textContent = "Online";
+        txt.style.color = "var(--green)";
+    } else if (kind === "syncing") {
+        dot.style.background = "var(--yellow)";
+        txt.textContent = "Sincronizando";
+        txt.style.color = "var(--yellow)";
+    } else if (kind === "forking") {
+        dot.style.background = "var(--red)";
+        txt.textContent = "FORK";
+        txt.style.color = "var(--red)";
+    } else {
+        dot.style.background = "var(--red)";
+        txt.textContent = "Offline";
+        txt.style.color = "var(--red)";
+    }
+}
+
+// ============================================================
+// SYNC
+// ============================================================
+async function refreshSync() {
+    try {
+        const s = await fetchJSON("/api/sync-status-proxy");
+        if (s.error) throw new Error(s.error);
+        state.sync = s;
+
+        const forking = !!s.forking;
+        const syncing = !!s.syncing;
+        const synced = !!s.synced;
+
+        $("alertFork").style.display = forking ? "block" : "none";
+        if (forking) setStatusBadge("forking");
+        else if (syncing) setStatusBadge("syncing");
+        else if (state.serverOnline) setStatusBadge("online");
+
+        // Mostrar card se está sincronizando OU tem progresso < 100
+        const progress = Number(s.progress ?? 100);
+        const showSync = syncing || forking || progress < 99.9;
+
+        const card = $("syncCard");
+        if (showSync) {
+            card.classList.add("show");
+            $("syncBar").style.width = progress + "%";
+            $("syncLocal").textContent = s.local_height ?? "—";
+            $("syncTarget").textContent = s.target_height ?? "—";
+            $("syncPct").textContent = progress.toFixed(1) + "%";
+
+            const st = $("syncStatus");
+            if (forking) {
+                st.textContent = "FORK";
+                st.className = "tag red";
+            } else if (syncing) {
+                st.textContent = "Sincronizando";
+                st.className = "tag yellow";
+            } else {
+                st.textContent = "OK";
+                st.className = "tag green";
+            }
+
+            $("syncPeer").innerHTML = s.active_peer
+                ? `Peer ativo: <b>${shortHash(s.active_peer, 24)}</b>`
+                : "";
+
+            $("syncBar").style.background = forking
+                ? "var(--red)" : (syncing ? "var(--yellow)" : "var(--green)");
+        } else {
+            card.classList.remove("show");
+        }
+    } catch (e) {
+        // Sync status é proxy — se falhar, pode ser server down
+        $("syncCard").classList.remove("show");
+    }
+}
+
+// ============================================================
+// PEERS
+// ============================================================
+async function refreshPeers() {
+    try {
+        const s = await fetchJSON("/api/peers-discovered-proxy");
+        if (s.error || !s.ok) throw new Error(s.error || "error");
+        state.peers = s.peers || [];
+        renderPeers(state.peers);
+    } catch (e) {
+        $("peersSection").style.display = "none";
+    }
+}
+
+function renderPeers(peers) {
+    const section = $("peersSection");
+    const tbody = $("peersBody");
+    $("peersCount").textContent = peers.length;
+
+    if (peers.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4" class="empty">Nenhum peer descoberto</td></tr>';
+        section.style.display = "block";
+        return;
+    }
+
+    const localH = state.status?.height ?? 0;
+    tbody.innerHTML = "";
+    for (const p of peers.slice(0, 50)) {
+        const tr = document.createElement("tr");
+        const behind = p.height < localH - 5;
+        if (behind) tr.className = "behind";
+
+        const score = p.score || 0;
+        const scoreColor = score < 0 ? "var(--red)" : (score > 0 ? "var(--green)" : "var(--text-muted)");
+
+        tr.innerHTML = `
+            <td><code>${p.address || "?"}</code></td>
+            <td>${p.height ?? "—"}</td>
+            <td style="color:${scoreColor}">${score}</td>
+            <td class="hide-sm">${fmtAgo(p.last_seen)}</td>
+        `;
+        tbody.appendChild(tr);
+    }
+
+    if (peers.length > 50) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td colspan="4" class="empty">… e mais ${peers.length - 50} peers</td>`;
+        tbody.appendChild(tr);
+    }
+
+    section.style.display = "block";
+}
+
+// ============================================================
+// BLOCOS
+// ============================================================
+async function refreshBlocks() {
+    const tbody = $("blocksBody");
+    try {
+        const blocks = await fetchJSON("/api/latest");
+        if (!Array.isArray(blocks)) throw new Error("resposta inválida");
+
+        state.blocks = blocks.slice().sort((a, b) => b.height - a.height);
+        state.byHeight.clear();
+        for (const b of state.blocks) {
+            state.byHeight.set(b.height, b);
         }
 
-        async function carregarStatus() {
-            try {
-                const s = await fetchJSON(API + "/api/status");
-                document.getElementById("height").textContent = s.height;
-                document.getElementById("utxos").textContent = s.utxos;
-                document.getElementById("mempool").textContent = s.mempool;
-                document.getElementById("peers").textContent = s.peers;
-                document.getElementById("difficulty").textContent = s.difficulty;
-                document.getElementById("reward").textContent =
-                    (s.reward / 1e8).toFixed(2) + " BRN";
-                document.getElementById("tipHash").textContent = s.tip_hash;
-                document.getElementById("online").textContent = "Online";
-                document.getElementById("online").style.color = "#3fb950";
-            } catch (e) {
-                document.getElementById("online").textContent = "Offline";
-                document.getElementById("online").style.color = "#f85149";
-                console.error("Status falhou:", e);
+        if (state.blocks.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" class="empty">Nenhum bloco ainda</td></tr>';
+            return;
+        }
+
+        renderBlocks();
+    } catch (e) {
+        tbody.innerHTML = `<tr><td colspan="5" class="empty">Erro: ${e.message}</td></tr>`;
+    }
+}
+
+function renderBlocks() {
+    const tbody = $("blocksBody");
+    tbody.innerHTML = "";
+
+    for (const b of state.blocks) {
+        const tr = document.createElement("tr");
+        tr.className = "clickable";
+        const txs = b.transactions ? b.transactions.length : 0;
+
+        tr.innerHTML = `
+            <td><b>${b.height}</b></td>
+            <td><code>${shortHash(b.hash, 20)}</code></td>
+            <td class="hide-sm">${fmtTs(b.timestamp)}</td>
+            <td>${txs}</td>
+            <td class="hide-sm">${b.difficulty ?? "—"}</td>
+        `;
+        tr.onclick = () => showBlockDetail(b);
+        tbody.appendChild(tr);
+    }
+}
+
+// ============================================================
+// MODAL DE DETALHE
+// ============================================================
+function showBlockDetail(b) {
+    $("mHeight").textContent = b.height ?? "—";
+    $("mHash").textContent = b.hash || "—";
+    $("mPrev").textContent = b.prev_hash || "—";
+    $("mMerkle").textContent = b.merkle || "—";
+    $("mNonce").textContent = b.nonce ?? "—";
+    $("mDiff").textContent = b.difficulty ?? "—";
+    $("mTs").textContent = fmtTs(b.timestamp);
+
+    const txs = b.transactions || [];
+    $("mTxCount").textContent = txs.length;
+
+    const box = $("mTxs");
+    box.innerHTML = "";
+
+    for (let i = 0; i < txs.length; i++) {
+        const tx = txs[i];
+        const isCoinbase = tx.inputs && tx.inputs.length > 0 && tx.inputs[0].txid === "0".repeat(64);
+        const outputs = (tx.outputs || []).map(o =>
+            `${o.address ? shortHash(o.address, 16) : "?"}: ${(Number(o.amount || 0) / 1e8).toFixed(8)}`
+        ).join(" · ");
+
+        const div = document.createElement("div");
+        div.className = "tx-item";
+        div.innerHTML = `
+            <div class="txid">
+                ${isCoinbase ? '<span class="coinbase">[COINBASE]</span> ' : ''}
+                ${tx.txid || "—"}
+            </div>
+            <div class="outputs">
+                ${tx.inputs ? tx.inputs.length : 0} input(s) → ${outputs || "(sem outputs)"}
+            </div>
+        `;
+        box.appendChild(div);
+    }
+
+    if (txs.length === 0) {
+        box.innerHTML = '<div class="empty">Sem transações</div>';
+    }
+
+    $("blockModal").classList.add("show");
+}
+
+function closeModal() {
+    $("blockModal").classList.remove("show");
+}
+
+document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeModal();
+});
+
+$("blockModal").addEventListener("click", (e) => {
+    if (e.target.id === "blockModal") closeModal();
+});
+
+// ============================================================
+// REFRESH CONTROL
+// ============================================================
+async function carregarTudo(manual = false) {
+    if (state.refreshing) return;
+    state.refreshing = true;
+    try {
+        await Promise.all([
+            refreshStatus(),
+            refreshSync(),
+            refreshPeers(),
+            refreshBlocks(),
+        ]);
+        const now = new Date();
+        $("lastUpdate").textContent =
+            "atualizado " + now.toLocaleTimeString("pt-BR");
+    } finally {
+        state.refreshing = false;
+        if (manual) scheduleAuto();
+    }
+}
+
+function scheduleAuto() {
+    if (state.autoTimer) {
+        clearInterval(state.autoTimer);
+        state.autoTimer = null;
+    }
+    const sel = $("refreshSelect");
+    const secs = parseInt(sel.value, 10);
+    if (secs > 0) {
+        state.autoTimer = setInterval(async () => {
+            // Auto-refresh NÃO recarrega blocos (para não resetar scroll)
+            await Promise.all([
+                refreshStatus(),
+                refreshSync(),
+                refreshPeers(),
+            ]);
+            $("lastUpdate").textContent =
+                "atualizado " + new Date().toLocaleTimeString("pt-BR");
+        }, secs * 1000);
+    }
+}
+
+// Carrega preferência salva
+(function initRefreshSelect() {
+    const saved = localStorage.getItem(REFRESH_KEY);
+    const sel = $("refreshSelect");
+    if (saved !== null) {
+        for (const opt of sel.options) {
+            if (opt.value === saved) {
+                sel.value = saved;
+                break;
             }
         }
+    }
+    sel.addEventListener("change", () => {
+        localStorage.setItem(REFRESH_KEY, sel.value);
+        scheduleAuto();
+    });
+})();
 
-        async function carregarBlocos() {
-            const tbody = document.getElementById("blocksBody");
-            try {
-                const blocos = await fetchJSON(API + "/api/latest");
-                if (!blocos || blocos.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="5" class="loading">Nenhum bloco ainda</td></tr>';
-                    return;
-                }
-                tbody.innerHTML = "";
-                // mais recentes primeiro
-                blocos.sort((a, b) => b.height - a.height);
-                for (const b of blocos) {
-                    const tr = document.createElement("tr");
-                    const ts = b.timestamp ? new Date(b.timestamp * 1000).toLocaleString("pt-BR") : "—";
-                    tr.innerHTML = `
-                        <td><strong>${b.height}</strong></td>
-                        <td><code>${(b.hash || "").slice(0, 20)}…</code></td>
-                        <td>${ts}</td>
-                        <td>${b.transactions ? b.transactions.length : 0}</td>
-                        <td>${b.difficulty || "—"}</td>
-                    `;
-                    tbody.appendChild(tr);
-                }
-            } catch (e) {
-                tbody.innerHTML = '<tr><td colspan="5" class="loading">Erro ao carregar</td></tr>';
-                console.error("Blocos falhou:", e);
-            }
-        }
-
-        async function carregarTudo() {
-            await Promise.all([carregarStatus(), carregarBlocos()]);
-        }
-
-        carregarTudo();
-        setInterval(carregarTudo, 5000);  // atualiza a cada 5s
-    </script>
+// ============================================================
+// INICIALIZAÇÃO
+// ============================================================
+carregarTudo(false);
+scheduleAuto();
+</script>
 </body>
 </html>
