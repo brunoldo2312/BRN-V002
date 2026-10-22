@@ -1,1128 +1,683 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.6.3)
+"""server.py — Servidor HTTP Flask do nó BRN (v10.0)
 ================================================================
-v13.6.3 (2026-10-22):
-  [FIX] auth_tag configurável via BRN_REQUIRE_AUTH_TAG.
-        Permite sync de nós com BRN_NETWORK_SECRET diferente (rede aberta).
-v13.6.2:
-  [FIX] _validate_required_secrets: defaults fracos viram WARNING
-        em vez de ERROR.
-v13.6.1:
-  [SECURITY] Removidos _HARDCODED_DEFAULTS sensíveis.
-  [FIX] chain.is_origin = is_origin.
-  [FIX] miner.start(..., is_origin=is_origin).
-  [NEW] Heartbeat em peers.json no status loop.
-v13.6:
-  [NEW] --pool-client e --no-pool-client.
+Expõe a interface esperada por main.py v13.6.3:
+    app                         — Flask app
+    set_chain(chain)            — injeta Blockchain
+    set_p2p_manager(p2p)        — injeta P2PManager
+    set_sync_manager(sync)      — injeta ChainSyncManager
+    set_pool_manager(pool)      — injeta PoolManager
+    set_trust_network(trust)    — injeta TrustNetwork
+    auto_registrar_carteira_atual() -> dict
 ================================================================
 """
 from __future__ import annotations
 
 import os
-import sys
-import signal
-import argparse
-import threading
 import time
-import json
-import subprocess
-import urllib.request
-from pathlib import Path
+import logging
+import threading
+from decimal import Decimal, ROUND_DOWN
+from functools import wraps
 
-BASE_DIR = Path(__file__).resolve().parent
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
+log = logging.getLogger("server")
 
-def _bootstrap_env() -> None:
-    env_file = BASE_DIR / "brn_network.env"
-    if not env_file.exists():
-        return
-    try:
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            k = k.strip()
-            v = v.strip().strip('"').strip("'")
-            if k and k not in os.environ:
-                os.environ[k] = v
-    except Exception as e:
-        print("[boot] aviso: falha lendo " + str(env_file) + ": " + str(e))
+app = Flask(__name__)
+CORS(app)
+
+_state = {"chain": None, "p2p": None, "sync": None, "pool": None, "trust": None}
+_lock = threading.RLock()
 
 
-_HARDCODED_DEFAULTS = {
-    "BRN_BOOTSTRAP_PEERS":     "",
-    "BRN_IS_ORIGIN":           "0",
-    "BRN_HTTPS":               "0",
-    "BRN_AUDIT_ENABLED":       "1",
-    "BRN_AUDIT_LOG":           "audit.log",
-    "BRN_P2P_AUTH":            "optional",
-    "BRN_P2P_AUTH_WINDOW":     "30",
-    "BRN_P2P_NONCE_CACHE":     "10000",
-    "BRN_SKIP_VERIFY":         "0",
-    "BRN_VERIFY_STRICT":       "0",
-    "BRN_TRACKER":             "",
-    "MONGO_USER":              "",
-    "MONGO_PASS":              "",
-    "MONGO_HOST":              "",
-    "MONGO_DB":                "brn_analytics",
-    "TS_AUTH_KEY":             "",
-    "TS_API_KEY":              "",
-    "TS_TAILNET":              "",
-    "TS_HOSTNAME_PREFIX":      "brn-node",
-    "BRN_POOL_ENABLED":        "1",
-    "BRN_POOL_URL_LOCAL":      "http://127.0.0.1:5000",
-    "BRN_WEB_PASS":            "",
-}
+def set_chain(chain):
+    with _lock: _state["chain"] = chain
+    log.info("server: chain injetada (altura=%s)", chain.db.height() if chain else -1)
 
 
-def _apply_hardcoded_defaults() -> int:
-    aplicados = 0
-    for k, v in _HARDCODED_DEFAULTS.items():
-        if k not in os.environ or os.environ[k] == "":
-            os.environ[k] = v
-            aplicados += 1
-    return aplicados
+def set_p2p_manager(p2p):
+    with _lock: _state["p2p"] = p2p
+    log.info("server: p2p injetado")
 
 
-_bootstrap_env()
-_applied = _apply_hardcoded_defaults()
-if _applied:
-    print(f"[boot] defaults não-sensíveis aplicados: {_applied} variáveis")
+def set_sync_manager(sync):
+    with _lock: _state["sync"] = sync
+    log.info("server: sync injetado")
 
 
-from brn_config import Config
-from brn_logger import setup_logger, get_logger
-from version import VERSION, BUILD_DATE, GITHUB_USER, GITHUB_REPO
+def set_pool_manager(pool):
+    with _lock: _state["pool"] = pool
+    log.info("server: pool injetado")
 
+
+def set_trust_network(trust):
+    with _lock: _state["trust"] = trust
+    log.info("server: trust injetado")
+
+
+def _get(k):
+    with _lock: return _state[k]
+
+
+# Rate limiting (graceful se security.py ausente)
 try:
-    from trust_network import TrustNetwork
-    _HAS_TRUST = True
+    from security import require_rate_limit
 except ImportError:
-    TrustNetwork = None
-    _HAS_TRUST = False
-
-_shutdown = threading.Event()
-
-NODE_ID_PATH        = BASE_DIR / "node_identity.enc"
-CLIENT_BOOT_TIMEOUT = int(os.environ.get("BRN_CLIENT_BOOT_TIMEOUT", "120"))
-WEB_HOST            = os.environ.get("BRN_WEB_HOST",      "127.0.0.1")
-EXPLORER_HOST       = os.environ.get("BRN_EXPLORER_HOST", "127.0.0.1")
-AUTO_MINE           = os.environ.get("BRN_AUTO_MINE", "0") == "1"
-
-_running_services: list = []
-_services_lock = threading.Lock()
+    def require_rate_limit(_k):
+        def deco(fn): return fn
+        return deco
 
 
-def _register_service(name: str, svc) -> None:
-    with _services_lock:
-        _running_services.append((name, svc))
+def _body():
+    try: return request.get_json(force=True, silent=True) or {}
+    except Exception: return {}
 
 
-def _thread_excepthook(args):
+def _err(msg, status=400):
+    r = jsonify({"ok": False, "error": msg, "msg": msg})
+    r.status_code = status
+    return r
+
+
+def _ok(**kw):
+    return jsonify({"ok": True, **kw})
+
+
+# ============================================================
+# HEALTH / STATUS
+# ============================================================
+@app.route("/health")
+def health():
+    chain = _get("chain")
+    if chain is None:
+        return jsonify({"ok": False, "error": "chain nao injetada"}), 503
     try:
-        log = get_logger("thread")
-        thread_name = args.thread.name if args.thread else "?"
-        log.error(
-            "Thread '" + str(thread_name) + "' morreu: " + str(args.exc_value),
-            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
-        )
-    except Exception:
-        pass
-
-
-threading.excepthook = _thread_excepthook
-
-
-def _thread_wrap(name: str, fn):
-    def runner():
-        try:
-            fn()
-        except Exception as e:
-            try:
-                get_logger(name).exception("thread " + name + " caiu: " + str(e))
-            except Exception:
-                pass
-    return runner
-
-
-def _check_required_modules() -> list:
-    required = [
-        "brn_config", "brn_logger", "version",
-        "blockchain", "db", "crypto", "wallet", "bech32",
-        "secure_store", "chain_validator", "checkpoints",
-        "p2p_auth", "p2p_cipher", "p2p_secure", "p2p_unified",
-        "discovery_v2", "miner_loop", "trust_network",
-    ]
-    missing = []
-    for m in required:
-        try:
-            __import__(m)
-        except Exception:
-            missing.append(m)
-    return missing
-
-
-L2_ENABLED = False
-btc_config = None
-BTCWatcher = None
-L2Manager = None
-try:
-    import btc_config
-    from btc_watcher import BTCWatcher
-    from l2_manager import L2Manager
-    L2_ENABLED = True
-    print("[L2] Módulos BTC carregados OK")
-except Exception as _e:
-    print("[AVISO] btc_watcher/l2_manager indisponível: " + str(_e))
-
-
-def _l2_disponivel() -> bool:
-    return bool(
-        L2_ENABLED
-        and btc_config is not None
-        and BTCWatcher is not None
-        and L2Manager is not None
-    )
-
-
-POOL_ENABLED = os.environ.get("BRN_POOL_ENABLED", "1") == "1"
-PoolManager = None
-PoolClient = None
-_POOL_MANAGER_AVAILABLE = False
-
-if POOL_ENABLED:
-    try:
-        from mining_pool import PoolManager
-        _POOL_MANAGER_AVAILABLE = True
-        print("[Pool] PoolManager carregado OK")
-    except Exception as _e:
-        print("[AVISO] mining_pool indisponível: " + str(_e))
-        PoolManager = None
-
-    try:
-        from miner_pool_client import PoolClient
-        print("[Pool] PoolClient carregado OK")
-    except Exception as _e:
-        print("[AVISO] miner_pool_client indisponível: " + str(_e))
-        PoolClient = None
-
-
-def _pool_disponivel() -> bool:
-    return bool(POOL_ENABLED and _POOL_MANAGER_AVAILABLE and PoolManager is not None)
-
-
-def _audit(event: str, data: dict = None) -> None:
-    try:
-        from security import audit_log
-        audit_log(event, data or {})
-    except Exception:
-        pass
-
-
-def _close_audit() -> None:
-    try:
-        from security import close_audit
-        close_audit()
-    except Exception:
-        pass
-
-
-def _setup_tailscale_auto(log) -> bool:
-    auth_key = os.environ.get("TS_AUTH_KEY", "").strip()
-    if not auth_key:
-        log.info("Tailscale: desabilitado (TS_AUTH_KEY vazia)")
-        return True
-    setup_path = BASE_DIR / "brn_tailscale_setup.py"
-    if not setup_path.exists():
-        log.warning("Tailscale: brn_tailscale_setup.py não encontrado — pulando")
-        return True
-    log.info("Tailscale: configurando automaticamente...")
-    try:
-        r = subprocess.run(
-            [sys.executable, str(setup_path), "--auto"],
-            capture_output=True, text=True, timeout=180,
-            cwd=str(BASE_DIR),
-        )
-        return r.returncode == 0
-    except subprocess.TimeoutExpired:
-        log.warning("Tailscale: timeout de 180s — continuando sem VPN")
-        return False
+        return jsonify({"ok": True, "height": chain.db.height(),
+                        "version": "10.0", "ts": int(time.time())})
     except Exception as e:
-        log.warning("Tailscale: erro — " + str(e))
-        return False
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
-def parse_args():
-    p = argparse.ArgumentParser(prog="main.py", description="BRN Node v13")
-    p.add_argument("--status", action="store_true")
-    p.add_argument("--headless", action="store_true")
-    p.add_argument("--read-only", action="store_true")
-    p.add_argument("--version", action="store_true")
-    p.add_argument("--check-update", action="store_true")
-    p.add_argument("--config", default="config.json")
-    p.add_argument("--log-level", default=None)
-    p.add_argument("--log-file", default=None)
-    p.add_argument("--password-file", default=None)
-    p.add_argument("--rotate-node-id", action="store_true")
-    p.add_argument("--client-mode", action="store_true")
-    p.add_argument("--discover", action="store_true")
-    p.add_argument("--l2", action="store_true")
-    p.add_argument("--l2-stats", action="store_true")
-    p.add_argument("--mine", action="store_true")
-    p.add_argument("--no-p2p", action="store_true")
-    p.add_argument("--relay", dest="relay", action="store_true", default=None)
-    p.add_argument("--no-relay", dest="relay", action="store_false")
-    p.add_argument("--verify-only", action="store_true")
-    p.add_argument("--skip-verify", action="store_true")
-    p.add_argument("--no-tailscale", action="store_true")
-    p.add_argument("--no-sync", action="store_true")
-    p.add_argument("--no-pool", action="store_true")
-    p.add_argument("--no-pool-client", action="store_true")
-    p.add_argument("--pool-client", action="store_true")
-    p.add_argument("--pool-stats", action="store_true")
-    p.add_argument("--gui", action="store_true")
-    p.add_argument("--no-gui", action="store_true")
-    return p.parse_args()
+@app.route("/api/status")
+@require_rate_limit("status")
+def api_status():
+    chain = _get("chain")
+    if chain is None:
+        return _err("chain nao injetada", 503)
+    try:
+        h = chain.db.height()
+        return jsonify({
+            "height": h,
+            "tip_hash": chain.db.tip_hash() or "",
+            "mempool": len(chain.db.all_mempool(limit=1000)),
+            "utxos": chain.db.count_utxos(),
+            "difficulty": chain.current_difficulty(),
+            "reward": chain.current_reward(h + 1),
+            "l2_enabled": False,
+            "pool_enabled": _get("pool") is not None,
+            "fila_tamanho": len(getattr(chain, "fila_mineracao", {})),
+            "rede_descentralizada": getattr(chain, "rede_descentralizada", False),
+        })
+    except Exception as e:
+        log.exception("api_status")
+        return _err(str(e), 500)
 
 
-def _validate_required_secrets(log, is_origin: bool, wants_mining: bool) -> bool:
-    critical = {
-        "BRN_NODE_PASSWORD": "senha da identidade Ed25519 do no",
-        "BRN_NETWORK_SECRET": "segredo HMAC da rede P2P",
+@app.route("/api/chain-info")
+def api_chain_info():
+    chain = _get("chain")
+    if chain is None:
+        return _err("chain nao injetada", 503)
+    try:
+        h = chain.db.height()
+        return jsonify({
+            "ok": True, "height": h,
+            "tip_hash": chain.db.tip_hash() or "",
+            "difficulty": chain.current_difficulty(),
+            "reward": chain.current_reward(h + 1),
+        })
+    except Exception as e:
+        return _err(str(e), 500)
+
+
+@app.route("/api/work")
+@require_rate_limit("work")
+def api_work():
+    chain = _get("chain")
+    if chain is None:
+        return _err("chain nao injetada", 503)
+    try:
+        return jsonify({"ok": True, "cumulative_work": chain.cumulative_work()})
+    except Exception as e:
+        return _err(str(e), 500)
+
+
+@app.route("/api/sync-info")
+@require_rate_limit("sync_info")
+def api_sync_info():
+    chain = _get("chain")
+    sync = _get("sync")
+    if chain is None:
+        return jsonify({"ok": False, "erro": "chain nao injetada"}), 503
+    try:
+        local_h = chain.db.height()
+    except Exception as e:
+        return jsonify({"ok": False, "erro": str(e)}), 500
+    if sync is None:
+        return jsonify({"ok": True, "sync": {
+            "height": local_h, "target": local_h, "percent": 100.0,
+            "synced": True, "syncing": False,
+        }})
+    try:
+        s = sync.get_status()
+        return jsonify({"ok": True, "sync": {
+            "height": s.get("local_height", local_h),
+            "target": s.get("target_height", local_h),
+            "percent": s.get("progress", 100.0),
+            "synced": s.get("synced", False),
+            "syncing": s.get("syncing", False),
+            "active_peer": s.get("active_peer"),
+            "last_error": s.get("last_error", ""),
+        }})
+    except Exception as e:
+        return jsonify({"ok": False, "erro": str(e)}), 500
+
+
+@app.route("/api/sync/status")
+def api_sync_status():
+    chain = _get("chain")
+    sync = _get("sync")
+    if chain is None:
+        return _err("chain nao injetada", 503)
+    if sync is None:
+        h = chain.db.height()
+        return jsonify({"synced": True, "syncing": False, "progress": 100.0,
+                        "local_height": h, "target_height": h})
+    try:
+        return jsonify(sync.get_status())
+    except Exception as e:
+        return _err(str(e), 500)
+
+
+# ============================================================
+# BLOCKS
+# ============================================================
+def _ser_block(b):
+    return {
+        "height": b.get("height"),
+        "hash": b.get("hash", ""),
+        "prev_hash": b.get("prev_hash", ""),
+        "timestamp": b.get("timestamp"),
+        "nonce": b.get("nonce"),
+        "merkle": b.get("merkle", ""),
+        "difficulty": b.get("difficulty"),
+        "transactions": [
+            {"txid": t.get("txid", ""),
+             "inputs": t.get("inputs", []),
+             "outputs": t.get("outputs", [])}
+            for t in b.get("transactions", [])
+        ],
     }
-    if wants_mining:
-        critical["BRN_WALLET_SESSION_PASS"] = "senha da carteira local (para minerar)"
-    OLD_DEFAULTS = (
-        "senha-no-temp-123", "senha-temp-123",
-        "senha-forte-da-carteira-2026",
-        "9226edea8ba62bc1c6ae36883c0536c95b4c85642195465d6c4d9456abef20f9",
-    )
-    missing, weak = [], []
-    for k, desc in critical.items():
-        val = os.environ.get(k, "").strip()
-        if not val:
-            missing.append(f"  - {k}  ({desc})")
-        elif val in OLD_DEFAULTS:
-            weak.append(f"  - {k}  ({desc})")
-    if missing:
-        log.error("=" * 64)
-        log.error(" SEGREDOS OBRIGATORIOS AUSENTES")
-        log.error("=" * 64)
-        for m in missing:
-            log.error(m)
-        log.error(" O no NAO VAI INICIAR sem esses segredos.")
-        log.error("=" * 64)
-        return False
-    if weak:
-        log.warning("=" * 64)
-        log.warning(" SEGREDOS FRACOS (defaults antigos) - continuando")
-        log.warning("=" * 64)
-        for w in weak:
-            log.warning(w)
-        log.warning(" O no VAI INICIAR, mas recomendamos rotacionar depois.")
-        log.warning("=" * 64)
-    return True
 
 
-def _resolve_password(args) -> str:
-    if args.password_file:
-        p = Path(args.password_file)
-        if not p.exists():
-            raise SystemExit("--password-file não encontrado: " + str(p))
-        return p.read_text(encoding="utf-8").rstrip("\r\n")
-    env = os.environ.get("BRN_NODE_PASSWORD")
-    if env:
-        return env
-    if sys.stdin.isatty():
-        import getpass
-        return getpass.getpass("Senha do nó (identidade Ed25519): ")
-    raise SystemExit("Senha do nó não informada.")
-
-
-def _resolve_wallet_password() -> str:
-    return (
-        os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
-        or os.environ.get("BRN_NODE_PASSWORD", "").strip()
-    )
-
-
-def load_or_create_node_identity(password: str, rotate: bool = False):
-    from crypto import Ed25519PrivateKey
-    from secure_store import save_wallet, load_wallet
-    log = get_logger("identity")
-
-    if rotate and NODE_ID_PATH.exists():
-        backup = NODE_ID_PATH.with_suffix(".enc.bak")
-        NODE_ID_PATH.replace(backup)
-        log.warning("Identidade rotacionada. Backup em " + str(backup))
-
-    if NODE_ID_PATH.exists():
-        data = load_wallet(password, str(NODE_ID_PATH))
-        if not data:
-            raise SystemExit("Falha ao decifrar " + str(NODE_ID_PATH))
-        sk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(data["sk"]))
-        pub_hex = data["pub"]
-    else:
-        sk = Ed25519PrivateKey.generate()
-        pub_hex = sk.public_key().public_bytes_raw().hex()
-        save_wallet(
-            {"sk": sk.private_bytes_raw().hex(), "pub": pub_hex},
-            password, str(NODE_ID_PATH),
-        )
-        log.info("Identidade nova criada: " + pub_hex[:16] + "...")
-
+@app.route("/api/blocks")
+@require_rate_limit("list_blocks")
+def api_blocks():
+    chain = _get("chain")
+    if chain is None:
+        return jsonify({"error": "chain nao injetada"}), 503
     try:
-        from ab_test import get_variant, get_node_id_hash
-        from security import set_node_id_hash, audit_log
-        node_hash = get_node_id_hash(pub_hex)
-        set_node_id_hash(node_hash)
-        variant = get_variant(node_hash)
-        audit_log("exposure_log", {"variant": variant, "node_id": node_hash})
-        log.info(f"Teste A/B: Variante atribuída -> {variant}")
+        start = int(request.args.get("start", 0))
+        limit = max(1, min(int(request.args.get("limit", 15)), 100))
+        h = chain.db.height()
+        end = min(h, start + limit - 1)
+        blocks = []
+        for i in range(start, end + 1):
+            b = chain.db.get_block(i)
+            if b:
+                blocks.append(_ser_block(b))
+        return jsonify({"blocks": blocks, "start": start, "count": len(blocks)})
     except Exception as e:
-        log.warning(f"Falha ao registrar A/B test: {e}")
-
-    return sk, pub_hex
+        return jsonify({"error": str(e)}), 500
 
 
-def _read_role() -> str:
+@app.route("/api/block/<int:height>")
+@require_rate_limit("get_block")
+def api_block(height):
+    chain = _get("chain")
+    if chain is None:
+        return jsonify({"error": "chain nao injetada"}), 503
     try:
-        p = BASE_DIR / "brn_role.txt"
-        if p.exists():
-            return p.read_text(encoding="utf-8").strip().lower()
-    except Exception:
-        pass
-    return "auto"
-
-
-def _is_origin(client_mode: bool) -> bool:
-    if client_mode:
-        return False
-    if os.environ.get("BRN_IS_ORIGIN", "0") == "1":
-        return True
-    return _read_role() in ("origin", "hub", "servidor")
-
-
-VERIFY_OK      = "ok"
-VERIFY_INVALID = "invalid"
-VERIFY_ERROR   = "error"
-
-
-def _verify_chain(chain) -> str:
-    try:
-        from chain_validator import verify_chain
-    except ImportError:
-        get_logger("verify").info("chain_validator.py não disponível")
-        return VERIFY_ERROR
-    log = get_logger("verify")
-    log.info("Verificando integridade da cadeia...")
-    t0 = time.time()
-    try:
-        r = verify_chain(chain)
+        b = chain.db.get_block(height)
+        if not b:
+            return jsonify({"error": "bloco nao encontrado"}), 404
+        return jsonify(_ser_block(b))
     except Exception as e:
-        log.exception("validador falhou: " + str(e))
-        return VERIFY_ERROR
-    dt = time.time() - t0
-    valid = getattr(r, "valid", None)
-    if valid is None:
-        valid = bool(r)
-    summary_fn = getattr(r, "summary", None)
-    blocks = getattr(r, "blocks_checked", 0)
-    warns = getattr(r, "warnings", []) or []
-    errs = getattr(r, "errors", []) or []
-    if valid:
-        if callable(summary_fn):
-            log.info(f"OK {summary_fn()} ({dt:.2f}s)")
-        else:
-            log.info(f"OK cadeia íntegra ({dt:.2f}s, {blocks} blocos)")
-        for w in warns[:5]:
-            log.warning("  " + str(w))
-        return VERIFY_OK
-    log.error(f"CADEIA INVÁLIDA ({len(errs)} erros)")
-    for e in errs[:10]:
-        log.error("  - " + str(e))
-    return VERIFY_INVALID
+        return jsonify({"error": str(e)}), 500
 
 
-def _inject_into_server(what: str, obj, log) -> bool:
-    setter_name = {
-        "p2p":  "set_p2p_manager",
-        "sync": "set_sync_manager",
-        "pool": "set_pool_manager",
-        "trust": "set_trust_network",
-    }.get(what)
-    if setter_name is None:
-        log.warning(f"[inject] tipo desconhecido: {what}")
-        return False
+@app.route("/api/latest")
+def api_latest():
+    chain = _get("chain")
+    if chain is None:
+        return jsonify({"error": "chain nao injetada"}), 503
     try:
-        import server as _srv
-        setter = getattr(_srv, setter_name, None)
-        if setter is None:
-            log.warning(f"[inject] server.py NAO tem {setter_name}()")
-            return False
-        setter(obj)
-        log.info(f"[inject] {what} injetado em server.py")
-        return True
-    except ImportError as e:
-        log.warning(f"[inject] server.py indisponível ({what}): {e}")
-        return False
+        h = chain.db.height()
+        out = []
+        for i in range(max(0, h - 9), h + 1):
+            b = chain.db.get_block(i)
+            if b:
+                out.append(_ser_block(b))
+        return jsonify(out)
     except Exception as e:
-        log.warning(f"[inject] {what} falhou: {e}")
-        return False
+        return jsonify({"error": str(e)}), 500
 
 
-def _init_http_server(chain, log):
+# ============================================================
+# PORTFOLIO
+# ============================================================
+@app.route("/api/portfolio/<address>")
+@require_rate_limit("portfolio")
+def api_portfolio(address):
+    chain = _get("chain")
+    if chain is None:
+        return jsonify({"error": "chain nao injetada"}), 503
     try:
-        from server import (
-            app as http_app,
-            set_chain,
-            auto_registrar_carteira_atual,
-        )
+        from bech32 import validate_address
+        if not validate_address(address):
+            return jsonify({"error": "endereco invalido"}), 400
+        utxos = chain.db.get_utxos(address)
+        total = sum(int(u.get("amount", 0)) for u in utxos)
+        return jsonify({"portfolio": {"BRN": total, "KYC": 0},
+                        "utxos_count": len(utxos)})
     except Exception as e:
-        log.error("Falha importando server.py: " + str(e))
-        return None
-    try:
-        set_chain(chain)
-        log.info("server.py: chain injetada")
-    except Exception as e:
-        log.error("Falha set_chain: " + str(e))
-        return None
-    try:
-        reg = auto_registrar_carteira_atual()
-        if reg.get("ok"):
-            log.info("auto-registro pubkey: " + str(reg.get("msg")))
-        else:
-            log.info("auto-registro pubkey: pulado (" + str(reg.get("msg")) + ")")
-    except Exception as e:
-        log.warning("auto-registro pubkey falhou: " + str(e))
-    return http_app
+        return jsonify({"error": str(e)}), 500
 
 
-def run_http(app_instance):
-    log = get_logger("http")
-    port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    ssl_ctx = None
-    if os.environ.get("BRN_HTTPS", "0") == "1":
+# ============================================================
+# WALLET
+# ============================================================
+@app.route("/api/nova-carteira", methods=["POST"])
+@require_rate_limit("nova_carteira")
+def api_nova_carteira():
+    try:
+        from wallet import Wallet
+        w = Wallet()
+        return jsonify({"success": True, "address": w.address,
+                        "private_key": w.priv_hex, "public_key": w.pub_hex})
+    except Exception as e:
+        log.exception("nova-carteira")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ============================================================
+# TRANSFER
+# ============================================================
+@app.route("/api/transfer", methods=["POST"])
+@require_rate_limit("transfer")
+def api_transfer():
+    chain = _get("chain")
+    if chain is None:
+        return jsonify({"ok": False, "error": "chain nao injetada"}), 503
+    b = _body()
+    try:
+        from_addr = (b.get("from") or "").strip()
+        to_addr = (b.get("to") or "").strip()
+        priv_hex = (b.get("private_key") or "").strip()
+        pub_hex = (b.get("pubkey") or "").strip()
+        asset = b.get("asset_id", "BRN")
+        if asset not in ("BRN", ""):
+            return jsonify({"ok": False, "error": "apenas BRN"}), 400
+
+        from bech32 import validate_address
+        if not validate_address(from_addr):
+            return jsonify({"ok": False, "error": "from invalido"}), 400
+        if not validate_address(to_addr):
+            return jsonify({"ok": False, "error": "to invalido"}), 400
+        if not priv_hex or not pub_hex:
+            return jsonify({"ok": False, "error": "priv/pub obrigatorios"}), 400
+
+        UNIT = 10 ** 8
         try:
-            from security import ensure_self_signed_cert
-            cert, key = ensure_self_signed_cert()
-            ssl_ctx = (cert, key)
-            log.info("HTTPS https://" + WEB_HOST + ":" + str(port))
-        except Exception as e:
-            log.warning("Falha HTTPS: " + str(e) + ". Caindo para HTTP.")
-            ssl_ctx = None
-    if ssl_ctx is None:
-        log.info("HTTP http://" + WEB_HOST + ":" + str(port))
-    app_instance.run(
-        host=WEB_HOST, port=port, threaded=True,
-        debug=False, use_reloader=False, ssl_context=ssl_ctx,
-    )
+            amount = int((Decimal(str(b.get("amount", "0"))) * UNIT)
+                         .quantize(Decimal("1"), rounding=ROUND_DOWN))
+        except Exception:
+            return jsonify({"ok": False, "error": "amount invalido"}), 400
+        if amount <= 0:
+            return jsonify({"ok": False, "error": "amount <= 0"}), 400
 
+        from crypto import pubkey_to_address
+        if pubkey_to_address(pub_hex) != from_addr:
+            return jsonify({"ok": False, "error": "pubkey nao corresponde a from"}), 400
 
-def run_explorer():
-    from explorer import app as explorer_app
-    log = get_logger("explorer")
-    port = int(os.environ.get("BRN_EXPLORER_PORT", "8080"))
-    ssl_ctx = None
-    log.info("Explorer http://" + EXPLORER_HOST + ":" + str(port))
-    explorer_app.run(
-        host=EXPLORER_HOST, port=port, threaded=True,
-        debug=False, use_reloader=False, ssl_context=ssl_ctx,
-    )
+        utxos = chain.db.get_utxos(from_addr)
+        if not utxos:
+            return jsonify({"ok": False, "error": "sem UTXOs"}), 400
 
+        MIN_FEE = 1000
+        selected, s = [], 0
+        for u in utxos:
+            selected.append(u)
+            s += int(u["amount"])
+            if s >= amount + MIN_FEE:
+                break
+        if s < amount + MIN_FEE:
+            return jsonify({"ok": False, "error": "saldo insuficiente"}), 400
 
-def run_status_loop(chain, p2p, sync=None, pool=None, pool_client=None,
-                    trust_net=None, node_id_short=""):
-    log = get_logger("status")
-    if p2p is None:
-        log.warning("P2P desabilitado — status loop sem peers")
+        change = s - amount - MIN_FEE
+        nonce = chain.db.get_nonce_for_pubkey(pub_hex)
 
-    last_peers_hb = 0.0
-    PEERS_HB_INTERVAL = 60.0
-    _already_warned_no_endereco = [False]
+        inputs = [{"txid": u["txid"], "vout": int(u["vout"]),
+                   "pubkey": pub_hex, "signature": ""} for u in selected]
+        outputs = [{"address": to_addr, "amount": amount, "pubkey": ""}]
+        if change > 0:
+            outputs.append({"address": from_addr, "amount": change, "pubkey": ""})
 
-    while not _shutdown.is_set():
-        time.sleep(30)
-        try:
-            peer_count = 0
-            if p2p is not None:
-                try:
-                    st = p2p.get_status()
-                    peer_count = st.get("peer_count", 0)
-                except Exception as e:
-                    log.warning("p2p.get_status: " + str(e))
+        tx = {"inputs": inputs, "outputs": outputs,
+              "timestamp": int(time.time()), "locktime": 0, "nonce": nonce}
 
-            mempool_n = len(chain.db.all_mempool(limit=1000))
-            utxos_n = chain.db.count_utxos()
-            msg = ("Altura=" + str(chain.db.height())
-                   + " Peers=" + str(peer_count)
-                   + " Mempool=" + str(mempool_n)
-                   + " UTXOs=" + str(utxos_n))
-            if sync is not None:
-                try:
-                    s = sync.get_status()
-                    msg += (" Sync=" + str(s.get("mode", "?"))
-                            + "/" + str(s.get("local_height", 0))
-                            + "→" + str(s.get("target_height", 0))
-                            + " (" + str(s.get("progress", 0)) + "%)")
-                except Exception:
-                    pass
-            if pool_client is not None:
-                try:
-                    pcs = pool_client.status()
-                    if pcs.get("running"):
-                        msg += (" PoolClient["
-                                + str(round(pcs.get("hashrate_khs", 0), 1))
-                                + " kH/s shares="
-                                + str(pcs.get("shares_accepted", 0)) + "/"
-                                + str(pcs.get("shares_submitted", 0))
-                                + "]")
-                except Exception:
-                    pass
-            if trust_net is not None:
-                try:
-                    ts = trust_net.get_network_stats()
-                    msg += (" Trust[Nodes=" + str(ts.get("total_nodes", 0))
-                            + " Valid=" + str(ts.get("validators_count", 0)) + "]")
-                except Exception:
-                    pass
-            log.info(msg)
+        from blockchain import txid as calc_txid, signing_hash
+        tx["txid"] = calc_txid(tx)
 
-            agora = time.time()
-            if agora - last_peers_hb >= PEERS_HB_INTERVAL:
-                last_peers_hb = agora
-                try:
-                    from update_peers import update_local_timestamp
-                    update_local_timestamp(
-                        height=chain.db.height(),
-                        node_id=node_id_short or "",
-                    )
-                except TimeoutError as _te:
-                    log.warning("update_peers: lock timeout (" + str(_te) + ")")
-                except RuntimeError as _re:
-                    if not _already_warned_no_endereco[0]:
-                        _already_warned_no_endereco[0] = True
-                        log.info("update_peers: " + str(_re))
-                except Exception as _ue:
-                    log.debug("update_peers falhou: " + str(_ue))
+        from crypto import sign_ecdsa
+        sig_hex = sign_ecdsa(bytes.fromhex(priv_hex), signing_hash(tx)).hex()
+        for inp in tx["inputs"]:
+            inp["signature"] = sig_hex
 
-        except Exception as e:
-            log.warning("status loop: " + str(e))
-
-
-def run_wallet_main_thread():
-    try:
-        if not os.environ.get("BRN_WEB_PASS"):
-            get_logger("wallet").error("BRN_WEB_PASS não definida")
-            return
-        from app_wallet_v3 import WalletApi
-        import webview
-        log = get_logger("wallet")
-        index_path = BASE_DIR / "index_wallet.html"
-        if not index_path.exists():
-            log.error("index_wallet.html não encontrado: " + str(index_path))
-            return
-        api = WalletApi()
-        webview.create_window(
-            "BRN RWA — Carteira Digital",
-            url=index_path.resolve().as_uri(),
-            js_api=api,
-            width=1020, height=880,
-            min_size=(820, 640),
-            background_color="#0d1117",
-        )
-        webview.start(debug=False)
-    except Exception as e:
-        get_logger("wallet").error("Falha: " + str(e))
-
-
-def _setup_pool_client_local(chain, pool, log, disabled: bool, is_origin_node: bool):
-    if disabled:
-        log.info("PoolClient: desativado por --no-pool-client")
-        return None
-    if PoolClient is None:
-        log.info("PoolClient: miner_pool_client indisponível")
-        return None
-
-    wallet_pass = _resolve_wallet_password()
-    if not wallet_pass:
-        log.warning("PoolClient: BRN_WALLET_SESSION_PASS/BRN_NODE_PASSWORD vazias")
-        return None
-
-    addr = ""
-    pub = ""
-    try:
-        from secure_store import load_current_wallet
-        w = load_current_wallet(wallet_pass)
-        if w and w.get("ok"):
-            addr = (w.get("address") or "").strip()
-            pub = (w.get("public_key") or w.get("pub_hex")
-                   or w.get("pubkey") or "").strip()
-        else:
-            log.info("PoolClient: current_wallet.enc não decifrou ("
-                     + str((w or {}).get("msg", "?")) + ")")
-    except Exception as e:
-        log.warning("PoolClient: falha lendo current_wallet: " + str(e))
-
-    if not addr.startswith("brn1") or not pub:
-        log.warning("PoolClient: current_wallet.enc sem address/public_key")
-        return None
-
-    if is_origin_node:
-        pool_url = os.environ.get("BRN_POOL_URL_LOCAL", "http://127.0.0.1:5000")
-    else:
-        pool_url = os.environ.get("BRN_POOL_URL", "http://127.0.0.1:5000")
-
-    try:
-        pc = PoolClient(addr, pub, pool_url=pool_url)
-        ok, msg = pc.start_mining()
+        ok, msg = chain.submit_tx(tx)
         if not ok:
-            log.warning("PoolClient: start_mining falhou: " + str(msg))
-            return None
-        log.info("PoolClient iniciado (is_origin=" + str(is_origin_node)
-                 + " pool=" + pool_url + ")")
-        return pc
+            return jsonify({"ok": False, "error": msg}), 400
+
+        p2p = _get("p2p")
+        if p2p is not None and hasattr(p2p, "broadcast_tx"):
+            try: p2p.broadcast_tx(tx)
+            except Exception: pass
+
+        return jsonify({"ok": True, "txid": tx["txid"]})
     except Exception as e:
-        log.warning("PoolClient: exceção: " + str(e))
-        return None
+        log.exception("api_transfer")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
-def _setup_local_miner_broadcast(chain, p2p, log):
+# ============================================================
+# TRANSACTIONS
+# ============================================================
+@app.route("/api/tx-status/<txid>")
+@require_rate_limit("tx_status")
+def api_tx_status(txid):
+    chain = _get("chain")
+    if chain is None:
+        return jsonify({"ok": False, "error": "chain nao injetada"}), 503
+    try:
+        h = chain.get_transaction_block_height(txid)
+        if h is None or h < 0:
+            if chain.db.has_mempool(txid):
+                return jsonify({"ok": True, "status": "pending", "height": None})
+            return jsonify({"ok": False, "status": "not_found"}), 404
+        return jsonify({"ok": True, "status": "confirmed", "height": h,
+                        "confirmations": chain.count_confirmations(txid)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/minhas-txs/<address>")
+@require_rate_limit("minhas_txs")
+def api_minhas_txs(address):
+    chain = _get("chain")
+    if chain is None:
+        return jsonify({"ok": False, "error": "chain nao injetada"}), 503
+    try:
+        limit = max(1, min(int(request.args.get("limit", 50)), 500))
+        fn = getattr(chain.db, "get_txs_for_address", None)
+        if fn is None:
+            return jsonify({"ok": True, "transactions": [], "count": 0,
+                            "note": "endpoint indisponivel no db"})
+        rows = fn(address, limit=limit) or []
+        return jsonify({"ok": True, "transactions": rows, "count": len(rows)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ============================================================
+# MINING
+# ============================================================
+@app.route("/api/miner/start", methods=["POST"])
+@require_rate_limit("miner_start")
+def api_miner_start():
+    chain = _get("chain")
+    if chain is None:
+        return jsonify({"ok": False, "error": "chain nao injetada"}), 503
+    b = _body()
+    address = (b.get("address") or "").strip()
+    pubkey = (b.get("miner_pubkey") or b.get("pubkey") or "").strip()
+    if not address or not pubkey:
+        return jsonify({"ok": False, "error": "address e miner_pubkey obrigatorios"}), 400
+    try:
+        from miner_loop import get_miner
+        ok, msg = get_miner(chain).start(address, pubkey)
+        return jsonify({"ok": ok, "msg": msg})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/miner/stop", methods=["POST"])
+@require_rate_limit("miner_stop")
+def api_miner_stop():
+    chain = _get("chain")
+    if chain is None:
+        return jsonify({"ok": False, "error": "chain nao injetada"}), 503
+    try:
+        from miner_loop import get_miner
+        ok, msg = get_miner(chain).stop()
+        return jsonify({"ok": ok, "msg": msg})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/miner/status")
+@require_rate_limit("miner_status")
+def api_miner_status():
+    chain = _get("chain")
+    if chain is None:
+        return jsonify({"running": False, "error": "chain nao injetada"}), 503
+    try:
+        from miner_loop import get_miner
+        return jsonify(get_miner(chain).status())
+    except Exception as e:
+        return jsonify({"running": False, "error": str(e)}), 500
+
+
+# ============================================================
+# PEERS / BOOTSTRAP
+# ============================================================
+@app.route("/api/peers")
+def api_peers():
+    p2p = _get("p2p")
     if p2p is None:
-        log.info("chain.on_block_mined: P2P desligado — broadcast inativo")
-        return False
+        return jsonify({"ok": True, "peers": [], "count": 0, "active": 0})
     try:
-        def _on_local_block(block):
-            try:
-                p2p.broadcast_block(block)
-                log.info("miner local: bloco #" + str(block.get("height"))
-                         + " propagado via P2P")
-            except Exception as e:
-                log.debug("broadcast_block falhou: " + str(e))
-        chain.on_block_mined = _on_local_block
-        log.info("chain.on_block_mined ligado ao P2P")
-        return True
+        st = p2p.get_status()
+        peers = st.get("peers", []) if isinstance(st, dict) else []
+        return jsonify({"ok": True, "peers": peers, "count": len(peers),
+                        "active": st.get("peer_count", len(peers))})
     except Exception as e:
-        log.warning("Falha ligando on_block_mined: " + str(e))
-        return False
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
-def _stop_with_timeout(name: str, svc, timeout: float = 5.0, log=None) -> None:
+@app.route("/api/bootstrap/add", methods=["POST"])
+@require_rate_limit("bootstrap_add")
+def api_bootstrap_add():
+    chain = _get("chain")
+    if chain is None:
+        return jsonify({"ok": False, "error": "chain nao injetada"}), 503
+    b = _body()
+    address = (b.get("address") or "").strip()
+    pubkey = (b.get("pubkey") or "").strip()
+    if not address or not pubkey:
+        return jsonify({"ok": False, "error": "address e pubkey obrigatorios"}), 400
     try:
-        if hasattr(svc, "stop"):
-            fn = svc.stop
-        elif hasattr(svc, "stop_mining"):
-            fn = svc.stop_mining
-        elif callable(svc):
-            fn = svc
-        else:
-            return
-    except Exception:
-        return
-    t = threading.Thread(target=fn, daemon=True, name="stop-" + name)
-    t.start()
-    t.join(timeout)
-    if t.is_alive() and log is not None:
-        log.warning("Serviço " + name + " não parou em " + str(timeout) + "s")
-
-
-def _graceful_shutdown(log, trust_net=None) -> None:
-    log.info("Encerrando serviços...")
-    with _services_lock:
-        services = list(_running_services)
-    for name, svc in reversed(services):
-        _stop_with_timeout(name, svc, timeout=5.0, log=log)
-    try:
-        from wallet import WalletManager
-        WalletManager.lock_session()
-    except Exception:
-        pass
-    try:
-        from mongo_client import mongo
-        mongo.close()
-    except Exception:
-        pass
-    if trust_net is not None:
-        try:
-            trust_net.shutdown()
-            log.info("TrustNetwork salva com sucesso.")
-        except Exception as e:
-            log.warning("Falha salvando TrustNetwork: " + str(e))
-    _audit("node_stop", {})
-    _close_audit()
-
-
-def main():
-    args = parse_args()
-    cfg = Config(args.config)
-
-    if args.read_only:
-        cfg.data["read_only"] = True
-    if args.headless or args.no_gui:
-        cfg.data["headless"] = True
-    if args.gui:
-        cfg.data["headless"] = False
-    if args.log_level:
-        cfg.data["log_level"] = args.log_level
-    if args.log_file:
-        cfg.data["log_file"] = args.log_file
-
-    cfg.apply_to_env()
-    log = setup_logger(level=cfg["log_level"],
-                       log_file=cfg["log_file"] or None)
-    is_origin = _is_origin(args.client_mode)
-
-    log.info("=" * 60)
-    log.info(" BRN Node v" + VERSION + " (" + BUILD_DATE + ")")
-
-    if args.l2 and _l2_disponivel():
-        l2_mode = "ON"
-    elif not args.l2:
-        l2_mode = "off"
-    else:
-        l2_mode = "INDISPONÍVEL"
-
-    pool_mode = (
-        "off" if args.no_pool
-        else ("ON" if _pool_disponivel() else "off")
-    )
-
-    log.info(" Config: " + cfg.source
-             + " | Modo: " + ("ORIGEM" if is_origin else "CLIENTE")
-             + " | L2: " + l2_mode
-             + " | Pool: " + pool_mode)
-    log.info(" HTTPS: " + ("ON" if os.environ.get("BRN_HTTPS") == "1" else "off")
-             + " | Auto-mine: " + ("ON" if AUTO_MINE else "off"))
-    log.info(" GUI: " + ("headless" if cfg["headless"] else "pywebview"))
-    log.info("=" * 60)
-
-    if args.version:
-        print(VERSION)
-        return 0
-    if args.status:
-        print("=" * 64)
-        print(" BRN Node — Diagnóstico (v" + VERSION + ")")
-        print("=" * 64)
-        print(" Config    : " + cfg.source)
-        print(" Web       : " + WEB_HOST + ":" + str(cfg["web_port"]))
-        print(" Explorer  : " + EXPLORER_HOST + ":" + str(cfg["explorer_port"]))
-        print(" P2P       : " + str(cfg["p2p_port"]))
-        print(" Pool      : " + ("SIM" if _pool_disponivel() else "não"))
-        print(" L2        : " + ("SIM" if _l2_disponivel() else "não"))
-        print(" Role      : " + ("ORIGEM" if is_origin else "CLIENTE"))
-        print("=" * 64)
-        return 0
-    if args.check_update:
-        print('{"ok": false, "msg": "check_update simplificado"}')
-        return 0
-
-    missing = _check_required_modules()
-    if missing:
-        log.error("Módulos obrigatórios faltando: " + ", ".join(missing))
-        return 1
-
-    wants_mining = bool(args.mine or AUTO_MINE or (not args.no_pool))
-    if not _validate_required_secrets(log, is_origin, wants_mining):
-        return 1
-
-    if not args.no_tailscale:
-        _setup_tailscale_auto(log)
-    else:
-        log.info("Tailscale: pulado por --no-tailscale")
-
-    try:
-        node_password = _resolve_password(args)
-    except SystemExit as e:
-        log.error(str(e))
-        return 1
-
-    try:
-        node_sk, node_pub = load_or_create_node_identity(
-            node_password, rotate=args.rotate_node_id
-        )
-    except SystemExit as e:
-        log.error(str(e))
-        return 1
+        chain.adicionar_na_fila(address, pubkey)
+        return jsonify({"ok": True,
+                        "fila_tamanho": len(chain.fila_mineracao),
+                        "rede_descentralizada": chain.rede_descentralizada})
     except Exception as e:
-        log.exception("Falha ao carregar identidade: " + str(e))
-        return 1
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-    log.info("Nó ID: " + node_pub[:16] + "...")
 
-    from blockchain import Blockchain
-    require_auth_tag = (os.environ.get("BRN_REQUIRE_AUTH_TAG", "1") == "1")
-    chain = Blockchain(
-        cfg["db_path"],
-        auto_genesis=is_origin,
-        network_secret=cfg["network_secret"],
-        require_auth_tag=require_auth_tag,
-    )
-    chain._fork_signal = threading.Event()
-    chain.is_origin = is_origin
-    log.info("Blockchain pronta (altura=" + str(chain.db.height()) + ")")
-
-    trust_net = None
-    if _HAS_TRUST:
-        try:
-            trust_net = TrustNetwork(str(BASE_DIR / "trust_network.json"))
-            chain.trust_net = trust_net
-            log.info("TrustNetwork: " + str(len(trust_net.nodes)) + " nós carregados")
-        except Exception as e:
-            log.warning("TrustNetwork desativada: " + str(e))
-            trust_net = None
-
-    if args.verify_only:
-        st = _verify_chain(chain)
-        try:
-            chain.db.close()
-        except Exception:
-            pass
-        return 0 if st == VERIFY_OK else 2
-
-    if not args.skip_verify and os.environ.get("BRN_SKIP_VERIFY", "0") != "1":
-        strict = os.environ.get("BRN_VERIFY_STRICT", "0") == "1"
-        st = _verify_chain(chain)
-        if st == VERIFY_INVALID and strict:
-            log.error("Abortando: cadeia inválida (BRN_VERIFY_STRICT=1)")
-            try:
-                chain.db.close()
-            except Exception:
-                pass
-            return 2
-        if st == VERIFY_ERROR:
-            log.warning("Verificação não conclusiva — seguindo com cautela")
-
-    p2p = None
-    if not args.no_p2p:
-        try:
-            from p2p_unified import P2PManager
-            p2p = P2PManager(chain, node_sk,
-                             tcp_port=cfg["p2p_port"],
-                             enable_upnp=cfg["upnp"])
-            p2p.start()
-            _register_service("p2p", p2p)
-            log.info("P2P iniciado na porta " + str(cfg["p2p_port"]))
-        except Exception as e:
-            log.error("Falha ao iniciar P2P: " + str(e))
-            p2p = None
-
-    if p2p is not None and trust_net is not None:
-        try:
-            if hasattr(p2p, "set_trust"):
-                p2p.set_trust(trust_net)
-        except Exception as e:
-            log.warning("Falha ligando TrustNetwork ao P2P: " + str(e))
-
-    sync = None
-    if not args.no_sync and p2p is not None:
-        try:
-            from sync_manager import ChainSyncManager
-            sync = ChainSyncManager(chain, chain.db, p2p)
-            try:
-                sync.set_sync_mode("full")
-            except Exception:
-                pass
-            sync.start_sync_loop()
-            _register_service("sync", sync)
-            log.info("Sync iniciado (full mode)")
-        except ImportError as e:
-            log.warning("sync_manager indisponível: " + str(e))
-            sync = None
-        except Exception as e:
-            log.warning("Falha ao iniciar Sync: " + str(e))
-            sync = None
-    elif args.no_sync:
-        log.info("Sync: pulado por --no-sync")
-
-    pool = None
-    if not args.no_pool and _pool_disponivel():
-        try:
-            pool = PoolManager(chain)
-            _register_service("pool", pool)
-            log.info("PoolManager iniciado")
-        except Exception as e:
-            log.warning("Falha ao iniciar PoolManager: " + str(e))
-            pool = None
-    elif args.no_pool:
-        log.info("Pool: desativado por --no-pool")
-    else:
-        log.info("Pool server: mining_pool indisponível — pulando")
-
-    http_app = _init_http_server(chain, log)
-    if http_app is not None:
-        threading.Thread(
-            target=_thread_wrap("HTTP", lambda: run_http(http_app)),
-            daemon=True, name="HTTP",
-        ).start()
-    else:
-        log.error("HTTP não pôde ser inicializado — seguindo sem API")
-
-    if p2p is not None:
-        _inject_into_server("p2p", p2p, log)
-    else:
-        log.warning("Sem P2PManager — tx nao serao propagadas")
-
-    if sync is not None:
-        _inject_into_server("sync", sync, log)
-    else:
-        log.info("Sem SyncManager — /api/sync/status retornara default")
-
-    if pool is not None:
-        _inject_into_server("pool", pool, log)
-    else:
-        log.info("Sem PoolManager — /api/pool/* retornara 503")
-
-    if trust_net is not None:
-        _inject_into_server("trust", trust_net, log)
-    else:
-        log.info("Sem TrustNetwork — rotas /api/trust/* indisponiveis")
-
-    disabled_pool_client = args.no_pool_client
-    if args.pool_client:
-        disabled_pool_client = False
-
-    pool_client = _setup_pool_client_local(
-        chain, pool, log,
-        disabled=disabled_pool_client,
-        is_origin_node=is_origin,
-    )
-    if pool_client is not None:
-        _register_service("pool_client", pool_client)
-
-    _setup_local_miner_broadcast(chain, p2p, log)
-
-    quer_miner_local = bool(args.mine or AUTO_MINE)
-
-    if quer_miner_local and (pool is not None or pool_client is not None):
-        log.warning("Miner local IGNORADO: pool/pool_client está ativo "
-                    "(evita forks).")
-        quer_miner_local = False
-
-    if quer_miner_local:
-        try:
-            from miner_loop import get_miner
-            miner = get_miner(chain)
-            wallet_pass = _resolve_wallet_password()
-            w = {"address": "", "pubkey": ""}
-            try:
-                from secure_store import load_current_wallet
-                wd = load_current_wallet(wallet_pass)
-                if wd.get("ok"):
-                    w = {
-                        "address": wd.get("address", ""),
-                        "pubkey": (wd.get("public_key")
-                                   or wd.get("pubkey")
-                                   or wd.get("pub_hex")
-                                   or ""),
-                    }
-            except Exception as e:
-                log.warning("Miner local: falha lendo carteira: " + str(e))
-            if w.get("address") and w.get("pubkey"):
-                ok, msg = miner.start(
-                    w["address"], w["pubkey"],
-                    is_origin=is_origin,
-                )
-                log.info(f"Miner auto-start: {msg}")
-                _register_service("miner", miner)
-            else:
-                log.warning("Miner: sem carteira ativa para minerar.")
-        except Exception as e:
-            log.warning("Miner local falhou: " + str(e))
-
-    node_id_short = node_pub[:16]
-    threading.Thread(
-        target=_thread_wrap(
-            "StatusLoop",
-            lambda: run_status_loop(
-                chain, p2p, sync, pool, pool_client, trust_net,
-                node_id_short=node_id_short,
-            ),
-        ),
-        daemon=True, name="StatusLoop",
-    ).start()
-
-    if not is_origin and chain.db.height() < 0:
-        log.info("Aguardando genesis (timeout "
-                 + str(CLIENT_BOOT_TIMEOUT) + "s)...")
-        t0 = time.time()
-        while (chain.db.height() < 0
-               and (time.time() - t0) < CLIENT_BOOT_TIMEOUT
-               and not _shutdown.is_set()):
-            time.sleep(1)
-
-    _audit("node_start", {
-        "mode":        "origin" if is_origin else "client",
-        "l2":          bool(args.l2 and _l2_disponivel()),
-        "mine":        bool(quer_miner_local),
-        "pool":        bool(pool),
-        "pool_client": bool(pool_client),
-        "https":       os.environ.get("BRN_HTTPS") == "1",
-        "height":      chain.db.height(),
-        "node_id":     node_pub[:16],
-        "sync":        bool(sync),
-        "p2p":         bool(p2p),
-    })
-
-    log.info("Nó pronto. Ctrl+C para encerrar.")
-
+# ============================================================
+# POOL
+# ============================================================
+@app.route("/api/pool/register", methods=["POST"])
+@require_rate_limit("pool_register")
+def api_pool_register():
+    pool = _get("pool")
+    if pool is None:
+        return jsonify({"ok": False, "error": "pool indisponivel"}), 503
+    b = _body()
     try:
-        if not cfg["headless"]:
-            log.info("Abrindo carteira desktop (pywebview)...")
-            run_wallet_main_thread()
-        else:
-            log.info("Modo headless. Ctrl+C para encerrar.")
-            while not _shutdown.is_set():
-                time.sleep(1)
-    except KeyboardInterrupt:
-        log.info("Encerrando por Ctrl+C...")
-
-    log.info("Encerrando...")
-    _shutdown.set()
-    _graceful_shutdown(log, trust_net)
-
-    try:
-        chain.db.close()
-    except Exception:
-        pass
-
-    try:
-        del node_password
-    except Exception:
-        pass
-
-    return 0
-
-
-_signal_count = 0
-
-
-def _on_signal(signum, frame):
-    global _signal_count
-    _signal_count += 1
-    if _signal_count >= 2:
-        print("\n[!] Forçando saída.", file=sys.stderr)
-        os._exit(1)
-    _shutdown.set()
-
-
-if __name__ == "__main__":
-    signal.signal(signal.SIGINT,  _on_signal)
-    signal.signal(signal.SIGTERM, _on_signal)
-    if hasattr(signal, "SIGHUP"):
-        signal.signal(signal.SIGHUP, _on_signal)
-
-    try:
-        sys.exit(main())
-    except SystemExit:
-        raise
+        return jsonify(pool.register(
+            address=(b.get("address") or "").strip(),
+            pubkey=(b.get("pubkey") or "").strip(),
+            miner_id=b.get("miner_id"),
+        ))
     except Exception as e:
-        try:
-            log = get_logger("main")
-            log.exception("Erro fatal: " + str(e))
-            try:
-                _graceful_shutdown(log)
-            except Exception:
-                pass
-        except Exception:
-            print("Erro fatal: " + str(e), file=sys.stderr)
-        sys.exit(1)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/pool/work", methods=["POST"])
+@require_rate_limit("pool_work")
+def api_pool_work():
+    pool = _get("pool")
+    if pool is None:
+        return jsonify({"ok": False, "error": "pool indisponivel"}), 503
+    try:
+        return jsonify(pool.get_work(miner_id=_body().get("miner_id", "")))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/pool/submit", methods=["POST"])
+@require_rate_limit("pool_submit")
+def api_pool_submit():
+    pool = _get("pool")
+    if pool is None:
+        return jsonify({"ok": False, "error": "pool indisponivel"}), 503
+    b = _body()
+    try:
+        return jsonify(pool.submit_share(
+            miner_id=b.get("miner_id", ""),
+            nonce=int(b.get("nonce", 0)),
+            hash_hex=b.get("hash", ""),
+        ))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/pool/heartbeat", methods=["POST"])
+@require_rate_limit("pool_heartbeat")
+def api_pool_heartbeat():
+    pool = _get("pool")
+    if pool is None:
+        return jsonify({"ok": False, "error": "pool indisponivel"}), 503
+    b = _body()
+    try:
+        return jsonify(pool.heartbeat(
+            miner_id=b.get("miner_id", ""),
+            hashrate=float(b.get("hashrate", 0)),
+            hashes_total=int(b.get("hashes_total", 0)),
+        ))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/pool/disconnect", methods=["POST"])
+@require_rate_limit("pool_disconnect")
+def api_pool_disconnect():
+    pool = _get("pool")
+    if pool is None:
+        return jsonify({"ok": False, "error": "pool indisponivel"}), 503
+    try:
+        return jsonify(pool.disconnect(miner_id=_body().get("miner_id", "")))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/pool/stats")
+@require_rate_limit("pool_stats")
+def api_pool_stats():
+    pool = _get("pool")
+    if pool is None:
+        return jsonify({"ok": False, "error": "pool indisponivel"}), 503
+    try:
+        return jsonify(pool.stats())
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/pool/miners")
+@require_rate_limit("pool_miners")
+def api_pool_miners():
+    pool = _get("pool")
+    if pool is None:
+        return jsonify({"ok": False, "error": "pool indisponivel"}), 503
+    try:
+        return jsonify({"ok": True, "miners": pool.miners_list()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ============================================================
+# TRUST
+# ============================================================
+@app.route("/api/trust/stats")
+@require_rate_limit("trust_stats")
+def api_trust_stats():
+    trust = _get("trust")
+    if trust is None:
+        return jsonify({"ok": False, "error": "trust indisponivel"}), 503
+    try:
+        return jsonify(trust.get_network_stats())
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/trust/nodes")
+@require_rate_limit("trust_nodes")
+def api_trust_nodes():
+    trust = _get("trust")
+    if trust is None:
+        return jsonify({"ok": False, "error": "trust indisponivel"}), 503
+    try:
+        return jsonify({"ok": True, "nodes": trust.list_all_nodes()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ============================================================
+# AUTO-REGISTRO DA CARTEIRA ATUAL
+# ============================================================
+def auto_registrar_carteira_atual() -> dict:
+    chain = _get("chain")
+    if chain is None:
+        return {"ok": False, "msg": "chain nao injetada"}
+    try:
+        pw = (os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
+              or os.environ.get("BRN_NODE_PASSWORD", "").strip())
+        if not pw:
+            return {"ok": False, "msg": "senha nao configurada"}
+        from secure_store import load_current_wallet
+        w = load_current_wallet(pw)
+        if not w or not w.get("ok"):
+            return {"ok": False, "msg": "current_wallet.enc nao decifrou"}
+        addr = (w.get("address") or "").strip()
+        pub = (w.get("public_key") or w.get("pub_hex") or w.get("pubkey") or "").strip()
+        if not addr.startswith("brn1") or not pub:
+            return {"ok": False, "msg": "address/pubkey ausentes"}
+        fn = getattr(chain.db, "register_pubkey", None)
+        if fn is None:
+            return {"ok": False, "msg": "db.register_pubkey indisponivel"}
+        fn(pub, addr)
+        return {"ok": True, "msg": f"{addr[:16]}... ({pub[:16]}...)"}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
