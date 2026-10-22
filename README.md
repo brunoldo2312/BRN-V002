@@ -88,7 +88,7 @@ Fase 2: Rede Descentralizada (20 Mineradores)
 Assim que o 20º minerador entra na fila, o terminal do Ubuntu imprime:
 [BOOTSTRAP] 20 MINERADORES ATINGIDOS! REDE DESCENTRALIZADA.
 
-Recompensa: A fila para de crescer. A recompensa volta a ser 100% (50 BRN) para quem encontrar o bloco.
+Recompensa: A fila para de crescer. O subsídio segue a regra de consenso por altura: até o bloco 4999, aplica-se a regra histórica de 50 BRN com halving; a partir do bloco 5000, o subsídio é fixo em 1 BRN por bloco. A distribuição da fase continua sendo aplicada ao subsídio vigente.
 
 💡 Dica de Teste: Para simular 20 mineradores e ver a transição, corra este script no Ubuntu:
 
