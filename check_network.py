@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """check_network.py — Diagnóstico completo de rede e consenso BRN
 ================================================================
-Verifica em uma única execução:
+Verifica em uma única execução (somente leitura; não altera a blockchain):
 
   1. Config local (brn_network.env + env vars)
   2. Fingerprint da rede (deve bater nas duas máquinas)
@@ -25,7 +25,7 @@ Uso:
 Exit codes:
     0 = rede OK, sem fork
     1 = fork detectado
-    2 = rede errada (fingerprint diverge de peers)
+    2 = configuração de segredo ausente (fingerprint remoto não é validado por este script)
     3 = nó offline (HTTP não responde)
 ================================================================
 """
@@ -51,8 +51,9 @@ except ImportError:
 # CONFIG
 # ============================================================
 BASE_DIR = Path(__file__).resolve().parent
-API = os.environ.get("BRN_API_URL", "http://127.0.0.1:5000")
-TIMEOUT = 5
+API = os.environ.get("BRN_API_URL", "http://127.0.0.1:5000").rstrip("/")
+TIMEOUT = max(1, int(os.environ.get("BRN_HTTP_TIMEOUT", "5")))
+PEER_API_PORT = int(os.environ.get("BRN_PEER_API_PORT", "5000"))
 
 # Cores
 class C:
@@ -97,7 +98,7 @@ def info(msg):
 # HELPERS DE REDE
 # ============================================================
 def http_get(path: str, timeout: int = TIMEOUT):
-    """GET em http://127.0.0.1:5000 + path."""
+    """GET na API local configurada em BRN_API_URL + path."""
     try:
         r = requests.get(f"{API}{path}", timeout=timeout)
         if r.status_code == 200:
@@ -159,7 +160,7 @@ def check_config() -> dict:
         result["network"] = "custom"
         ok(f"BRN_NETWORK_SECRET presente (len={len(secret)})")
         info(f"Fingerprint: {C.BOLD}{fp}{C.RESET}")
-        out(f"     {C.YELLOW}↑ deve ser IDÊNTICO nas duas máquinas{C.RESET}")
+        out(f"     {C.YELLOW}compare manualmente nas máquinas; o script não verifica fingerprint remoto{C.RESET}")
     else:
         err("BRN_NETWORK_SECRET ausente (brn_network.env nem env var)")
 
@@ -496,15 +497,23 @@ def check_fork(local: dict, peers_data: dict) -> dict:
         checked += 1
         # Tenta pedir /api/chain-info do peer (se ele tiver HTTP exposto)
         try:
-            r = requests.get(f"http://{ip}:5000/api/chain-info", timeout=5)
+            r = requests.get(f"http://{ip}:{PEER_API_PORT}/api/chain-info", timeout=TIMEOUT)
             if r.status_code == 200:
                 remote = r.json()
                 r_height = int(remote.get("height", -1))
                 r_hash = remote.get("tip_hash", "")
-                r_diff = int(remote.get("height", 0))  # placeholder
+                remote_work = None
+                try:
+                    wr = requests.get(f"http://{ip}:{PEER_API_PORT}/api/work", timeout=TIMEOUT)
+                    if wr.status_code == 200:
+                        work_payload = wr.json()
+                        if isinstance(work_payload, dict):
+                            remote_work = int(work_payload.get("cumulative_work", 0))
+                except (requests.RequestException, ValueError, TypeError):
+                    pass
 
                 fork = False
-                if r_height == local_height and r_hash != local_hash:
+                if r_height == local_height and local_hash and r_hash and r_hash != local_hash:
                     fork = True
                     err(f"FORK com {addr}!")
                     info(f"  altura: ambos #{local_height}")
@@ -515,8 +524,15 @@ def check_fork(local: dict, peers_data: dict) -> dict:
                          f"— sincronização pendente")
                 elif r_height < local_height:
                     info(f"{addr} atrás ({r_height} < {local_height})")
-                else:
+                elif local_hash and r_hash and r_hash == local_hash:
                     ok(f"{addr}: mesma altura e mesmo hash ✓")
+                else:
+                    warn(f"{addr}: comparação inconclusiva (hash ausente ou resposta incompleta)")
+
+                if remote_work is not None:
+                    info(f"{addr}: trabalho acumulado remoto={remote_work:,}; local={local_work:,}")
+                    if remote_work != local_work:
+                        warn("Trabalho acumulado difere; validar a cadeia antes de qualquer reorganização.")
 
                 if fork:
                     forks.append({
@@ -584,15 +600,15 @@ def final_summary(config: dict, chain: dict, peers: dict,
 
     # Imprime
     if not issues:
-        print()
+        out()
         ok(f"{C.BOLD}Rede OK — sem problemas{C.RESET}")
-        print(f"\n     {C.GREEN}Fingerprint: {config.get('fingerprint', '?')}{C.RESET}")
-        print(f"     {C.GREEN}Altura: {chain.get('height', '?')}  |  "
+        out(f"\n     {C.GREEN}Fingerprint: {config.get('fingerprint', '?')}{C.RESET}")
+        out(f"     {C.GREEN}Altura: {chain.get('height', '?')}  |  "
               f"Peers: {peers.get('count', 0)}  |  "
               f"Miner: {'ON' if miner.get('running') else 'off'}{C.RESET}")
         return 0
 
-    print()
+    out()
     for level, msg in issues:
         if level == "ERR":
             err(msg)
@@ -602,34 +618,34 @@ def final_summary(config: dict, chain: dict, peers: dict,
             info(msg)
 
     # Mensagem contextual
-    print()
+    out()
     if fork.get("fork"):
-        print(f"{C.RED}{C.BOLD}  ❌ FORK DETECTADO{C.RESET}")
-        print(f"     Os dois nós estão minerando cadeias diferentes.")
-        print(f"     Causa mais comum: BRN_NETWORK_SECRET divergente")
-        print(f"     ou um nó não conseguiu sincronizar antes de minerar.")
-        print()
-        print(f"     Como resolver:")
-        print(f"     1. Confirme fingerprint IGUAL nas duas: "
+        out(f"{C.RED}{C.BOLD}  ❌ FORK DETECTADO{C.RESET}")
+        out(f"     Os dois nós estão minerando cadeias diferentes.")
+        out(f"     Causa mais comum: BRN_NETWORK_SECRET divergente")
+        out(f"     ou um nó não conseguiu sincronizar antes de minerar.")
+        out()
+        out(f"     Como resolver:")
+        out(f"     1. Confirme fingerprint IGUAL nas duas: "
               f"{C.CYAN}{config.get('fingerprint')}{C.RESET}")
-        print(f"     2. Pare o miner nas duas (Ctrl+C)")
-        print(f"     3. Apague brn_v2_chain.db da máquina com cadeia MENOR")
-        print(f"     4. Suba ela com --client-mode, deixe sincronizar")
-        print(f"     5. Só depois, suba com --mine")
+        out(f"     2. Pare o miner nas duas (Ctrl+C)")
+        out(f"     3. NÃO apague o banco de dados automaticamente.")
+        out(f"     4. Faça backup do banco e valide os blocos com uma fonte confiável.")
+        out(f"     5. Só retome a mineração depois de confirmar a cadeia correta.")
         return 1
 
     if not config.get("secret_ok"):
-        print(f"{C.RED}{C.BOLD}  ❌ REDE INCORRETA{C.RESET}")
-        print(f"     Defina BRN_NETWORK_SECRET em brn_network.env")
+        out(f"{C.RED}{C.BOLD}  ❌ REDE INCORRETA{C.RESET}")
+        out(f"     Defina BRN_NETWORK_SECRET em brn_network.env")
         return 2
 
     if peers.get("count", 0) == 0:
-        print(f"{C.YELLOW}{C.BOLD}  ⚠️  NÓ ISOLADO{C.RESET}")
-        print(f"     Nenhum peer conectado. Verifique:")
-        print(f"     - Tailscale rodando nas duas (tailscale status)")
-        print(f"     - IP correto em bootstrap_peers.json")
-        print(f"     - Porta 6001 aberta (nc -zv <ip-peer> 6001)")
-        print(f"     - BRN_NETWORK_SECRET IDÊNTICO nas duas")
+        out(f"{C.YELLOW}{C.BOLD}  ⚠️  NÓ ISOLADO{C.RESET}")
+        out(f"     Nenhum peer conectado. Verifique:")
+        out(f"     - Tailscale rodando nas duas (tailscale status)")
+        out(f"     - IP correto em bootstrap_peers.json")
+        out(f"     - Porta 6001 aberta (nc -zv <ip-peer> 6001)")
+        out(f"     - BRN_NETWORK_SECRET IDÊNTICO nas duas")
         return 1
 
     return 0
@@ -648,7 +664,7 @@ def main() -> int:
                    help="Só o veredito final")
     args = p.parse_args()
 
-    _QUIET = args.quiet
+    _QUIET = args.quiet or args.json
 
     # Banner
     if not _QUIET:

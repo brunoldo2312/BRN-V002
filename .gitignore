@@ -1,0 +1,20 @@
+# Segredos e configurações locais
+brn_network.env
+.env
+.env.*
+!.env.example
+!brn_network.env.example
+
+# Artefatos locais de Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Dados locais da blockchain e logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Configuração local de peers descobertos
+peers_discovered.json
