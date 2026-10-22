@@ -1,13 +1,14 @@
-"""miner_pool_client.py — Cliente do pool de mineração BRN (v3)
+"""miner_pool_client.py — Cliente do pool de mineração BRN (v4)
 ================================================================
+v4:
+  [NEW] Suporte a Vardiff: o cliente agora detecta mudanças de
+        share_difficulty mesmo quando o job_id é o mesmo, permitindo
+        que o servidor ajuste a dificuldade por minerador sem
+        invalidar o job atual.
 v3:
   [FIX] Corrigido o bug onde _http_post ignorava o self.pool_url
         e tentava ligar sempre a 127.0.0.1 (localhost).
-        Agora usa o IP do Ubuntu (API_BASE) corretamente.
-  [FIX] CORREÇÃO CRÍTICA: _mine_batch agora usa share_difficulty
-        no pow_search da biblioteca C. Antes usava a dificuldade
-        do bloco inteiro, fazendo com que o minerador C nunca
-        enviasse shares para o pool.
+  [FIX] _mine_batch agora usa share_difficulty no pow_search.
 ================================================================
 """
 from __future__ import annotations
@@ -60,7 +61,7 @@ def _http_post(base_url: str, path: str, body: dict, timeout: float = HTTP_TIMEO
         req = urllib.request.Request(
             url, data=data,
             headers={"Content-Type": "application/json",
-                     "User-Agent": "brn-pool-client/3"},
+                     "User-Agent": "brn-pool-client/4"},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -119,7 +120,7 @@ def _mine_batch(prev_hash: str, merkle: str, ts: int, diff: int, share_difficult
         prefix = prev_hash + merkle + str(ts)
         diff_str = str(int(diff))
         try:
-            # [FIX CRÍTICO] Usa share_difficulty (não diff) no pow_search em C
+            # Usa share_difficulty (não diff) no pow_search em C
             result = _brn_miner_c.pow_search(
                 prefix, diff_str, int(share_difficulty),
                 nonce_start=nonce_start,
@@ -246,11 +247,27 @@ class PoolClient(threading.Thread):
             return
         job = r.get("job") or {}
         with self._job_lock:
-            if not self._job or self._job.get("job_id") != job.get("job_id"):
+            # [VARDIFF] Atualiza também quando só a share_difficulty muda
+            if self._job is None:
+                should_update = True
+            else:
+                should_update = (
+                    self._job.get("job_id") != job.get("job_id")
+                    or self._job.get("share_difficulty") != job.get("share_difficulty")
+                )
+
+            if should_update:
+                old_id = self._job.get("job_id") if self._job else None
+                old_diff = self._job.get("share_difficulty") if self._job else None
                 self._job = job
-                log.info("pool client: novo job %s h=%s diff=%s share_diff=%s",
-                         job.get("job_id"), job.get("height"),
-                         job.get("difficulty"), job.get("share_difficulty"))
+
+                if old_id != job.get("job_id"):
+                    log.info("pool client: novo job %s h=%s diff=%s share_diff=%s",
+                             job.get("job_id"), job.get("height"),
+                             job.get("difficulty"), job.get("share_difficulty"))
+                else:
+                    log.info("pool client: vardiff %s -> %s (job %s)",
+                             old_diff, job.get("share_difficulty"), job.get("job_id"))
 
     def run(self):
         for _ in range(10):
@@ -267,6 +284,7 @@ class PoolClient(threading.Thread):
 
         nonce = 0
         last_job_id = None
+        last_share_diff = None
 
         while not self._stop.is_set():
             with self._job_lock:
@@ -276,12 +294,20 @@ class PoolClient(threading.Thread):
                 time.sleep(1.0)
                 continue
 
+            # Só reseta o nonce quando o job muda de verdade.
+            # Uma mudança apenas de share_difficulty mantém o nonce
+            # (mesmo bloco, apenas limiar de share diferente).
             if job.get("job_id") != last_job_id:
                 last_job_id = job.get("job_id")
                 nonce = 0
-                log.info("pool client: mining job %s", last_job_id)
+                log.info("pool client: mining job %s (share_diff=%s)",
+                         last_job_id, job.get("share_difficulty"))
 
             share_diff = int(job.get("share_difficulty", 4))
+            if share_diff != last_share_diff:
+                log.info("pool client: share_difficulty agora = %d", share_diff)
+                last_share_diff = share_diff
+
             share_target = _target_from_difficulty(share_diff)
 
             try:
@@ -290,7 +316,7 @@ class PoolClient(threading.Thread):
                     merkle=job["merkle"],
                     ts=int(job["timestamp"]),
                     diff=int(job["difficulty"]),
-                    share_difficulty=share_diff,  # [FIX] Passando a dificuldade do share
+                    share_difficulty=share_diff,
                     nonce_start=nonce,
                     batch=HASH_BATCH,
                     share_target=share_target,
@@ -326,7 +352,8 @@ class PoolClient(threading.Thread):
                 if r.get("block_found"):
                     self.blocks_found += 1
                     self.last_block_at = time.time()
-                    log.warning("pool client: FULL BLOCK #%s encontrado!", r.get("height"))
+                    log.warning("pool client: FULL BLOCK #%s encontrado!",
+                                r.get("height"))
                     try:
                         self._fetch_work()
                     except Exception:
