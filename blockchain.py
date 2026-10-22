@@ -1,14 +1,24 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.2.5 | Data: 18/10/2026
+Versão: 9.2.7 | Data: 22/10/2026
 ================================================================
+v9.2.7 (2026-10-22):
+  [CRITICAL] validate_block() agora chama validate_tx(t, from_mempool=True).
+             Antes chamava validate_tx(t) (default from_mempool=False), que
+             verifica utxos_gastos_na_mempool(). Como as transações do bloco
+             JÁ estão na mempool, TODA validação falhava com "UTXO ja esta
+             sendo gasta por outra tx na mempool". Isso travava o accept_block
+             de todos os blocos minerados → chain congelava na altura atual.
+             Fix: aceita from_mempool=True — as txs de um bloco são por
+             definição "do mempool" (já selecionadas), então o check de
+             double-spend dentro da mempool não deve ser aplicado.
+v9.2.6:
+  [CRITICAL] accept_block() NÃO seta mais _fork_signal.
 v9.2.5:
-  [OPT] cumulative_work() agora faz SELECT apenas da coluna 'difficulty'
-        em vez de descomprimir o bloco inteiro (raw). Isso evita
-        gargalos de CPU/Memória em cadeias grandes e acelera o boot.
+  [OPT] cumulative_work() faz SELECT apenas da coluna 'difficulty'.
 v9.2.4:
   [FIX] MTP alterado de <= para < para aceitar blocos no mesmo segundo.
 v9.2.3:
-  [FIX] accept_block() reativa self._fork_signal.
+  [FIX] accept_block() reativa self._fork_signal.  <- REVERTIDO no v9.2.6
 v9.2.2:
   [NEW] Modo Bootstrap: fila de mineradores.
 ================================================================
@@ -40,7 +50,6 @@ UNIT            = 10 ** DECIMALS
 MAX_SUPPLY      = 21_000_000 * UNIT
 INITIAL_REWARD  = 50 * UNIT
 HALVING_INTERVAL = 210_000
-
 
 # ============================================================
 # CONSENSO / DIFICULDADE
@@ -362,17 +371,12 @@ class Blockchain:
         new = max(prev // 4, min(prev * 4, new))
         return max(1, min(MAX_DIFFICULTY, new))
 
-    # ============================================================
-    # [FIX v9.2.5] cumulative_work otimizado
-    # ============================================================
     def cumulative_work(self) -> int:
         total = 0
-        # [FIX] Otimização: busca apenas a coluna 'difficulty', sem descomprimir o bloco!
         with self.db.lock:
             rows = self.db.conn.execute("SELECT difficulty FROM blocks").fetchall()
             for r in rows:
                 try:
-                    # 'difficulty' já vem como int direto do SQLite
                     total += work_from_difficulty(r["difficulty"])
                 except Exception:
                     continue
@@ -516,7 +520,7 @@ class Blockchain:
         return timestamps[len(timestamps) // 2]
 
     # ============================================================
-    # VALIDAÇÃO DE BLOCO [FIX v9.2.4 — MTP < em vez de <=]
+    # VALIDAÇÃO DE BLOCO — [FIX v9.2.7] from_mempool=True no validate_tx
     # ============================================================
     def validate_block(self, block: dict, prev_block=None) -> tuple:
         if block["height"] == 0 and prev_block is None:
@@ -563,7 +567,8 @@ class Blockchain:
         fees = 0
         for i, t in enumerate(block["transactions"][1:], 1):
             if t["txid"] != txid(t): return False, "txid invalido"
-            ok_tx, msg_tx = self.validate_tx(t)
+            # [FIX v9.2.7] from_mempool=True — as txs já foram selecionadas da mempool
+            ok_tx, msg_tx = self.validate_tx(t, from_mempool=True)
             if not ok_tx: return False, f"tx #{i}: {msg_tx}"
             fees += self.tx_fee(t)
         total_cb = sum(o["amount"] for o in cb["outputs"])
@@ -586,10 +591,7 @@ class Blockchain:
                 if (isinstance(tx_data, dict) and tx_data.get("type") in ("deploy", "call")):
                     try: self._apply_contract_tx(t)
                     except Exception as e: print(f"[CONTRACT] tx {t['txid'][:16]}... falhou: {e}")
-        sig = getattr(self, "_fork_signal", None)
-        if sig is not None:
-            try: sig.set()
-            except Exception: pass
+        # [FIX v9.2.6] _fork_signal gerenciado APENAS por sync_manager.
         return True, block["hash"]
 
     def _attach_auth_tag(self, block: dict) -> dict:
