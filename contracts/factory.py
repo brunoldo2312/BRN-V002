@@ -316,6 +316,7 @@ if __name__ == "__main__":
             pass
 
     expiring = factory.create_btc_to_brn("BRN_TREASURY", 100_000, buyer, ttl_s=1)
+    db.rows[expiring.escrow_id]["created_at"] = int(time.time()) - 10
     db.rows[expiring.escrow_id]["expires_at"] = int(time.time()) - 1
     assert factory.expire_overdue() == 1
     assert factory.get(expiring.escrow_id).status == STATUS_EXPIRED
