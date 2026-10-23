@@ -1,29 +1,12 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.6.4)
+"""main.py — Entrypoint unificado do nó BRN (v13.6.6)
 ================================================================
-v13.6.4 (2026-10-22):
-  [FIX] WEB_HOST/EXPLORER_HOST agora resolvidos dentro de
-        run_http()/run_explorer() (após cfg.apply_to_env). Antes eram
-        capturados no module load e "web_host" em config.json era
-        ignorado silenciosamente (ficava 127.0.0.1).
-  [FIX] AUTO_MINE agora também respeita BRN_MINER_ENABLED (alias de
-        "miner_enabled" via brn_config). Antes só lia BRN_AUTO_MINE.
-  [FIX] --discover / --l2-stats / --pool-stats agora funcionam.
-        Antes eram argparse no-op.
-  [NEW] --relay / --no-relay propagam via env BRN_RELAY.
-  [NEW] Explorer sobe automaticamente se explorer.py existir
-        (BRN_EXPLORER_ENABLED=0 desativa).
-  [SECURITY] Removido "BRN_WEB_PASS" de _HARDCODED_DEFAULTS.
-v13.6.3:
-  [FIX] auth_tag configurável via BRN_REQUIRE_AUTH_TAG.
-v13.6.2:
-  [FIX] _validate_required_secrets: defaults fracos viram WARNING.
-v13.6.1:
-  [SECURITY] Removidos _HARDCODED_DEFAULTS sensíveis.
-  [FIX] chain.is_origin = is_origin.
-  [FIX] miner.start(..., is_origin=is_origin).
-  [NEW] Heartbeat em peers.json no status loop.
-v13.6:
-  [NEW] --pool-client e --no-pool-client.
+v13.6.6 (2026-10-23):
+  [FIX] Substituído o Flask dev server por Waitress na função run_http.
+        Isso impede que a interface gráfica (pywebview) trave as
+        requisições do Pool HTTP.
+v13.6.5 (2026-10-23):
+  [FIX] Aviso explícito se o p2p_unified.py não tiver o método
+        set_trust().
 ================================================================
 """
 from __future__ import annotations
@@ -116,8 +99,6 @@ _shutdown = threading.Event()
 NODE_ID_PATH        = BASE_DIR / "node_identity.enc"
 CLIENT_BOOT_TIMEOUT = int(os.environ.get("BRN_CLIENT_BOOT_TIMEOUT", "120"))
 
-# [FIX v13.6.4] WEB_HOST e EXPLORER_HOST agora são lidos dentro de
-# run_http()/run_explorer() — fora daqui, para pegar cfg.apply_to_env().
 WEB_HOST_DEFAULT      = "127.0.0.1"
 EXPLORER_HOST_DEFAULT = "127.0.0.1"
 
@@ -126,12 +107,6 @@ _services_lock = threading.Lock()
 
 
 def _resolve_auto_mine() -> bool:
-    """
-    [FIX v13.6.4] Aceita tanto BRN_AUTO_MINE quanto BRN_MINER_ENABLED
-    (alias de "miner_enabled" via brn_config). Antes só BRN_AUTO_MINE
-    era consultada, então config.json {"miner_enabled": true} era
-    ignorado silenciosamente.
-    """
     return (
         os.environ.get("BRN_AUTO_MINE", "").strip() == "1"
         or os.environ.get("BRN_MINER_ENABLED", "").strip() == "1"
@@ -211,7 +186,6 @@ def _l2_disponivel() -> bool:
 
 
 def _l2_operacional() -> bool:
-    # Não declarar a ponte ativa enquanto faltar a entrada de crédito na chain.
     if not _l2_disponivel():
         return False
     try:
@@ -540,10 +514,6 @@ def _init_http_server(chain, log):
 
 
 def run_http(app_instance):
-    """
-    [FIX v13.6.4] WEB_HOST resolvido AQUI (após cfg.apply_to_env),
-    não no module load. Antes, "web_host" em config.json era ignorado.
-    """
     log = get_logger("http")
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
     host = os.environ.get("BRN_WEB_HOST", WEB_HOST_DEFAULT)
@@ -557,18 +527,27 @@ def run_http(app_instance):
         except Exception as e:
             log.warning("Falha HTTPS: " + str(e) + ". Caindo para HTTP.")
             ssl_ctx = None
-    if ssl_ctx is None:
-        log.info("HTTP http://" + host + ":" + str(port))
-    app_instance.run(
-        host=host, port=port, threaded=True,
-        debug=False, use_reloader=False, ssl_context=ssl_ctx,
-    )
+
+    try:
+        # [FIX v13.6.6] Usar Waitress em vez do Flask dev server
+        from waitress import serve
+        log.info("HTTP (Waitress) http://" + host + ":" + str(port))
+        
+        # O Waitress roda em background de forma limpa e não trava a GUI
+        serve(app_instance, host=host, port=port, threads=16, 
+              url_scheme='https' if ssl_ctx else 'http')
+              
+    except ImportError:
+        log.warning("Waitress NAO instalado! Usando Flask dev server (pode travar a GUI).")
+        if ssl_ctx is None:
+            log.info("HTTP http://" + host + ":" + str(port))
+        app_instance.run(
+            host=host, port=port, threaded=True,
+            debug=False, use_reloader=False, ssl_context=ssl_ctx,
+        )
 
 
 def run_explorer():
-    """
-    [FIX v13.6.4] EXPLORER_HOST resolvido AQUI (após cfg.apply_to_env).
-    """
     from explorer import app as explorer_app
     log = get_logger("explorer")
     port = int(os.environ.get("BRN_EXPLORER_PORT", "8080"))
@@ -877,13 +856,11 @@ def main():
     is_origin = _is_origin(args.client_mode)
     auto_mine = _resolve_auto_mine()
 
-    # [NEW v13.6.4] --relay / --no-relay via env
     if args.relay is not None:
         os.environ["BRN_RELAY"] = "1" if args.relay else "0"
         log.info("Relay: " + ("ON" if args.relay else "off")
                  + " (via BRN_RELAY env)")
 
-    # [NEW v13.6.4] Subcomandos diagnósticos (curto-circuito, sem subir nó)
     if args.discover:
         return _cmd_discover(log)
     if args.l2_stats:
@@ -920,8 +897,6 @@ def main():
         print(VERSION)
         return 0
     if args.status:
-        # [FIX v13.6.4] usa cfg["web_host"]/["explorer_host"] — refletem
-        # o valor efetivo após apply_to_env (não o default stale).
         print("=" * 64)
         print(" BRN Node — Diagnóstico (v" + VERSION + ")")
         print("=" * 64)
@@ -1032,6 +1007,9 @@ def main():
         try:
             if hasattr(p2p, "set_trust"):
                 p2p.set_trust(trust_net)
+            else:
+                log.warning("AVISO: p2p_unified.py NAO TEM o metodo set_trust(trust_net)!")
+                log.warning("A TrustNetwork NAO SERA ATUALIZADA pelo P2P. Nodes ficarao em 0.")
         except Exception as e:
             log.warning("Falha ligando TrustNetwork ao P2P: " + str(e))
 
@@ -1079,7 +1057,6 @@ def main():
     else:
         log.error("HTTP não pôde ser inicializado — seguindo sem API")
 
-    # [NEW v13.6.4] Explorer sobe em paralelo (opt-out via env)
     if (os.environ.get("BRN_EXPLORER_ENABLED", "1") == "1"
             and (BASE_DIR / "explorer.py").exists()):
         threading.Thread(
