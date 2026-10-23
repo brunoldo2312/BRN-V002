@@ -1,10 +1,11 @@
 @echo off
 REM ============================================================
-REM   iniciar_origem.bat - BRN Node ORIGEM (Windows) - v6
+REM   iniciar_cliente.bat - BRN Node CLIENTE (Windows) - v6
 REM ============================================================
 REM   v6:
-REM     [FIX] Executa o main.py --gui corretamente.
-REM           O servidor HTTP agora usa Waitress (não trava).
+REM     [FIX] Corrigido para atuar como CLIENTE (não força Origem).
+REM     [FIX] Mantém o BRN_BOOTSTRAP_PEERS para conectar no Origem.
+REM     [FIX] Abre a GUI corretamente usando Waitress.
 REM ============================================================
 
 setlocal EnableDelayedExpansion
@@ -34,13 +35,15 @@ shift
 goto parse_args
 
 :show_help
-echo Uso: iniciar_origem.bat [--skip-tailscale] [--gui] [--no-gui] [--pool-client]
+echo Uso: iniciar_cliente.bat [--skip-tailscale] [--gui] [--no-gui] [--pool-client]
+echo   --gui     Forca abrir a carteira
+echo   --no-gui  Roda apenas o servidor em background
 exit /b 0
 
 :args_done
 
 echo ============================================================
-echo   BRN Node - ORIGEM (Windows) - v6
+echo   BRN Node - CLIENTE (Windows) - v6
 echo ============================================================
 echo.
 
@@ -65,22 +68,22 @@ echo [ok] Python %PYVER% ^(%PY%^)
 echo.
 
 if not exist "brn_network.env" (
-    echo [AVISO] brn_network.env nao existe - criando com defaults de ORIGEM...
+    echo [AVISO] brn_network.env nao existe - criando com defaults de CLIENTE...
     (
         echo BRN_NETWORK_SECRET=9226edea8ba62bc1c6ae36883c0536c95b4c85642195465d6c4d9456abef20f9
         echo BRN_NODE_PASSWORD=senha-no-temp-123
         echo BRN_WEB_PASS=senha-temp-123
         echo BRN_WALLET_SESSION_PASS=senha-forte-da-carteira-2026
         echo BRN_ADMIN_TOKEN=
-        echo BRN_BOOTSTRAP_PEERS=
-        echo BRN_IS_ORIGIN=1
-        echo BRN_ALL_MINERS=1
+        echo BRN_BOOTSTRAP_PEERS=100.111.253.8:6001
+        echo BRN_IS_ORIGIN=0
+        echo BRN_ALL_MINERS=0
         echo BRN_WEB_HOST=0.0.0.0
         echo BRN_WEB_PORT=5000
         echo BRN_EXPLORER_PORT=8080
         echo BRN_EXPLORER_HOST=0.0.0.0
         echo BRN_HTTP_THREADS=16
-        echo BRN_P2P_PORT=6001
+        echo BRN_P2P_PORT=6002
         echo BRN_P2P_AUTH=optional
         echo BRN_RATE_LIMIT=200
         echo BRN_UPNP=0
@@ -90,8 +93,9 @@ if not exist "brn_network.env" (
         echo BRN_MINER_INTERVAL=30
         echo BRN_LOG_LEVEL=INFO
         echo BRN_POOL_ENABLED=1
+        echo BRN_POOL_URL=http://100.111.253.8:5000
     ) > brn_network.env
-    echo [ok] brn_network.env criado
+    echo [ok] brn_network.env criado ^(BRN_IS_ORIGIN=0^)
 )
 
 echo [*] Carregando brn_network.env...
@@ -115,21 +119,14 @@ if "%BRN_WEB_PASS%"==""            set "BRN_WEB_PASS=senha-temp-123"
 if "%BRN_WALLET_SESSION_PASS%"=="" set "BRN_WALLET_SESSION_PASS=senha-forte-da-carteira-2026"
 if "%BRN_WEB_PORT%"==""            set "BRN_WEB_PORT=5000"
 if "%BRN_EXPLORER_PORT%"==""       set "BRN_EXPLORER_PORT=8080"
-if "%BRN_P2P_PORT%"==""            set "BRN_P2P_PORT=6001"
+if "%BRN_P2P_PORT%"==""            set "BRN_P2P_PORT=6002"
 if "%BRN_LOG_LEVEL%"==""           set "BRN_LOG_LEVEL=INFO"
 if "%BRN_MINER_AUTO%"==""          set "BRN_MINER_AUTO=1"
 if "%BRN_MINER_INTERVAL%"==""      set "BRN_MINER_INTERVAL=30"
 set "PYTHONUNBUFFERED=1"
 
-if not "%BRN_IS_ORIGIN%"=="1" (
-    echo [AVISO] BRN_IS_ORIGIN=%BRN_IS_ORIGIN% no env - forcando 1
-    set "BRN_IS_ORIGIN=1"
-)
-
-if not "%BRN_BOOTSTRAP_PEERS%"=="" (
-    echo [AVISO] BRN_BOOTSTRAP_PEERS definido no .env - IGNORADO na memoria
-    set "BRN_BOOTSTRAP_PEERS="
-)
+REM [FIX] Força modo CLIENTE, independentemente do .env
+set "BRN_IS_ORIGIN=0"
 
 set "FALTA="
 for %%F in (
@@ -171,24 +168,11 @@ if errorlevel 1 (
 )
 echo [ok] Tailscale instalado
 
-tailscale status >nul 2>&1
-if errorlevel 1 (
-    echo [AVISO] Tailscale NAO esta logado.
-    pause
-    exit /b 1
-)
-echo [ok] Tailscale logado
-
 for /f "tokens=*" %%I in ('tailscale ip -4 2^>nul') do (
     if "!MY_TS_IP!"=="" set "MY_TS_IP=%%I"
 )
-if "%MY_TS_IP%"=="" (
-    echo [AVISO] Tailscale sem IP.
-    pause
-    exit /b 1
-)
 echo [ok] Meu IP Tailscale: %MY_TS_IP%
-echo [*] Este no E o ponto de entrada ^(Origem/Bootstrap^).
+echo [*] Este no vai se conectar ao Origem em %BRN_BOOTSTRAP_PEERS%.
 
 :tailscale_done
 echo.
@@ -196,15 +180,14 @@ echo.
 %PY% -c "import waitress" >nul 2>&1
 if errorlevel 1 (
     echo [AVISO] Waitress NAO instalado - HTTP usara Flask dev server
-    echo         Para producao: %PY% -m pip install waitress
 ) else (
     for /f "tokens=*" %%V in ('%PY% -c "import waitress;print(waitress.__version__)" 2^>nul') do set "WV=%%V"
     echo [ok] Waitress v!WV!
 )
 echo.
 
-> "brn_role.txt" echo origin
-echo [ok] Papel: ORIGEM
+> "brn_role.txt" echo client
+echo [ok] Papel: CLIENTE
 echo.
 
 set "HEADLESS_FLAG=--headless"
@@ -237,16 +220,14 @@ echo.
 set "ADMIN_STATUS=NAO (endpoints admin ABERTOS)"
 if not "%BRN_ADMIN_TOKEN%"=="" (
     set "ADMIN_STATUS=SIM"
-) else (
-    echo [AVISO] BRN_ADMIN_TOKEN vazio.
 )
 echo.
 
 set "POOL_CLIENT_FLAG="
-set "POOL_CLIENT_STATUS=DISABLED (origem nao roda pool client)"
+set "POOL_CLIENT_STATUS=DISABLED (evita duplicidade com a GUI)"
 if "%NO_POOL_CLIENT%"=="0" (
     set "POOL_CLIENT_FLAG=--pool-client"
-    set "POOL_CLIENT_STATUS=ENABLED (ATENCAO: pode minerar 2x)"
+    set "POOL_CLIENT_STATUS=ENABLED"
 )
 
 set "NODE_VERSION=?"
@@ -255,27 +236,26 @@ echo [ok] main.py versao: %NODE_VERSION%
 echo.
 
 echo ============================================================
-echo   CONFIGURACAO ATUAL (ORIGEM)
+echo   CONFIGURACAO ATUAL (CLIENTE)
 echo ============================================================
-echo   Modo       : ORIGEM ^(validador / bootstrap^)
+echo   Modo       : CLIENTE ^(conectando ao Origem^)
 echo   Versao     : %NODE_VERSION%
 echo   IS_ORIGIN  : %BRN_IS_ORIGIN%
-echo   Bootstrap  : ^(nenhum - este no E o bootstrap^)
+echo   Bootstrap  : %BRN_BOOTSTRAP_PEERS%
+echo   Pool URL   : %BRN_POOL_URL%
 echo   Dificuldade: Automatica ^(Calculada pelo programa^)
 echo   Miner auto : %BRN_MINER_AUTO%
-echo   Admin tok  : %ADMIN_STATUS%
 echo   P2P porta  : %BRN_P2P_PORT%
 echo   HTTP       : http://0.0.0.0:%BRN_WEB_PORT%
-echo   Explorer   : http://0.0.0.0:%BRN_EXPLORER_PORT%
 echo   pywebview  : %GUI_STATUS%
 echo   PoolClient : %POOL_CLIENT_STATUS%
 echo   Tailscale  : %MY_TS_IP%
 echo ============================================================
 echo.
-echo   ATENCAO: deixe esta janela ABERTA enquanto o ORIGEM roda.
+echo   ATENCAO: deixe esta janela ABERTA enquanto o CLIENTE roda.
 echo.
 
-echo [*] Iniciando ORIGEM BRN... ^(Ctrl+C para encerrar^)
+echo [*] Iniciando CLIENTE BRN... ^(Ctrl+C para encerrar^)
 echo.
 
 %PY% main.py %HEADLESS_FLAG% %POOL_CLIENT_FLAG%
@@ -287,10 +267,7 @@ if not "%EXITCODE%"=="0" (
     echo.
     echo   Se o erro foi 'Falha ao decifrar node_identity.enc':
     echo     del node_identity.enc
-    echo     iniciar_origem.bat
-    echo.
-    echo   Se o erro foi 'Modulos obrigatorios faltando':
-    echo     %PY% verify.py
+    echo     iniciar_cliente.bat
     echo.
 ) else (
     echo [ok] No encerrado normalmente.
