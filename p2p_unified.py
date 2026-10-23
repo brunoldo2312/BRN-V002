@@ -1,15 +1,15 @@
 """
-p2p_unified.py — BRN P2P Network v6.6.6-Bootstrap
+p2p_unified.py — BRN P2P Network v6.6.7-Bootstrap
 ================================================================
+v6.6.7 (2026-10-23):
+  [NEW] Integração com a TrustNetwork:
+        - Adicionado set_trust() no P2PManager.
+        - _on_peer_found registra o nó na TrustNetwork.
+        - _on_new_block pontua (+2) ou penaliza (-50) na TrustNetwork.
+        - _on_peer_bad aplica penalidade na TrustNetwork.
+        - P2PServer passa o peer_ip e peer_id para o _on_new_block.
 v6.6.6:
   [FIX] _registrar_peer_no_db agora aceita e respeita `height`.
-        Antes sempre passava height=0, zerando a altura dos peers
-        a cada reconexão (bug detectado pelo monitor_rede.py).
-  [FIX] _refresh_heights_loop passa o height real do peer
-        (resp["height"]) para o DB após cada ping.
-  [FIX] upsert_peer usa `height=int(height)` em vez de `height=0`.
-v6.6.5:
-  [FIX] P2PClient.send_message e variantes aceitam timeout.
 ================================================================
 """
 from __future__ import annotations
@@ -160,9 +160,6 @@ def _carregar_bootstrap() -> set[str]:
     return peers
 
 
-# ============================================================
-# [FIX v6.6.6] Aceita e respeita height
-# ============================================================
 def _registrar_peer_no_db(blockchain, ip: str, port: int, peer_id: Optional[str] = None, height: int = 0) -> None:
     if blockchain is None: return
     try:
@@ -431,7 +428,8 @@ class P2PServer(threading.Thread):
                 if READ_ONLY: return {"type": "ack", "ok": False, "reason": "read_only"}
                 block_dict = msg.get("block")
                 if block_dict and self.on_new_block:
-                    ok = self.on_new_block(block_dict)
+                    # [FIX v6.6.7] Passa o peer_ip e peer_id para o TrustNetwork
+                    ok = self.on_new_block(peer_ip, peer_id, block_dict)
                     if ok and self.on_peer_good: self.on_peer_good(peer_ip, peer_id)
                     elif not ok and self.on_peer_bad: self.on_peer_bad(peer_ip, peer_id)
                     return {"type": "ack", "ok": bool(ok)}
@@ -765,9 +763,6 @@ class PeerDiscovery:
                 self._salvar_peers()
             except Exception: pass
 
-    # ============================================================
-    # [FIX v6.6.6] Passa height real para o DB
-    # ============================================================
     def _refresh_heights_loop(self) -> None:
         while self.running:
             try:
@@ -841,6 +836,7 @@ class P2PManager:
         self.metrics = Metrics()
         self.external_ip = None
         self.upnp = None
+        self.trust_net = None  # [FIX v6.6.7] TrustNetwork injection
 
         if node_id_priv is not None:
             _auth_set_priv(node_id_priv)
@@ -865,6 +861,11 @@ class P2PManager:
 
         if enable_upnp and not READ_ONLY:
             threading.Thread(target=self._setup_upnp, daemon=True, name="UPnP").start()
+
+    # [FIX v6.6.7] Método para conectar a TrustNetwork
+    def set_trust(self, trust_net):
+        self.trust_net = trust_net
+        log.info("[P2P] TrustNetwork conectada ao P2P com sucesso")
 
     def start(self) -> None:
         mode = "READ-ONLY" if self.read_only else "FULL"
@@ -920,12 +921,21 @@ class P2PManager:
             resp, latency = P2PClient.get_chain_height(ip, port)
             if not resp: return
             self.metrics.peer_update(f"{ip}:{port}", latency_ms=latency)
+            
+            # [FIX v6.6.7] Pega o ID do peer para a TrustNetwork
+            peer_uuid = resp.get("_uuid", f"peer-{ip}:{port}")
             if resp.get("_uuid"): self.discovery.register_uuid(resp["_uuid"], ip, port)
 
-            # [FIX v6.6.6] Passa height real ao registrar
-            try:
-                _registrar_peer_no_db(self.bc, ip, port, resp.get("_uuid"), height=resp.get("height", 0))
-            except Exception: pass
+            _registrar_peer_no_db(self.bc, ip, port, resp.get("_uuid"), height=resp.get("height", 0))
+
+            # [FIX v6.6.7] Registra o nó na TrustNetwork
+            if self.trust_net:
+                self.trust_net.register_node(
+                    node_id=peer_uuid,
+                    address=f"{ip}:{port}",
+                    public_key=resp.get("pub", "")
+                )
+                self.trust_net.mark_connected(peer_uuid)
 
             if resp.get("decentralized") and not self.bc.rede_descentralizada:
                 log.warning("[P2P] Rede descentralizada detectada via peer! Iniciando mineracao.")
@@ -1064,7 +1074,8 @@ class P2PManager:
                 self._broadcast_pool.submit(P2PClient.send_tx, ip, int(port), tx_dict)
             except Exception: pass
 
-    def _on_new_block(self, block_dict: dict) -> bool:
+    # [FIX v6.6.7] Recebe peer_ip e peer_id
+    def _on_new_block(self, peer_ip: str, peer_id: str, block_dict: dict) -> bool:
         try:
             h = int(block_dict.get("height", -1))
             local_h = self.bc.db.height()
@@ -1073,11 +1084,23 @@ class P2PManager:
                 if ok:
                     self.metrics.inc("blocks_accepted")
                     log.info(f"novo bloco aceito: #{h}")
+                    
+                    # [FIX v6.6.7] Dá pontos na TrustNetwork por bloco válido
+                    trust_id = peer_id or peer_ip
+                    if self.trust_net and trust_id:
+                        self.trust_net.record_block_validated(trust_id, h)
+                        
                     try: self._broadcast_pool.submit(self.broadcast_block, block_dict)
                     except Exception: pass
                 else:
                     self.metrics.inc("blocks_rejected")
                     log.warning(f"bloco #{h} rejeitado: {msg}")
+                    
+                    # [FIX v6.6.7] Penaliza na TrustNetwork por bloco inválido
+                    trust_id = peer_id or peer_ip
+                    if self.trust_net and trust_id:
+                        self.trust_net.record_block_rejected(trust_id, h, msg)
+                        
                 return ok
             if h <= local_h:
                 try: local_blk = self.bc.db.get_block(h)
@@ -1104,6 +1127,12 @@ class P2PManager:
     def _on_peer_bad(self, peer_ip: str, peer_id: Optional[str] = None) -> None:
         try:
             novo = self.bc.db.add_peer_score(peer_ip, PEER_SCORE_PENALTY_BAD)
+            
+            # [FIX v6.6.7] Penaliza na TrustNetwork
+            trust_id = peer_id or peer_ip
+            if self.trust_net and trust_id:
+                self.trust_net.penalize(trust_id, "comportamento malicioso detectado", "high")
+                
             if novo <= PEER_SCORE_BAN_THRESHOLD:
                 log.warning(f"BAN: {peer_ip}")
                 if peer_id:
@@ -1114,7 +1143,8 @@ class P2PManager:
         except Exception: pass
 
     def _on_peer_good(self, peer_ip: str, peer_id: Optional[str] = None) -> None:
-        try: self.bc.db.add_peer_score(peer_ip, PEER_SCORE_REWARD_GOOD)
+        try: 
+            self.bc.db.add_peer_score(peer_ip, PEER_SCORE_REWARD_GOOD)
         except Exception: pass
 
 
