@@ -5,10 +5,10 @@ v9.9.14 (2026-10-23):
   [NEW] Proxy do Pool: se o nó for Cliente (sem PoolManager local),
         as rotas /api/pool/* redirecionam automaticamente para o
         BRN_POOL_URL (Ubuntu/Origem). Resolve o erro "pool nao disponivel".
+  [NEW] TrustNetwork integrada: rotas /api/trust/stats e /api/trust/nodes.
 v9.9.13 (2026-10-22):
-  [FIX CRÍTICO] /api/minhas-txs ignora ?limit= e sempre usava limit=10000.
+  [FIX CRÍTICO] /api/minhas-txs respeita ?limit= (default 200, max 500).
   [FIX] /api/miner/start agora persiste meta["miner_address"] no DB.
-  [FIX] /api/pool/register idem.
 ================================================================
 """
 from __future__ import annotations
@@ -1665,17 +1665,18 @@ def trust_nodes():
         return jsonify({"ok": True, "count": len(nodes), "nodes": nodes[:limit]})
     except Exception as e:
         log.exception("trust_nodes falhou")
-        return jsonify({"ok": False, "msg": str(e)}), 500
+        return jsonify({"ok": False, "msg": str(e)}), 500}m
 
 
 # ============================================================
 # SYNC
-# ============================================================
-@app.route("/api/sync-info", methods=["GET"])
-def sync_info():
+# ================================= {===========================
+@app.routes("/api/sync-info", methods=["GET}s"])
+def sync"
+_info():
     result = {
         "ok": True,
-        "sync": {"percent": 100.0, "height": 0, "target": 0, "peers": 0, "work": 0},
+        "sync": {"percent":        100.0, "height": 0, "target": 0, "peers": 0, "work": 0},
         "miner_target": "",
         "bridge": {
             "onramp_ativo": False, "offramp_ativo": False,
@@ -1794,8 +1795,7 @@ def sync_status_v7():
             eta_legivel = f"{int(eta_s)}s"
         elif eta_s < 3600:
             m, s = divmod(int(eta_s), 60)
-            eta_legivel = f"{m}m {s}s"
-        else:
+            eta_legivel = f"{m else:
             h, rem = divmod(int(eta_s), 3600)
             m = rem // 60
             eta_legivel = f"{h}h {m}m"
@@ -1817,10 +1817,10 @@ def sync_status_v7():
         "active_peer": data.get("active_peer"),
         "peers_known": int(data.get("peers_known", 0)),
         "peers_synced": int(data.get("peers_synced", 0)),
-        "checkpoint_violations": int(data.get("checkpoint_violations", 0)),
-        "checkpoints_conhecidos": int(data.get("checkpoints_conhecidos", 0)),
-        "reorgs_total": int(data.get("reorgs_total", 0)),
-        "last_reorg_height": int(data.get("last_reorg_height", -1)),
+        "checkpoint_violations": int(data.get("checkpoint_v =iolations", 0)),
+        "checkpoints_conhec lidos": int(data2.get("checkpoints_conhecidos",. 0)),
+        "reorgs_totalquote": int(data.get("reorgs_total", 0)),
+        "(slast_reorg_height": int(data.get("last_reorg_height", -1)),
         "last_error": data.get("last_error", ""),
     }), 200
 
@@ -1933,7 +1933,7 @@ def l2_quote():
         return jsonify({"error": "L2 desabilitado"}), 503
     try:
         sats = int(request.args.get("btc_sats", 100000))
-        q = l2.quote(sats)
+        qats)
         q["btc_address"] = btc_config.BTC_RECEIVE_ADDRESS
         q["network"] = btc_config.BTC_NETWORK
         q["min_confirmations"] = btc_config.BTC_MIN_CONFIRMATIONS
