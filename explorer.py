@@ -1,13 +1,15 @@
 """
-explorer.py — Backend do Explorer + Painéis + Block Explorer (v3.0)
+explorer.py — Backend do Explorer + Painéis + Block Explorer (v3.1)
 ================================================================
-v3.0:
-  [NEW] Block Explorer estilo Bitcoin (Busca, Blocos, Carteiras, TXs).
-  [KEEP] Rotas de proxy (/api/*-proxy) usadas pelo panel.html e monitor.html.
+v3.1 (2026-10-23):
+  [NEW] Proxy Genérico para /api/*. Agora o explorer.html pode chamar
+        /api/trust/nodes ou /api/status sem erros de CORS.
+  [NEW] Rota /dashboard para servir o explorer.html (Monitor de Rede).
+  [KEEP] Block Explorer clássico (/) gerado via Python.
   [KEEP] Servidor dos arquivos estáticos panel.html e monitor.html.
 ================================================================
 """
-from flask import Flask, render_template_string, request, jsonify, send_file, abort
+from flask import Flask, render_template_string, request, jsonify, send_file
 import sqlite3
 import zlib
 import orjson
@@ -23,7 +25,7 @@ DB_PATH = str(BASE_DIR / "brn_v2_chain.db")
 API_BASE = "http://127.0.0.1:5000" # Porta do server.py
 
 # ============================================================
-# TEMPLATES HTML (Block Explorer)
+# TEMPLATES HTML (Block Explorer Clássico)
 # ============================================================
 LAYOUT = """
 <!DOCTYPE html>
@@ -58,7 +60,7 @@ LAYOUT = """
 <div class="container">
     <header>
         <h1>🔷 BRN Explorer</h1>
-        <div><a href="/">Home</a> | <a href="/panel">Painel</a> | <a href="/monitor">Monitor</a></div>
+        <div><a href="/">Home</a> | <a href="/dashboard">Dashboard ao Vivo</a> | <a href="/monitor">Monitor</a></div>
     </header>
     <form class="search-box" action="/search" method="GET">
         <input type="text" name="q" placeholder="Pesquisar por Bloco, TxID ou Endereço (brn1...)">
@@ -273,8 +275,14 @@ def search():
     else: return "Formato não reconhecido.", 400
 
 # ============================================================
-# SERVIDOR DE ARQUIVOS (Panel e Monitor)
+# SERVIDOR DE ARQUIVOS (Dashboard, Panel e Monitor)
 # ============================================================
+@app.route("/dashboard")
+def serve_dashboard():
+    p = BASE_DIR / "explorer.html"
+    if p.exists(): return send_file(p)
+    return "explorer.html não encontrado", 404
+
 @app.route("/panel")
 def serve_panel():
     p = BASE_DIR / "panel.html"
@@ -288,51 +296,37 @@ def serve_monitor():
     return "monitor.html não encontrado", 404
 
 # ============================================================
-# ROTAS DE PROXY (Para o Panel.html e Monitor.html)
+# PROXY GENÉRICO (Para explorer.html, panel.html, monitor.html)
 # ============================================================
-def _proxy_get(path):
+@app.route("/api/<path:path>", methods=["GET", "POST", "OPTIONS"])
+def api_proxy(path):
+    """
+    Repassa qualquer requisição /api/* para o nó principal (porta 5000).
+    Isso evita erros de CORS e centraliza as chamadas.
+    """
+    if request.method == "OPTIONS":
+        return "", 200
+        
+    target_url = f"{API_BASE}/api/{path}"
+    
     try:
-        r = requests.get(f"{API_BASE}{path}", timeout=10)
-        return jsonify(r.json())
+        if request.method == "POST":
+            data = request.get_json(silent=True) or {}
+            r = requests.post(target_url, json=data, timeout=15)
+        else:
+            r = requests.get(target_url, params=request.args, timeout=15)
+            
+        return jsonify(r.json()), r.status_code
+        
+    except requests.exceptions.ConnectionError:
+        return jsonify({"ok": False, "error": "Nó principal offline (:5000)"}), 502
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-def _proxy_post(path, data=None):
-    try:
-        r = requests.post(f"{API_BASE}{path}", json=data, timeout=10)
-        return jsonify(r.json())
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/status-proxy")
-def p_status(): return _proxy_get("/api/status")
-
-@app.route("/api/chain-info-proxy")
-def p_chain_info(): return _proxy_get("/api/chain-info")
-
-@app.route("/api/sync-status-proxy")
-def p_sync_status(): return _proxy_get("/api/sync/status")
-
-@app.route("/api/sync-info-proxy")
-def p_sync_info(): return _proxy_get("/api/sync-info")
-
-@app.route("/api/miner-status-proxy")
-def p_miner_status(): return _proxy_get("/api/miner/status")
-
-@app.route("/api/peers-score-proxy")
-def p_peers_score(): return _proxy_get("/api/peers/score")
-
-@app.route("/api/peers-discovered-proxy")
-def p_peers_discovered(): return _proxy_get("/api/peers/discovered")
-
-@app.route("/api/latest")
-def p_latest(): return _proxy_get("/api/latest")
-
-@app.route("/api/miner/start-proxy", methods=["POST"])
-def p_miner_start(): return _proxy_post("/api/miner/start", request.json)
-
-@app.route("/api/miner/stop-proxy", methods=["POST"])
-def p_miner_stop(): return _proxy_post("/api/miner/stop")
+# Suporte para rotas antigas com sufixo -proxy
+@app.route("/api/<path:path>-proxy", methods=["GET", "POST"])
+def api_proxy_compat(path):
+    return api_proxy(path)
 
 # ============================================================
 # MAIN
@@ -340,4 +334,8 @@ def p_miner_stop(): return _proxy_post("/api/miner/stop")
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_EXPLORER_PORT", "8080"))
     print(f"BRN Explorer + Painéis rodando em http://127.0.0.1:{port}")
+    print(f"  → Block Explorer: http://127.0.0.1:{port}/")
+    print(f"  → Dashboard:      http://127.0.0.1:{port}/dashboard")
+    print(f"  → Monitor:        http://127.0.0.1:{port}/monitor")
+    print(f"  → Painel:         http://127.0.0.1:{port}/panel")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
