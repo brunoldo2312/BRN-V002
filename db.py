@@ -1,9 +1,12 @@
-"""db.py — Banco SQLite do BRN (v6.6)
+"""db.py — Banco SQLite do BRN (v6.7)
 ================================================================
-v6.6:
-  [FIX] Adicionado PRAGMA busy_timeout=30000 (evita database is locked)
-  [FIX] utxos_gastos_na_mempool agora tem lock (proteção de leitura)
-  [FIX] all_mempool agora tem lock (evita leitura suja durante escrita)
+v6.7:
+  [FIX] Restaurados/preservados métodos essenciais (count_utxos, etc.)
+  [FIX] Limite de get_txs_for_address aumentado para 10000
+  [FIX] Limite de all_mempool aumentado para 10000
+  [FIX] Limite máximo da mempool aumentado para 10000
+  [FIX] Preservado PRAGMA busy_timeout=30000 (evita database is locked)
+  [FIX] Preservados locks em utxos_gastos_na_mempool e all_mempool
 ================================================================
 """
 import os
@@ -275,7 +278,7 @@ class ChainDB:
             return -1
 
     # ==================== HISTÓRICO POR ENDEREÇO ====================
-    def get_txs_for_address(self, address: str, limit: int = 200) -> list:
+    def get_txs_for_address(self, address: str, limit: int = 10000) -> list:
         result = []
         seen_txids = set()
 
@@ -411,7 +414,7 @@ class ChainDB:
             self._prune_mempool()
             return True
 
-    def _prune_mempool(self, max_size=1000, ttl=86400):
+    def _prune_mempool(self, max_size=10000, ttl=86400):
         self.conn.execute("DELETE FROM mempool WHERE received_at < ?", (time.time() - ttl,))
         n = self.conn.execute("SELECT COUNT(*) AS c FROM mempool").fetchone()["c"]
         if n > max_size:
@@ -425,7 +428,7 @@ class ChainDB:
         return orjson.loads(zlib.decompress(row["raw"])) if row else None
 
     # [FIX v6.6] lock na leitura da mempool
-    def all_mempool(self, limit=1000):
+    def all_mempool(self, limit=10000):
         with self.lock:
             rows = self.conn.execute("SELECT raw FROM mempool ORDER BY fee DESC LIMIT ?", (limit,)).fetchall()
             return [orjson.loads(zlib.decompress(r["raw"])) for r in rows]
