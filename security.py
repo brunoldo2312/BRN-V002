@@ -9,7 +9,7 @@ v6 (2026-10-22):
              virava plaintext no audit.log).
   [SECURITY] ADMIN_TOKEN com tamanho mínimo de 16 chars.
   [SECURITY] _SENSITIVE_KEYS expandido: token, api_key, brn_admin_token.
-  [FIX] DEFAULT_RATE_LIMITS cobre TODOS os endpoints do server.py v9.9.12.
+  [FIX] DEFAULT_RATE_LIMITS cobre TODOS os endpoints do server.py v9.9.14.
   [FIX] RateLimiter._maybe_cleanup chamado também em 429.
   [NEW] atexit.close_audit() — flush garantido em crash não tratado.
 ================================================================
