@@ -262,7 +262,7 @@
   </div>
 
   <div class="footer">
-    BRN Monitor v1.2 · <a href="http://127.0.0.1:8080/panel">Painel local</a> ·
+    BRN Monitor v1.3 · <a href="http://127.0.0.1:8080/panel">Painel local</a> ·
     <a href="http://127.0.0.1:8080/">Explorer</a>
   </div>
 </div>
@@ -287,15 +287,16 @@
 "use strict";
 
 // ============================================================
-// CONFIGURAÇÃO (AJUSTADA PARA O SEU AMBIENTE)
+// CONFIGURAÇÃO — LISTA FIXA COM TODOS OS IPs DO TAILSCALE + LAN
 // ============================================================
-const STORAGE_KEY = "brn_monitor_nodes_v3";
+const STORAGE_KEY = "brn_monitor_nodes_v4";
 
-// IPs e Portas corretos para a API HTTP (5000)
 const DEFAULT_NODES = [
-  { name: "Origem (Mayra)", host: "100.84.11.48", port: 5000, role: "origin" },
-  { name: "Linux (Cliente)", host: "100.111.253.8", port: 5000, role: "client" },
+  { name: "Origem (Mayra)",   host: "100.84.11.48",  port: 5000, role: "origin" },
+  { name: "Linux (Cliente)",  host: "100.111.253.8", port: 5000, role: "client" },
   { name: "Filipe (Cliente)", host: "100.64.151.67", port: 5000, role: "client" },
+  { name: "Desktop 61ltr",    host: "100.70.107.15", port: 5000, role: "client" },
+  { name: "Ubuntu Local",     host: "192.168.0.19",  port: 5000, role: "client" }
 ];
 
 const DISCOVERY_INTERVAL_MS = 30000;
