@@ -1,6 +1,10 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.2.8 | Data: 22/10/2026
+Versão: 9.2.9 | Data: 22/10/2026
 ================================================================
+v9.2.9 (2026-10-22):
+  [CONSENSO] Restaurado pagamento integral da recompensa ao minerador.
+             Mantidos recompensa inicial de 50 BRN e halving a cada
+             210.000 blocos para compatibilidade com nós antigos.
 v9.2.8 (2026-10-22):
   [CRITICAL] set_network_secret() agora respeita BRN_REQUIRE_AUTH_TAG=0.
              Antes, se chamado com require_auth_tag=False no __init__,
@@ -268,21 +272,14 @@ def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0, should_continue=None
 
 
 def make_coinbase(address: str, pubkey_hex: str, height: int, reward: int, fila_mineracao: dict = None) -> dict:
+    """Coinbase compatível com o consenso antigo: recompensa integral ao minerador.
+
+    fila_mineracao permanece como parâmetro opcional por compatibilidade com
+    chamadas antigas, mas não altera os outputs de consenso do bloco.
+    """
     if not pubkey_hex:
         raise ValueError("make_coinbase: pubkey_hex é obrigatória")
-    outputs = []
-    if fila_mineracao and len(fila_mineracao) > 0:
-        valor_validador = int(reward * 0.5)
-        valor_restante = reward - valor_validador
-        valor_por_cliente = valor_restante // len(fila_mineracao)
-        outputs.append({"address": address, "amount": valor_validador, "pubkey": pubkey_hex})
-        for cliente_addr, cliente_pub in fila_mineracao.items():
-            outputs.append({"address": cliente_addr, "amount": valor_por_cliente, "pubkey": cliente_pub})
-        total_pago = sum(o["amount"] for o in outputs)
-        if total_pago < reward:
-            outputs[0]["amount"] += (reward - total_pago)
-    else:
-        outputs.append({"address": address, "amount": reward, "pubkey": pubkey_hex})
+    outputs = [{"address": address, "amount": int(reward), "pubkey": pubkey_hex}]
     cb = {"txid": "", "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}], "outputs": outputs, "timestamp": int(time.time()), "locktime": 0, "height": int(height), "nonce": 0}
     cb["txid"] = txid(cb)
     return cb
@@ -710,10 +707,9 @@ class Blockchain:
         height = self.db.height() + 1
         reward = self.current_reward(height)
         diff = self.current_difficulty()
-        fila_para_pagar = None
-        if (not self.rede_descentralizada and len(self.fila_mineracao) > 0):
-            fila_para_pagar = self.fila_mineracao
-        cb = make_coinbase(miner_address, miner_pubkey, height, reward, fila_mineracao=fila_para_pagar)
+        # Compatibilidade de consenso: a recompensa inteira pertence ao minerador.
+        # A fila de bootstrap não divide pagamentos na coinbase.
+        cb = make_coinbase(miner_address, miner_pubkey, height, reward)
         candidatas = self.db.all_mempool(limit=MAX_TX_PER_BLOCK - 1)
         selected = []
         gastos_neste_bloco = set()
