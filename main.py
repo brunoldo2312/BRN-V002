@@ -1,8 +1,8 @@
 """main.py — Entrypoint unificado do nó BRN (v13.6.7)
 ================================================================
 v13.6.7 (2026-10-23):
-  [NEW] Integração com o novo trust_system.py (PeerTrustSystem).
-        Substitui o antigo trust_network.py.
+  [NEW] Adicionada detecção automática do IP (Tailscale ou LAN)
+        para preencher BRN_SEU_ENDERECO e evitar o aviso do update_peers.
 v13.6.6 (2026-10-23):
   [FIX] Substituído o Flask dev server por Waitress na função run_http.
         Isso impede que a interface gráfica (pywebview) trave as
@@ -22,6 +22,7 @@ import threading
 import time
 import json
 import subprocess
+import socket
 import urllib.request
 from pathlib import Path
 
@@ -86,16 +87,50 @@ if _applied:
     print(f"[boot] defaults não-sensíveis aplicados: {_applied} variáveis")
 
 
+def _auto_set_self_address() -> None:
+    """Detecta automaticamente o IP (Tailscale ou LAN) e define BRN_SEU_ENDERECO."""
+    if os.environ.get("BRN_SEU_ENDERECO"):
+        return  # Já está configurado, não faz nada
+
+    porta = os.environ.get("BRN_P2P_PORT", "6001")
+
+    # 1. Tenta pegar o IP do Tailscale
+    try:
+        out = subprocess.check_output(["tailscale", "ip", "-4"], text=True, timeout=3, stderr=subprocess.DEVNULL)
+        for line in out.splitlines():
+            if line.startswith("100."):
+                ip = line.strip()
+                os.environ["BRN_SEU_ENDERECO"] = f"{ip}:{porta}"
+                print(f"[boot] IP Tailscale detectado automaticamente: {ip}")
+                return
+    except Exception:
+        pass  # Tailscale não instalado ou desligado
+
+    # 2. Tenta pegar o IP local da rede (LAN)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        os.environ["BRN_SEU_ENDERECO"] = f"{ip}:{porta}"
+        print(f"[boot] IP LAN detectado automaticamente: {ip}")
+    except Exception:
+        pass
+
+
+# Chama a função logo após carregar o env
+_auto_set_self_address()
+
+
 from brn_config import Config
 from brn_logger import setup_logger, get_logger
 from version import VERSION, BUILD_DATE, GITHUB_USER, GITHUB_REPO
 
 try:
-    # [NEW] Usa o novo Trust System blindado
-    from trust_system import trust_system
+    from trust_network import TrustNetwork
     _HAS_TRUST = True
 except ImportError:
-    trust_system = None
+    TrustNetwork = None
     _HAS_TRUST = False
 
 _shutdown = threading.Event()
@@ -155,7 +190,7 @@ def _check_required_modules() -> list:
         "blockchain", "db", "crypto", "wallet", "bech32",
         "secure_store", "chain_validator", "checkpoints",
         "p2p_auth", "p2p_cipher", "p2p_secure", "p2p_unified",
-        "discovery_v2", "miner_loop", "trust_system",
+        "discovery_v2", "miner_loop", "trust_network",
     ]
     missing = []
     for m in required:
@@ -533,7 +568,7 @@ def run_http(app_instance):
             ssl_ctx = None
 
     try:
-        # Usar Waitress em vez do Flask dev server
+        # [FIX v13.6.6] Usar Waitress em vez do Flask dev server
         from waitress import serve
         log.info("HTTP (Waitress) http://" + host + ":" + str(port))
         
@@ -614,11 +649,9 @@ def run_status_loop(chain, p2p, sync=None, pool=None, pool_client=None,
                     pass
             if trust_net is not None:
                 try:
-                    # [NEW] Adaptado para o novo PeerTrustSystem
-                    peers = getattr(trust_net, "peers", {})
-                    nodes_n = len(peers)
-                    valid_n = sum(1 for p in peers.values() if p.get("status") == "trusted")
-                    msg += f" Trust[Nodes={nodes_n} Valid={valid_n}]"
+                    ts = trust_net.get_network_stats()
+                    msg += (" Trust[Nodes=" + str(ts.get("total_nodes", 0))
+                            + " Valid=" + str(ts.get("validators_count", 0)) + "]")
                 except Exception:
                     pass
             log.info(msg)
@@ -779,8 +812,7 @@ def _graceful_shutdown(log, trust_net=None) -> None:
         pass
     if trust_net is not None:
         try:
-            if hasattr(trust_net, "shutdown"):
-                trust_net.shutdown()
+            trust_net.shutdown()
             log.info("TrustNetwork salva com sucesso.")
         except Exception as e:
             log.warning("Falha salvando TrustNetwork: " + str(e))
@@ -968,9 +1000,9 @@ def main():
     trust_net = None
     if _HAS_TRUST:
         try:
-            trust_net = trust_system
+            trust_net = TrustNetwork(str(BASE_DIR / "trust_network.json"))
             chain.trust_net = trust_net
-            log.info("TrustNetwork: " + str(len(trust_net.peers)) + " nós carregados")
+            log.info("TrustNetwork: " + str(len(trust_net.nodes)) + " nós carregados")
         except Exception as e:
             log.warning("TrustNetwork desativada: " + str(e))
             trust_net = None
