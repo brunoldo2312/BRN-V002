@@ -1,15 +1,14 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.2.9 | Data: 22/10/2026
+Versão: 9.3.0 | Data: 23/10/2026
 ================================================================
+v9.3.0 (2026-10-23):
+  [FIX CRÍTICO] Validação do auth_tag corrigida para permitir a criação
+                do Gênesis do zero (bloco 0) sem erro.
+                Blocos legados (<= 6000) não exigem auth_tag se não tiverem.
 v9.2.9 (2026-10-22):
   [CONSENSO] Restaurado pagamento integral da recompensa ao minerador.
-             Mantidos recompensa inicial de 50 BRN e halving a cada
-             210.000 blocos para compatibilidade com nós antigos.
 v9.2.8 (2026-10-22):
   [CRITICAL] set_network_secret() agora respeita BRN_REQUIRE_AUTH_TAG=0.
-             Antes, se chamado com require_auth_tag=False no __init__,
-             este método o resetava para True. Isso quebrava o sync em
-             blocos > 6000 com "auth_tag invalido (segredo errado?)".
 v9.2.7 (2026-10-22):
   [CRITICAL] validate_block() chama validate_tx(from_mempool=True).
 v9.2.6:
@@ -633,20 +632,32 @@ class Blockchain:
         ok_cp, msg_cp = _verify_checkpoint_for_block(block)
         if not ok_cp:
             return False, msg_cp
-        if self.require_auth_tag:
+
+        # ============================================================
+        # [FIX v9.3.0] VALIDAÇÃO DE AUTENTICAÇÃO CORRIGIDA
+        # ============================================================
+        # Permite criar o Gênesis (bloco 0) sem se auto-bloquear
+        if block["height"] > 0 and self.require_auth_tag:
             if not self.network_secret:
                 return False, "no exige auth_tag mas sem BRN_NETWORK_SECRET"
+            
+            # Se for bloco novo (> 6000), exige auth_tag obrigatório
             if block["height"] > AUTH_TAG_START_HEIGHT:
                 tag = block.get("auth_tag")
                 if not tag:
                     return False, "bloco sem auth_tag"
                 if not verify_auth_tag(block["height"], block["hash"], tag, self.network_secret):
                     return False, "auth_tag invalido (segredo errado?)"
+            
+            # Se for bloco legado (<= 6000), valida o auth_tag apenas se ele existir.
+            # Se não existir, permite (para compatibilidade com blocos antigos e Gênesis).
             else:
                 tag = block.get("auth_tag")
                 if tag:
                     if not verify_auth_tag(block["height"], block["hash"], tag, self.network_secret):
                         return False, "auth_tag invalido em bloco legado"
+                # Se tag não existir, não bloqueia.
+
         cb = block["transactions"][0]
         if cb["inputs"][0]["txid"] != "0" * 64:
             return False, "primeira tx nao e coinbase"
@@ -664,125 +675,4 @@ class Blockchain:
         for i, t in enumerate(block["transactions"][1:], 1):
             if t["txid"] != txid(t):
                 return False, "txid invalido"
-            ok_tx, msg_tx = self.validate_tx(t, from_mempool=True)
-            if not ok_tx:
-                return False, f"tx #{i}: {msg_tx}"
-            fees += self.tx_fee(t)
-        total_cb = sum(o["amount"] for o in cb["outputs"])
-        if total_cb > reward + fees:
-            return False, "coinbase acima do permitido"
-        return True, "ok"
-
-    def accept_block(self, block: dict) -> tuple:
-        prev = self.db.get_block_by_hash(block["prev_hash"])
-        ok, msg = self.validate_block(block, prev)
-        if not ok:
-            return False, msg
-        self.db.add_block(block)
-        _maybe_sign_checkpoint(block)
-        for i, t in enumerate(block["transactions"]):
-            coinbase = (i == 0)
-            self.db.apply_tx(t, block["height"], coinbase=coinbase)
-            if i > 0:
-                self.db.remove_mempool(t["txid"])
-            if not coinbase:
-                tx_data = t.get("data") or {}
-                if (isinstance(tx_data, dict) and tx_data.get("type") in ("deploy", "call")):
-                    try:
-                        self._apply_contract_tx(t)
-                    except Exception as e:
-                        print(f"[CONTRACT] tx {t['txid'][:16]}... falhou: {e}")
-        return True, block["hash"]
-
-    def _attach_auth_tag(self, block: dict) -> dict:
-        tag = compute_auth_tag(block["height"], block["hash"], self.network_secret)
-        if tag:
-            block["auth_tag"] = tag
-        return block
-
-    def _fire_block_mined(self, block: dict) -> None:
-        cb = self.on_block_mined
-        if cb is None:
-            return
-        try:
-            cb(block)
-        except Exception as e:
-            print(f"[on_block_mined] callback falhou: {e}")
-
-    def mine_block(self, miner_address: str, miner_pubkey: str) -> dict:
-        if not miner_pubkey:
-            raise ValueError("mine_block: miner_pubkey é obrigatória")
-        return self.mine_block_interruptible(miner_address, miner_pubkey, None)
-
-    def mine_block_interruptible(self, miner_address: str, miner_pubkey: str, should_continue=None, progress_cb=None) -> dict:
-        if not miner_pubkey:
-            raise ValueError("mine_block_interruptible: miner_pubkey é obrigatória")
-        height = self.db.height() + 1
-        reward = self.current_reward(height)
-        diff = self.current_difficulty()
-        # Compatibilidade de consenso: a recompensa inteira pertence ao minerador.
-        # A fila de bootstrap não divide pagamentos na coinbase.
-        cb = make_coinbase(miner_address, miner_pubkey, height, reward)
-        candidatas = self.db.all_mempool(limit=MAX_TX_PER_BLOCK - 1)
-        selected = []
-        gastos_neste_bloco = set()
-        for t in candidatas:
-            try:
-                ok_tx, msg_tx = self.validate_tx(t, from_mempool=True)
-                if not ok_tx:
-                    continue
-                conflito = False
-                for inp in t.get("inputs", []):
-                    key = (inp["txid"], int(inp["vout"]))
-                    if key in gastos_neste_bloco:
-                        conflito = True
-                        break
-                if conflito:
-                    continue
-                for inp in t.get("inputs", []):
-                    gastos_neste_bloco.add((inp["txid"], int(inp["vout"])))
-                selected.append(t)
-            except Exception:
-                continue
-        txs = [cb] + selected
-        merkle = compute_merkle_root([t["txid"] for t in txs])
-        prev_hash = self.db.tip_hash()
-        ts = int(time.time())
-        nonce, h_hex, _ = _pow_search(prev_hash, merkle, ts, diff, should_continue=should_continue, progress_cb=progress_cb)
-        if nonce is None:
-            return None
-        block = {"height": height, "hash": h_hex, "prev_hash": prev_hash, "timestamp": ts, "nonce": nonce, "merkle": merkle, "difficulty": diff, "transactions": txs}
-        self._attach_auth_tag(block)
-        ok, _msg = self.accept_block(block)
-        if ok:
-            self._fire_block_mined(block)
-            return block
-        log.warning(f"[MINER] bloco #{block.get('height')} minerado mas REJEITADO: {_msg}")
-        return None
-
-    def state_snapshot(self) -> dict:
-        return {"height": self.get_latest_height(), "tip_hash": self.db.tip_hash(), "difficulty": self.current_difficulty(), "cumulative_work": self.cumulative_work(), "mempool": self.db.mempool_count(), "checkpoints": len(_checkpoints), "rede_descentralizada": self.rede_descentralizada, "fila_tamanho": len(self.fila_mineracao)}
-
-
-try:
-    from reorg import reorg_to as _reorg_to, find_fork_point as _find_fork
-    def _reorg_to_method(self, new_blocks, max_depth=MAX_REORG_DEPTH, allow_genesis_reorg=False):
-        res = _reorg_to(self, new_blocks, max_depth, allow_genesis_reorg)
-        return res.to_tuple()
-    def _find_fork_method(self, remote_blocks, max_depth=1000):
-        return _find_fork(self, remote_blocks, max_depth)
-    Blockchain.reorg_to = _reorg_to_method
-    Blockchain.find_fork_point = _find_fork_method
-    print("reorg.py plugado em Blockchain")
-except ImportError:
-    print("reorg.py nao encontrado (reorg desabilitado)")
-
-try:
-    from chain_validator import verify_chain as _verify_ext
-    def _verify_chain_method(self, full=True):
-        return _verify_ext(self)
-    Blockchain.verify_chain = _verify_chain_method
-    Blockchain.verify_chain_dict = lambda self: _verify_ext(self).to_dict()
-    print("chain_validator.py plugado em Blockchain")
-except ImportError:
-    print("chain_validator.py nao encontrado")
+            ok_tx, msg_tx = self.validate_tx(t, from_m
