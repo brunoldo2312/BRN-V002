@@ -1,32 +1,14 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.13)
+server.py — Backend HTTP do nó BRN (v9.9.14)
 ================================================================
+v9.9.14 (2026-10-23):
+  [NEW] Proxy do Pool: se o nó for Cliente (sem PoolManager local),
+        as rotas /api/pool/* redirecionam automaticamente para o
+        BRN_POOL_URL (Ubuntu/Origem). Resolve o erro "pool nao disponivel".
 v9.9.13 (2026-10-22):
-  [FIX CRÍTICO] /api/minhas-txs ignorava ?limit= e sempre usava
-                limit=10000. Com 3000+ UTXOs, cada request travava
-                o lock do SQLite por 10-30s, causando timeout em
-                TODAS as outras chamadas (portfolio, node_status,
-                sync_info). Fix: respeita ?limit= (default 200, max 500).
+  [FIX CRÍTICO] /api/minhas-txs ignora ?limit= e sempre usava limit=10000.
   [FIX] /api/miner/start agora persiste meta["miner_address"] no DB.
-        Antes o painel "MINERANDO PARA" ficava vazio.
   [FIX] /api/pool/register idem.
-v9.9.12:
-  [FIX CRÍTICO] l2_claim usava escrow["btc_amount_sats"] e
-                escrow["brn_amount_sats"], mas db.py grava
-                btc_expected_sats e brn_amount. Agora usa .get().
-  [FIX] l2_order: status usava order["status"] direto. Agora .get().
-v9.9.11:
-  [FIX CRÍTICO] Decorators pool_submit=1200/min, pool_heartbeat=600/min.
-  [FIX] bootstrap_add (sem rate limit → DoS).
-  [FIX] experiment, trust_*, l2_* com chaves próprias.
-  [FIX] _notify_bootstrap_peers() com BOOTSTRAP_HTTP_PORT.
-  [FIX] miner_start passa is_origin (via chain.is_origin).
-v9.9.10:
-  [FIX] /api/trust/nodes asdict().
-  [FIX] HDWalletManager except Exception.
-  [FIX] /api/status peer_count do P2P.
-  [NEW] /api/experiment/variant.
-  [FIX] _get_l2 fallback de assinatura.
 ================================================================
 """
 from __future__ import annotations
@@ -108,7 +90,6 @@ FAUCET_MAX_PER_ADDRESS = 3
 FAUCET_COOLDOWN_S     = 60 * 60
 CACHE_TTL_S           = 5
 
-# [FIX v9.9.13] Limite padrão e máximo para /api/minhas-txs
 TXT_HISTORY_LIMIT_DEFAULT = 200
 TXT_HISTORY_LIMIT_MAX     = 500
 
@@ -154,7 +135,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str,
                     "address": addr, "pubkey": pubkey,
                 }).encode("utf-8"),
                 headers={"Content-Type": "application/json",
-                         "User-Agent": "brn-server/9.9.13"},
+                         "User-Agent": "brn-server/9.9.14"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -704,9 +685,6 @@ def verificar_recebimento(address, txid_str):
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
-# ============================================================
-# [FIX v9.9.13] /api/minhas-txs respeita ?limit=
-# ============================================================
 @app.route("/api/minhas-txs/<address>", methods=["GET"])
 @app.route("/api/transacoes/<address>", methods=["GET"])
 @require_rate_limit("minhas_txs")
@@ -726,7 +704,6 @@ def minhas_txs(address):
                 "msg": "Endpoint de histórico precisa do db.py v6.4+",
             })
 
-        # [FIX v9.9.13] Respeita ?limit= (default 200, max 500)
         try:
             _limit = int(request.args.get("limit", TXT_HISTORY_LIMIT_DEFAULT))
         except (ValueError, TypeError):
@@ -1052,7 +1029,7 @@ def mine():
 
 
 # ============================================================
-# [FIX v9.9.13] MINER START persiste miner_address
+# MINER START / STOP / STATUS
 # ============================================================
 @app.route("/api/miner/start", methods=["POST"])
 @require_rate_limit("miner_start")
@@ -1077,7 +1054,6 @@ def miner_start():
         chain = _get_chain()
         chain.adicionar_na_fila(addr, pubkey)
 
-        # [FIX v9.9.13] Persiste miner_address para o painel "MINERANDO PARA"
         try:
             chain.db.set_meta("miner_address", addr)
         except Exception:
@@ -1231,14 +1207,46 @@ def faucet():
 
 
 # ============================================================
-# [FIX v9.9.13] POOL REGISTER persiste miner_address
+# POOL (COM PROXY PARA CLIENTES)
 # ============================================================
+def _proxy_pool_request(path: str, method: str = "POST") -> tuple:
+    """Se for cliente, repassa a chamada para o Origem."""
+    remote_pool = os.environ.get("BRN_POOL_URL", "").strip().rstrip("/")
+    if not remote_pool or not remote_pool.startswith("http"):
+        return jsonify({"ok": False, "msg": "pool nao disponivel e BRN_POOL_URL nao configurada"}), 503
+
+    url = f"{remote_pool}{path}"
+    try:
+        if method == "POST":
+            data = request.get_json(force=True) or {}
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(data).encode("utf-8"),
+                headers={"Content-Type": "application/json",
+                         "User-Agent": "brn-server-proxy/1.0"},
+                method="POST"
+            )
+        else:
+            req = urllib.request.Request(url, method="GET")
+
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return jsonify(json.loads(resp.read().decode("utf-8"))), resp.status
+            
+    except urllib.error.HTTPError as e:
+        try:
+            return jsonify(json.loads(e.read().decode("utf-8"))), e.code
+        except Exception:
+            return jsonify({"ok": False, "msg": f"HTTP {e.code} no pool remoto"}), e.code
+    except Exception as e:
+        return jsonify({"ok": False, "msg": f"Falha no proxy do pool: {e}"}), 502
+
+
 @app.route("/api/pool/register", methods=["POST"])
 @require_rate_limit("pool_register")
 def pool_register():
     pool = _get_pool_manager()
     if pool is None:
-        return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
+        return _proxy_pool_request("/api/pool/register", "POST")
     try:
         data = request.get_json(force=True) or {}
         address = (data.get("address") or "").strip()
@@ -1253,7 +1261,6 @@ def pool_register():
         chain = _get_chain()
         chain.adicionar_na_fila(address, pubkey)
 
-        # [FIX v9.9.13] Persiste miner_address
         try:
             chain.db.set_meta("miner_address", address)
         except Exception:
@@ -1278,7 +1285,7 @@ def pool_register():
 def pool_work():
     pool = _get_pool_manager()
     if pool is None:
-        return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
+        return _proxy_pool_request("/api/pool/work", "POST")
     try:
         data = request.get_json(force=True) or {}
         miner_id = (data.get("miner_id") or "").strip()
@@ -1295,7 +1302,7 @@ def pool_work():
 def pool_submit():
     pool = _get_pool_manager()
     if pool is None:
-        return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
+        return _proxy_pool_request("/api/pool/submit", "POST")
     try:
         data = request.get_json(force=True) or {}
         miner_id = (data.get("miner_id") or "").strip()
@@ -1334,7 +1341,7 @@ def pool_submit():
 def pool_heartbeat():
     pool = _get_pool_manager()
     if pool is None:
-        return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
+        return _proxy_pool_request("/api/pool/heartbeat", "POST")
     try:
         data = request.get_json(force=True) or {}
         miner_id = (data.get("miner_id") or "").strip()
@@ -1355,7 +1362,7 @@ def pool_heartbeat():
 def pool_disconnect():
     pool = _get_pool_manager()
     if pool is None:
-        return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
+        return _proxy_pool_request("/api/pool/disconnect", "POST")
     try:
         data = request.get_json(force=True) or {}
         miner_id = (data.get("miner_id") or "").strip()
@@ -1372,7 +1379,7 @@ def pool_disconnect():
 def pool_stats():
     pool = _get_pool_manager()
     if pool is None:
-        return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
+        return _proxy_pool_request("/api/pool/stats", "GET")
     try:
         return jsonify(pool.stats())
     except Exception as e:
@@ -1384,7 +1391,7 @@ def pool_stats():
 def pool_miners():
     pool = _get_pool_manager()
     if pool is None:
-        return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
+        return _proxy_pool_request("/api/pool/miners", "GET")
     try:
         return jsonify({"ok": True, "miners": pool.miners_list()})
     except Exception as e:
@@ -1396,7 +1403,7 @@ def pool_miners():
 def pool_miner_status(miner_id):
     pool = _get_pool_manager()
     if pool is None:
-        return jsonify({"ok": False, "msg": "pool nao disponivel"}), 503
+        return _proxy_pool_request(f"/api/pool/miner/{miner_id}", "GET")
     try:
         r = pool.miner_status(miner_id)
         return jsonify(r), (200 if r.get("ok") else 404)
@@ -2015,9 +2022,6 @@ def l2_list():
 @app.route("/api/l2/claim", methods=["POST"])
 @require_rate_limit("l2_claim")
 def l2_claim():
-    """
-    Verifica BTC na rede ANTES de creditar BRN.
-    """
     l2 = _get_l2()
     if not l2:
         return jsonify({"error": "L2 desabilitado"}), 503
@@ -2241,7 +2245,7 @@ def health():
             "trust_injected": _TRUST_NETWORK is not None,
             "hd_wallet": _HAS_HD,
             "mode": "modo2_aberto",
-            "version": "9.9.13",
+            "version": "9.9.14",
             "rate_limits_keys": rate_limits_keys,
             "bootstrap_http_port": BOOTSTRAP_HTTP_PORT,
         })
@@ -2253,7 +2257,7 @@ def health():
 def index():
     return jsonify({
         "name": "BRN Node API",
-        "version": "9.9.13",
+        "version": "9.9.14",
         "mode": "modo2_aberto",
         "l2_enabled": L2_ENABLED,
         "pool_enabled": _POOL_MANAGER is not None,
@@ -2278,7 +2282,7 @@ def _shutdown():
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.13 (P2P + L2 + Trust + A/B + RateLimit + TXLimit)")
+    print(f"BRN Server v9.9.14 (P2P + L2 + Trust + A/B + RateLimit + TXLimit + Proxy)")
     print(f"  → http://{WEB_HOST}:{port}")
     print(f"  L2: {'ATIVO' if L2_ENABLED else 'DESABILITADO'}")
     print(f"  Admin token: {'SIM' if ADMIN_TOKEN else 'NÃO (dev mode)'}")
