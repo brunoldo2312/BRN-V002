@@ -126,7 +126,7 @@ class BTCWatcher(threading.Thread):
         now = int(time.time())
         for e in open_escrows:
             try:
-                if int(e.get("expires_at", 0)) < now:
+                if int(e.get("expires_at", 0)) <= now:
                     self.db.update_l2_escrow_status(
                         e["escrow_id"], "EXPIRED")
                     log.info(f"{LOG_PREFIX} escrow expirado: "
@@ -160,9 +160,8 @@ class BTCWatcher(threading.Thread):
         if expected_sats <= 0:
             return
 
-        # tolerância de 1% para fee
-        min_ok = int(expected_sats * 0.99)
-
+        # Não aceitar pagamento abaixo do valor combinado: o crédito BRN
+        # é fixo por ordem e tolerar subpagamento criaria crédito sem lastro.
         for btc_tx in txs:
             txid = btc_tx.get("txid", "")
             if not txid:
@@ -172,20 +171,24 @@ class BTCWatcher(threading.Thread):
             try:
                 if self.db.is_btc_txid_used(txid):
                     continue
-            except Exception:
-                pass
+            except Exception as exc:
+                # Falha fechada: sem verificação anti-replay, não processa depósito.
+                log.error(f"{LOG_PREFIX} anti-replay indisponível; ignorando tx: {exc}")
+                return
 
-            # Já foi usada em outro escrow?
+            # Defesa adicional para bancos antigos que ainda não preencheram btc_used.
             try:
                 rows = self.db.get_l2_escrows()
                 if any(r.get("btc_txid") == txid and
                        r.get("status") != "OPEN" for r in rows):
                     continue
-            except Exception:
-                pass
+            except Exception as exc:
+                log.error(f"{LOG_PREFIX} não foi possível verificar txid em escrows: {exc}")
+                return
 
-            # Valor suficiente?
-            if btc_tx["value_sats"] < min_ok:
+            # A ordem é cotada por valor fixo: exige o valor exato para evitar
+            # atribuir um pagamento parcial ou ambíguo a uma ordem.
+            if int(btc_tx.get("value_sats", 0)) != expected_sats:
                 continue
 
             # Confirmações suficientes?
