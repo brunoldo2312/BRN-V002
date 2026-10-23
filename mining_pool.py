@@ -1,5 +1,10 @@
-"""mining_pool.py — Pool de mineração BRN (v5 - Vardiff)
+"""mining_pool.py — Pool de mineração BRN (v5.1 - Bootstrap + Vardiff)
 ================================================================
+v5.1:
+  [FIX] Registro do pool agora alimenta a fila persistente da blockchain;
+        reconexões não contam duas vezes e a fase muda ao atingir 20.
+  [FIX] Resposta de registro informa fase, tamanho/alvo da fila e estado
+        descentralizado para diagnóstico do cliente.
 v5:
   [NEW] Vardiff: cada minerador tem sua própria share_difficulty,
         que sobe/desce automaticamente para convergir a
@@ -177,10 +182,26 @@ class PoolManager:
                 m.pubkey = pubkey
                 m.last_seen = time.time()
 
-            # Lê o estado real da blockchain
+            # Registra o endereço na fila persistente de bootstrap da blockchain.
+            # A fila é indexada por endereço, portanto reconexões não contam duas vezes.
+            # Ao atingir 20 endereços, Blockchain.adicionar_na_fila ativa a fase descentralizada.
+            try:
+                self.chain.adicionar_na_fila(address, pubkey)
+            except Exception as e:
+                log.exception("pool: falha ao registrar minerador na fila de bootstrap: %s", e)
+                return {"ok": False, "msg": "falha ao registrar na fila de mineradores"}
+
+            # Mantém o estado do pool sincronizado com o estado autoritativo da blockchain.
             self.phase = 2 if self.chain.rede_descentralizada else 1
             self.miner_queue = list(self.chain.fila_mineracao.keys())
-        return {"ok": True, "miner_id": miner_id}
+            log.info(
+                "pool: fase=%d fila=%d/%d minerador=%s",
+                self.phase, len(self.miner_queue), self.phase2_threshold, address[:16]
+            )
+        return {"ok": True, "miner_id": miner_id, "phase": self.phase,
+                "miner_queue_len": len(self.miner_queue),
+                "miner_queue_target": self.phase2_threshold,
+                "decentralized": bool(self.chain.rede_descentralizada)}
 
     def heartbeat(self, miner_id: str, hashrate: float = 0.0, hashes_total: int = 0) -> dict:
         with self.lock:
