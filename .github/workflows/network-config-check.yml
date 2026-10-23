@@ -16,6 +16,8 @@ on:
     branches: [main]
     paths:
       - "db.py"
+      - "blockchain.py"
+      - "chain_validator.py"
       - "auto_config_network.py"
       - "tracker.py"
       - "check_network.py"
