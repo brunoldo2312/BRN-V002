@@ -40,7 +40,7 @@ from collections import defaultdict
 # ============================================================
 # CONFIG
 # ============================================================
-PORT = int(os.environ.get("PORT", "9000"))
+PORT = int(os.environ.get("BRN_TRACKER_PORT", os.environ.get("PORT", "9000")))
 TTL = int(os.environ.get("BRN_TRACKER_TTL", "600"))                # 10 min
 CLEANUP_INTERVAL = int(os.environ.get("BRN_TRACKER_CLEANUP", "60"))  # 1 min
 MAX_PEERS = int(os.environ.get("BRN_TRACKER_MAX_PEERS", "5000"))
