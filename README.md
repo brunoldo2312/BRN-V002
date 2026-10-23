@@ -126,13 +126,11 @@ Verifica se os nós estão sincronizados.
 Deteta forks (se dois nós mineraram blocos diferentes na mesma altura).
 
 🌉 6. Ponte L2 (BTC → BRN)
-O sistema inclui uma bridge nativa (Layer 2) para converter Bitcoin em BRN.
+Há módulos experimentais para acompanhar depósitos BTC e criar ordens BTC→BRN, mas a ponte **não está operacional para conversão real**: o método `Blockchain.add_l2_transaction()` ainda não existe na blockchain principal e, por isso, não há um caminho de crédito BTC→BRN concluído e validado por consenso. Ao iniciar com `--l2`, o nó deve informar que a integração está indisponível.
 
-O utilizador envia BTC para o endereço do cofre (definido em btc_config.py).
+O watcher foi endurecido para exigir o valor exato da ordem, falhar fechado quando a verificação anti-replay não está disponível e expirar ordens no instante do vencimento. A fábrica agora recusa criar ordens enquanto o endereço de recebimento for um placeholder.
 
-O btc_watcher.py monitoriza a blockchain do Bitcoin.
-
-Assim que o BTC atinge as confirmações necessárias, o sistema cria uma transação na mempool do BRN e credita a carteira do utilizador.
+**Não envie BTC para esta ponte** até a integração on-chain, a proteção contra reutilização de txid, os testes de reorg/confirmacões e a emissão de BRN terem sido implementados e auditados.
 
 🛠️ 7. Resolução de Problemas (Troubleshooting)
 Problema	Causa Provável	Solução
