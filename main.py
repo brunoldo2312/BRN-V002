@@ -1,5 +1,8 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.6.6)
+"""main.py — Entrypoint unificado do nó BRN (v13.6.7)
 ================================================================
+v13.6.7 (2026-10-23):
+  [NEW] Integração com o novo trust_system.py (PeerTrustSystem).
+        Substitui o antigo trust_network.py.
 v13.6.6 (2026-10-23):
   [FIX] Substituído o Flask dev server por Waitress na função run_http.
         Isso impede que a interface gráfica (pywebview) trave as
@@ -88,10 +91,11 @@ from brn_logger import setup_logger, get_logger
 from version import VERSION, BUILD_DATE, GITHUB_USER, GITHUB_REPO
 
 try:
-    from trust_network import TrustNetwork
+    # [NEW] Usa o novo Trust System blindado
+    from trust_system import trust_system
     _HAS_TRUST = True
 except ImportError:
-    TrustNetwork = None
+    trust_system = None
     _HAS_TRUST = False
 
 _shutdown = threading.Event()
@@ -151,7 +155,7 @@ def _check_required_modules() -> list:
         "blockchain", "db", "crypto", "wallet", "bech32",
         "secure_store", "chain_validator", "checkpoints",
         "p2p_auth", "p2p_cipher", "p2p_secure", "p2p_unified",
-        "discovery_v2", "miner_loop", "trust_network",
+        "discovery_v2", "miner_loop", "trust_system",
     ]
     missing = []
     for m in required:
@@ -529,7 +533,7 @@ def run_http(app_instance):
             ssl_ctx = None
 
     try:
-        # [FIX v13.6.6] Usar Waitress em vez do Flask dev server
+        # Usar Waitress em vez do Flask dev server
         from waitress import serve
         log.info("HTTP (Waitress) http://" + host + ":" + str(port))
         
@@ -610,9 +614,11 @@ def run_status_loop(chain, p2p, sync=None, pool=None, pool_client=None,
                     pass
             if trust_net is not None:
                 try:
-                    ts = trust_net.get_network_stats()
-                    msg += (" Trust[Nodes=" + str(ts.get("total_nodes", 0))
-                            + " Valid=" + str(ts.get("validators_count", 0)) + "]")
+                    # [NEW] Adaptado para o novo PeerTrustSystem
+                    peers = getattr(trust_net, "peers", {})
+                    nodes_n = len(peers)
+                    valid_n = sum(1 for p in peers.values() if p.get("status") == "trusted")
+                    msg += f" Trust[Nodes={nodes_n} Valid={valid_n}]"
                 except Exception:
                     pass
             log.info(msg)
@@ -773,7 +779,8 @@ def _graceful_shutdown(log, trust_net=None) -> None:
         pass
     if trust_net is not None:
         try:
-            trust_net.shutdown()
+            if hasattr(trust_net, "shutdown"):
+                trust_net.shutdown()
             log.info("TrustNetwork salva com sucesso.")
         except Exception as e:
             log.warning("Falha salvando TrustNetwork: " + str(e))
@@ -961,9 +968,9 @@ def main():
     trust_net = None
     if _HAS_TRUST:
         try:
-            trust_net = TrustNetwork(str(BASE_DIR / "trust_network.json"))
+            trust_net = trust_system
             chain.trust_net = trust_net
-            log.info("TrustNetwork: " + str(len(trust_net.nodes)) + " nós carregados")
+            log.info("TrustNetwork: " + str(len(trust_net.peers)) + " nós carregados")
         except Exception as e:
             log.warning("TrustNetwork desativada: " + str(e))
             trust_net = None
