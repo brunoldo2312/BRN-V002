@@ -2,7 +2,7 @@
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
-<title>BRN Wallet v3.11</title>
+<title>BRN Wallet v3.12</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -153,6 +153,8 @@
   .badge.pending  { background:#2d2200; color:#e3b341; border:1px solid #9e6a03; }
   .badge.confirmed{ background:#0d2818; color:#7ee787; border:1px solid #238636; }
   .badge.behind   { background:#2d2200; color:#e3b341; border:1px solid #9e6a03; }
+  .badge.trusted  { background:#1f2d1f; color:#7ee787; border:1px solid #238636; }
+  .badge.banned   { background:#2d1416; color:#ffa198; border:1px solid #8b2424; }
 
   .sync-card {
     background: linear-gradient(135deg, #0d1d2f 0%, #161b22 100%);
@@ -244,7 +246,6 @@
     </button>
   </div>
 
-  <!-- [NEW v3.11] Banner de fork -->
   <div id="forkBanner" class="fork-banner">
     ⚠️ FORK DETECTADO — o nó está em reorg. Miner pausado até sincronizar.
   </div>
@@ -351,7 +352,6 @@
       <div class="msg" id="mExp"></div>
     </div>
 
-    <!-- [NEW v3.11] Card de Peers -->
     <div class="card" id="peersCard" style="display:none;">
       <h2>
         👥 Peers conhecidos (<span id="peersTableCount">0</span>)
@@ -362,7 +362,7 @@
           <tr>
             <th>Endereço</th>
             <th>Altura</th>
-            <th>Score</th>
+            <th>Reputação (Trust)</th>
             <th>Última vez</th>
           </tr>
         </thead>
@@ -515,6 +515,9 @@
           Blocks: <b id="poolBlocks">0</b> ·
           <span style="color:#7ee787">⚡ <b id="poolHashrate">0.00</b> kH/s</span>
         </div>
+        <div style="margin-top:4px;border-top:1px solid #21262d;padding-top:4px;font-size:0.75rem;">
+          Dificuldade do Share (Vardiff): <b id="poolShareDiff" style="color:#e3b341;">—</b>
+        </div>
       </div>
 
       <div class="msg" id="mMine"></div>
@@ -629,14 +632,14 @@
     </div>
   </div>
 
-  <div class="footer">BRN Wallet v3.11 · ponte pywebview · <span id="apiLbl">—</span></div>
+  <div class="footer">BRN Wallet v3.12 · ponte pywebview · <span id="apiLbl">—</span></div>
 </div>
 
 <script>
 "use strict";
 
 // ============================================================
-// ESTADO GLOBAL (antes das funções, para evitar TDZ)
+// ESTADO GLOBAL
 // ============================================================
 let wallet = { address:"", private_key:"", public_key:"" };
 let ready = false;
@@ -647,12 +650,10 @@ let syncTimer = null;
 let syncMode = "idle";
 let myTxsLimit = 50;
 
-// [FIX v3.11] Declarados ANTES das funções que os usam
 let _blockCursor = null;
 let _allBlocksLoaded = false;
 let _blocksLoading = false;
 
-// Cache de peers e sync
 let _lastStatus = null;
 let _lastSyncInfo = null;
 let _lastPeers = [];
@@ -747,7 +748,6 @@ async function refreshStatus() {
     if (!s.ok) throw new Error(s.msg || "offline");
     _lastStatus = s;
 
-    // Modo: ORIGEM vs CLIENTE
     const badge = $("modeBadge");
     if (s.rede_descentralizada === true) {
       badge.className = "mode-badge origin";
@@ -825,14 +825,22 @@ async function refreshSyncInfo() {
 }
 
 // ============================================================
-// PEERS (tabela + summary no topbar)
+// PEERS (Trust System + DB)
 // ============================================================
 async function refreshPeers() {
   try {
-    const s = await api("peers_score");
-    if (s.error) throw new Error(s.error);
-
-    const peers = s.peers || [];
+    // [FIX v3.12] Puxa do novo Trust System
+    const s = await api("get_trust_nodes");
+    
+    // Se o Trust System ainda não tiver dados, usa o DB antigo
+    let peers = [];
+    if (s && s.nodes) {
+      peers = s.nodes;
+    } else {
+      const old = await api("peers_score");
+      peers = old.peers || [];
+    }
+    
     _lastPeers = peers;
 
     // Summary no topbar
@@ -840,15 +848,14 @@ async function refreshPeers() {
     if (peers.length === 0) {
       summary.innerHTML = "";
     } else {
-      let bad = 0, banned = 0;
+      let trusted = 0, banned = 0;
       for (const p of peers) {
-        const sc = p.score || 0;
-        if (sc <= -100) banned++;
-        else if (sc < 0) bad++;
+        if (p.status === "trusted") trusted++;
+        else if (p.status === "banned") banned++;
       }
       let html = "";
+      if (trusted > 0) html += `<span class="pill" style="background:#0d2818;color:#7ee787;">${trusted} confiável(eis)</span>`;
       if (banned > 0) html += `<span class="pill err">${banned} banido(s)</span>`;
-      if (bad > 0) html += `<span class="pill warn">${bad} ruim(ns)</span>`;
       summary.innerHTML = html;
     }
 
@@ -864,21 +871,23 @@ async function refreshPeers() {
 
     const localH = _lastStatus ? (_lastStatus.height || 0) : 0;
     tbody.innerHTML = "";
+    
     for (const p of peers.slice(0, 100)) {
       const tr = document.createElement("tr");
-      const score = p.score || 0;
+      
+      // Dados do Trust System
       const addr = p.address || "?";
-      const h = p.height || 0;
-      const behind = localH > 0 && h < localH - 5;
-
-      let scoreHtml = String(score);
-      if (score <= -100) scoreHtml = `<span class="badge behind">${score} (BAN)</span>`;
-      else if (score < 0) scoreHtml = `<span class="badge behind">${score}</span>`;
+      const h = p.height || 0; 
+      const status = p.status || "new";
+      
+      let statusHtml = `<span class="badge">${status.toUpperCase()}</span>`;
+      if (status === "trusted") statusHtml = `<span class="badge trusted">✓ CONFIÁVEL</span>`;
+      else if (status === "banned") statusHtml = `<span class="badge banned">✗ BANIDO</span>`;
 
       tr.innerHTML = `
         <td><code>${addr}</code></td>
         <td>${h}</td>
-        <td>${scoreHtml}</td>
+        <td>${statusHtml}</td>
         <td>${fmtAgo(p.last_seen)}</td>
       `;
       tbody.appendChild(tr);
@@ -1031,7 +1040,7 @@ function syncStop() {
 }
 
 // ============================================================
-// EXPLORADOR — blocos paginados (v3.11: botões persistem)
+// EXPLORADOR — blocos paginados
 // ============================================================
 async function carregarBlocos(reset) {
   if (_blocksLoading) return;
@@ -1462,7 +1471,7 @@ async function minerarPool() {
 }
 
 // ============================================================
-// ATUALIZAR UI DE MINERAÇÃO
+// ATUALIZAR UI DE MINERAÇÃO (com Vardiff)
 // ============================================================
 async function updateMiningUI() {
   // ---------- MINER LOCAL ----------
@@ -1530,6 +1539,11 @@ async function updateMiningUI() {
       $("poolSharesOk").textContent   = pst.shares_accepted || 0;
       $("poolSharesTotal").textContent = pst.shares_submitted || 0;
       $("poolBlocks").textContent     = pst.blocks_found || 0;
+      
+      // [NEW v3.12] Vardiff Display
+      const sd = pst.job_share_diff != null ? pst.job_share_diff : "—";
+      $("poolShareDiff").textContent  = sd;
+
       const hr = pst.hashrate_khs != null
         ? pst.hashrate_khs
         : ((pst.hashrate || 0) / 1000);
@@ -1755,11 +1769,9 @@ function configEventos() {
   $("bSyncStart").onclick = syncStart;
   $("bSyncStop").onclick  = syncStop;
 
-  // [FIX v3.11] "Atualizar" agora reseta cursor (recarrega os últimos 50)
   $("bRefreshExp").onclick = () => carregarBlocos(true);
   $("bRefreshPeers").onclick = refreshPeers;
 
-  // [FIX v3.11] Botões de paginação explícitos
   $("bVerMaisBlocos").onclick = () => carregarBlocos(false);
   $("bVerTodosBlocos").onclick = carregarTodosBlocos;
 
@@ -1839,7 +1851,6 @@ async function boot() {
   await listarWallets();
   await updateMiningUI();
 
-  // [FIX v3.11] Auto-refresh com reset=True (recarrega últimos 50)
   setInterval(refreshStatus,     10000);
   setInterval(refreshSyncInfo,    6000);
   setInterval(refreshPeers,      15000);
@@ -1848,11 +1859,11 @@ async function boot() {
   setInterval(function() { if (wallet.address) atualizarSaldo(); }, 20000);
   setInterval(function() { if (wallet.address) carregarMinhasTxs(); }, 30000);
 
-  // [NEW v3.11] Banner de fork global (verifica a cada 5s)
+  // Banner de fork global
   setInterval(async () => {
     try {
       const d = await api("sync_info");
-      const forking = !!(d && d.sync && d.forking) || false;
+      const forking = !!(d && d.sync && d.syncing === false && d.sync.forking) || false;
       $("forkBanner").classList.toggle("show", forking);
       const dot = $("dot");
       if (forking) {
