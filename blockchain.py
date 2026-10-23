@@ -480,23 +480,36 @@ class Blockchain:
             return True, "ok"
         return False, f"tipo de contrato desconhecido: {t}"
 
+    def _contract_sender_address(self, tx: dict) -> str:
+        """Deriva o remetente da chave pública de uma entrada, nunca de outputs."""
+        inputs = tx.get("inputs") or []
+        if not inputs or not isinstance(inputs[0], dict):
+            raise ValueError("transacao de contrato sem input valido")
+        pubkey_hex = inputs[0].get("pubkey", "")
+        if not isinstance(pubkey_hex, str) or not pubkey_hex:
+            raise ValueError("transacao de contrato sem pubkey do remetente")
+        try:
+            from bech32 import address_from_pubkey
+            pubkey = bytes.fromhex(pubkey_hex)
+            address = address_from_pubkey(pubkey)
+        except Exception as exc:
+            raise ValueError("pubkey do remetente invalida") from exc
+        if not address:
+            raise ValueError("nao foi possivel derivar endereco do remetente")
+        return address
+
     def _apply_contract_tx(self, tx: dict) -> dict:
         tx_data = tx.get("data") or {}
         t = tx_data.get("type")
         from contracts import deploy as _deploy, call as _call
+        sender = self._contract_sender_address(tx)
         if t == "deploy":
-            owner = ""
-            if tx.get("outputs"):
-                owner = tx["outputs"][0].get("address", "") or ""
-            r = _deploy(self, owner, tx_data.get("code") or {}, metadata=tx_data.get("metadata"))
+            r = _deploy(self, sender, tx_data.get("code") or {}, metadata=tx_data.get("metadata"))
             if not r.get("ok"):
                 raise ValueError(f"deploy falhou: {r.get('msg')}")
             return r
         if t == "call":
-            caller = ""
-            if tx.get("outputs"):
-                caller = tx["outputs"][0].get("address", "") or ""
-            r = _call(self, tx_data.get("contract_id", ""), caller, tx_data.get("args"))
+            r = _call(self, tx_data.get("contract_id", ""), sender, tx_data.get("args"))
             if not r.get("ok"):
                 raise ValueError(f"call falhou: {r.get('msg')}")
             return r
