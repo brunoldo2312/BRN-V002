@@ -410,6 +410,10 @@ def _confirmations_required() -> int:
 # AUTO-TESTE
 # ============================================================
 if __name__ == "__main__":
+    # Usa endereço de teste somente durante este autoteste.
+    import contracts.factory as _factory_module
+    _factory_module._btc_address = lambda: "bc1qtestaddress000000000000000000000000000000"
+
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(message)s")
 
