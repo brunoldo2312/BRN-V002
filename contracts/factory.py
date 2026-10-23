@@ -143,8 +143,15 @@ class ContractFactory:
             raise ValueError("brn_amount calculado <= 0")
 
         btc_address = _btc_address()
-        if not btc_address or "SEU_ENDERECO" in btc_address or btc_address.startswith("bc1qSEU_"):
-            log.warning("BTC_RECEIVE_ADDRESS nao configurado: configure btc_config.py antes de usar L2")
+        if (
+            not btc_address
+            or "SEU_ENDERECO" in btc_address.upper()
+            or btc_address.startswith("bc1qSEU_")
+        ):
+            raise ValueError(
+                "BTC_RECEIVE_ADDRESS nao configurado; defina um endereco BTC real "
+                "em btc_config.py/BRN_BTC_RECEIVE_ADDRESS antes de criar ordens"
+            )
 
         now = int(time.time())
         escrow_id = generate_escrow_id()
