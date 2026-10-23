@@ -10,7 +10,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
-import blockchain as brn_chain
 
 
 @dataclass
@@ -45,6 +44,9 @@ def _fail(result: ChainVerificationResult, message: str) -> ChainVerificationRes
 
 def verify_chain(chain: Any) -> ChainVerificationResult:
     """Audita blocos armazenados no ChainDB, sem depender de chain.chain."""
+    # Importação tardia evita ciclo quando blockchain.py conecta este módulo.
+    import blockchain as brn_chain
+
     result = ChainVerificationResult(valid=True)
     db = getattr(chain, "db", None)
     if db is None or not callable(getattr(db, "height", None)) or not callable(
