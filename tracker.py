@@ -49,8 +49,9 @@ try:
             if not _line or _line.startswith("#") or "=" not in _line:
                 continue
             _key, _value = _line.split("=", 1)
-            if _key.strip() == "BRN_TRACKER_PORT" and "BRN_TRACKER_PORT" not in os.environ:
-                os.environ["BRN_TRACKER_PORT"] = _value.strip().strip('"').strip("'")
+            _candidate_port = _value.strip().strip('"').strip("'")
+            if _key.strip() == "BRN_TRACKER_PORT" and _candidate_port and "BRN_TRACKER_PORT" not in os.environ:
+                os.environ["BRN_TRACKER_PORT"] = _candidate_port
                 break
 except OSError:
     pass
