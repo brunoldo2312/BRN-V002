@@ -210,6 +210,17 @@ def _l2_disponivel() -> bool:
     )
 
 
+def _l2_operacional() -> bool:
+    # Não declarar a ponte ativa enquanto faltar a entrada de crédito na chain.
+    if not _l2_disponivel():
+        return False
+    try:
+        from blockchain import Blockchain
+        return callable(getattr(Blockchain, 'add_l2_transaction', None))
+    except Exception:
+        return False
+
+
 POOL_ENABLED = os.environ.get("BRN_POOL_ENABLED", "1") == "1"
 PoolManager = None
 PoolClient = None
@@ -883,12 +894,13 @@ def main():
     log.info("=" * 60)
     log.info(" BRN Node v" + VERSION + " (" + BUILD_DATE + ")")
 
-    if args.l2 and _l2_disponivel():
+    if args.l2 and _l2_operacional():
         l2_mode = "ON"
     elif not args.l2:
         l2_mode = "off"
     else:
         l2_mode = "INDISPONÍVEL"
+        log.error("L2 solicitado, mas blockchain.py não implementa add_l2_transaction; ponte BTC-BRN indisponível. Não envie BTC.")
 
     pool_mode = (
         "off" if args.no_pool
