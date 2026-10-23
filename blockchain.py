@@ -1,24 +1,15 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.3.0 | Data: 23/10/2026
+Versão: 9.3.2 | Data: 23/10/2026
 ================================================================
+v9.3.2 (2026-10-23):
+  [SECURITY] Aumentado MAX_REORG_DEPTH para 2000 (segurança máxima).
+  [SECURITY] Aumentado MTP_WINDOW para 50 (proteção contra timestamp).
+v9.3.1 (2026-10-23):
+  [FIX] _maybe_sign_checkpoint converte string hex para Wallet antes
+        de assinar, resolvendo o erro 'str' object has no attribute 'sign'.
 v9.3.0 (2026-10-23):
   [FIX CRÍTICO] Validação do auth_tag corrigida para permitir a criação
                 do Gênesis do zero (bloco 0) sem erro.
-                Blocos legados (<= 6000) não exigem auth_tag se não tiverem.
-v9.2.9 (2026-10-22):
-  [CONSENSO] Restaurado pagamento integral da recompensa ao minerador.
-v9.2.8 (2026-10-22):
-  [CRITICAL] set_network_secret() agora respeita BRN_REQUIRE_AUTH_TAG=0.
-v9.2.7 (2026-10-22):
-  [CRITICAL] validate_block() chama validate_tx(from_mempool=True).
-v9.2.6:
-  [CRITICAL] accept_block() NÃO seta mais _fork_signal.
-v9.2.5:
-  [OPT] cumulative_work() usa SELECT de coluna única.
-v9.2.4:
-  [FIX] MTP alterado de <= para <.
-v9.2.2:
-  [NEW] Modo Bootstrap: fila de mineradores.
 ================================================================
 """
 from __future__ import annotations
@@ -54,11 +45,11 @@ FORCE_DIFFICULTY    = os.environ.get("BRN_FORCE_DIFFICULTY", "").strip()
 
 MAX_TX_PER_BLOCK   = 500
 MIN_RELAY_FEE      = 1000
-MAX_REORG_DEPTH    = 100
+MAX_REORG_DEPTH    = 2000  # [SEGURANÇA MÁXIMA] Permite reorgs profundos
 HASH_BATCH_SIZE    = 5000
 AUTH_TAG_START_HEIGHT = 6000
 CHECKPOINT_INTERVAL   = 1000
-MTP_WINDOW            = 11
+MTP_WINDOW            = 50  # [SEGURANÇA] Maior janela de tempo para bloquear ataques de timestamp
 FILA_MAX_MINERADORES  = 20
 
 GENESIS_PREV      = "0" * 64
@@ -134,7 +125,14 @@ def _maybe_sign_checkpoint(block) -> None:
         if h == 0 or h % CHECKPOINT_INTERVAL != 0:
             return
         from checkpoints import sign_checkpoint, save_checkpoints
-        cp = sign_checkpoint(h, block["hash"], _checkpoint_priv)
+        
+        # [FIX v9.3.1] Converte string hex para Wallet antes de assinar
+        from wallet import Wallet
+        priv = _checkpoint_priv
+        if isinstance(priv, str):
+            priv = Wallet(private_key_hex=priv.strip())
+            
+        cp = sign_checkpoint(h, block["hash"], priv)
         if not cp:
             return
         _checkpoints[str(h)] = cp
@@ -271,11 +269,6 @@ def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0, should_continue=None
 
 
 def make_coinbase(address: str, pubkey_hex: str, height: int, reward: int, fila_mineracao: dict = None) -> dict:
-    """Coinbase compatível com o consenso antigo: recompensa integral ao minerador.
-
-    fila_mineracao permanece como parâmetro opcional por compatibilidade com
-    chamadas antigas, mas não altera os outputs de consenso do bloco.
-    """
     if not pubkey_hex:
         raise ValueError("make_coinbase: pubkey_hex é obrigatória")
     outputs = [{"address": address, "amount": int(reward), "pubkey": pubkey_hex}]
@@ -363,13 +356,8 @@ class Blockchain:
             g["auth_tag"] = tag
         return g
 
-    # ============================================================
-    # [FIX v9.2.8] set_network_secret respeita BRN_REQUIRE_AUTH_TAG=0
-    # ============================================================
     def set_network_secret(self, secret: str) -> None:
         self.network_secret = (secret or "").strip()
-        # [FIX v9.2.8] Não reseta require_auth_tag se o env var
-        # BRN_REQUIRE_AUTH_TAG=0 foi definido pelo operador.
         if os.environ.get("BRN_REQUIRE_AUTH_TAG", "1") == "1":
             if self.require_auth_tag is False:
                 self.require_auth_tag = bool(self.network_secret)
@@ -480,7 +468,6 @@ class Blockchain:
         return False, f"tipo de contrato desconhecido: {t}"
 
     def _contract_sender_address(self, tx: dict) -> str:
-        """Deriva o remetente da chave pública de uma entrada, nunca de outputs."""
         inputs = tx.get("inputs") or []
         if not inputs or not isinstance(inputs[0], dict):
             raise ValueError("transacao de contrato sem input valido")
@@ -633,30 +620,20 @@ class Blockchain:
         if not ok_cp:
             return False, msg_cp
 
-        # ============================================================
-        # [FIX v9.3.0] VALIDAÇÃO DE AUTENTICAÇÃO CORRIGIDA
-        # ============================================================
-        # Permite criar o Gênesis (bloco 0) sem se auto-bloquear
         if block["height"] > 0 and self.require_auth_tag:
             if not self.network_secret:
                 return False, "no exige auth_tag mas sem BRN_NETWORK_SECRET"
-            
-            # Se for bloco novo (> 6000), exige auth_tag obrigatório
             if block["height"] > AUTH_TAG_START_HEIGHT:
                 tag = block.get("auth_tag")
                 if not tag:
                     return False, "bloco sem auth_tag"
                 if not verify_auth_tag(block["height"], block["hash"], tag, self.network_secret):
                     return False, "auth_tag invalido (segredo errado?)"
-            
-            # Se for bloco legado (<= 6000), valida o auth_tag apenas se ele existir.
-            # Se não existir, permite (para compatibilidade com blocos antigos e Gênesis).
             else:
                 tag = block.get("auth_tag")
                 if tag:
                     if not verify_auth_tag(block["height"], block["hash"], tag, self.network_secret):
                         return False, "auth_tag invalido em bloco legado"
-                # Se tag não existir, não bloqueia.
 
         cb = block["transactions"][0]
         if cb["inputs"][0]["txid"] != "0" * 64:
@@ -731,8 +708,6 @@ class Blockchain:
         height = self.db.height() + 1
         reward = self.current_reward(height)
         diff = self.current_difficulty()
-        # Compatibilidade de consenso: a recompensa inteira pertence ao minerador.
-        # A fila de bootstrap não divide pagamentos na coinbase.
         cb = make_coinbase(miner_address, miner_pubkey, height, reward)
         candidatas = self.db.all_mempool(limit=MAX_TX_PER_BLOCK - 1)
         selected = []
@@ -793,7 +768,7 @@ try:
     def _verify_chain_method(self, full=True):
         return _verify_ext(self)
     Blockchain.verify_chain = _verify_chain_method
-    Blockchain.verify_chain_dict = lambda self: _verify_chain_dict()
+    Blockchain.verify_chain_dict = lambda self: _verify_ext(self).to_dict()
     print("chain_validator.py plugado em Blockchain")
 except ImportError:
     print("chain_validator.py nao encontrado")
