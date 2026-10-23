@@ -9,6 +9,8 @@ on:
       - "check_network.py"
       - "main.py"
       - "db.py"
+      - "blockchain.py"
+      - "chain_validator.py"
       - ".github/workflows/network-config-check.yml"
   pull_request:
     branches: [main]
@@ -29,4 +31,4 @@ jobs:
         with:
           python-version: "3.11"
       - name: Check Python syntax
-        run: python -m py_compile auto_config_network.py tracker.py check_network.py main.py db.py
+        run: python -m py_compile auto_config_network.py tracker.py check_network.py main.py db.py blockchain.py chain_validator.py
