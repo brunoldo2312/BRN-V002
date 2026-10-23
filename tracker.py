@@ -40,6 +40,21 @@ from collections import defaultdict
 # ============================================================
 # CONFIG
 # ============================================================
+# Carrega a porta do Tracker do arquivo local sem sobrescrever o ambiente do processo.
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "brn_network.env")
+try:
+    with open(_env_path, "r", encoding="utf-8-sig") as _env_stream:
+        for _raw_line in _env_stream:
+            _line = _raw_line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            _key, _value = _line.split("=", 1)
+            if _key.strip() == "BRN_TRACKER_PORT" and "BRN_TRACKER_PORT" not in os.environ:
+                os.environ["BRN_TRACKER_PORT"] = _value.strip().strip('"').strip("'")
+                break
+except OSError:
+    pass
+
 PORT = int(os.environ.get("BRN_TRACKER_PORT", os.environ.get("PORT", "9000")))
 TTL = int(os.environ.get("BRN_TRACKER_TTL", "600"))                # 10 min
 CLEANUP_INTERVAL = int(os.environ.get("BRN_TRACKER_CLEANUP", "60"))  # 1 min
