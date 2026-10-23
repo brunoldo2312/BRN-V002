@@ -1,14 +1,14 @@
-"""miner_pool_client.py — Cliente do pool de mineração BRN (v4.1)
+"""miner_pool_client.py — Cliente do pool de mineração BRN (v4)
 ================================================================
-v4.1 (2026-10-22):
-  [FIX] A função _mine_batch passava a variável 'diff' (do bloco)
-        para a função _target_from_difficulty, em vez de passar
-        'share_difficulty'. Isso fazia o minerador em Python puro
-        nunca encontrar um share válido no Vardiff.
-v4.0:
-  [NEW] Suporte a Vardiff.
-v3.0:
-  [FIX] _http_post ignorava self.pool_url.
+v4:
+  [NEW] Suporte a Vardiff: o cliente agora detecta mudanças de
+        share_difficulty mesmo quando o job_id é o mesmo, permitindo
+        que o servidor ajuste a dificuldade por minerador sem
+        invalidar o job atual.
+v3:
+  [FIX] Corrigido o bug onde _http_post ignorava o self.pool_url
+        e tentava ligar sempre a 127.0.0.1 (localhost).
+  [FIX] _mine_batch agora usa share_difficulty no pow_search.
 ================================================================
 """
 from __future__ import annotations
@@ -24,7 +24,9 @@ import urllib.request
 import urllib.error
 import logging
 
+
 log = logging.getLogger("pool-client")
+
 
 # ============================================================
 # CONFIG
@@ -34,6 +36,7 @@ HEARTBEAT_S        = 5.0
 WORK_REFRESH_S     = 15.0
 HASH_BATCH         = 50000
 HTTP_TIMEOUT_S     = 10.0
+
 
 try:
     import brn_miner as _brn_miner_c
@@ -47,8 +50,9 @@ except Exception as e:
     _HAS_C = False
     log.info(f"pool-client: brn_miner indisponivel ({e})")
 
+
 # ============================================================
-# HTTP
+# HTTP (RECEBE A BASE_URL)
 # ============================================================
 def _http_post(base_url: str, path: str, body: dict, timeout: float = HTTP_TIMEOUT_S) -> dict:
     url = base_url.rstrip("/") + path
@@ -56,7 +60,8 @@ def _http_post(base_url: str, path: str, body: dict, timeout: float = HTTP_TIMEO
     try:
         req = urllib.request.Request(
             url, data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "brn-pool-client/4"},
+            headers={"Content-Type": "application/json",
+                     "User-Agent": "brn-pool-client/4"},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -68,6 +73,7 @@ def _http_post(base_url: str, path: str, body: dict, timeout: float = HTTP_TIMEO
             return {"ok": False, "msg": f"HTTP {e.code}"}
     except Exception as e:
         return {"ok": False, "msg": str(e)}
+
 
 # ============================================================
 # HASH RATE METER
@@ -100,11 +106,13 @@ class HashrateMeter:
         with self._lock:
             return self._samples[-1][1] if self._samples else 0
 
+
 # ============================================================
 # POW SEARCH
 # ============================================================
 def _target_from_difficulty(diff: int) -> int:
     return int("0" * int(diff) + "f" * (64 - int(diff)), 16)
+
 
 def _mine_batch(prev_hash: str, merkle: str, ts: int, diff: int, share_difficulty: int,
                 nonce_start: int, batch: int, share_target: int) -> tuple:
@@ -112,7 +120,7 @@ def _mine_batch(prev_hash: str, merkle: str, ts: int, diff: int, share_difficult
         prefix = prev_hash + merkle + str(ts)
         diff_str = str(int(diff))
         try:
-            # C recebe diff para o hash string, mas share_difficulty para o target
+            # Usa share_difficulty (não diff) no pow_search
             result = _brn_miner_c.pow_search(
                 prefix, diff_str, int(share_difficulty),
                 nonce_start=nonce_start,
@@ -141,6 +149,7 @@ def _mine_batch(prev_hash: str, merkle: str, ts: int, diff: int, share_difficult
             return nonce, h.hex(), i + 1, nonce + 1
         nonce += 1
     return None, None, batch, nonce
+
 
 # ============================================================
 # POOL CLIENT
@@ -185,6 +194,7 @@ class PoolClient(threading.Thread):
             return False, r.get("msg", "register falhou")
 
         self.miner_id = r.get("miner_id", self.miner_id)
+
         self._stop.clear()
         self._running = True
         self.started_at = time.time()
@@ -237,6 +247,7 @@ class PoolClient(threading.Thread):
             return
         job = r.get("job") or {}
         with self._job_lock:
+            # [VARDIFF] Atualiza também quando só a share_difficulty muda
             if self._job is None:
                 should_update = True
             else:
@@ -283,10 +294,12 @@ class PoolClient(threading.Thread):
                 time.sleep(1.0)
                 continue
 
+            # Só reseta o nonce quando o job muda de verdade.
             if job.get("job_id") != last_job_id:
                 last_job_id = job.get("job_id")
                 nonce = 0
-                log.info("pool client: mining job %s (share_diff=%s)", last_job_id, job.get("share_difficulty"))
+                log.info("pool client: mining job %s (share_diff=%s)",
+                         last_job_id, job.get("share_difficulty"))
 
             share_diff = int(job.get("share_difficulty", 4))
             if share_diff != last_share_diff:
@@ -337,7 +350,8 @@ class PoolClient(threading.Thread):
                 if r.get("block_found"):
                     self.blocks_found += 1
                     self.last_block_at = time.time()
-                    log.warning("pool client: FULL BLOCK #%s encontrado!", r.get("height"))
+                    log.warning("pool client: FULL BLOCK #%s encontrado!",
+                                r.get("height"))
                     try:
                         self._fetch_work()
                     except Exception:
@@ -373,11 +387,13 @@ class PoolClient(threading.Thread):
                 "c_acceleration":     _HAS_C,
             }
 
+
 # ============================================================
 # SINGLETON
 # ============================================================
 _INSTANCE = None
 _INSTANCE_LOCK = threading.RLock()
+
 
 def get_pool_client(address: str = None, pubkey: str = None) -> PoolClient:
     global _INSTANCE
@@ -391,6 +407,7 @@ def get_pool_client(address: str = None, pubkey: str = None) -> PoolClient:
                 _INSTANCE.stop_mining()
             _INSTANCE = PoolClient(address, pubkey)
         return _INSTANCE
+
 
 def stop_pool_client() -> bool:
     global _INSTANCE
