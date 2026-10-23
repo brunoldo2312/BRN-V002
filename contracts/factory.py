@@ -268,6 +268,9 @@ class ContractFactory:
 
 
 if __name__ == "__main__":
+    # Endereço fictício apenas para os autotestes; nunca usado em produção.
+    _btc_address = lambda: "bc1qtestaddress000000000000000000000000000000"
+
     class FakeDB:
         def __init__(self):
             self.rows = {}
