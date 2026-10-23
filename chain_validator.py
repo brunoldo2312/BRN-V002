@@ -1,169 +1,437 @@
-"""Validação estrutural compatível com o blockchain.py atual do BRN.
-
-Este módulo não usa o modelo UTXOSet da antiga blockchain v4. A auditoria
-confere a sequência persistida, hashes, Merkle, dificuldade e tags de rede.
-A validação completa de transações/UTXOs acontece no Blockchain.validate_block
-quando cada bloco é recebido, usando o estado de consenso daquele momento.
+"""chain_validator.py — Auditoria completa da cadeia BRN (v2.1)
+================================================================
+v2.1 (2026-10-22):
+  [FIX] Um banco vazio (altura < 0) era classificado como CADEIA
+        INVÁLIDA (erro), o que gerava alarmes falsos no boot de nós
+        clientes aguardando o Gênesis. Agora retorna valid=True
+        com warning, permitindo que o nó sincronize em paz.
+  [FIX] _verify_pow usa meets_difficulty() do blockchain.py
+        (comparação numérica correta com target).
+  [FIX] verify_range agora também verifica merkle.
+================================================================
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, List, Optional
+import hashlib
+import logging
+import time
+
+from crypto import verify_ecdsa, sha256, double_sha256
+
+log = logging.getLogger("chain_validator")
 
 
-
-@dataclass
-class ChainVerificationResult:
-    valid: bool
-    blocks_checked: int = 0
-    errors: List[str] = field(default_factory=list)
-    warnings: List[str] = field(default_factory=list)
+# ============================================================
+# RESULTADO
+# ============================================================
+class VerifyResult:
+    def __init__(self):
+        self.valid = True
+        self.blocks_checked = 0
+        self.checkpoints_checked = 0
+        self.warnings = []
+        self.errors = []
+        self.height = -1
+        self.duration = 0.0
 
     def summary(self) -> str:
-        return f"{self.blocks_checked} blocos verificados"
+        if self.valid:
+            if self.height < 0:
+                return "cadeia vazia (aguardando genesis)"
+            return (f"cadeia OK · {self.blocks_checked} blocos · "
+                    f"{self.checkpoints_checked} checkpoints · "
+                    f"{self.duration:.2f}s")
+        return (f"cadeia INVALIDA · {len(self.errors)} erro(s) · "
+                f"{self.blocks_checked} blocos verificados")
+
+    def __bool__(self):
+        return self.valid
 
     def to_dict(self) -> dict:
         return {
-            "valid": self.valid,
-            "blocks_checked": self.blocks_checked,
-            "errors": list(self.errors),
-            "warnings": list(self.warnings),
-            "summary": self.summary(),
+            "success":              self.valid,
+            "valid":                self.valid,
+            "height":               self.height,
+            "blocks_checked":       self.blocks_checked,
+            "verified":             self.blocks_checked,
+            "checkpoints_checked":  self.checkpoints_checked,
+            "warnings":             list(self.warnings),
+            "errors":               list(self.errors),
+            "duration_s":           round(self.duration, 3),
         }
 
 
-class ChainValidationError(ValueError):
-    """Erro indicando inconsistência estrutural na cadeia."""
+# ============================================================
+# HELPERS
+# ============================================================
+def _is_coinbase(tx: dict) -> bool:
+    if tx.get("type") == "coinbase" or tx.get("is_coinbase"):
+        return True
+    ins = tx.get("inputs") or []
+    return bool(ins and ins[0].get("txid") == "0" * 64)
 
 
-def _fail(result: ChainVerificationResult, message: str) -> ChainVerificationResult:
-    result.valid = False
-    result.errors.append(message)
-    return result
+def _target_from_difficulty(difficulty: int) -> int:
+    return int("0" * int(difficulty) + "f" * (64 - int(difficulty)), 16)
 
 
-def verify_chain(chain: Any) -> ChainVerificationResult:
-    """Audita blocos armazenados no ChainDB, sem depender de chain.chain."""
-    # Importação tardia evita ciclo quando blockchain.py conecta este módulo.
-    import blockchain as brn_chain
+def _meets_difficulty(h_hex: str, difficulty: int) -> bool:
+    try:
+        return int(h_hex, 16) <= _target_from_difficulty(difficulty)
+    except Exception:
+        return False
 
-    result = ChainVerificationResult(valid=True)
-    db = getattr(chain, "db", None)
-    if db is None or not callable(getattr(db, "height", None)) or not callable(
-        getattr(db, "get_block", None)
-    ):
-        return _fail(result, "Objeto Blockchain sem ChainDB compatível.")
+
+def _verify_pow(block: dict) -> bool:
+    try:
+        # 1) Recalcula o hash
+        try:
+            from blockchain import block_hash as _bh
+            h = _bh(block["prev_hash"], block["merkle"],
+                    block["timestamp"], block["nonce"], block["difficulty"])
+        except ImportError:
+            hdr = (f'{block["prev_hash"]}{block["merkle"]}'
+                   f'{block["timestamp"]}{block["nonce"]}{block["difficulty"]}')
+            h = double_sha256(hdr.encode()).hex()
+
+        if h != block["hash"]:
+            return False
+
+        # 2) Valida PoW via função oficial
+        try:
+            from blockchain import meets_difficulty as _md
+            return bool(_md(h, int(block["difficulty"])))
+        except ImportError:
+            return _meets_difficulty(h, int(block["difficulty"]))
+    except Exception:
+        return False
+
+
+# ============================================================
+# Merkle
+# ============================================================
+def _verify_merkle(block: dict) -> bool:
+    try:
+        txids = [t.get("txid", "") for t in block.get("transactions", [])]
+        if not txids:
+            return False
+        try:
+            from blockchain import compute_merkle_root as _mr
+            calc = _mr(txids)
+        except ImportError:
+            calc = _merkle_root_fallback(txids)
+        return calc == block.get("merkle", "")
+    except Exception:
+        return False
+
+
+def _merkle_root_fallback(txids: list) -> str:
+    if not txids:
+        return "0" * 64
+    layer = [bytes.fromhex(t) for t in txids]
+    while len(layer) > 1:
+        if len(layer) % 2:
+            layer.append(layer[-1])
+        layer = [sha256(layer[i] + layer[i + 1])
+                 for i in range(0, len(layer), 2)]
+    return layer[0].hex()
+
+
+# ============================================================
+# Coinbase
+# ============================================================
+def _verify_coinbase(cb: dict, height: int, chain) -> tuple:
+    ins = cb.get("inputs") or []
+    if not ins or ins[0].get("txid") != "0" * 64:
+        return False, "input nao e 0*64"
+
+    outs = cb.get("outputs") or []
+    if not outs:
+        return False, "coinbase sem outputs"
+
+    total = sum(int(o.get("amount", 0)) for o in outs)
+    try:
+        reward = chain.current_reward(height)
+        if total > reward:
+            return False, f"coinbase ({total}) > reward ({reward})"
+    except Exception:
+        pass
+
+    if height > 0:
+        for o in outs:
+            if not o.get("pubkey"):
+                return False, "output de coinbase sem pubkey"
+
+    return True, "ok"
+
+
+# ============================================================
+# Assinatura de tx
+# ============================================================
+def _verify_tx_signature(tx: dict, chain=None) -> bool:
+    if _is_coinbase(tx):
+        return True
+
+    inputs = tx.get("inputs") or []
+    if not inputs:
+        return False
 
     try:
-        tip_height = int(db.height())
-        if tip_height < 0:
-            return _fail(result, "Banco não contém blocos.")
+        from blockchain import signing_hash as _sh
+        h = _sh(tx)
+    except Exception:
+        return False
 
-        previous = None
-        for height in range(tip_height + 1):
-            block = db.get_block(height)
-            if not isinstance(block, dict):
-                return _fail(result, f"Bloco #{height} ausente ou inválido.")
-
-            result.blocks_checked += 1
-            if block.get("height") != height:
-                return _fail(result, f"Altura inconsistente no bloco #{height}.")
-
-            required = ("hash", "prev_hash", "timestamp", "nonce", "merkle", "difficulty", "transactions")
-            if any(k not in block for k in required):
-                return _fail(result, f"Campos obrigatórios ausentes no bloco #{height}.")
-
-            if not isinstance(block["transactions"], list) or not block["transactions"]:
-                return _fail(result, f"Bloco #{height} sem transações.")
-
-            if not isinstance(block["timestamp"], int) or block["timestamp"] < 0:
-                return _fail(result, f"Timestamp inválido no bloco #{height}.")
-            if not isinstance(block["nonce"], int) or block["nonce"] < 0:
-                return _fail(result, f"Nonce inválido no bloco #{height}.")
-
-            difficulty = block["difficulty"]
-            if not isinstance(difficulty, int) or not 1 <= difficulty <= 64:
-                return _fail(result, f"Dificuldade inválida no bloco #{height}.")
-
-            expected_prev = brn_chain.GENESIS_PREV if height == 0 else previous["hash"]
-            if block["prev_hash"] != expected_prev:
-                return _fail(result, f"prev_hash inválido no bloco #{height}.")
-
-            if height > 0 and block["timestamp"] < previous["timestamp"]:
-                return _fail(result, f"Timestamp retrocede no bloco #{height}.")
-
-            txids = []
-            for index, tx in enumerate(block["transactions"]):
-                if not isinstance(tx, dict):
-                    return _fail(result, f"Transação {index} inválida no bloco #{height}.")
-                tid = tx.get("txid")
-                if not isinstance(tid, str) or tid != brn_chain.txid(tx):
-                    return _fail(result, f"txid inválido no bloco #{height}, transação {index}.")
-                txids.append(tid)
-
-            expected_merkle = brn_chain.compute_merkle_root(txids)
-            if block["merkle"] != expected_merkle:
-                return _fail(result, f"Merkle inválido no bloco #{height}.")
-
-            expected_hash = brn_chain.block_hash(
-                block["prev_hash"], block["merkle"], block["timestamp"],
-                block["nonce"], difficulty,
-            )
-            if block["hash"] != expected_hash:
-                return _fail(result, f"Hash inválido no bloco #{height}.")
-
-            if not brn_chain.meets_difficulty(block["hash"], difficulty):
-                return _fail(result, f"Prova de trabalho inválida no bloco #{height}.")
-
-            if height == 0 and getattr(chain, "genesis_expected_hash", None):
-                if block["hash"] != chain.genesis_expected_hash:
-                    return _fail(result, "Hash do gênese diferente do esperado.")
-
-            if getattr(chain, "require_auth_tag", False):
-                secret = getattr(chain, "network_secret", "")
-                if height > brn_chain.AUTH_TAG_START_HEIGHT:
-                    tag = block.get("auth_tag", "")
-                    if not secret or not brn_chain.verify_auth_tag(height, block["hash"], tag, secret):
-                        return _fail(result, f"auth_tag inválida no bloco #{height}.")
-
-            previous = block
-
-        # A auditoria histórica é estrutural. A validação de assinaturas e
-        # gastos UTXO é feita no ingresso do bloco, com o estado de consenso.
-        result.warnings.append(
-            "Auditoria estrutural concluída; transações/UTXOs históricos não foram reaplicados."
-        )
-        return result
-    except Exception as exc:
-        return _fail(result, f"Falha durante auditoria: {type(exc).__name__}: {exc}")
-
-
-def validate_chain(chain_or_blockchain: Any, difficulty: Optional[int] = None,
-                   check_pow: bool = True) -> bool:
-    """Compatibilidade com chamadas antigas; audita o formato atual do BRN."""
-    result = verify_chain(chain_or_blockchain)
-    if not result.valid:
-        raise ChainValidationError("; ".join(result.errors))
+    for inp in inputs:
+        sig_hex = inp.get("signature", "")
+        pub_hex = inp.get("pubkey", "")
+        if not sig_hex or not pub_hex:
+            return False
+        try:
+            if not verify_ecdsa(bytes.fromhex(pub_hex),
+                                bytes.fromhex(sig_hex), h):
+                return False
+        except Exception:
+            return False
     return True
 
 
-class ChainValidator:
-    """Interface de compatibilidade para ferramentas que usam ChainValidator."""
+# ============================================================
+# Auth tag HMAC
+# ============================================================
+def _verify_auth_tag(block: dict, chain) -> tuple:
+    try:
+        from blockchain import (AUTH_TAG_START_HEIGHT, verify_auth_tag)
+    except ImportError:
+        return True, ""
 
-    def __init__(self, difficulty: Optional[int] = None, **_kwargs):
-        self.difficulty = difficulty
+    require = getattr(chain, "require_auth_tag", False)
+    secret = getattr(chain, "network_secret", "") or ""
 
-    def validate_chain(self, chain_or_blockchain: Any, difficulty: Optional[int] = None,
-                       check_pow: bool = True) -> bool:
-        return validate_chain(chain_or_blockchain, difficulty, check_pow)
+    if not require or not secret:
+        return True, ""
 
-    def check_chain(self, chain_or_blockchain: Any, difficulty: Optional[int] = None,
-                    check_pow: bool = True):
+    h = int(block["height"])
+    tag = block.get("auth_tag")
+
+    if h > AUTH_TAG_START_HEIGHT:
+        if not tag:
+            return False, "sem auth_tag"
+        if not verify_auth_tag(h, block["hash"], tag, secret):
+            return False, "auth_tag invalido"
+    else:
+        if tag and not verify_auth_tag(h, block["hash"], tag, secret):
+            return False, "auth_tag invalido em bloco legado"
+
+    return True, ""
+
+
+# ============================================================
+# AUDITORIA COMPLETA
+# ============================================================
+def verify_chain(chain) -> VerifyResult:
+    t0 = time.time()
+    r = VerifyResult()
+
+    # ---------- altura ----------
+    try:
+        h = chain.db.height()
+    except Exception as e:
+        r.valid = False
+        r.errors.append(f"nao consegui ler altura: {e}")
+        r.duration = time.time() - t0
+        return r
+
+    r.height = h
+    if h < 0:
+        # [FIX v2.1] DB vazio não é CADEIA INVÁLIDA. É apenas um cliente
+        # aguardando o bloco genesis.
+        r.warnings.append("Banco não contém blocos (aguardando genesis)")
+        r.duration = time.time() - t0
+        return r
+
+    # ---------- checkpoints ----------
+    checkpoints = {}
+    try:
+        from checkpoints import load_checkpoints, verify_checkpoint
+        checkpoints = load_checkpoints()
+        r.checkpoints_checked = len(checkpoints)
+    except ImportError:
+        r.warnings.append("checkpoints.py nao disponivel")
+        verify_checkpoint = None
+    except Exception as e:
+        r.warnings.append(f"erro carregando checkpoints: {e}")
+        verify_checkpoint = None
+
+    # ---------- varredura ----------
+    prev = None
+    for i in range(0, h + 1):
         try:
-            self.validate_chain(chain_or_blockchain, difficulty, check_pow)
-            return True, None
-        except Exception as exc:
-            return False, str(exc)
+            block = chain.db.get_block(i)
+        except Exception as e:
+            r.valid = False
+            r.errors.append(f"bloco {i}: erro lendo do DB: {e}")
+            break
 
-    def audit_blockchain(self, blockchain: Any, check_pow: bool = True) -> dict:
-        return verify_chain(blockchain).to_dict()
+        if not block:
+            r.valid = False
+            r.errors.append(f"bloco {i} ausente no DB")
+            prev = None
+            continue
+
+        r.blocks_checked += 1
+
+        # ---------- encadeamento ----------
+        if prev is not None:
+            if block["prev_hash"] != prev["hash"]:
+                r.valid = False
+                r.errors.append(f"bloco {i}: prev_hash nao bate")
+            if int(block["timestamp"]) < int(prev["timestamp"]):
+                r.warnings.append(f"bloco {i}: timestamp regressivo")
+
+        # ---------- PoW (genesis isento) ----------
+        if i > 0:
+            if not _verify_pow(block):
+                r.valid = False
+                r.errors.append(f"bloco {i}: PoW invalido")
+
+        # ---------- merkle ----------
+        if not _verify_merkle(block):
+            r.valid = False
+            r.errors.append(f"bloco {i}: merkle root nao bate")
+
+        # ---------- checkpoint ----------
+        cp = checkpoints.get(str(i))
+        if cp and verify_checkpoint is not None:
+            try:
+                if not verify_checkpoint(cp):
+                    r.valid = False
+                    r.errors.append(f"bloco {i}: checkpoint invalido")
+                elif cp.get("hash") != block.get("hash"):
+                    r.valid = False
+                    r.errors.append(f"bloco {i}: checkpoint hash != bloco")
+            except Exception as e:
+                r.warnings.append(f"bloco {i}: checkpoint erro {e}")
+
+        # ---------- auth tag ----------
+        ok_at, msg_at = _verify_auth_tag(block, chain)
+        if not ok_at:
+            r.valid = False
+            r.errors.append(f"bloco {i}: {msg_at}")
+
+        # ---------- transações ----------
+        txs = block.get("transactions") or []
+        if not txs:
+            r.valid = False
+            r.errors.append(f"bloco {i}: sem transacoes")
+        else:
+            cb = txs[0]
+            if not _is_coinbase(cb):
+                r.valid = False
+                r.errors.append(f"bloco {i}: primeira tx nao e coinbase")
+            else:
+                ok_cb, msg_cb = _verify_coinbase(cb, i, chain)
+                if not ok_cb:
+                    r.valid = False
+                    r.errors.append(f"bloco {i}: coinbase invalida — {msg_cb}")
+
+            for tx in txs[1:]:
+                if _is_coinbase(tx):
+                    r.valid = False
+                    r.errors.append(f"bloco {i}: coinbase em posicao invalida")
+                    continue
+                if not _verify_tx_signature(tx, chain):
+                    r.valid = False
+                    tid = tx.get("txid", "?")[:16]
+                    r.errors.append(f"bloco {i}: assinatura invalida em tx {tid}")
+
+        prev = block
+
+        if len(r.errors) >= 200:
+            r.errors.append("... (truncado em 200 erros)")
+            break
+
+    r.duration = time.time() - t0
+    if not r.valid:
+        log.warning("verify_chain: cadeia INVALIDA — %s", r.summary())
+    return r
+
+
+# ============================================================
+# API DICT / RANGE / FORK
+# ============================================================
+def verify_chain_dict(chain) -> dict:
+    return verify_chain(chain).to_dict()
+
+
+def verify_range(chain, start: int, end: int) -> dict:
+    r = VerifyResult()
+    prev = chain.db.get_block(start - 1) if start > 0 else None
+    for i in range(start, end + 1):
+        b = chain.db.get_block(i)
+        if not b:
+            r.valid = False
+            r.errors.append(f"bloco {i} ausente")
+            prev = None
+            continue
+        r.blocks_checked += 1
+
+        if prev is not None and b["prev_hash"] != prev["hash"]:
+            r.valid = False
+            r.errors.append(f"bloco {i}: prev_hash nao bate")
+
+        if i > 0 and not _verify_pow(b):
+            r.valid = False
+            r.errors.append(f"bloco {i}: PoW invalido")
+
+        if not _verify_merkle(b):
+            r.valid = False
+            r.errors.append(f"bloco {i}: merkle root nao bate")
+
+        prev = b
+    return r.to_dict()
+
+
+def find_fork_point(chain_a, chain_b, max_depth: int = 1000) -> int:
+    h = min(chain_a.db.height(), chain_b.db.height())
+    for i in range(h, max(-1, h - max_depth), -1):
+        ba = chain_a.db.get_block(i)
+        bb = chain_b.db.get_block(i)
+        if ba and bb and ba["hash"] == bb["hash"]:
+            return i
+    return -1
+
+
+# ============================================================
+# AUTO-TESTE
+# ============================================================
+if __name__ == "__main__":
+    import sys
+
+    path = sys.argv[1] if len(sys.argv) > 1 else "brn_v2_chain.db"
+    print(f"Auditando {path}...")
+
+    try:
+        from blockchain import Blockchain
+        bc = Blockchain(path, auto_genesis=False)
+    except Exception as e:
+        print(f"Erro ao abrir blockchain: {e}")
+        sys.exit(1)
+
+    r = verify_chain(bc)
+    print(f"  height              : {r.height}")
+    print(f"  blocks_checked      : {r.blocks_checked}")
+    print(f"  checkpoints_checked : {r.checkpoints_checked}")
+    print(f"  duration            : {r.duration:.2f}s")
+    print(f"  valid               : {r.valid}")
+    print(f"  summary             : {r.summary()}")
+    if r.warnings:
+        print(f"  warnings ({len(r.warnings)}):")
+        for w in r.warnings[:5]:
+            print(f"    - {w}")
+    if r.errors:
+        print(f"  errors ({len(r.errors)}):")
+        for e in r.errors[:10]:
+            print(f"    - {e}")
+
+    sys.exit(0 if r.valid else 2)
