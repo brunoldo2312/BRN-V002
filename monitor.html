@@ -48,6 +48,8 @@
                             border-color: #d29922; color: #d29922; }
   .status-banner.err     { background: rgba(248,81,73,0.1);
                             border-color: #f85149; color: #f85149; }
+  .status-banner.info    { background: rgba(88,166,255,0.1);
+                            border-color: #58a6ff; color: #58a6ff; }
   .status-banner .icon   { font-size: 2rem; }
   .status-banner .main   { flex: 1; }
   .status-banner .title  { font-size: 1.1rem; font-weight: 700; }
@@ -252,8 +254,7 @@
       <button class="btn danger" onclick="resetNodes()">🗑 Restaurar nós padrão</button>
     </div>
     <p style="font-size:0.75rem;color:#8b949e;margin-top:8px;">
-      Peers descobertos automaticamente via P2P (multicast, tracker,
-      MongoDB rendezvous, Tailscale) aparecem com a badge
+      Peers descobertos automaticamente via P2P aparecem com a badge
       <span class="badge auto">auto</span>.
       Nós adicionados manualmente têm a badge
       <span class="badge manual">manual</span>.
@@ -261,7 +262,7 @@
   </div>
 
   <div class="footer">
-    BRN Monitor v1.1 · <a href="http://127.0.0.1:8080/panel">Painel local</a> ·
+    BRN Monitor v1.2 · <a href="http://127.0.0.1:8080/panel">Painel local</a> ·
     <a href="http://127.0.0.1:8080/">Explorer</a>
   </div>
 </div>
@@ -274,7 +275,7 @@
     <label for="nodeHost">IP (Tailscale ou LAN)</label>
     <input type="text" id="nodeHost" placeholder="Ex: 100.111.253.8" autocomplete="off">
     <label for="nodeRole">Papel</label>
-    <input type="text" id="nodeRole" placeholder="miner / client" autocomplete="off">
+    <input type="text" id="nodeRole" placeholder="origin / client" autocomplete="off">
     <div class="modal-actions">
       <button class="btn" onclick="closeAddNode()">Cancelar</button>
       <button class="btn primary" onclick="addNode()">Adicionar</button>
@@ -286,16 +287,17 @@
 "use strict";
 
 // ============================================================
-// CONFIGURAÇÃO
+// CONFIGURAÇÃO (AJUSTADA PARA O SEU AMBIENTE)
 // ============================================================
-const STORAGE_KEY = "brn_monitor_nodes_v2";
+const STORAGE_KEY = "brn_monitor_nodes_v3";
 
+// IPs e Portas corretos para a API HTTP (5000)
 const DEFAULT_NODES = [
-  { name: "Ubuntu",  host: "100.111.253.8", port: 8080, role: "miner"  },
-  { name: "Windows", host: "100.84.11.48",  port: 8080, role: "client" },
+  { name: "Origem (Mayra)", host: "100.84.11.48", port: 5000, role: "origin" },
+  { name: "Linux (Cliente)", host: "100.111.253.8", port: 5000, role: "client" },
+  { name: "Filipe (Cliente)", host: "100.64.151.67", port: 5000, role: "client" },
 ];
 
-const DISCOVERY_ENDPOINT = "/api/peers-discovered-proxy";
 const DISCOVERY_INTERVAL_MS = 30000;
 
 let nodes = [];
@@ -328,8 +330,7 @@ function saveNodes() {
 
 function resetNodes() {
   if (!confirm("Restaurar a lista padrão de nós?\n\n" +
-               DEFAULT_NODES.map(n => `${n.name} (${n.host})`).join("\n") +
-               "\n\nOs nós descobertos automaticamente serão removidos.")) return;
+               DEFAULT_NODES.map(n => `${n.name} (${n.host})`).join("\n"))) return;
   nodes = DEFAULT_NODES.map(n => ({ ...n }));
   saveNodes();
   render();
@@ -349,19 +350,26 @@ function clearAutoNodes() {
 }
 
 // ============================================================
-// AUTO-DESCOBERTA DE PEERS
+// AUTO-DESCOBERTA DE PEERS (Ajustada para bater na API real)
 // ============================================================
 async function fetchDiscoveredPeers() {
+  if (nodes.length === 0) return [];
+  
+  // Tenta buscar a lista de peers do primeiro nó da lista
+  const firstNode = nodes[0];
+  const url = `http://${firstNode.host}:${firstNode.port}/api/peers/discovered`;
+  
   try {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 8000);
-    const r = await fetch(DISCOVERY_ENDPOINT, { signal: ctrl.signal });
+    const r = await fetch(url, { signal: ctrl.signal });
     clearTimeout(t);
     if (!r.ok) return [];
     const data = await r.json();
     if (!data || !data.ok || !Array.isArray(data.peers)) return [];
     return data.peers;
   } catch (e) {
+    console.warn("Falha na descoberta:", e);
     return [];
   }
 }
@@ -374,34 +382,27 @@ function mergeDiscoveredPeers(discovered) {
   for (const p of discovered) {
     const ip = (p.ip || "").trim();
     if (!ip) continue;
-
-    // Filtra loopback e IPs inválidos
     if (ip.startsWith("127.") || ip === "0.0.0.0" || ip === "::1") continue;
 
     if (existingIps.has(ip)) {
-      // Se o IP já existe (ex: está no DEFAULT_NODES), atualiza para a categoria AUTO
       const existingNode = nodes.find(n => n.host === ip);
-      if (existingNode) {
+      if (existingNode && !existingNode.manual) {
         existingNode.role = "auto";
         existingNode.auto = true;
-        existingNode.manual = false;
         existingNode.node_id = p.node_id || existingNode.node_id || "";
-        existingNode.last_seen = p.last_seen || existingNode.last_seen || 0;
         updated++;
       }
       continue;
     }
 
-    // Se é novo, adiciona à lista
     nodes.push({
       name:       (p.node_id ? "peer-" + p.node_id.slice(0, 8) : ip),
       host:       ip,
-      port:       8080,
+      port:       5000, // API HTTP
       role:       "auto",
       auto:       true,
       manual:     false,
       node_id:    p.node_id || "",
-      last_seen:  p.last_seen || 0,
     });
     existingIps.add(ip);
     added++;
@@ -409,7 +410,6 @@ function mergeDiscoveredPeers(discovered) {
 
   if (added > 0 || updated > 0) {
     saveNodes();
-    console.log(`[monitor] P2P: ${added} adicionado(s), ${updated} atualizado(s) para AUTO`);
   }
   return added;
 }
@@ -423,13 +423,7 @@ async function forceDiscovery() {
   try {
     const discovered = await fetchDiscoveredPeers();
     if (discovered.length === 0) {
-      alert("Nenhum peer descoberto pelo P2P do nó local.\n\n" +
-            "Verifique se:\n" +
-            "• O nó está a correr\n" +
-            "• O endpoint /api/peers-discovered-proxy responde\n" +
-            "• Existem peers conectados (Peers > 0 no painel)\n\n" +
-            "Dica: abra http://127.0.0.1:8080/api/peers-discovered-proxy " +
-            "no browser para ver a resposta crua.");
+      alert("Nenhum peer descoberto.\nVerifique se o nó está rodando e se o CORS está liberado (BRN_CORS_ORIGIN=*).");
     } else {
       const added = mergeDiscoveredPeers(discovered);
       alert(`Descoberta concluída.\n\n${discovered.length} peer(s) encontrado(s).\n${added} novo(s) adicionado(s).`);
@@ -470,7 +464,7 @@ function addNode() {
     alert("Esse IP já está na lista");
     return;
   }
-  nodes.push({ name, host, port: 8080, role, manual: true });
+  nodes.push({ name, host, port: 5000, role, manual: true });
   saveNodes();
   closeAddNode();
   render();
@@ -490,7 +484,7 @@ function removeNode(host) {
 // ============================================================
 // FETCH COM TIMEOUT
 // ============================================================
-async function fetchFromNode(host, port, path, timeoutMs = 80000) {
+async function fetchFromNode(host, port, path, timeoutMs = 5000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   const t0 = performance.now();
@@ -508,15 +502,16 @@ async function fetchFromNode(host, port, path, timeoutMs = 80000) {
 }
 
 // ============================================================
-// QUERY DE UM NÓ
+// QUERY DE UM NÓ (Rotas Corretas da API HTTP)
 // ============================================================
 async function queryNode(node) {
   const { host, port } = node;
+  
   const [status, chain, sync, miner] = await Promise.all([
-    fetchFromNode(host, port, "/api/status-proxy"),
-    fetchFromNode(host, port, "/api/chain-info-proxy"),
-    fetchFromNode(host, port, "/api/sync-status-proxy"),
-    fetchFromNode(host, port, "/api/miner-status-proxy"),
+    fetchFromNode(host, port, "/api/status"),
+    fetchFromNode(host, port, "/api/chain-info"),
+    fetchFromNode(host, port, "/api/sync/status"), 
+    fetchFromNode(host, port, "/api/miner/status"),
   ]);
 
   const anyOk = status.ok || chain.ok || sync.ok || miner.ok;
@@ -554,9 +549,8 @@ function analyzeNetwork(states) {
     return {
       level: "err",
       title: "Nenhum nó respondendo",
-      detail: "Verifique se os nós estão rodando e acessíveis pela rede.",
-      alerts: [{ type: "err", msg: "Todos os nós offline. " +
-                "Confirme que o `main.py` está rodando em cada máquina." }],
+      detail: "Verifique se os nós estão rodando e se o CORS está liberado.",
+      alerts: [{ type: "err", msg: "Todos os nós offline." }],
     };
   }
 
@@ -589,35 +583,24 @@ function analyzeNetwork(states) {
   if (forkAtHeight !== null) {
     level = "err";
     title = `🔴 FORK DETECTADO no bloco #${forkAtHeight}`;
-    detail = "Dois nós têm hashes diferentes na mesma altura. Precisa intervir.";
+    detail = "Nós têm hashes diferentes na mesma altura.";
     alerts.push({
       type: "err",
-      msg: `FORK em #${forkAtHeight}: nós mineraram blocos divergentes. ` +
-           `Resetar o nó com menos blocos ou aguardar reorg automático.`,
+      msg: `FORK em #${forkAtHeight}: blocos divergentes.`,
     });
   } else if (diffH > 0) {
     if (diffH <= 2) {
       level = "warn";
       title = "Sincronizando — diferença pequena";
-      detail = `Diferença de ${diffH} bloco(s) — normal durante mineração`;
+      detail = `Diferença de ${diffH} bloco(s) — normal.`;
     } else if (diffH <= 10) {
       level = "warn";
       title = `Atenção — ${diffH} blocos de diferença`;
-      detail = "Alguns nós estão atrás. Devem sincronizar em alguns minutos.";
-      alerts.push({
-        type: "warn",
-        msg: `${diffH} blocos de diferença entre os nós. ` +
-             `O nó com menor altura deve sincronizar automaticamente.`,
-      });
+      detail = "Alguns nós estão atrás.";
     } else {
       level = "err";
       title = `Problema — ${diffH} blocos de diferença`;
-      detail = "Nós estão muito dessincronizados. Verificar P2P.";
-      alerts.push({
-        type: "err",
-        msg: `${diffH} blocos de diferença. Verificar se o nó atrás ` +
-             `consegue conectar no peer.`,
-      });
+      detail = "Nós muito dessincronizados. Verifique o P2P.";
     }
   }
 
@@ -625,15 +608,13 @@ function analyzeNetwork(states) {
     if (level === "ok") level = "warn";
     alerts.push({
       type: "warn",
-      msg: "⚠ Nenhum nó está minerando. A altura não vai avançar. " +
-           "Ligue a mineração em pelo menos 1 nó.",
+      msg: "⚠ Nenhum nó está minerando.",
     });
   } else if (minersRunning.length > 1) {
     if (level === "ok") level = "warn";
     alerts.push({
       type: "warn",
-      msg: `⚠ ${minersRunning.length} nós minerando simultaneamente. ` +
-           `Isso pode gerar forks. O ideal é só 1 minerador.`,
+      msg: `⚠ ${minersRunning.length} nós minerando simultaneamente. Cuidado com forks.`,
     });
   }
 
@@ -649,8 +630,7 @@ function render() {
     grid.innerHTML = `
       <div class="node-card">
         <p style="color:#8b949e;text-align:center">
-          Nenhum nó configurado. Clique em "🛰️ Descobrir Peers" ou
-          "+ Adicionar Nó".
+          Nenhum nó configurado. Clique em "+ Adicionar Nó".
         </p>
       </div>`;
     return;
@@ -701,10 +681,6 @@ function render() {
             <div class="k">Erro</div>
             <div class="v sm red">${escapeHtml(st.error || "?")}</div>
           </div>
-          <div class="stat">
-            <div class="k">Ação</div>
-            <div class="v sm">Verificar nó</div>
-          </div>
         </div>
         <div class="node-actions">
           <button class="btn" onclick="removeNode('${escapeAttr(n.host)}')">Remover</button>
@@ -732,7 +708,6 @@ function render() {
 
     if (sy.synced) badges.push('<span class="badge ok">✓ sync</span>');
     else if (sy.syncing) badges.push('<span class="badge warn">↻ sync</span>');
-
     if (sy.forking) badges.push('<span class="badge err">⚠ fork</span>');
 
     const allOnline = Object.values(nodeStates).filter(x => x && x.online);
@@ -864,7 +839,6 @@ function renderComparison() {
 // LOAD ALL
 // ============================================================
 async function loadAll() {
-  // Fase 0: auto-descoberta (a cada 30s ou no primeiro load)
   const now = Date.now();
   if (now - lastDiscoveryTs > DISCOVERY_INTERVAL_MS && !discoveryInFlight) {
     discoveryInFlight = true;
@@ -881,15 +855,12 @@ async function loadAll() {
     }
   }
 
-  // Fase 1: consulta todos em paralelo
   const results = await Promise.all(nodes.map(n => queryNode(n)));
 
-  // Fase 2: registra no estado
   for (const r of results) {
     nodeStates[r.host] = r;
   }
 
-  // Fase 3: analisa rede
   const allStates = Object.values(nodeStates).filter(
     s => s && nodes.some(n => n.host === s.host)
   );
