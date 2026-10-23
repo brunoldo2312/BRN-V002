@@ -13,6 +13,7 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - "db.py"
       - "auto_config_network.py"
       - "tracker.py"
       - "check_network.py"
