@@ -1,0 +1,41 @@
+name: BRN Python checks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "main.py"
+      - "blockchain.py"
+      - "l2_manager.py"
+      - "btc_watcher.py"
+      - "contracts/**"
+      - ".github/workflows/contract-checks.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "main.py"
+      - "blockchain.py"
+      - "l2_manager.py"
+      - "btc_watcher.py"
+      - "contracts/**"
+      - ".github/workflows/contract-checks.yml"
+
+jobs:
+  syntax-and-self-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check Python syntax
+        run: |
+          python -m py_compile main.py blockchain.py l2_manager.py btc_watcher.py contracts/vm.py contracts/factory.py contracts/escrow_btc_brn.py
+      - name: Test contract VM
+        run: python -m contracts.vm
+      - name: Test escrow model
+        run: python -m contracts.escrow_btc_brn
+      - name: Test contract factory
+        run: python -m contracts.factory
+      - name: Test L2 manager
+        run: python -m l2_manager
