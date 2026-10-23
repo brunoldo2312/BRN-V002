@@ -160,3 +160,47 @@ Segurança e Config:
 secure_store.py, checkpoints.py, brn_network.env, brn_config.py, security.py.
 
 Este manual cobre o ciclo de vida completo do projeto. Com ele, pode inicializar a rede, conectar múltiplos PCs via Tailscale, monitorizar o progresso da fila de mineração e até fazer a ponte com o Bitcoin.
+
+
+## 9. VM declarativa de contratos (experimental)
+
+O pacote `contracts/` contém uma máquina virtual declarativa limitada, que não é EVM:
+
+- `contracts/vm.py`: valida e executa métodos declarativos com operações `set`, `add`, `sub`, `emit`, `require_eq`, `require_ge`, `transfer` e `inc_nonce`.
+- `contracts/escrow_btc_brn.py` e `contracts/factory.py`: modelos e criação de ordens de escrow BTC→BRN.
+- `contracts/__init__.py`: expõe `ContractVM`, `deploy` e `call`.
+
+### Teste local da validação
+
+Na raiz do repositório, execute:
+
+```bash
+python -m contracts.vm
+```
+
+O comando executa autotestes básicos da validação. Isso **não** substitui testes de integração com a base de dados, API, consenso ou rede.
+
+### Exemplo de contrato
+
+```python
+from contracts.vm import ContractVM
+
+code = {
+    "version": 1,
+    "name": "Counter",
+    "initial_state": {"count": 0},
+    "methods": {
+        "increment": [
+            {"op": "add", "path": "count", "value": 1},
+            {"op": "emit", "event": "Incremented"},
+        ]
+    },
+}
+print(ContractVM.validate(code))
+```
+
+### Avisos de segurança
+
+A VM é experimental e não deve ser considerada pronta para fundos reais. As funções `deploy` e `call` são APIs Python; a integração com uma API pública precisa autenticar a identidade do chamador e aplicar autorização. A execução de contratos ainda não foi demonstrada como parte do consenso validado por todos os nós. Transferências, eventos e estado precisam de testes de atomicidade e concorrência antes de produção.
+
+Para a ponte BTC→BRN, configure e verifique o endereço real de recebimento e a fonte de dados do watcher. Não considere uma ordem criada como prova de depósito BTC nem como crédito confirmado de BRN.
