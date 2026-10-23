@@ -112,7 +112,7 @@ def _validate_server_ip(raw: str) -> str:
         address = ipaddress.ip_address(candidate)
     except ValueError as exc:
         raise ValueError("Informe somente um endereço IPv4 ou IPv6 válido.") from exc
-    if address.is_loopback or address.is_unspecified or address.is_link_local or address.is_multicast:
+    if address.is_loopback or address.is_unspecified or address.is_link_local or address.is_multicast or address.is_reserved:
         raise ValueError("Esse IP não é adequado para anunciar um servidor remoto.")
     return str(address)
 
