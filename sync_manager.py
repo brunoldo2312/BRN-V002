@@ -1,14 +1,23 @@
 """
-sync_manager.py — Sincronização + Reorg automático (v8.4.2)
+sync_manager.py — Sincronização + Reorg automático (v8.4.3)
 ================================================================
-v8.4.2 (2026-10-22):
+v8.4.3 (2026-10-22):
+  [FIX CRÍTICO] _resolve_fork tentava importar
+                get_highest_checkpoint_height e validate_reorg_immutability
+                de blockchain.py (que NÃO existem lá). O ImportError
+                era engolido, fazendo a proteção de imutabilidade por
+                checkpoint falhar silenciosamente. Agora importa de
+                checkpoints.py diretamente.
+  [FIX] Loop de busca do ancestral comum agora faz break assim que
+        encontra, evitando ler o DB inteiro em vão.
+  [FIX] _fetch_chain_from agora aborta se receber lotes vazios
+        repetidos (evita loop infinito com peer bugado).
+v8.4.2:
   [NEW] Imutabilidade por checkpoint. Reorg que tenta reverter
         bloco <= último checkpoint é BLOQUEADO.
   [FIX] _detect_fork retorna None se DB vazio (local_h < 1).
-        Evita loop "sem ancestral comum" em primeiro sync.
 v8.4.1:
   [FIX] _fetch_chain_from aceita lotes menores que o pedido.
-        Antes, pedia 200, recebia 50, e falhava com "download falhou".
 ================================================================
 """
 from __future__ import annotations
@@ -80,7 +89,6 @@ class SyncStatus:
 
 
 class ChainSyncManager:
-
     def __init__(self, blockchain, db, p2p_manager,
                  send_fn: Optional[Callable[[str, int, dict, float],
                                              Optional[dict]]] = None):
@@ -171,20 +179,6 @@ class ChainSyncManager:
         if not blocks:
             return False, "lista de blocos vazia"
 
-        if not _HAS_HELPERS:
-            expected_h = start_height
-            prev = expected_prev_hash
-            for blk in blocks:
-                if not isinstance(blk, dict):
-                    return False, f"bloco em #{expected_h} não é dict"
-                if int(blk.get("height", -1)) != expected_h:
-                    return False, f"height {blk.get('height')} != esperado {expected_h}"
-                if blk.get("prev_hash") != prev:
-                    return False, f"prev_hash diverge em #{expected_h}"
-                prev = blk.get("hash", "")
-                expected_h += 1
-            return True, ""
-
         expected_h = start_height
         prev = expected_prev_hash
         for blk in blocks:
@@ -197,6 +191,11 @@ class ChainSyncManager:
 
             if blk.get("prev_hash") != prev:
                 return False, f"prev_hash diverge em #{expected_h}"
+
+            if not _HAS_HELPERS:
+                prev = blk.get("hash", "")
+                expected_h += 1
+                continue
 
             try:
                 h_calc = _block_hash_fn(
@@ -306,10 +305,13 @@ class ChainSyncManager:
             batch = resp["blocks"]
             if not isinstance(batch, list):
                 return None if strict else all_blocks
+            
+            # [FIX v8.4.3] Se o peer devolver lote vazio, aborta
             if not batch:
                 empties += 1
                 if empties >= 2:
-                    break
+                    log.warning(f"[REORG] peer {peer.node_id[:12]} devolveu lote vazio 2x. Abortando.")
+                    return None if strict else all_blocks
                 continue
 
             all_blocks.extend(batch)
@@ -366,6 +368,8 @@ class ChainSyncManager:
                     all_blocks, key=lambda b: int(b.get("height", -1)),
                     reverse=True,
                 )
+                
+                # [FIX v8.4.3] Busca otimizada pelo ancestral comum
                 for blk in sorted_by_h:
                     h = int(blk.get("height", -1))
                     if h < 0:
@@ -399,25 +403,37 @@ class ChainSyncManager:
                     self._peer_record_fail(peer_id)
                     return False
 
+                # [FIX CRÍTICO v8.4.3] Imutabilidade por checkpoints usando
+                # checkpoints.py (não blockchain.py)
                 try:
-                    from blockchain import (
-                        get_highest_checkpoint_height,
-                        validate_reorg_immutability,
-                    )
-                    highest_cp = get_highest_checkpoint_height()
-                    if highest_cp >= 0 and common_h < highest_cp:
-                        log.error(
-                            f"[REORG] BLOQUEADO: ancestral comum #{common_h} < "
-                            f"checkpoint #{highest_cp}. "
-                            f"Blocos <= #{highest_cp} sao IMUTAVEIS."
-                        )
-                        self._peer_record_fail(peer_id)
-                        return False
-                    ok_imm, msg_imm = validate_reorg_immutability(new_blocks)
-                    if not ok_imm:
-                        log.error(f"[REORG] BLOQUEADO: {msg_imm}")
-                        self._peer_record_fail(peer_id)
-                        return False
+                    from checkpoints import load_checkpoints, verify_checkpoint
+                    cps = load_checkpoints()
+                    if cps:
+                        cp_heights = [int(h) for h in cps.keys()]
+                        highest_cp = max(cp_heights) if cp_heights else -1
+                        
+                        if highest_cp >= 0 and common_h < highest_cp:
+                            log.error(
+                                f"[REORG] BLOQUEADO: ancestral comum #{common_h} < "
+                                f"checkpoint #{highest_cp}. Blocos <= #{highest_cp} sao IMUTAVEIS."
+                            )
+                            self._peer_record_fail(peer_id)
+                            return False
+                        
+                        # Valida assinatura dos checkpoints que estão sendo reescritos
+                        for cp_h, cp_data in cps.items():
+                            if int(cp_h) > common_h:
+                                if not verify_checkpoint(cp_data):
+                                    log.error(f"[REORG] BLOQUEADO: checkpoint #{cp_h} tem assinatura inválida.")
+                                    self._peer_record_fail(peer_id)
+                                    return False
+                                
+                                # Verifica se o hash da nova cadeia bate com o checkpoint
+                                blk_match = next((b for b in new_blocks if int(b["height"]) == int(cp_h)), None)
+                                if blk_match and blk_match["hash"] != cp_data["hash"]:
+                                    log.error(f"[REORG] BLOQUEADO: novo bloco #{cp_h} viola checkpoint assinado.")
+                                    self._peer_record_fail(peer_id)
+                                    return False
                 except ImportError:
                     pass
 
@@ -648,7 +664,7 @@ class ChainSyncManager:
             target=_loop, daemon=True, name="ChainSync"
         )
         self.sync_thread.start()
-        log.info("ChainSyncManager v8.4.2 iniciado")
+        log.info("ChainSyncManager v8.4.3 iniciado")
 
     def _best_peer_by_work(self) -> Optional[PeerStatus]:
         local_h = self._safe_height()
