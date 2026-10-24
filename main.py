@@ -1,12 +1,14 @@
 """main.py — Entrypoint unificado do nó BRN (v13.6.9)
 ================================================================
 v13.6.9 (2026-10-24):
-  [NEW] Descoberta automática de Origem via Tailscale.
-        O nó Cliente agora consulta o Tailscale, encontra o peer
-        com a maior altura (blockchain mais completa) e se conecta
-        a ele automaticamente, ignorando o Multicast bloqueado.
-v13.6.8 (2026-10-23):
-  [NEW] Migração de Waitress para Uvicorn.
+  [NEW] Reintegrada a descoberta automática de Origem via Tailscale.
+        O nó Cliente consulta o Tailscale, encontra o peer com a maior
+        altura e se conecta automaticamente.
+  [FIX] Threads do Waitress agora lidas do .env (BRN_HTTP_THREADS).
+v13.6.7 (2026-10-23):
+  [NEW] Integração com o novo trust_system.py (PeerTrustSystem).
+v13.6.6 (2026-10-23):
+  [FIX] Substituído o Flask dev server por Waitress.
 ================================================================
 """
 from __future__ import annotations
@@ -19,9 +21,9 @@ import threading
 import time
 import json
 import subprocess
-import socket
 import urllib.request
 import urllib.error
+import socket
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -92,7 +94,6 @@ def _auto_set_self_address() -> None:
 
     porta = os.environ.get("BRN_P2P_PORT", "6001")
 
-    # 1. Tenta pegar o IP do Tailscale
     try:
         out = subprocess.check_output(["tailscale", "ip", "-4"], text=True, timeout=3, stderr=subprocess.DEVNULL)
         for line in out.splitlines():
@@ -104,7 +105,6 @@ def _auto_set_self_address() -> None:
     except Exception:
         pass
 
-    # 2. Tenta pegar o IP local da rede (LAN)
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -119,36 +119,13 @@ def _auto_set_self_address() -> None:
 _auto_set_self_address()
 
 
-from brn_config import Config
-from brn_logger import setup_logger, get_logger
-from version import VERSION, BUILD_DATE, GITHUB_USER, GITHUB_REPO
-
-try:
-    from trust_network import TrustNetwork
-    _HAS_TRUST = True
-except ImportError:
-    TrustNetwork = None
-    _HAS_TRUST = False
-
-_shutdown = threading.Event()
-
-NODE_ID_PATH        = BASE_DIR / "node_identity.enc"
-CLIENT_BOOT_TIMEOUT = int(os.environ.get("BRN_CLIENT_BOOT_TIMEOUT", "120"))
-
-WEB_HOST_DEFAULT      = "127.0.0.1"
-EXPLORER_HOST_DEFAULT = "127.0.0.1"
-
-_running_services: list = []
-_services_lock = threading.Lock()
-
-
 # ============================================================
 # DESCOBERTA AUTOMÁTICA VIA TAILSCALE
 # ============================================================
 def _auto_discover_bootstrap(log) -> None:
     """Encontra o peer Tailscale com a maior blockchain e define o Bootstrap."""
     if os.environ.get("BRN_IS_ORIGIN", "0") == "1":
-        return  # Origem não precisa buscar bootstrap
+        return
 
     log.info("Tailscale: buscando o melhor peer (Origem) automaticamente...")
     try:
@@ -159,7 +136,6 @@ def _auto_discover_bootstrap(log) -> None:
         data = json.loads(out)
         peers = []
 
-        # Outros peers online
         for pid, p in data.get("Peer", {}).items():
             if not p.get("Online"):
                 continue
@@ -190,7 +166,7 @@ def _auto_discover_bootstrap(log) -> None:
                 continue
 
         if best_peer and best_height >= 0:
-            porta_p2p = os.environ.get("BRN_P2P_PORT", "6001")
+            porta_p2p = "6001"
             novo_bootstrap = f"{best_peer['ip']}:{porta_p2p}"
             os.environ["BRN_BOOTSTRAP_PEERS"] = novo_bootstrap
             log.info(f"Tailscale: Melhor peer encontrado -> {best_peer['hostname']} ({best_peer['ip']}) | Altura: {best_height}")
@@ -200,6 +176,29 @@ def _auto_discover_bootstrap(log) -> None:
             
     except Exception as e:
         log.warning(f"Tailscale: falha na descoberta automática: {e}")
+
+
+from brn_config import Config
+from brn_logger import setup_logger, get_logger
+from version import VERSION, BUILD_DATE, GITHUB_USER, GITHUB_REPO
+
+try:
+    from trust_system import trust_system
+    _HAS_TRUST = True
+except ImportError:
+    trust_system = None
+    _HAS_TRUST = False
+
+_shutdown = threading.Event()
+
+NODE_ID_PATH        = BASE_DIR / "node_identity.enc"
+CLIENT_BOOT_TIMEOUT = int(os.environ.get("BRN_CLIENT_BOOT_TIMEOUT", "120"))
+
+WEB_HOST_DEFAULT      = "127.0.0.1"
+EXPLORER_HOST_DEFAULT = "127.0.0.1"
+
+_running_services: list = []
+_services_lock = threading.Lock()
 
 
 def _resolve_auto_mine() -> bool:
@@ -247,7 +246,7 @@ def _check_required_modules() -> list:
         "blockchain", "db", "crypto", "wallet", "bech32",
         "secure_store", "chain_validator", "checkpoints",
         "p2p_auth", "p2p_cipher", "p2p_secure", "p2p_unified",
-        "discovery_v2", "miner_loop", "trust_network",
+        "discovery_v2", "miner_loop", "trust_system",
     ]
     missing = []
     for m in required:
@@ -620,12 +619,11 @@ def run_http(app_instance):
             ssl_ctx = None
 
     try:
-        # [FIX v13.6.8] Usar Waitress em vez do Flask dev server
         from waitress import serve
-        log.info("HTTP (Waitress) http://" + host + ":" + str(port))
-        
-        # O Waitress roda em background de forma limpa e não trava a GUI
+        # [FIX] Lê as threads do .env (padrão 16 se não existir)
         threads_count = int(os.environ.get("BRN_HTTP_THREADS", "16"))
+        log.info(f"HTTP (Waitress) http://{host}:{port} com {threads_count} threads")
+        
         serve(app_instance, host=host, port=port, threads=threads_count, 
               url_scheme='https' if ssl_ctx else 'http')
               
@@ -702,9 +700,10 @@ def run_status_loop(chain, p2p, sync=None, pool=None, pool_client=None,
                     pass
             if trust_net is not None:
                 try:
-                    ts = trust_net.get_network_stats()
-                    msg += (" Trust[Nodes=" + str(ts.get("total_nodes", 0))
-                            + " Valid=" + str(ts.get("validators_count", 0)) + "]")
+                    peers = getattr(trust_net, "peers", {})
+                    nodes_n = len(peers)
+                    valid_n = sum(1 for p in peers.values() if p.get("status") == "trusted")
+                    msg += f" Trust[Nodes={nodes_n} Valid={valid_n}]"
                 except Exception:
                     pass
             log.info(msg)
@@ -865,7 +864,8 @@ def _graceful_shutdown(log, trust_net=None) -> None:
         pass
     if trust_net is not None:
         try:
-            trust_net.shutdown()
+            if hasattr(trust_net, "shutdown"):
+                trust_net.shutdown()
             log.info("TrustNetwork salva com sucesso.")
         except Exception as e:
             log.warning("Falha salvando TrustNetwork: " + str(e))
@@ -1019,7 +1019,7 @@ def main():
     else:
         log.info("Tailscale: pulado por --no-tailscale")
 
-    # [NOVO v13.6.9] Descobre o Origem automaticamente via Tailscale
+    # [NEW] Descobre o Origem automaticamente via Tailscale
     if not is_origin:
         _auto_discover_bootstrap(log)
 
@@ -1057,9 +1057,9 @@ def main():
     trust_net = None
     if _HAS_TRUST:
         try:
-            trust_net = TrustNetwork(str(BASE_DIR / "trust_network.json"))
+            trust_net = trust_system
             chain.trust_net = trust_net
-            log.info("TrustNetwork: " + str(len(trust_net.nodes)) + " nós carregados")
+            log.info("TrustNetwork: " + str(len(trust_net.peers)) + " nós carregados")
         except Exception as e:
             log.warning("TrustNetwork desativada: " + str(e))
             trust_net = None
