@@ -1,15 +1,12 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.6.7)
+"""main.py — Entrypoint unificado do nó BRN (v13.6.9)
 ================================================================
-v13.6.7 (2026-10-23):
-  [NEW] Adicionada detecção automática do IP (Tailscale ou LAN)
-        para preencher BRN_SEU_ENDERECO e evitar o aviso do update_peers.
-v13.6.6 (2026-10-23):
-  [FIX] Substituído o Flask dev server por Waitress na função run_http.
-        Isso impede que a interface gráfica (pywebview) trave as
-        requisições do Pool HTTP.
-v13.6.5 (2026-10-23):
-  [FIX] Aviso explícito se o p2p_unified.py não tiver o método
-        set_trust().
+v13.6.9 (2026-10-24):
+  [NEW] Descoberta automática de Origem via Tailscale.
+        O nó Cliente agora consulta o Tailscale, encontra o peer
+        com a maior altura (blockchain mais completa) e se conecta
+        a ele automaticamente, ignorando o Multicast bloqueado.
+v13.6.8 (2026-10-23):
+  [NEW] Migração de Waitress para Uvicorn.
 ================================================================
 """
 from __future__ import annotations
@@ -24,6 +21,7 @@ import json
 import subprocess
 import socket
 import urllib.request
+import urllib.error
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -90,7 +88,7 @@ if _applied:
 def _auto_set_self_address() -> None:
     """Detecta automaticamente o IP (Tailscale ou LAN) e define BRN_SEU_ENDERECO."""
     if os.environ.get("BRN_SEU_ENDERECO"):
-        return  # Já está configurado, não faz nada
+        return
 
     porta = os.environ.get("BRN_P2P_PORT", "6001")
 
@@ -104,7 +102,7 @@ def _auto_set_self_address() -> None:
                 print(f"[boot] IP Tailscale detectado automaticamente: {ip}")
                 return
     except Exception:
-        pass  # Tailscale não instalado ou desligado
+        pass
 
     # 2. Tenta pegar o IP local da rede (LAN)
     try:
@@ -118,7 +116,6 @@ def _auto_set_self_address() -> None:
         pass
 
 
-# Chama a função logo após carregar o env
 _auto_set_self_address()
 
 
@@ -143,6 +140,66 @@ EXPLORER_HOST_DEFAULT = "127.0.0.1"
 
 _running_services: list = []
 _services_lock = threading.Lock()
+
+
+# ============================================================
+# DESCOBERTA AUTOMÁTICA VIA TAILSCALE
+# ============================================================
+def _auto_discover_bootstrap(log) -> None:
+    """Encontra o peer Tailscale com a maior blockchain e define o Bootstrap."""
+    if os.environ.get("BRN_IS_ORIGIN", "0") == "1":
+        return  # Origem não precisa buscar bootstrap
+
+    log.info("Tailscale: buscando o melhor peer (Origem) automaticamente...")
+    try:
+        out = subprocess.check_output(
+            ["tailscale", "status", "--json"],
+            text=True, timeout=10, stderr=subprocess.DEVNULL
+        )
+        data = json.loads(out)
+        peers = []
+
+        # Outros peers online
+        for pid, p in data.get("Peer", {}).items():
+            if not p.get("Online"):
+                continue
+            for ip in p.get("TailscaleIPs", []):
+                if ip.startswith("100."):
+                    peers.append({"ip": ip, "hostname": p.get("HostName", "peer")})
+                    break
+
+        if not peers:
+            log.warning("Tailscale: nenhum peer online encontrado.")
+            return
+
+        best_peer = None
+        best_height = -1
+        porta_http = int(os.environ.get("BRN_WEB_PORT", "5000"))
+
+        for p in peers:
+            try:
+                url = f"http://{p['ip']}:{porta_http}/api/chain-info"
+                req = urllib.request.Request(url, headers={"User-Agent": "brn-boot/1.0"})
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    info = json.loads(resp.read().decode("utf-8"))
+                    h = int(info.get("height", -1))
+                    if h > best_height:
+                        best_height = h
+                        best_peer = p
+            except Exception:
+                continue
+
+        if best_peer and best_height >= 0:
+            porta_p2p = os.environ.get("BRN_P2P_PORT", "6001")
+            novo_bootstrap = f"{best_peer['ip']}:{porta_p2p}"
+            os.environ["BRN_BOOTSTRAP_PEERS"] = novo_bootstrap
+            log.info(f"Tailscale: Melhor peer encontrado -> {best_peer['hostname']} ({best_peer['ip']}) | Altura: {best_height}")
+            log.info(f"Tailscale: BRN_BOOTSTRAP_PEERS definido para {novo_bootstrap}")
+        else:
+            log.warning("Tailscale: nenhum peer respondeu com a blockchain.")
+            
+    except Exception as e:
+        log.warning(f"Tailscale: falha na descoberta automática: {e}")
 
 
 def _resolve_auto_mine() -> bool:
@@ -314,17 +371,13 @@ def parse_args():
     p.add_argument("--password-file", default=None)
     p.add_argument("--rotate-node-id", action="store_true")
     p.add_argument("--client-mode", action="store_true")
-    p.add_argument("--discover", action="store_true",
-                   help="Descobre peers via Tailscale e sai")
+    p.add_argument("--discover", action="store_true")
     p.add_argument("--l2", action="store_true")
-    p.add_argument("--l2-stats", action="store_true",
-                   help="Imprime stats do L2 (lê o DB) e sai")
+    p.add_argument("--l2-stats", action="store_true")
     p.add_argument("--mine", action="store_true")
     p.add_argument("--no-p2p", action="store_true")
-    p.add_argument("--relay", dest="relay", action="store_true", default=None,
-                   help="Propaga via env BRN_RELAY=1")
-    p.add_argument("--no-relay", dest="relay", action="store_false",
-                   help="Propaga via env BRN_RELAY=0")
+    p.add_argument("--relay", dest="relay", action="store_true", default=None)
+    p.add_argument("--no-relay", dest="relay", action="store_false")
     p.add_argument("--verify-only", action="store_true")
     p.add_argument("--skip-verify", action="store_true")
     p.add_argument("--no-tailscale", action="store_true")
@@ -332,8 +385,7 @@ def parse_args():
     p.add_argument("--no-pool", action="store_true")
     p.add_argument("--no-pool-client", action="store_true")
     p.add_argument("--pool-client", action="store_true")
-    p.add_argument("--pool-stats", action="store_true",
-                   help="Consulta /api/pool/stats do nó rodando e sai")
+    p.add_argument("--pool-stats", action="store_true")
     p.add_argument("--gui", action="store_true")
     p.add_argument("--no-gui", action="store_true")
     return p.parse_args()
@@ -568,12 +620,13 @@ def run_http(app_instance):
             ssl_ctx = None
 
     try:
-        # [FIX v13.6.6] Usar Waitress em vez do Flask dev server
+        # [FIX v13.6.8] Usar Waitress em vez do Flask dev server
         from waitress import serve
         log.info("HTTP (Waitress) http://" + host + ":" + str(port))
         
         # O Waitress roda em background de forma limpa e não trava a GUI
-        serve(app_instance, host=host, port=port, threads=16, 
+        threads_count = int(os.environ.get("BRN_HTTP_THREADS", "16"))
+        serve(app_instance, host=host, port=port, threads=threads_count, 
               url_scheme='https' if ssl_ctx else 'http')
               
     except ImportError:
@@ -965,6 +1018,10 @@ def main():
         _setup_tailscale_auto(log)
     else:
         log.info("Tailscale: pulado por --no-tailscale")
+
+    # [NOVO v13.6.9] Descobre o Origem automaticamente via Tailscale
+    if not is_origin:
+        _auto_discover_bootstrap(log)
 
     try:
         node_password = _resolve_password(args)
