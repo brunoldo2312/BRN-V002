@@ -1,5 +1,12 @@
-"""db.py — Banco SQLite do BRN (v6.6)
+"""db.py — Banco SQLite do BRN (v6.7)
 ================================================================
+v6.7 (2026-10-24):
+  [FIX CRÍTICO] Blindagem contra blocos/transações corrompidos.
+                Todas as funções de leitura agora verificam se o
+                dado (raw) é NULL antes de tentar descompactar
+                (zlib.decompress). Evita o erro NoneType que
+                derrubava o nó durante o REORG.
+  [FIX] try/except em todos os zlib.decompress.
 v6.6:
   [FIX] Adicionado PRAGMA busy_timeout=30000 (evita database is locked)
   [FIX] utxos_gastos_na_mempool agora tem lock (proteção de leitura)
@@ -226,16 +233,36 @@ class ChainDB:
             return n
 
     def get_block(self, height):
+        """[FIX v6.7] Protegido contra dados nulos e corrompidos."""
         row = self.conn.execute("SELECT raw FROM blocks WHERE height=?", (height,)).fetchone()
-        return orjson.loads(zlib.decompress(row["raw"])) if row else None
+        if not row or row["raw"] is None:
+            return None
+        try:
+            return orjson.loads(zlib.decompress(row["raw"]))
+        except Exception:
+            return None
 
     def get_block_by_hash(self, h):
+        """[FIX v6.7] Protegido contra dados nulos e corrompidos."""
         row = self.conn.execute("SELECT raw FROM blocks WHERE hash=?", (h,)).fetchone()
-        return orjson.loads(zlib.decompress(row["raw"])) if row else None
+        if not row or row["raw"] is None:
+            return None
+        try:
+            return orjson.loads(zlib.decompress(row["raw"]))
+        except Exception:
+            return None
 
     def get_blocks_range(self, start, end):
+        """[FIX v6.7] Protegido contra dados nulos e corrompidos."""
         rows = self.conn.execute("SELECT raw FROM blocks WHERE height >= ? AND height < ? ORDER BY height", (start, end)).fetchall()
-        return [orjson.loads(zlib.decompress(r["raw"])) for r in rows]
+        result = []
+        for r in rows:
+            if r["raw"] is not None:
+                try:
+                    result.append(orjson.loads(zlib.decompress(r["raw"])))
+                except Exception:
+                    pass
+        return result
 
     def height(self):
         row = self.conn.execute("SELECT MAX(height) AS h FROM blocks").fetchone()
@@ -260,9 +287,11 @@ class ChainDB:
 
     # ==================== TX LOOKUP ====================
     def get_tx_by_txid(self, txid: str):
+        """[FIX v6.7] Protegido contra dados nulos e corrompidos."""
         try:
             row = self.conn.execute("SELECT raw, block_height FROM transactions WHERE txid = ? LIMIT 1", (txid,)).fetchone()
-            if not row or row["raw"] is None: return None, None
+            if not row or row["raw"] is None: 
+                return None, None
             return orjson.loads(zlib.decompress(row["raw"])), row["block_height"]
         except Exception:
             return None, None
@@ -314,6 +343,8 @@ class ChainDB:
             for r in mp_rows:
                 txid_str = r["txid"]
                 if txid_str in seen_txids: continue
+                if r["raw"] is None: continue
+                
                 try:
                     tx = orjson.loads(zlib.decompress(r["raw"]))
                 except Exception:
@@ -421,14 +452,28 @@ class ChainDB:
         return self.conn.execute("SELECT 1 FROM mempool WHERE txid=?", (txid,)).fetchone() is not None
 
     def get_mempool_tx(self, txid):
+        """[FIX v6.7] Protegido contra dados nulos e corrompidos."""
         row = self.conn.execute("SELECT raw FROM mempool WHERE txid=?", (txid,)).fetchone()
-        return orjson.loads(zlib.decompress(row["raw"])) if row else None
+        if not row or row["raw"] is None:
+            return None
+        try:
+            return orjson.loads(zlib.decompress(row["raw"]))
+        except Exception:
+            return None
 
     # [FIX v6.6] lock na leitura da mempool
     def all_mempool(self, limit=1000):
+        """[FIX v6.7] Protegido contra dados nulos e corrompidos."""
         with self.lock:
             rows = self.conn.execute("SELECT raw FROM mempool ORDER BY fee DESC LIMIT ?", (limit,)).fetchall()
-            return [orjson.loads(zlib.decompress(r["raw"])) for r in rows]
+            result = []
+            for r in rows:
+                if r["raw"] is not None:
+                    try:
+                        result.append(orjson.loads(zlib.decompress(r["raw"])))
+                    except Exception:
+                        pass
+            return result
 
     def remove_mempool(self, txid):
         with self.lock:
@@ -449,6 +494,7 @@ class ChainDB:
             try:
                 rows = self.conn.execute("SELECT raw FROM mempool").fetchall()
                 for r in rows:
+                    if r["raw"] is None: continue
                     try:
                         tx = orjson.loads(zlib.decompress(r["raw"]))
                         for inp in tx.get("inputs", []):
