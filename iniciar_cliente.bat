@@ -1,13 +1,11 @@
-set "BRN_BOOTSTRAP_PEERS=100.84.11.48:6001"  // Se o Origem for a Mayra
-set "BRN_POOL_URL=http://100.84.11.48:5000"
 @echo off
 REM ============================================================
-REM   iniciar_cliente.bat - BRN Node CLIENTE (Windows) - v6
+REM   iniciar_cliente.bat - BRN Node CLIENTE (Windows) - v7
 REM ============================================================
-REM   v6:
-REM     [FIX] Corrigido para atuar como CLIENTE (não força Origem).
-REM     [FIX] Mantém o BRN_BOOTSTRAP_PEERS para conectar no Origem.
-REM     [FIX] Abre a GUI corretamente usando Waitress.
+REM   v7:
+REM     [FIX] Removidas as linhas com "//" que quebravam o script.
+REM     [FIX] Garantido que o IP do Bootstrap e do Pool apontem
+REM           para o Ubuntu (Origem).
 REM ============================================================
 
 setlocal EnableDelayedExpansion
@@ -45,7 +43,7 @@ exit /b 0
 :args_done
 
 echo ============================================================
-echo   BRN Node - CLIENTE (Windows) - v6
+echo   BRN Node - CLIENTE (Windows) - v7
 echo ============================================================
 echo.
 
@@ -127,7 +125,7 @@ if "%BRN_MINER_AUTO%"==""          set "BRN_MINER_AUTO=1"
 if "%BRN_MINER_INTERVAL%"==""      set "BRN_MINER_INTERVAL=30"
 set "PYTHONUNBUFFERED=1"
 
-REM [FIX] Força modo CLIENTE, independentemente do .env
+REM Força modo CLIENTE, independentemente do .env
 set "BRN_IS_ORIGIN=0"
 
 set "FALTA="
