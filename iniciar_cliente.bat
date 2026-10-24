@@ -1,3 +1,5 @@
+set "BRN_BOOTSTRAP_PEERS=100.84.11.48:6001"  // Se o Origem for a Mayra
+set "BRN_POOL_URL=http://100.84.11.48:5000"
 @echo off
 REM ============================================================
 REM   iniciar_cliente.bat - BRN Node CLIENTE (Windows) - v6
