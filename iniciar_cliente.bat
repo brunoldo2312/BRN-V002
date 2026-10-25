@@ -1,11 +1,13 @@
 @echo off
 REM ============================================================
-REM   iniciar_cliente.bat - BRN Node CLIENTE (Windows) - v7
+REM   iniciar_cliente.bat - BRN Node CLIENTE (Windows) - v9
 REM ============================================================
-REM   v7:
-REM     [FIX] Removidas as linhas com "//" que quebravam o script.
-REM     [FIX] Garantido que o IP do Bootstrap e do Pool apontem
-REM           para o Ubuntu (Origem).
+REM   v9:
+REM     [NEW] Executa o brn_tailscale_setup.py --auto antes do nó
+REM           para descobrir dinamicamente todos os peers online
+REM           na rede global do Tailscale.
+REM     [FIX] Removido IP fixo do Bootstrap. Agora ele usa o
+REM           bootstrap_peers.json gerado automaticamente.
 REM ============================================================
 
 setlocal EnableDelayedExpansion
@@ -43,7 +45,7 @@ exit /b 0
 :args_done
 
 echo ============================================================
-echo   BRN Node - CLIENTE (Windows) - v7
+echo   BRN Node - CLIENTE (Windows) - v9
 echo ============================================================
 echo.
 
@@ -75,7 +77,7 @@ if not exist "brn_network.env" (
         echo BRN_WEB_PASS=senha-temp-123
         echo BRN_WALLET_SESSION_PASS=senha-forte-da-carteira-2026
         echo BRN_ADMIN_TOKEN=
-        echo BRN_BOOTSTRAP_PEERS=100.111.253.8:6001
+        echo BRN_BOOTSTRAP_PEERS=
         echo BRN_IS_ORIGIN=0
         echo BRN_ALL_MINERS=0
         echo BRN_WEB_HOST=0.0.0.0
@@ -125,8 +127,25 @@ if "%BRN_MINER_AUTO%"==""          set "BRN_MINER_AUTO=1"
 if "%BRN_MINER_INTERVAL%"==""      set "BRN_MINER_INTERVAL=30"
 set "PYTHONUNBUFFERED=1"
 
-REM Força modo CLIENTE, independentemente do .env
 set "BRN_IS_ORIGIN=0"
+
+REM ============================================================
+REM [NOVO v9] DESCOBERTA GLOBAL VIA TAILSCALE
+REM ============================================================
+if "%SKIP_TAILSCALE%"=="0" (
+    echo [*] Executando descoberta global via Tailscale...
+    %PY% brn_tailscale_setup.py --auto
+    
+    if errorlevel 1 (
+        echo [AVISO] Descoberta automatica falhou ou Tailscale offline.
+        echo         Usando apenas os peers do arquivo local (se houver).
+    ) else (
+        echo [ok] Descoberta concluida. bootstrap_peers.json atualizado.
+        REM Limpa a variável para que o main.py use o arquivo JSON
+        set "BRN_BOOTSTRAP_PEERS="
+    )
+    echo.
+)
 
 set "FALTA="
 for %%F in (
@@ -154,7 +173,6 @@ echo [ok] Arquivos essenciais OK
 echo.
 
 set "MY_TS_IP="
-
 if "%SKIP_TAILSCALE%"=="1" (
     echo [*] Tailscale: pulado ^(--skip-tailscale^)
     goto tailscale_done
@@ -172,7 +190,12 @@ for /f "tokens=*" %%I in ('tailscale ip -4 2^>nul') do (
     if "!MY_TS_IP!"=="" set "MY_TS_IP=%%I"
 )
 echo [ok] Meu IP Tailscale: %MY_TS_IP%
-echo [*] Este no vai se conectar ao Origem em %BRN_BOOTSTRAP_PEERS%.
+
+if "%BRN_BOOTSTRAP_PEERS%"=="" (
+    echo [*] Bootstrap: Usando bootstrap_peers.json gerado automaticamente.
+) else (
+    echo [*] Bootstrap: %BRN_BOOTSTRAP_PEERS%
+)
 
 :tailscale_done
 echo.
@@ -191,36 +214,26 @@ echo [ok] Papel: CLIENTE
 echo.
 
 set "HEADLESS_FLAG=--headless"
-
 if "%FORCE_NO_GUI%"=="1" (
     echo [*] GUI desabilitada por --no-gui
     goto gui_done
 )
-
 if "%FORCE_GUI%"=="1" (
     set "HEADLESS_FLAG="
     echo [ok] GUI forcada por --gui
     goto gui_done
 )
-
 %PY% -c "import webview" >nul 2>&1
 if errorlevel 1 (
     echo [AVISO] pywebview ausente - modo HEADLESS
     goto gui_done
 )
-
 echo [ok] pywebview OK - carteira desktop vai abrir
 set "HEADLESS_FLAG="
 
 :gui_done
 set "GUI_STATUS=HEADLESS"
 if "%HEADLESS_FLAG%"=="" set "GUI_STATUS=GUI"
-echo.
-
-set "ADMIN_STATUS=NAO (endpoints admin ABERTOS)"
-if not "%BRN_ADMIN_TOKEN%"=="" (
-    set "ADMIN_STATUS=SIM"
-)
 echo.
 
 set "POOL_CLIENT_FLAG="
@@ -241,7 +254,6 @@ echo ============================================================
 echo   Modo       : CLIENTE ^(conectando ao Origem^)
 echo   Versao     : %NODE_VERSION%
 echo   IS_ORIGIN  : %BRN_IS_ORIGIN%
-echo   Bootstrap  : %BRN_BOOTSTRAP_PEERS%
 echo   Pool URL   : %BRN_POOL_URL%
 echo   Dificuldade: Automatica ^(Calculada pelo programa^)
 echo   Miner auto : %BRN_MINER_AUTO%
@@ -264,10 +276,6 @@ set "EXITCODE=%ERRORLEVEL%"
 echo.
 if not "%EXITCODE%"=="0" (
     echo [ERRO] O no saiu com codigo %EXITCODE%
-    echo.
-    echo   Se o erro foi 'Falha ao decifrar node_identity.enc':
-    echo     del node_identity.enc
-    echo     iniciar_cliente.bat
     echo.
 ) else (
     echo [ok] No encerrado normalmente.
