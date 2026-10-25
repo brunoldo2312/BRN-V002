@@ -1,17 +1,12 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.15)
+server.py — Backend HTTP do nó BRN (v9.9.16)
 ================================================================
+v9.9.16 (2026-10-25):
+  [FIX CRÍTICO] Re-adicionada a rota /api/minhas-txs que havia sido
+                removida por engano na v9.9.15, causando erro 404.
+  [FIX] Mantidas as rotas /api/sync-info e /api/miner/status.
 v9.9.15 (2026-10-24):
-  [FIX CRÍTICO] Adicionadas rotas /api/sync-info e /api/miner/status
-                que estavam faltando e causavam erro 404 na GUI.
-  [FIX] Integração robusta com trust_system.py (novo) e trust_network.py.
-  [FIX] Proxy do Pool com timeout e tratamento de erro 502.
-v9.9.14 (2026-10-23):
-  [NEW] Proxy do Pool para clientes.
-  [NEW] Rotas /api/trust/stats e /api/trust/nodes.
-v9.9.13 (2026-10-22):
-  [FIX CRÍTICO] /api/minhas-txs respeita ?limit=.
-  [FIX] Persiste meta["miner_address"] no DB.
+  [NEW] Integração robusta com trust_system.py e proxy do pool.
 ================================================================
 """
 from __future__ import annotations
@@ -120,7 +115,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
             req = urllib.request.Request(
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
-                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.15"},
+                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.16"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -197,17 +192,12 @@ def _get_trust_network(): return _TRUST_NETWORK
 
 
 def _register_miner_in_trust(pubkey: str, address: str) -> None:
-    """[FIX v9.9.15] Detecta se é o trust_system novo ou o trust_network antigo."""
     trust = _get_trust_network()
     if trust is None: return
     try:
-        # Tenta o NOVO trust_system.py (PeerTrustSystem)
         if hasattr(trust, "ensure_peer_entry"):
             trust.ensure_peer_entry(pubkey)
             trust.update_score(pubkey, "heartbeat_ok")
-            if hasattr(trust, "check_auto_promotion"):
-                trust.check_auto_promotion(pubkey)
-        # Tenta o ANTIGO trust_network.py
         elif hasattr(trust, "register_node"):
             trust.register_node(node_id=pubkey, address=address, public_key=pubkey)
             trust.mark_connected(pubkey)
@@ -365,6 +355,16 @@ def _pubkey_from_db_or_payload(addr: str, payload_pubkey: str = "", payload_sk: 
     return ""
 
 
+def _find_tx_in_mempool(txid_str: str):
+    try: return _get_chain().db.get_mempool_tx(txid_str)
+    except Exception: return None
+
+
+def _find_tx_in_chain(txid_str: str):
+    try: return _get_chain().db.get_tx_by_txid(txid_str)
+    except Exception: return None, None
+
+
 # ============================================================
 # CLEANUP LOOP
 # ============================================================
@@ -385,7 +385,7 @@ threading.Thread(target=_cleanup_loop, daemon=True, name="CacheCleanup").start()
 
 
 # ============================================================
-# ROTAS BÁSICAS (BOOTSTRAP / CARTEIRA / TRANSFER)
+# ROTAS BÁSICAS (BOOTSTRAP / CARTEIRA / TRANSFER / HISTÓRICO)
 # ============================================================
 @app.route("/api/bootstrap/add", methods=["POST"])
 @require_rate_limit("bootstrap_add")
@@ -397,10 +397,7 @@ def bootstrap_add():
         if not addr or not pubkey: return jsonify({"ok": False, "msg": "Dados incompletos"}), 400
         chain = _get_chain()
         chain.adicionar_na_fila(addr, pubkey)
-        
-        # Registra na Trust
         _register_miner_in_trust(pubkey, addr)
-        
         return jsonify({
             "ok": True, "fila_tamanho": len(chain.fila_mineracao),
             "rede_descentralizada": chain.rede_descentralizada,
@@ -444,6 +441,53 @@ def portfolio(address):
             _saldo_cache_set(address, cached)
         return jsonify({"portfolio": {"BRN": cached / 10**8, "KYC": 0}})
     except Exception as e: return jsonify({"portfolio": {}, "error": str(e)}), 500
+
+
+@app.route("/api/minhas-txs/<address>", methods=["GET"])
+@app.route("/api/transacoes/<address>", methods=["GET"])
+@require_rate_limit("minhas_txs")
+def minhas_txs(address):
+    try:
+        if not WalletManager.validate_address(address): return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
+        chain = _get_chain()
+        current_height = chain.db.height()
+        
+        try: _limit = int(request.args.get("limit", TXT_HISTORY_LIMIT_DEFAULT))
+        except: _limit = TXT_HISTORY_LIMIT_DEFAULT
+        _limit = max(1, min(_limit, TXT_HISTORY_LIMIT_MAX))
+
+        raw_list = chain.db.get_txs_for_address(address, limit=_limit)
+        transactions = []
+        for item in raw_list:
+            tx = item["tx"]
+            block_height = item["block_height"]
+            is_mempool = item["is_mempool"]
+
+            outputs_to_addr = sum(int(o.get("amount", 0) or 0) for o in tx.get("outputs", []) if o.get("address") == address)
+            inputs_from_addr = 0
+            for inp in tx.get("inputs", []):
+                if inp.get("txid") == "0" * 64: continue
+                try:
+                    row = chain.db.conn.execute("SELECT address, amount FROM utxos WHERE txid = ? AND vout = ?", (inp.get("txid"), inp.get("vout"))).fetchone()
+                    if row and row["address"] == address: inputs_from_addr += int(row["amount"] or 0)
+                except Exception: pass
+
+            if inputs_from_addr > 0 and outputs_to_addr > 0: direction, amount = "self", 0
+            elif outputs_to_addr > 0: direction, amount = "received", outputs_to_addr
+            else: direction, amount = "sent", max(0, inputs_from_addr - outputs_to_addr)
+
+            if is_mempool or block_height is None: status, confirmations = "pending", 0
+            else:
+                status = "confirmed"
+                confirmations = max(0, current_height - block_height)
+
+            transactions.append({
+                "txid": tx.get("txid", ""), "direction": direction, "amount": amount, "status": status,
+                "block_height": block_height, "confirmations": confirmations, "timestamp": int(tx.get("timestamp", 0) or 0),
+            })
+
+        return jsonify({"ok": True, "address": address, "count": len(transactions), "limit": _limit, "transactions": transactions})
+    except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
 
 @app.route("/api/transfer", methods=["POST"])
@@ -517,7 +561,7 @@ def transfer():
 
 
 # ============================================================
-# ROTAS DE STATUS E SYNC (FIX 404)
+# STATUS E SYNC
 # ============================================================
 @app.route("/api/status", methods=["GET"])
 def status():
@@ -557,7 +601,6 @@ def chain_info():
 
 @app.route("/api/sync-info", methods=["GET"])
 def sync_info():
-    """Rota que alimenta o painel 'SINCRONIZAÇÃO DA BLOCKCHAIN' da GUI."""
     result = {
         "ok": True,
         "sync": {"percent": 100.0, "height": 0, "target": 0, "peers": 0, "work": 0},
@@ -569,7 +612,6 @@ def sync_info():
         result["sync"]["height"] = local_h
         result["sync"]["peers"] = chain.db.contar_peers(apenas_ativos=False)
         
-        # Tenta descobrir o alvo olhando os peers
         target_h = local_h
         todos = chain.db.listar_peers(apenas_ativos=False)
         heights = [int(p["height"]) for p in todos if p.get("height")]
@@ -613,7 +655,7 @@ def sync_status():
 
 
 # ============================================================
-# MINERADOR (FIX 404)
+# MINERADOR
 # ============================================================
 @app.route("/api/miner/start", methods=["POST"])
 @require_rate_limit("miner_start")
@@ -652,7 +694,6 @@ def miner_start():
 
 @app.route("/api/miner/status", methods=["GET"])
 def miner_status():
-    """Rota que alimenta o painel 'MINERANDO' da GUI."""
     try:
         from miner_loop import get_miner
         chain = _get_chain()
@@ -697,7 +738,7 @@ def _proxy_pool_request(path: str, method: str = "POST") -> tuple:
         else:
             req = urllib.request.Request(url, method="GET")
 
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=100) as resp:
             return jsonify(json.loads(resp.read().decode("utf-8"))), resp.status
             
     except urllib.error.HTTPError as e:
@@ -852,7 +893,7 @@ def trust_nodes():
 
 
 # ============================================================
-# BLOCOS / PEERS
+# BLOCOS / PEERS / HEALTH
 # ============================================================
 @app.route("/api/blocks", methods=["GET"])
 def api_get_blocks():
@@ -888,16 +929,13 @@ def peers_discovered():
 def health():
     try:
         return jsonify({
-            "ok": True, "height": _get_chain().db.height(), "version": "9.9.15",
+            "ok": True, "height": _get_chain().db.height(), "version": "9.9.16",
             "chain_injected": _CHAIN is not None, "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
         })
     except Exception as e: return jsonify({"ok": False, "error": str(e)}), 500
 
 
-# ============================================================
-# SHUTDOWN
-# ============================================================
 @atexit.register
 def _shutdown():
     log.info("encerrando server…")
@@ -907,5 +945,5 @@ def _shutdown():
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.15 (Proxy + Trust + SyncInfo)")
+    print(f"BRN Server v9.9.16 (Proxy + Trust + History)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
