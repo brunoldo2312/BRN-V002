@@ -1,8 +1,10 @@
 """
-brn_tailscale_setup.py - Setup idempotente do Tailscale para o BRN
+brn_tailscale_setup.py - Setup idempotente do Tailscale para o BRN (v2)
 ==================================================================
 
-Versão corrigida e robusta.
+Versão corrigida, robusta e com descoberta automática via Tailscale.
+Agora ele consulta `tailscale status --json` para achar todos os peers
+online na rede global, sem depender de arquivo manual.
 """
 import os
 import sys
@@ -36,14 +38,8 @@ def err(msg):  log("X", msg)
 # HELPERS DE SISTEMA
 # ============================================================
 def run_cmd(cmd_list, capture=True, timeout=10):
-    """Roda um comando com segurança (sem shell=True)."""
     try:
-        r = subprocess.run(
-            cmd_list,
-            capture_output=capture,
-            text=True,
-            timeout=timeout,
-        )
+        r = subprocess.run(cmd_list, capture_output=capture, text=True, timeout=timeout)
         return r.returncode, r.stdout.strip()
     except Exception as e:
         return -1, str(e)
@@ -55,22 +51,14 @@ def is_windows():
 # HELPERS DO TAILSCALE
 # ============================================================
 def get_tailscale_cmd():
-    """Retorna o caminho do executável Tailscale."""
-    # Tenta usar o comando no PATH primeiro
     rc, _ = run_cmd(["tailscale", "version"])
-    if rc == 0:
-        return ["tailscale"]
-    
-    # Fallback Windows
+    if rc == 0: return ["tailscale"]
     if is_windows():
-        for p in [r"C:\Program Files\Tailscale\tailscale.exe", 
-                  r"C:\Program Files (x86)\Tailscale\tailscale.exe"]:
-            if os.path.exists(p):
-                return [p]
+        for p in [r"C:\Program Files\Tailscale\tailscale.exe", r"C:\Program Files (x86)\Tailscale\tailscale.exe"]:
+            if os.path.exists(p): return [p]
     return None
 
 def get_tailscale_ip(ts_cmd):
-    """Retorna o IP Tailscale da maquina ou None."""
     rc, out = run_cmd(ts_cmd + ["ip", "-4"])
     if rc == 0:
         for line in out.splitlines():
@@ -80,10 +68,8 @@ def get_tailscale_ip(ts_cmd):
     return None
 
 def is_tailscale_authenticated(ts_cmd):
-    """Verifica autenticação usando JSON para robustez."""
     rc, out = run_cmd(ts_cmd + ["status", "--json"])
-    if rc != 0:
-        return False
+    if rc != 0: return False
     try:
         data = json.loads(out)
         return data.get("BackendState") == "Running"
@@ -91,25 +77,47 @@ def is_tailscale_authenticated(ts_cmd):
         return False
 
 # ============================================================
+# [NOVO] DESCOBERTA AUTOMÁTICA GLOBAL
+# ============================================================
+def discover_peers_from_tailscale(ts_cmd, self_ip):
+    """Usa `tailscale status --json` para achar todos os IPs online."""
+    rc, out = run_cmd(ts_cmd + ["status", "--json"], timeout=15)
+    if rc != 0:
+        warn("Não consegui ler o status do Tailscale.")
+        return []
+    
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        warn("Resposta do Tailscale não é JSON válido.")
+        return []
+
+    peers = []
+    for peer_id, peer in data.get("Peer", {}).items():
+        if not peer.get("Online"):
+            continue
+        for ip in peer.get("TailscaleIPs", []):
+            if ip.startswith("100.") and ip != self_ip:
+                peers.append(f"{ip}:{P2P_PORT}")
+                break
+    return peers
+
+# ============================================================
 # HELPERS DE ARQUIVO E VALIDAÇÃO
 # ============================================================
 def parse_and_validate_peer(line):
-    """Valida formato [ip]:porta ou ip:porta."""
     line = line.strip()
     if not line: return None
     
     if "[" in line and "]" in line:
-        # IPv6: [addr]:port
         parts = line.rsplit("]:", 1)
         addr = parts[0].strip("[")
         port = parts[1] if len(parts) > 1 else str(P2P_PORT)
     elif ":" in line:
-        # IPv4: ip:port
         parts = line.rsplit(":", 1)
         addr = parts[0]
         port = parts[1]
     else:
-        # Apenas IP
         addr = line
         port = str(P2P_PORT)
     
@@ -123,6 +131,7 @@ def parse_and_validate_peer(line):
         return None
 
 def read_peer_file():
+    """Lê peers manuais do arquivo (para quem quiser forçar algum IP extra)."""
     if not PEER_FILE.exists(): return []
     peers = set()
     for line in PEER_FILE.read_text(encoding="utf-8").splitlines():
@@ -131,7 +140,6 @@ def read_peer_file():
     return list(peers)
 
 def atomic_write_json(filepath, data):
-    """Escreve arquivo JSON de forma atômica."""
     with tempfile.NamedTemporaryFile('w', dir=filepath.parent, delete=False, encoding='utf-8') as tf:
         json.dump(data, tf, indent=2)
         temp_name = tf.name
@@ -144,7 +152,6 @@ def update_bootstrap(own_ip, peer_ips):
     
     new_list = sorted(list(entries))
     
-    # Verifica se houve mudança
     try:
         if BOOTSTRAP_FILE.exists():
             existing = json.loads(BOOTSTRAP_FILE.read_text(encoding="utf-8"))
@@ -169,12 +176,25 @@ def mode_auto():
     own_ip = get_tailscale_ip(ts)
     if not own_ip:
         err("Não consegui IP Tailscale."); return 1
-        
-    peer_ips = read_peer_file()
-    if update_bootstrap(own_ip, peer_ips):
-        ok("bootstrap_peers.json atualizado")
+    
+    # [NOVO] Descobre peers automaticamente na rede global
+    info("Consultando Tailscale para descobrir peers online...")
+    auto_peers = discover_peers_from_tailscale(ts, own_ip)
+    
+    # Junta com os manuais (se o usuário tiver algum no arquivo de texto)
+    manual_peers = read_peer_file()
+    
+    total_peers = set(auto_peers + manual_peers)
+    
+    if total_peers:
+        ok(f"Descobertos {len(auto_peers)} peers online via Tailscale.")
     else:
-        ok("bootstrap_peers.json já estava correto")
+        warn("Nenhum peer online encontrado além de você.")
+
+    if update_bootstrap(own_ip, list(total_peers)):
+        ok("bootstrap_peers.json atualizado com os peers descobertos.")
+    else:
+        ok("bootstrap_peers.json já estava correto.")
     return 0
 
 def mode_check():
@@ -183,17 +203,24 @@ def mode_check():
         print("Tailscale: NAO instalado"); return 1
     
     auth = is_tailscale_authenticated(ts)
-    print(f"Tailscale: Instalado | Autenticado: {'SIM' if auth else 'NAO'}")
-    
+    own_ip = get_tailscale_ip(ts)
     peers = read_peer_file()
-    print(f"Peers configurados: {len(peers)}")
-    return 0 if (ts and auth and peers) else 1
+    
+    print(f"Tailscale: Instalado | Autenticado: {'SIM' if auth else 'NAO'}")
+    print(f"Meu IP Tailscale: {own_ip}")
+    
+    if auth and own_ip:
+        print("\n--- Descoberta Global ---")
+        auto = discover_peers_from_tailscale(ts, own_ip)
+        print(f"Peers online descobertos: {len(auto)}")
+        for p in auto:
+            print(f"  - {p}")
+
+    print(f"\nPeers manuais configurados: {len(peers)}")
+    return 0 if (ts and auth) else 1
 
 def mode_interactive():
-    # ... (implementação similar à original, chamando as novas funções helper)
-    # Recomendado manter o fluxo interativo apenas para o setup inicial.
     info("Fluxo interativo não alterado significativamente, mas agora usa helpers robustos.")
-    # ...
     return 0
 
 def main():
