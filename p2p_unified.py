@@ -1,13 +1,13 @@
 """
-p2p_unified.py — BRN P2P Network v6.6.8-Bootstrap
+p2p_unified.py — BRN P2P Network v6.6.9-Bootstrap
 ================================================================
+v6.6.9 (2026-10-24):
+  [NEW] Sincronização Global de Reputação (Consenso de Top Validadores).
+        - Adicionada rota get_trust_scores e trust_scores.
+        - O P2PManager agora roda um loop que pede as pontuações
+          dos peers e atualiza o trust_system local.
 v6.6.8 (2026-10-23):
   [NEW] Integração total com o novo trust_system.py.
-        - Pontua blocos e transações válidas (+).
-        - Penaliza blocos e transações inválidas (-).
-        - Envia peers recém-descobertos para o trust_system.
-v6.6.7 (2026-10-23):
-  [NEW] Integração com a TrustNetwork antiga.
 ================================================================
 """
 from __future__ import annotations
@@ -80,6 +80,8 @@ RATE_LIMIT_MSGS_PER_SEC  = int(os.environ.get("BRN_RATE_LIMIT", "200"))
 MAX_DISCOVERED_PEERS = 500
 MAX_PEERS_PER_PEX    = 50
 HEIGHT_CACHE_TTL     = 120
+
+TRUST_SYNC_INTERVAL  = 60  # [NEW] Intervalo de sincronização de reputação
 
 PEERS_FILE     = "peers_discovered.json"
 BOOTSTRAP_FILE = "bootstrap_peers.json"
@@ -262,7 +264,7 @@ class Metrics:
 # SERVIDOR TCP
 # ============================================================
 class P2PServer(threading.Thread):
-    def __init__(self, blockchain, port: int, metrics: Metrics, on_new_block=None, on_new_tx=None, on_peer_bad=None, on_peer_good=None, get_peers_callback=None):
+    def __init__(self, blockchain, port: int, metrics: Metrics, on_new_block=None, on_new_tx=None, on_peer_bad=None, on_peer_good=None, get_peers_callback=None, trust_net=None):
         super().__init__(daemon=True, name="P2P-Server")
         self.bc = blockchain
         self.port = port
@@ -272,6 +274,7 @@ class P2PServer(threading.Thread):
         self.on_peer_bad = on_peer_bad
         self.on_peer_good = on_peer_good
         self.get_peers_callback = get_peers_callback
+        self.trust_net = trust_net  # [NEW] Trust System Reference
 
         self.on_relay_caps = None
         self.on_relay_request = None
@@ -442,7 +445,6 @@ class P2PServer(threading.Thread):
                 if READ_ONLY: return {"type": "ack", "ok": False, "reason": "read_only"}
                 tx_dict = msg.get("tx")
                 if tx_dict and self.on_new_tx:
-                    # [FIX] Passa peer_ip e peer_id para o TrustSystem
                     ok = self.on_new_tx(peer_ip, peer_id, tx_dict)
                     if ok and self.on_peer_good: self.on_peer_good(peer_ip, peer_id)
                     elif not ok and self.on_peer_bad: self.on_peer_bad(peer_ip, peer_id)
@@ -458,6 +460,27 @@ class P2PServer(threading.Thread):
                     try: peers = self.get_peers_callback()
                     except Exception: pass
                 return {"type": "peers", "peers": peers[:MAX_PEERS_PER_PEX]}
+
+            # ============================================================
+            # [NOVO] Rotas de Sincronização de Reputação (Trust System)
+            # ============================================================
+            if mtype == "get_trust_scores":
+                if self.trust_net and hasattr(self.trust_net, "peers"):
+                    top_peers = sorted(
+                        self.trust_net.peers.items(), 
+                        key=lambda x: x[1].get("score", 0), 
+                        reverse=True
+                    )[:10]
+                    scores = {pubkey: data.get("score", 0) for pubkey, data in top_peers}
+                    return {"type": "trust_scores", "scores": scores}
+                return {"type": "trust_scores", "scores": {}}
+
+            if mtype == "trust_scores":
+                scores = msg.get("scores", {})
+                if self.trust_net and hasattr(self.trust_net, "sync_scores_from_peer"):
+                    self.trust_net.sync_scores_from_peer(scores)
+                return {"type": "ack", "ok": True}
+            # ============================================================
 
             if mtype == "relay_capabilities":
                 if self.on_relay_caps and peer_id:
@@ -564,6 +587,10 @@ class P2PClient:
     def get_mempool(ip, port, timeout=None): return P2PClient.send_message(ip, port, {"type": "get_mempool"}, timeout=timeout)
     @staticmethod
     def get_peers(ip, port, timeout=None): return P2PClient.send_message(ip, port, {"type": "get_peers"}, timeout=timeout)
+    
+    # [NEW] Pede a lista de reputação
+    @staticmethod
+    def get_trust_scores(ip, port, timeout=None): return P2PClient.send_message(ip, port, {"type": "get_trust_scores"}, timeout=timeout)
 
 
 # ============================================================
@@ -842,6 +869,7 @@ class P2PManager:
         self.external_ip = None
         self.upnp = None
         self.trust_net = None  # TrustSystem injection
+        self._trust_sync_stop = threading.Event() # [NEW]
 
         if node_id_priv is not None:
             _auth_set_priv(node_id_priv)
@@ -859,6 +887,7 @@ class P2PManager:
             on_peer_bad=self._on_peer_bad,
             on_peer_good=self._on_peer_good,
             get_peers_callback=self._get_peers_for_pex,
+            trust_net=None, # injected later
         )
         self.server.node_uuid = self.node_uuid
 
@@ -869,6 +898,7 @@ class P2PManager:
 
     def set_trust(self, trust_net):
         self.trust_net = trust_net
+        self.server.trust_net = trust_net # [NEW] Injeta no server
         log.info("[P2P] TrustSystem conectado ao P2P com sucesso")
 
     def start(self) -> None:
@@ -876,8 +906,11 @@ class P2PManager:
         log.info(f"[P2P] iniciado node_id={self.node_uuid[:8]} modo={mode} chain={CHAIN_ID}")
         self.server.start()
         self.discovery.run()
+        # [NEW] Inicia a thread de sincronização de reputação
+        threading.Thread(target=self._sync_trust_loop, daemon=True, name="P2P-TrustSync").start()
 
     def stop(self) -> None:
+        self._trust_sync_stop.set()
         self.server.stop()
         self.discovery.stop()
         try: self._broadcast_pool.shutdown(wait=False, cancel_futures=True)
@@ -918,6 +951,28 @@ class P2PManager:
     def _get_peers_for_pex(self) -> list:
         try: return self.discovery.listar_peers_com_altura()[:MAX_PEERS_PER_PEX]
         except Exception: return []
+
+    def _sync_trust_loop(self) -> None:
+        """[NEW] Loop que pede os scores de reputação para os peers a cada 60s."""
+        while not self._trust_sync_stop.is_set():
+            if self._trust_sync_stop.wait(TRUST_SYNC_INTERVAL):
+                break
+            
+            if self.read_only or not self.trust_net:
+                continue
+                
+            peers = self.discovery.listar_peers()
+            for peer in peers:
+                if self._trust_sync_stop.is_set(): break
+                try:
+                    ip, port = peer.split(":")
+                    resp, _ = P2PClient.get_trust_scores(ip, int(port))
+                    if resp and resp.get("type") == "trust_scores":
+                        scores = resp.get("scores", {})
+                        if scores and hasattr(self.trust_net, "sync_scores_from_peer"):
+                            self.trust_net.sync_scores_from_peer(scores)
+                except Exception:
+                    continue
 
     def _on_peer_found(self, ip: str, port: int) -> None:
         _registrar_peer_no_db(self.bc, ip, port)
