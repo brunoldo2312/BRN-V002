@@ -1,15 +1,13 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.3.2 | Data: 23/10/2026
+Versão: 9.3.3 | Data: 24/10/2026
 ================================================================
+v9.3.3 (2026-10-24):
+  [NEW] Regra de Consenso dos Top 5 Validadores.
+        Quando a rede está descentralizada, valida se a pubkey do
+        minerador (extraída do coinbase) está no Top 5 da Trust Network.
 v9.3.2 (2026-10-23):
-  [SECURITY] Aumentado MAX_REORG_DEPTH para 2000 (segurança máxima).
-  [SECURITY] Aumentado MTP_WINDOW para 50 (proteção contra timestamp).
-v9.3.1 (2026-10-23):
-  [FIX] _maybe_sign_checkpoint converte string hex para Wallet antes
-        de assinar, resolvendo o erro 'str' object has no attribute 'sign'.
-v9.3.0 (2026-10-23):
-  [FIX CRÍTICO] Validação do auth_tag corrigida para permitir a criação
-                do Gênesis do zero (bloco 0) sem erro.
+  [SECURITY] Aumentado MAX_REORG_DEPTH para 2000.
+  [SECURITY] Aumentado MTP_WINDOW para 50.
 ================================================================
 """
 from __future__ import annotations
@@ -45,11 +43,11 @@ FORCE_DIFFICULTY    = os.environ.get("BRN_FORCE_DIFFICULTY", "").strip()
 
 MAX_TX_PER_BLOCK   = 500
 MIN_RELAY_FEE      = 1000
-MAX_REORG_DEPTH    = 2000  # [SEGURANÇA MÁXIMA] Permite reorgs profundos
+MAX_REORG_DEPTH    = 2000
 HASH_BATCH_SIZE    = 5000
 AUTH_TAG_START_HEIGHT = 6000
 CHECKPOINT_INTERVAL   = 1000
-MTP_WINDOW            = 50  # [SEGURANÇA] Maior janela de tempo para bloquear ataques de timestamp
+MTP_WINDOW            = 50
 FILA_MAX_MINERADORES  = 20
 
 GENESIS_PREV      = "0" * 64
@@ -126,7 +124,6 @@ def _maybe_sign_checkpoint(block) -> None:
             return
         from checkpoints import sign_checkpoint, save_checkpoints
         
-        # [FIX v9.3.1] Converte string hex para Wallet antes de assinar
         from wallet import Wallet
         priv = _checkpoint_priv
         if isinstance(priv, str):
@@ -619,6 +616,33 @@ class Blockchain:
         ok_cp, msg_cp = _verify_checkpoint_for_block(block)
         if not ok_cp:
             return False, msg_cp
+
+        # ============================================================
+        # [NOVO] REGRA DOS TOP 5 VALIDADORES (Descentralização)
+        # ============================================================
+        if getattr(self, "rede_descentralizada", False):
+            try:
+                from trust_system import trust_system
+                
+                # Extrai a pubkey do minerador de dentro do coinbase
+                miner_pubkey = ""
+                cb = block["transactions"][0]
+                if cb.get("outputs"):
+                    miner_pubkey = cb["outputs"][0].get("pubkey", "").strip()
+
+                if miner_pubkey:
+                    top_5 = trust_system.get_top_validators(count=5)
+                    
+                    # Se já temos 5 validadores definidos...
+                    if len(top_5) >= 5:
+                        if miner_pubkey not in top_5:
+                            return False, f"Bloco rejeitado: Minerador {miner_pubkey[:8]} nao esta no Top 5 de reputacao"
+                    else:
+                        # Se ainda não temos 5, permite para não travar a rede
+                        log.debug(f"[TRUST] Top 5 incompleto ({len(top_5)}/5). Aceitando bloco de {miner_pubkey[:8]}.")
+            except Exception as e:
+                log.warning(f"[Trust] Falha ao validar Top 5: {e}")
+        # ============================================================
 
         if block["height"] > 0 and self.require_auth_tag:
             if not self.network_secret:
