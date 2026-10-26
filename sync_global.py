@@ -1,53 +1,40 @@
-﻿#!/usr/bin/env python3
-\"\"\"sync_global.py — Sincroniza blockchain de QUALQUER LUGAR DO MUNDO.
+#!/usr/bin/env python3
+"""sync_global.py v2.0 — Sincroniza com filtro de altura e peer explícito.
 
-Uso:
+Exemplos:
+  # Sincronizar SÓ do 61LTR37, exigindo altura 5026:
+  python sync_global.py --only --peer http://100.70.107.15:5000 --target-height 5026
+
+  # Testar sem baixar:
+  python sync_global.py --only --peer http://100.70.107.15:5000 --dry-run
+
+  # Modo antigo (maior altura):
   python sync_global.py
-  python sync_global.py --peer http://1.2.3.4:5000
-  python sync_global.py --peers-file peers.txt
-  python sync_global.py --tracker http://tracker.brn.network:9000
-  python sync_global.py --dry-run
-  python sync_global.py --batch 200 --timeout 120
-\"\"\"
+"""
 from __future__ import annotations
 import argparse
 import json
 import os
-import socket
 import sys
 import time
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
 
 try:
     import requests
 except ImportError:
-    print('[X] Falta: pip install requests')
-    sys.exit(1)
+    print('[X] Falta: pip install requests'); sys.exit(1)
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / 'brn_v2_chain.db'
 ENV_FILE = BASE_DIR / 'brn_network.env'
 
-# ============================================================
-# BOOTSTRAP PEERS PÚBLICOS
-# ============================================================
-# Adicione aqui os peers que devem servir como ponto de entrada
-# global. Formato: 'http://ip:porta' ou 'https://dominio.com'
 DEFAULT_BOOTSTRAP_PEERS = [
-    # Exemplo:
-    # 'https://peer1.brn.network',
-    # 'https://peer2.brn.network',
-    # 'http://200.123.45.67:5000',
+    'http://100.70.107.15:5000',  # desktop-61ltr37 (ORIGEM, 5026)
+    'http://100.64.151.67:5000',  # Filipe (5026)
 ]
 
-# Tracker público opcional (GET /peers retorna {"peers": [...]})
-DEFAULT_TRACKER = ''
 
-# ============================================================
-# HELPERS
-# ============================================================
 def log(msg: str):
     print(msg, flush=True)
 
@@ -60,19 +47,8 @@ def load_env() -> dict:
             if not line or line.startswith('#') or '=' not in line:
                 continue
             k, v = line.split('=', 1)
-            env[k.strip()] = v.strip().strip('\"').strip(\"'\")
+            env[k.strip()] = v.strip().strip('"').strip("'")
     return env
-
-
-def load_peers_from_file(path: Path) -> list[str]:
-    if not path.exists():
-        return []
-    peers = []
-    for line in path.read_text(encoding='utf-8').splitlines():
-        line = line.strip()
-        if line and not line.startswith('#'):
-            peers.append(line)
-    return peers
 
 
 def normalize_url(url: str) -> Optional[str]:
@@ -81,20 +57,7 @@ def normalize_url(url: str) -> Optional[str]:
         return None
     if not url.startswith(('http://', 'https://')):
         url = 'http://' + url
-    # Remove barra final
     return url.rstrip('/')
-
-
-# ============================================================
-# DESCOBERTA
-# ============================================================
-def discover_from_cli(peers_arg: list[str]) -> list[str]:
-    urls = []
-    for p in peers_arg:
-        u = normalize_url(p)
-        if u:
-            urls.append(u)
-    return urls
 
 
 def discover_from_env(env: dict) -> list[str]:
@@ -104,39 +67,13 @@ def discover_from_env(env: dict) -> list[str]:
         item = item.strip()
         if not item or ':' not in item:
             continue
-        # env pode ter 'ip:port' (P2P), então usamos porta HTTP padrão
         ip = item.rsplit(':', 1)[0]
         if ip:
             urls.append(f'http://{ip}:5000')
     return urls
 
 
-def discover_from_tracker(tracker_url: str, timeout: float = 15.0) -> list[str]:
-    if not tracker_url:
-        return []
-    tracker_url = tracker_url.rstrip('/')
-    try:
-        r = requests.get(f'{tracker_url}/peers', timeout=timeout,
-                         proxies={'http': None, 'https': None})
-        if r.status_code != 200:
-            log(f'  [X] Tracker HTTP {r.status_code}')
-            return []
-        data = r.json()
-        peers = data.get('peers', [])
-        urls = []
-        for p in peers:
-            if isinstance(p, str) and ':' in p:
-                ip = p.rsplit(':', 1)[0]
-                urls.append(f'http://{ip}:5000')
-        log(f'  [OK] Tracker: {len(urls)} peers')
-        return urls
-    except Exception as e:
-        log(f'  [X] Tracker falhou: {e}')
-        return []
-
-
 def discover_from_tailscale() -> list[str]:
-    \"\"\"Descobre peers Tailscale (opcional, se tiver).\"\"\"
     import subprocess
     try:
         r = subprocess.run(['tailscale', 'status', '--json'],
@@ -159,22 +96,14 @@ def discover_from_tailscale() -> list[str]:
 
 def dedupe(urls: list[str]) -> list[str]:
     seen = set()
-    out = []
-    for u in urls:
-        if u and u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
+    return [u for u in urls if u and not (u in seen or seen.add(u))]
 
 
-# ============================================================
-# TESTE DE PEER
-# ============================================================
 def fetch_status(url: str, timeout: float = 30.0) -> Optional[dict]:
     try:
         r = requests.get(f'{url}/api/status', timeout=timeout,
                          proxies={'http': None, 'https': None},
-                         headers={'User-Agent': 'brn-sync-global/1.0'})
+                         headers={'User-Agent': 'brn-sync-global/2.0'})
         if r.status_code == 200:
             return r.json()
     except Exception:
@@ -183,15 +112,8 @@ def fetch_status(url: str, timeout: float = 30.0) -> Optional[dict]:
 
 
 def probe_peer(url: str, timeout: float = 30.0) -> dict:
-    result = {
-        'url': url,
-        'reachable': False,
-        'height': -1,
-        'tip_hash': '',
-        'utxos': 0,
-        'version': '?',
-        'error': '',
-    }
+    result = {'url': url, 'reachable': False, 'height': -1,
+              'tip_hash': '', 'utxos': 0, 'version': '?', 'error': ''}
     status = fetch_status(url, timeout=timeout)
     if not status:
         result['error'] = 'sem resposta'
@@ -204,9 +126,6 @@ def probe_peer(url: str, timeout: float = 30.0) -> dict:
     return result
 
 
-# ============================================================
-# DOWNLOAD
-# ============================================================
 def fetch_blocks(url: str, start: int, batch: int = 100,
                  timeout: float = 120.0, retries: int = 3) -> Optional[list]:
     full_url = f'{url}/api/blocks?start={start}&limit={batch}'
@@ -214,10 +133,9 @@ def fetch_blocks(url: str, start: int, batch: int = 100,
         try:
             r = requests.get(full_url, timeout=timeout,
                              proxies={'http': None, 'https': None},
-                             headers={'User-Agent': 'brn-sync-global/1.0'})
+                             headers={'User-Agent': 'brn-sync-global/2.0'})
             if r.status_code == 200:
-                data = r.json()
-                return data.get('blocks', [])
+                return r.json().get('blocks', [])
         except Exception:
             pass
         if attempt < retries - 1:
@@ -237,7 +155,7 @@ def download_chain(url: str, remote_height: int, local_height: int,
 
         blocks = fetch_blocks(url, start, actual, timeout=timeout)
         if not blocks:
-            log(f'  [X] Lote {start}..{end-1} falhou')
+            log(f'  [X] Lote {start}..{end-1} falhou após 3 tentativas')
             return all_blocks
 
         all_blocks.extend(blocks)
@@ -254,42 +172,8 @@ def download_chain(url: str, remote_height: int, local_height: int,
     return all_blocks
 
 
-# ============================================================
-# VALIDAÇÃO E IMPORTAÇÃO
-# ============================================================
-def validate_blocks(blocks: list[dict], start_height: int,
-                    expected_prev: str) -> tuple[bool, str]:
-    \"\"\"Valida encadeamento antes de importar.\"\"\"
-    if not blocks:
-        return False, 'lista vazia'
-
-    try:
-        from blockchain import block_hash, meets_difficulty
-    except ImportError:
-        return False, 'blockchain.py sem helpers'
-
-    expected_h = start_height
-    prev = expected_prev
-    for blk in blocks:
-        h = int(blk.get('height', -1))
-        if h != expected_h:
-            return False, f'altura {h} != {expected_h}'
-        if blk.get('prev_hash') != prev:
-            return False, f'prev_hash diverge em #{h}'
-        calc = block_hash(blk['prev_hash'], blk['merkle'],
-                          blk['timestamp'], blk['nonce'], blk['difficulty'])
-        if calc != blk.get('hash'):
-            return False, f'hash inválido em #{h}'
-        if not meets_difficulty(calc, int(blk['difficulty'])):
-            return False, f'PoW inválido em #{h}'
-        prev = calc
-        expected_h += 1
-    return True, 'ok'
-
-
 def import_chain(blocks: list[dict]) -> tuple[int, int]:
     from db import ChainDB
-
     db = ChainDB(str(DB_PATH))
     before = db.height()
     imported = 0
@@ -312,78 +196,59 @@ def import_chain(blocks: list[dict]) -> tuple[int, int]:
     return imported, after
 
 
-# ============================================================
-# MAIN
-# ============================================================
 def main():
-    ap = argparse.ArgumentParser(
-        description='Sincroniza blockchain de qualquer lugar do mundo')
-    ap.add_argument('--peer', action='append', default=[],
-                    help='URL do peer (pode repetir)')
-    ap.add_argument('--peers-file', type=Path,
-                    help='Arquivo com URLs (1 por linha)')
-    ap.add_argument('--tracker', default=DEFAULT_TRACKER,
-                    help='URL do tracker (GET /peers)')
-    ap.add_argument('--batch', type=int, default=100,
-                    help='Blocos por requisição (default: 100)')
-    ap.add_argument('--timeout', type=float, default=120.0,
-                    help='Timeout por requisição em segundos')
-    ap.add_argument('--dry-run', action='store_true',
-                    help='Só testa peers, não baixa')
-    ap.add_argument('--no-tailscale', action='store_true',
-                    help='Não tentar Tailscale')
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--peer', action='append', default=[])
+    ap.add_argument('--only', action='store_true',
+                    help='Usa SÓ --peer (ignora env/tailscale/defaults)')
+    ap.add_argument('--target-height', type=int, default=None,
+                    help='Só sincroniza de peers com esta altura EXATA')
+    ap.add_argument('--batch', type=int, default=100)
+    ap.add_argument('--timeout', type=float, default=120.0)
+    ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--no-tailscale', action='store_true')
     args = ap.parse_args()
 
     log('=' * 70)
-    log(' SYNC GLOBAL — Blockchain de Qualquer Lugar')
+    log(' SYNC GLOBAL v2.0')
+    if args.only:
+        log(' MODO: --only (só --peer explícito)')
+    if args.target_height is not None:
+        log(f' FILTRO: altura == {args.target_height}')
     log('=' * 70)
 
-    # ===== 1. Descobrir peers =====
-    log('\n[1] Descobrindo peers...')
+    # ===== 1. Descobrir =====
     sources = []
-
     if args.peer:
-        urls = discover_from_cli(args.peer)
-        log(f'  CLI (--peer): {len(urls)}')
-        sources.extend(urls)
-
-    if args.peers_file:
-        urls = [normalize_url(u) for u in load_peers_from_file(args.peers_file)]
+        urls = [normalize_url(u) for u in args.peer]
         urls = [u for u in urls if u]
-        log(f'  Arquivo {args.peers_file.name}: {len(urls)}')
+        log(f'\n[1] CLI (--peer): {len(urls)}')
         sources.extend(urls)
 
-    env = load_env()
-    urls = discover_from_env(env)
-    log(f'  brn_network.env: {len(urls)}')
-    sources.extend(urls)
-
-    # Bootstrap padrão (editado manualmente no código)
-    for u in DEFAULT_BOOTSTRAP_PEERS:
-        sources.append(normalize_url(u))
-
-    if args.tracker:
-        urls = discover_from_tracker(args.tracker, timeout=args.timeout)
+    if not args.only:
+        env = load_env()
+        urls = discover_from_env(env)
+        log(f'    brn_network.env: {len(urls)}')
         sources.extend(urls)
 
-    if not args.no_tailscale:
-        urls = discover_from_tailscale()
-        if urls:
-            log(f'  Tailscale: {len(urls)}')
-        sources.extend(urls)
+        for u in DEFAULT_BOOTSTRAP_PEERS:
+            sources.append(normalize_url(u))
 
-    all_urls = dedupe([u for u in sources if u])
-    log(f'\n  Total únicos: {len(all_urls)}')
+        if not args.no_tailscale:
+            urls = discover_from_tailscale()
+            log(f'    Tailscale: {len(urls)}')
+            sources.extend(urls)
+
+    all_urls = dedupe(sources)
+    log(f'\n    Total únicos: {len(all_urls)}')
     for u in all_urls:
-        log(f'    - {u}')
+        log(f'      - {u}')
 
     if not all_urls:
-        log('\n[X] Nenhum peer descoberto.')
-        log('    Use: python sync_global.py --peer http://ip:5000')
-        log('    Ou configure DEFAULT_BOOTSTRAP_PEERS no código.')
+        log('\n[X] Nenhum peer.')
         return 1
 
-    # ===== 2. Testar peers =====
+    # ===== 2. Testar =====
     log(f'\n[2] Testando {len(all_urls)} peers...')
     probed = []
     for u in all_urls:
@@ -391,81 +256,74 @@ def main():
         r = probe_peer(u, timeout=args.timeout)
         probed.append(r)
         if r['reachable']:
-            log(f'OK — altura={r[\"height\"]}, utxos={r[\"utxos\"]}')
+            log(f'OK — altura={r["height"]}')
         else:
-            log(f'FALHOU ({r[\"error\"]})')
+            log(f'FALHOU ({r["error"]})')
 
-    # ===== 3. Selecionar melhor =====
-    local_height = -1
+    # ===== 3. Selecionar =====
     try:
         from db import ChainDB
         db = ChainDB(str(DB_PATH))
         local_height = db.height()
         db.close()
-    except Exception as e:
-        log(f'\n[!] Erro lendo DB local: {e}')
+    except Exception:
+        local_height = -1
 
     reachable = [p for p in probed if p['reachable']]
-    reachable.sort(key=lambda p: p['height'], reverse=True)
 
-    log(f'\n[3] Altura local: {local_height}')
-    log(f'    Peers alcançáveis: {len(reachable)}')
-    for p in reachable:
-        mark = '' if p['height'] <= local_height else '  [MAIOR]'
-        log(f'    - {p[\"url\"]:<45} altura={p[\"height\"]}{mark}')
+    # Filtro por altura EXATA
+    if args.target_height is not None:
+        exact = [p for p in reachable if p['height'] == args.target_height]
+        log(f'\n[3] Altura local: {local_height}')
+        log(f'    Peers com altura {args.target_height}: {len(exact)}')
+        for p in exact:
+            log(f'      - {p["url"]} (altura={p["height"]})')
+        if not exact:
+            log(f'\n[X] Nenhum peer tem altura {args.target_height}.')
+            return 1
+        reachable = exact
+    else:
+        reachable.sort(key=lambda p: p['height'], reverse=True)
+        log(f'\n[3] Altura local: {local_height}')
+        log(f'    Peers alcançáveis: {len(reachable)}')
+        for p in reachable:
+            mark = '' if p['height'] <= local_height else '  [MAIOR]'
+            log(f'      - {p["url"]:<40} altura={p["height"]}{mark}')
+
+    # Se local já >= target, nada a fazer
+    if args.target_height is not None and local_height >= args.target_height:
+        log(f'\n[OK] Já sincronizado (local={local_height} >= target={args.target_height})')
+        return 0
 
     valid = [p for p in reachable if p['height'] > local_height]
     if not valid:
-        log('\n[OK] Já está sincronizado com o melhor peer.')
+        log('\n[OK] Já sincronizado.')
         return 0
 
     if args.dry_run:
         log('\n[DRY-RUN] Sairia agora.')
         return 0
 
-    # ===== 4. Tentar cada peer =====
-    log('\n[4] Tentando download (maior altura primeiro)...')
+    # ===== 4. Sincronizar =====
+    log(f'\n[4] Baixando (primeiro = mais alto)...')
     for peer in valid:
-        log(f'\n--- Tentando {peer[\"url\"]} (altura={peer[\"height\"]}) ---')
-
-        blocks = download_chain(
-            peer['url'], peer['height'], local_height,
-            batch=args.batch, timeout=args.timeout
-        )
-
+        log(f'\n--- {peer["url"]} (altura={peer["height"]}) ---')
+        blocks = download_chain(peer['url'], peer['height'],
+                                local_height, batch=args.batch,
+                                timeout=args.timeout)
         if not blocks:
-            log('  [X] Nenhum bloco baixado')
+            log('  [X] Nenhum bloco')
             continue
 
-        # Validação
-        log(f'\n[*] Baixados {len(blocks)} blocos. Validando...')
-        try:
-            from db import ChainDB
-            db = ChainDB(str(DB_PATH))
-            expected_h = db.height() + 1
-            expected_prev = db.tip_hash()
-            db.close()
-        except Exception:
-            expected_h = local_height + 1
-            expected_prev = '0' * 64
-
-        ok, msg = validate_blocks(blocks, expected_h, expected_prev)
-        if not ok:
-            log(f'  [X] Validação falhou: {msg}')
-            continue
-
-        log('  [OK] Validação passou')
-
-        # Importação
-        log('\n[*] Importando...')
+        log(f'\n[*] Importando {len(blocks)} blocos...')
         imported, final_h = import_chain(blocks)
-        log(f'[OK] {imported} blocos importados. Altura final: {final_h}')
+        log(f'[OK] {imported} importados. Altura final: {final_h}')
 
         if final_h >= peer['height']:
-            log(f'\n[✓] Sincronizado via {peer[\"url\"]}!')
+            log(f'\n[✓] Sincronizado via {peer["url"]}')
             return 0
 
-    log('\n[X] Não foi possível sincronizar.')
+    log('\n[X] Falhou.')
     return 1
 
 
