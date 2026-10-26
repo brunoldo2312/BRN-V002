@@ -1,11 +1,13 @@
 @echo off
 REM ============================================================
-REM   iniciar_cliente.bat - BRN Node CLIENTE (Windows) - v11.1
+REM   iniciar_cliente.bat - BRN Node CLIENTE (Windows) - v12.0
 REM ============================================================
-REM   v11.1:
-REM     [NEW] Bloco de criação de emergência do brn_network.env
-REM           atualizado com TODAS as variáveis do modelo correto,
-REM           incluindo o ADMIN_TOKEN e CORS.
+REM   v12.0:
+REM     [FIX] Removeu a leitura do .env no .bat. Agora o main.py
+REM           le direto do arquivo, evitando conflitos de variaveis.
+REM     [FIX] Todos os parenteses dentro de blocos IF foram
+REM           escapados, evitando o erro "foi inesperado neste momento".
+REM     [NEW] Cria o brn_network.env completo se ele nao existir.
 REM ============================================================
 
 setlocal EnableDelayedExpansion
@@ -28,7 +30,7 @@ goto parse_args
 :args_done
 
 echo ============================================================
-echo   BRN Node - CLIENTE (Windows) - v11.1
+echo   BRN Node - CLIENTE (Windows) - v12.0
 echo ============================================================
 echo.
 
@@ -36,7 +38,11 @@ set "PY="
 where python >nul 2>&1
 if not errorlevel 1 set "PY=python"
 if "%PY%"=="" ( where py >nul 2>&1 & set "PY=py -3" )
-if "%PY%"=="" ( echo [ERRO] Python nao encontrado. & pause & exit /b 1 )
+if "%PY%"=="" ( 
+    echo [ERRO] Python nao encontrado. 
+    pause 
+    exit /b 1 
+)
 set "PYTHONUNBUFFERED=1"
 
 REM ============================================================
@@ -45,19 +51,34 @@ REM ============================================================
 echo [*] Verificando dependencias do Python...
 
 %PY% -c "import waitress" >nul 2>&1
-if errorlevel 1 ( echo [!] Waitress ausente. Instalando... & %PY% -m pip install waitress --quiet ) else ( echo [ok] Waitress OK )
+if errorlevel 1 ( 
+    echo [!] Waitress ausente. Instalando... 
+    %PY% -m pip install waitress --quiet 
+) else ( echo [ok] Waitress OK )
 
 %PY% -c "import requests" >nul 2>&1
-if errorlevel 1 ( echo [!] Requests ausente. Instalando... & %PY% -m pip install requests --quiet ) else ( echo [ok] Requests OK )
+if errorlevel 1 ( 
+    echo [!] Requests ausente. Instalando... 
+    %PY% -m pip install requests --quiet 
+) else ( echo [ok] Requests OK )
 
 %PY% -c "import orjson" >nul 2>&1
-if errorlevel 1 ( echo [!] Orjson ausente. Instalando... & %PY% -m pip install orjson --quiet ) else ( echo [ok] Orjson OK )
+if errorlevel 1 ( 
+    echo [!] Orjson ausente. Instalando... 
+    %PY% -m pip install orjson --quiet 
+) else ( echo [ok] Orjson OK )
 
 %PY% -c "import flask, flask_cors" >nul 2>&1
-if errorlevel 1 ( echo [!] Flask ausente. Instalando... & %PY% -m pip install flask flask-cors --quiet ) else ( echo [ok] Flask OK )
+if errorlevel 1 ( 
+    echo [!] Flask ausente. Instalando... 
+    %PY% -m pip install flask flask-cors --quiet 
+) else ( echo [ok] Flask OK )
 
 %PY% -c "import webview" >nul 2>&1
-if errorlevel 1 ( echo [!] PyWebView ausente. Instalando... & %PY% -m pip install pywebview --quiet ) else ( echo [ok] PyWebView OK )
+if errorlevel 1 ( 
+    echo [!] PyWebView ausente. Instalando... 
+    %PY% -m pip install pywebview --quiet 
+) else ( echo [ok] PyWebView OK )
 echo.
 
 REM ============================================================
@@ -67,36 +88,36 @@ if not exist "brn_network.env" (
     echo [AVISO] brn_network.env nao existe - criando com o modelo CORRETO...
     (
         echo # ============================================================
-        echo # brn_network.env — Config do nó BRN (Máquina B - Windows Cliente)
+        echo # brn_network.env - Config do no BRN - Windows Cliente
         echo # ============================================================
         echo BRN_CORS_ORIGIN=*
         echo.
-        echo # 1) SEGREDOS COMPARTILHADOS (DEVEM SER IDÊNTICOS A MÁQUINA ORIGEM)
+        echo # 1 - SEGREDOS COMPARTILHADOS
         echo BRN_NETWORK_SECRET=9226edea8ba62bc1c6ae36883c0536c95b4c85642195465d6c4d9456abef20f9
         echo BRN_NODE_PASSWORD=senha-no-temp-123
         echo BRN_WALLET_SESSION_PASS=senha-forte-da-carteira-2026
         echo BRN_WEB_PASS=senha-temp-123
         echo.
-        echo # 2) ADMIN TOKEN
+        echo # 2 - ADMIN TOKEN
         echo BRN_ADMIN_TOKEN=c745d36d524ea92148d8139731ad663f929fbbe08fb7f9b2234f9109fe1d2b24
         echo.
-        echo # 3) DESCOBERTA DE PEERS
+        echo # 3 - DESCOBERTA DE PEERS
         echo BRN_BOOTSTRAP_PEERS=100.111.253.8:6001
         echo BRN_FALLBACK_PEERS=100.111.253.8:6001
         echo BRN_TRACKER=
         echo BRN_RENDEZVOUS_URL=
         echo.
-        echo # 4) MODO DE OPERAÇÃO
+        echo # 4 - MODO DE OPERACAO
         echo BRN_IS_ORIGIN=0
         echo BRN_POOL_ENABLED=1
         echo BRN_POOL_URL=http://100.111.253.8:5000
         echo.
-        echo # 5) CONSENSO
+        echo # 5 - CONSENSO
         echo BRN_SYNC_BATCH=50
         echo BRN_SYNC_BATCH_DELAY=0.06
         echo BRN_SYNC_INTERVAL=5
         echo.
-        echo # 6) P2P
+        echo # 6 - P2P
         echo BRN_P2P_PORT=6002
         echo BRN_P2P_AUTH=optional
         echo BRN_P2P_AUTH_WINDOW=30
@@ -105,12 +126,12 @@ if not exist "brn_network.env" (
         echo BRN_UPNP=0
         echo BRN_TCP_TIMEOUT=10.0
         echo.
-        echo # 7) MINERAÇÃO
+        echo # 7 - MINERACAO
         echo BRN_MINER_INTERVAL=30
         echo BRN_ALLOW_SOLO_MINING=0
         echo BRN_MIN_PEER_STABLE=1
         echo.
-        echo # 8) HTTP / API
+        echo # 8 - HTTP / API
         echo BRN_WEB_HOST=0.0.0.0
         echo BRN_WEB_PORT=5000
         echo BRN_EXPLORER_PORT=8080
@@ -120,35 +141,21 @@ if not exist "brn_network.env" (
         echo BRN_BEHIND_PROXY=0
         echo BRN_HTTPS=0
         echo.
-        echo # 9) AUDIT
+        echo # 9 - AUDIT
         echo BRN_AUDIT_ENABLED=1
         echo BRN_AUDIT_LOG=audit.log
         echo BRN_AUDIT_MAX_BYTES=52428800
         echo.
-        echo # 10) VERIFY
+        echo # 10 - VERIFY
         echo BRN_SKIP_VERIFY=0
         echo BRN_VERIFY_STRICT=0
         echo BRN_LOG_LEVEL=INFO
         echo.
-        echo # 14) PYTHON
+        echo # 14 - PYTHON
         echo PYTHONUNBUFFERED=1
     ) > brn_network.env
     echo [ok] brn_network.env criado com o modelo correto.
 )
-
-REM Carrega o .env para a memoria do .bat
-for /f "usebackq eol=# tokens=1,* delims==" %%A in ("brn_network.env") do (
-    set "K=%%A"
-    set "V=%%B"
-    if not "!K!"=="" (
-        if "!V:~0,1!"=="""" set "V=!V:~1!"
-        if "!V:~-1!"=="""" set "V=!V:~0,-1!"
-        for /f "tokens=* delims= " %%X in ("!K!") do set "K=%%X"
-        if not "!K!"=="" set "!K!=!V!"
-    )
-)
-
-set "BRN_IS_ORIGIN=0"
 
 REM ============================================================
 REM INSTALACAO AUTOMATICA DO TAILSCALE
@@ -174,12 +181,6 @@ if "%SKIP_TAILSCALE%"=="0" (
     
     echo [*] Executando descoberta global via Tailscale...
     %PY% brn_tailscale_setup.py --auto
-    
-    if errorlevel 1 (
-        echo [AVISO] Descoberta automatica falhou ou Tailscale offline.
-    ) else (
-        set "BRN_BOOTSTRAP_PEERS="
-    )
     echo.
 )
 
@@ -193,7 +194,11 @@ for %%F in (
     contracts\__init__.py contracts\vm.py contracts\escrow_btc_brn.py contracts\factory.py
 ) do ( if not exist "%%F" set "FALTA=!FALTA! %%F" )
 
-if not "%FALTA%"=="" ( echo [ERRO] Arquivos faltando:%FALTA% & pause & exit /b 1 )
+if not "%FALTA%"=="" ( 
+    echo [ERRO] Arquivos faltando:%FALTA% 
+    pause 
+    exit /b 1 
+)
 echo [ok] Arquivos essenciais OK
 
 > "brn_role.txt" echo client
