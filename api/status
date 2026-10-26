@@ -1,0 +1,9 @@
+# Dentro de @app.route("/api/status")
+return jsonify({
+    # ... campos existentes ...
+    "validators_active": (
+        len(_get_trust_network().get_top_validators(count=5))
+        if _get_trust_network() is not None
+        else 0
+    ),
+})
