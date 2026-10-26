@@ -1,17 +1,20 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.3.4 | Data: 26/10/2026
+Versão: 9.4.0 | Data: 26/10/2026
 ================================================================
-v9.3.4 (2026-10-26):
-  [FIX CRÍTICO] median_time_past agora usa try/except para evitar
-                sqlite3.InterfaceError em concorrência pesada.
-  [FIX] validate_block tolera falhas no MTP (não bloqueia o bloco).
-  [FIX] accept_block verifica se o bloco já existe antes de gravar,
-        evitando o erro UNIQUE constraint failed.
-v9.3.3 (2026-10-24):
-  [NEW] Regra de Consenso dos Top 5 Validadores.
-v9.3.2 (2026-10-23):
-  [SECURITY] Aumentado MAX_REORG_DEPTH para 2000.
-  [SECURITY] Aumentado MTP_WINDOW para 50.
+v9.4.0 (2026-10-26):
+  [NEW] REGRA MULTI-SIG DOS TOP VALIDADORES:
+        - Bloco precisa ter assinatura de TODOS os validadores ativos.
+        - 1 validador  → 1 assinatura
+        - 2 validadores → 2 assinaturas
+        - N validadores → N assinaturas
+        - Se faltar QUALQUER assinatura, o bloco é REJEITADO.
+  [FIX] Removido trust_system (não existia). Agora usa trust_network.
+  [NEW] chain.trust_net deve ser injetado pelo main.py (já é).
+  [NEW] chain.p2p deve ser injetado pelo main.py para coleta P2P.
+  [NEW] chain._sign_collector: callback opcional para coletar assinaturas.
+v9.3.4:
+  [FIX] median_time_past com try/except.
+  [FIX] accept_block verifica se bloco já existe antes de gravar.
 ================================================================
 """
 from __future__ import annotations
@@ -54,6 +57,10 @@ CHECKPOINT_INTERVAL   = 1000
 MTP_WINDOW            = 50
 FILA_MAX_MINERADORES  = 20
 
+# Multi-sig dos validadores
+MAX_VALIDATORS       = 5
+REQUIRE_ALL_SIGS     = True   # True = TODOS os validadores precisam assinar
+
 GENESIS_PREV      = "0" * 64
 GENESIS_TIMESTAMP = 1700000000
 GENESIS_REWARD    = INITIAL_REWARD
@@ -62,6 +69,7 @@ GENESIS_PUBKEY    = ""
 
 SIGNING_DOMAIN   = b"BRN-TX-v1|"
 AUTH_TAG_DOMAIN  = b"BRN-BLOCK-AUTH-v1|"
+BLOCK_SIG_DOMAIN = b"BRN-BLOCK-SIG-v1|"
 _CORE_V          = 1
 NETWORK_SECRET = os.environ.get("BRN_NETWORK_SECRET", "").strip()
 
@@ -127,12 +135,10 @@ def _maybe_sign_checkpoint(block) -> None:
         if h == 0 or h % CHECKPOINT_INTERVAL != 0:
             return
         from checkpoints import sign_checkpoint, save_checkpoints
-        
         from wallet import Wallet
         priv = _checkpoint_priv
         if isinstance(priv, str):
             priv = Wallet(private_key_hex=priv.strip())
-            
         cp = sign_checkpoint(h, block["hash"], priv)
         if not cp:
             return
@@ -143,6 +149,52 @@ def _maybe_sign_checkpoint(block) -> None:
         pass
 
 
+# ============================================================
+# [NEW v9.4.0] Assinatura de blocos (multi-sig)
+# ============================================================
+def signing_hash_block(block: dict) -> bytes:
+    """Mensagem assinada pelos validadores: domínio || hash do bloco."""
+    return BLOCK_SIG_DOMAIN + block["hash"].encode()
+
+
+def sign_block_as_validator(block: dict, priv) -> dict:
+    """
+    Assina o hash do bloco com a chave privada Ed25519 do validador.
+    Retorna {pubkey_hex, signature_hex} ou {} se falhar.
+    """
+    if priv is None:
+        return {}
+    try:
+        from wallet import Wallet
+        if not isinstance(priv, Wallet):
+            if isinstance(priv, str):
+                priv = Wallet(private_key_hex=priv.strip())
+            else:
+                return {}
+        h = signing_hash_block(block)
+        sig = priv.sign(h)
+        return {
+            "pubkey": priv.pub_hex,
+            "signature": sig,
+        }
+    except Exception as e:
+        log.debug(f"sign_block falhou: {e}")
+        return {}
+
+
+def verify_block_signature(pubkey_hex: str, block: dict, sig_hex: str) -> bool:
+    """Verifica a assinatura Ed25519 do hash do bloco."""
+    try:
+        from wallet import Wallet
+        h = signing_hash_block(block)
+        return Wallet.verify(h, sig_hex, pubkey_hex)
+    except Exception:
+        return False
+
+
+# ============================================================
+# AUTH TAG
+# ============================================================
 def compute_auth_tag(height: int, block_hash_hex: str, secret: str = None) -> str:
     sec = secret if secret is not None else NETWORK_SECRET
     if not sec:
@@ -158,6 +210,9 @@ def verify_auth_tag(height: int, block_hash_hex: str, tag: str, secret: str = No
     return hmac.compare_digest(expected, tag)
 
 
+# ============================================================
+# PoW / helpers
+# ============================================================
 def block_hash(prev_hash, merkle, timestamp, nonce, difficulty) -> str:
     header = f"{prev_hash}{merkle}{timestamp}{nonce}{difficulty}"
     return double_sha256(header.encode()).hex()
@@ -212,6 +267,9 @@ def signing_hash(tx: dict) -> bytes:
     return double_sha256(SIGNING_DOMAIN + _serialize_core(tx))
 
 
+# ============================================================
+# PoW search
+# ============================================================
 def _pow_search_py(prev_hash, merkle, ts, diff, nonce_start=0, should_continue=None, progress_cb=None):
     prefix = f"{prev_hash}{merkle}{ts}".encode()
     diff_bytes = str(diff).encode()
@@ -269,10 +327,25 @@ def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0, should_continue=None
     return _pow_search_py(prev_hash, merkle, ts, diff, nonce_start, should_continue, progress_cb)
 
 
+# ============================================================
+# Coinbase
+# ============================================================
 def make_coinbase(address: str, pubkey_hex: str, height: int, reward: int, fila_mineracao: dict = None) -> dict:
     if not pubkey_hex:
         raise ValueError("make_coinbase: pubkey_hex é obrigatória")
-    outputs = [{"address": address, "amount": int(reward), "pubkey": pubkey_hex}]
+    outputs = []
+    if fila_mineracao and len(fila_mineracao) > 0:
+        valor_validador = int(reward * 0.5)
+        valor_restante = reward - valor_validador
+        valor_por_cliente = valor_restante // len(fila_mineracao)
+        outputs.append({"address": address, "amount": valor_validador, "pubkey": pubkey_hex})
+        for cliente_addr, cliente_pub in fila_mineracao.items():
+            outputs.append({"address": cliente_addr, "amount": valor_por_cliente, "pubkey": cliente_pub})
+        total_pago = sum(o["amount"] for o in outputs)
+        if total_pago < reward:
+            outputs[0]["amount"] += (reward - total_pago)
+    else:
+        outputs.append({"address": address, "amount": int(reward), "pubkey": pubkey_hex})
     cb = {"txid": "", "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}], "outputs": outputs, "timestamp": int(time.time()), "locktime": 0, "height": int(height), "nonce": 0}
     cb["txid"] = txid(cb)
     return cb
@@ -288,7 +361,7 @@ def build_genesis() -> dict:
         if h.startswith("0"):
             break
         nonce += 1
-    g = {"height": 0, "hash": h, "prev_hash": GENESIS_PREV, "timestamp": GENESIS_TIMESTAMP, "nonce": nonce, "merkle": merkle, "difficulty": 1, "transactions": [cb], "cumulative_work": work_from_difficulty(1)}
+    g = {"height": 0, "hash": h, "prev_hash": GENESIS_PREV, "timestamp": GENESIS_TIMESTAMP, "nonce": nonce, "merkle": merkle, "difficulty": 1, "transactions": [cb], "cumulative_work": work_from_difficulty(1), "validators_sig": []}
     tag = compute_auth_tag(0, h)
     if tag:
         g["auth_tag"] = tag
@@ -298,6 +371,9 @@ def build_genesis() -> dict:
 GENESIS_BLOCK = build_genesis()
 
 
+# ============================================================
+# Blockchain
+# ============================================================
 class Blockchain:
     def __init__(self, db_path="brn_v2_chain.db", genesis_address=None, genesis_pubkey=None, auto_genesis=True, network_secret=None, require_auth_tag=None):
         self.db = ChainDB(db_path)
@@ -306,6 +382,12 @@ class Blockchain:
         self.require_auth_tag = bool(self.network_secret) if require_auth_tag is None else bool(require_auth_tag)
         self.on_block_mined = None
         self._fork_signal = None
+
+        # [NEW v9.4.0] Injetados pelo main.py
+        self.trust_net = None
+        self.p2p = None
+        self._sign_collector = None
+        self._local_validator_sk = None
 
         fila_salva = self.db.get_meta("fila_mineracao")
         self.fila_mineracao = json.loads(fila_salva) if fila_salva else {}
@@ -323,6 +405,23 @@ class Blockchain:
             self.db.apply_tx(g["transactions"][0], 0, coinbase=True)
             self.db.set_meta("genesis_hash", g["hash"])
 
+    # ---- setters (main.py injeta) ----
+    def set_trust_net(self, trust):
+        self.trust_net = trust
+        log.info(f"[Blockchain] trust_net injetado ({len(getattr(trust, 'nodes', {}))} nós)")
+
+    def set_p2p(self, p2p):
+        self.p2p = p2p
+
+    def set_local_validator_sk(self, sk):
+        """sk é um Wallet() ou hex."""
+        self._local_validator_sk = sk
+
+    def set_sign_collector(self, cb):
+        """cb(block) -> list[{pubkey, signature}]"""
+        self._sign_collector = cb
+
+    # ---- fila de mineradores (bootstrap) ----
     def adicionar_na_fila(self, address: str, pubkey: str) -> None:
         if self.rede_descentralizada:
             return
@@ -336,9 +435,7 @@ class Blockchain:
         if len(self.fila_mineracao) >= FILA_MAX_MINERADORES:
             self.rede_descentralizada = True
             self.db.set_meta("rede_descentralizada", "1")
-            print("\n[BOOTSTRAP] ==========================================")
-            print("[BOOTSTRAP] 20 MINERADORES ATINGIDOS! REDE DESCENTRALIZADA.")
-            print("[BOOTSTRAP] ==========================================\n")
+            print("\n[BOOTSTRAP] 20 MINERADORES ATINGIDOS! REDE DESCENTRALIZADA.\n")
 
     @staticmethod
     def _genesis_with_address(address: str, pubkey_hex: str = "") -> dict:
@@ -351,7 +448,7 @@ class Blockchain:
             if h.startswith("0"):
                 break
             nonce += 1
-        g = {"height": 0, "hash": h, "prev_hash": GENESIS_PREV, "timestamp": GENESIS_TIMESTAMP, "nonce": nonce, "merkle": merkle, "difficulty": 1, "transactions": [cb], "cumulative_work": work_from_difficulty(1)}
+        g = {"height": 0, "hash": h, "prev_hash": GENESIS_PREV, "timestamp": GENESIS_TIMESTAMP, "nonce": nonce, "merkle": merkle, "difficulty": 1, "transactions": [cb], "cumulative_work": work_from_difficulty(1), "validators_sig": []}
         tag = compute_auth_tag(0, h)
         if tag:
             g["auth_tag"] = tag
@@ -363,6 +460,7 @@ class Blockchain:
             if self.require_auth_tag is False:
                 self.require_auth_tag = bool(self.network_secret)
 
+    # ---- consenso ----
     def current_reward(self, height: int) -> int:
         halvings = height // HALVING_INTERVAL
         if halvings >= 64:
@@ -443,6 +541,7 @@ class Blockchain:
                 in_sum += u["amount"]
         return in_sum - sum(o["amount"] for o in tx["outputs"])
 
+    # ---- contratos ----
     def _validate_contract_tx(self, tx: dict) -> tuple:
         tx_data = tx.get("data") or {}
         t = tx_data.get("type")
@@ -502,6 +601,7 @@ class Blockchain:
             return r
         raise ValueError(f"tipo de contrato desconhecido: {t}")
 
+    # ---- validação de transação ----
     def validate_tx(self, tx: dict, from_mempool: bool = False) -> tuple:
         from wallet import Wallet
         if not tx.get("inputs") or not tx.get("outputs"):
@@ -583,7 +683,6 @@ class Blockchain:
         return True, tx["txid"]
 
     def median_time_past(self, height: int) -> int:
-        """[FIX v9.3.4] Protegido contra sqlite3.InterfaceError em concorrência."""
         timestamps = []
         for i in range(max(0, height - MTP_WINDOW), height):
             try:
@@ -596,6 +695,74 @@ class Blockchain:
             return 0
         timestamps.sort()
         return timestamps[len(timestamps) // 2]
+
+    # ============================================================
+    # [NEW v9.4.0] VALIDAÇÃO MULTI-SIG DOS TOP VALIDADORES
+    # ============================================================
+    def _get_active_validators(self) -> list:
+        """
+        Retorna lista de pubkeys dos validadores ativos.
+        1. Tenta trust_net.get_top_validators(count=5)
+        2. Se vazio, cai no fallback (fila ou genesis)
+        """
+        trust = self.trust_net
+        if trust is not None:
+            try:
+                top = trust.get_top_validators(count=MAX_VALIDATORS)
+                if top:
+                    return list(top)
+            except Exception as e:
+                log.warning(f"[VALIDATORS] get_top_validators falhou: {e}")
+        # Fallback: se ninguém no trust_net, usa a fila (bootstrap)
+        if self.fila_mineracao:
+            return list(self.fila_mineracao.values())
+        # Sem ninguém: aceita qualquer (modo bootstrap puro)
+        return []
+
+    def _validate_validators_sig(self, block: dict) -> tuple:
+        """
+        Verifica a regra multi-sig dos top validadores:
+          - Se N validadores ativos, bloco precisa de N assinaturas.
+          - Se N=0, aceita (bootstrap).
+        """
+        validators = self._get_active_validators()
+        if not validators:
+            return True, ""
+
+        required = len(validators)
+        sigs = block.get("validators_sig", [])
+        if not isinstance(sigs, list):
+            return False, "validators_sig inválido"
+
+        valid_pubkeys = set()
+        for entry in sigs:
+            if not isinstance(entry, dict):
+                continue
+            pubkey = (entry.get("pubkey") or "").strip()
+            signature = (entry.get("signature") or "").strip()
+            if not pubkey or not signature:
+                continue
+            if pubkey not in validators:
+                continue
+            if pubkey in valid_pubkeys:
+                continue  # duplicado
+            if verify_block_signature(pubkey, block, signature):
+                valid_pubkeys.add(pubkey)
+
+        got = len(valid_pubkeys)
+        if REQUIRE_ALL_SIGS:
+            if got < required:
+                missing = [p[:12] + "…" for p in validators if p not in valid_pubkeys]
+                return False, (
+                    f"Bloco #{block['height']} precisa de {required} assinaturas, "
+                    f"tem {got}. Faltam: {', '.join(missing[:3])}"
+                )
+            return True, ""
+        else:
+            need = (required // 2) + 1  # maioria
+            if got < need:
+                return False, f"precisa de {need}/{required} assinaturas, tem {got}"
+            return True, ""
 
     def validate_block(self, block: dict, prev_block=None) -> tuple:
         if block["height"] == 0 and prev_block is None:
@@ -624,37 +791,17 @@ class Blockchain:
         calc_merkle = compute_merkle_root([t["txid"] for t in block["transactions"]])
         if calc_merkle != block["merkle"]:
             return False, "merkle incorreto"
+
         ok_cp, msg_cp = _verify_checkpoint_for_block(block)
         if not ok_cp:
             return False, msg_cp
 
-        # ============================================================
-        # [NOVO] REGRA DOS TOP 5 VALIDADORES (Descentralização)
-        # ============================================================
-        if getattr(self, "rede_descentralizada", False):
-            try:
-                from trust_system import trust_system
-                
-                # Extrai a pubkey do minerador de dentro do coinbase
-                miner_pubkey = ""
-                cb = block["transactions"][0]
-                if cb.get("outputs"):
-                    miner_pubkey = cb["outputs"][0].get("pubkey", "").strip()
+        # ---- Multi-sig dos validadores ----
+        ok_sig, msg_sig = self._validate_validators_sig(block)
+        if not ok_sig:
+            return False, msg_sig
 
-                if miner_pubkey:
-                    top_5 = trust_system.get_top_validators(count=5)
-                    
-                    # Se já temos 5 validadores definidos...
-                    if len(top_5) >= 5:
-                        if miner_pubkey not in top_5:
-                            return False, f"Bloco rejeitado: Minerador {miner_pubkey[:8]} nao esta no Top 5 de reputacao"
-                    else:
-                        # Se ainda não temos 5, permite para não travar a rede
-                        log.debug(f"[TRUST] Top 5 incompleto ({len(top_5)}/5). Aceitando bloco de {miner_pubkey[:8]}.")
-            except Exception as e:
-                log.warning(f"[Trust] Falha ao validar Top 5: {e}")
-        # ============================================================
-
+        # ---- Auth tag ----
         if block["height"] > 0 and self.require_auth_tag:
             if not self.network_secret:
                 return False, "no exige auth_tag mas sem BRN_NETWORK_SECRET"
@@ -670,6 +817,7 @@ class Blockchain:
                     if not verify_auth_tag(block["height"], block["hash"], tag, self.network_secret):
                         return False, "auth_tag invalido em bloco legado"
 
+        # ---- Coinbase e txs ----
         cb = block["transactions"][0]
         if cb["inputs"][0]["txid"] != "0" * 64:
             return False, "primeira tx nao e coinbase"
@@ -702,7 +850,6 @@ class Blockchain:
         if not ok:
             return False, msg
 
-        # [FIX v9.3.4] Verifica se o bloco já existe antes de tentar gravar
         try:
             existing = self.db.get_block(block["height"])
             if existing:
@@ -745,6 +892,43 @@ class Blockchain:
         except Exception as e:
             print(f"[on_block_mined] callback falhou: {e}")
 
+    # ============================================================
+    # [NEW v9.4.0] COLETA DE ASSINATURAS
+    # ============================================================
+    def _collect_signatures(self, block: dict) -> list:
+        """
+        Coleta assinaturas dos validadores ativos para o bloco.
+        Retorna lista de {pubkey, signature}.
+        """
+        validators = self._get_active_validators()
+        if not validators:
+            return []  # bootstrap: sem validação
+
+        sigs = []
+        seen = set()
+
+        # 1) Assinatura local (se o nó é validador)
+        local_sk = self._local_validator_sk
+        if local_sk is not None:
+            entry = sign_block_as_validator(block, local_sk)
+            if entry and entry.get("pubkey") in validators:
+                sigs.append(entry)
+                seen.add(entry["pubkey"])
+
+        # 2) Coletor externo (P2P)
+        if self._sign_collector is not None:
+            try:
+                extra = self._sign_collector(block)
+                for entry in extra or []:
+                    pk = (entry or {}).get("pubkey", "")
+                    if pk and pk in validators and pk not in seen:
+                        sigs.append(entry)
+                        seen.add(pk)
+            except Exception as e:
+                log.warning(f"[SIG] _sign_collector falhou: {e}")
+
+        return sigs
+
     def mine_block(self, miner_address: str, miner_pubkey: str) -> dict:
         if not miner_pubkey:
             raise ValueError("mine_block: miner_pubkey é obrigatória")
@@ -756,7 +940,12 @@ class Blockchain:
         height = self.db.height() + 1
         reward = self.current_reward(height)
         diff = self.current_difficulty()
-        cb = make_coinbase(miner_address, miner_pubkey, height, reward)
+
+        fila_para_pagar = None
+        if (not self.rede_descentralizada and len(self.fila_mineracao) > 0):
+            fila_para_pagar = self.fila_mineracao
+        cb = make_coinbase(miner_address, miner_pubkey, height, reward, fila_mineracao=fila_para_pagar)
+
         candidatas = self.db.all_mempool(limit=MAX_TX_PER_BLOCK - 1)
         selected = []
         gastos_neste_bloco = set()
@@ -785,19 +974,47 @@ class Blockchain:
         nonce, h_hex, _ = _pow_search(prev_hash, merkle, ts, diff, should_continue=should_continue, progress_cb=progress_cb)
         if nonce is None:
             return None
-        block = {"height": height, "hash": h_hex, "prev_hash": prev_hash, "timestamp": ts, "nonce": nonce, "merkle": merkle, "difficulty": diff, "transactions": txs}
+
+        block = {
+            "height": height, "hash": h_hex, "prev_hash": prev_hash,
+            "timestamp": ts, "nonce": nonce, "merkle": merkle,
+            "difficulty": diff, "transactions": txs,
+            "validators_sig": [],
+        }
         self._attach_auth_tag(block)
-        ok, _msg = self.accept_block(block)
+
+        # ---- Coleta de assinaturas dos validadores ----
+        sigs = self._collect_signatures(block)
+        block["validators_sig"] = sigs
+
+        # ---- Valida multi-sig antes de aceitar ----
+        ok_sig, msg_sig = self._validate_validators_sig(block)
+        if not ok_sig:
+            log.warning(f"[MINER] bloco #{height} REJEITADO (multi-sig): {msg_sig}")
+            return None
+
+        ok, msg = self.accept_block(block)
         if ok:
             self._fire_block_mined(block)
             return block
-        log.warning(f"[MINER] bloco #{block.get('height')} minerado mas REJEITADO: {_msg}")
+        log.warning(f"[MINER] bloco #{height} minerado mas REJEITADO: {msg}")
         return None
 
     def state_snapshot(self) -> dict:
-        return {"height": self.get_latest_height(), "tip_hash": self.db.tip_hash(), "difficulty": self.current_difficulty(), "cumulative_work": self.cumulative_work(), "mempool": self.db.mempool_count(), "checkpoints": len(_checkpoints), "rede_descentralizada": self.rede_descentralizada, "fila_tamanho": len(self.fila_mineracao)}
+        return {
+            "height": self.get_latest_height(),
+            "tip_hash": self.db.tip_hash(),
+            "difficulty": self.current_difficulty(),
+            "cumulative_work": self.cumulative_work(),
+            "mempool": self.db.mempool_count(),
+            "checkpoints": len(_checkpoints),
+            "rede_descentralizada": self.rede_descentralizada,
+            "fila_tamanho": len(self.fila_mineracao),
+            "validators_active": len(self._get_active_validators()),
+        }
 
 
+# ---- reorg / chain_validator (como antes) ----
 try:
     from reorg import reorg_to as _reorg_to, find_fork_point as _find_fork
     def _reorg_to_method(self, new_blocks, max_depth=MAX_REORG_DEPTH, allow_genesis_reorg=False):
