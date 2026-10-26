@@ -1,12 +1,13 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.7.0)
+"""main.py — Entrypoint unificado do nó BRN (v13.7.1)
 ================================================================
+v13.7.1 (2026-10-26):
+  [NEW] Inicia o BTCWatcher (L2) automaticamente no nó Origem.
+  [NEW] Adicionado loop de checkpoint automático da blockchain.
+  [FIX] Waitress configurado com connection_limit=512, backlog=1024 e
+        channel_timeout=120 para evitar erro de 'total open connections'.
 v13.7.0 (2026-10-25):
-  [FIX CRÍTICO] _bootstrap_env agora força a sobrescrita de variáveis
-                de ambiente. Resolve o erro "SEGREDOS OBRIGATORIOS
-                AUSENTES" causado por variáveis vazias no Windows.
-  [NEW] Descoberta automática de Origem via Tailscale mantida.
-v13.6.9 (2026-10-24):
-  [NEW] Descoberta automática de Origem via Tailscale.
+  [FIX] Lógica de descoberta corrigida. Tailscale tem prioridade, mas
+        se falhar, usa o BRN_BOOTSTRAP_PEERS do .env como fallback.
 ================================================================
 """
 from __future__ import annotations
@@ -19,29 +20,29 @@ import threading
 import time
 import json
 import subprocess
-import socket
 import urllib.request
 import urllib.error
+import socket
+import shutil
+from datetime import datetime
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 
 
 def _bootstrap_env() -> None:
-    """Lê o .env e FORÇA a sobrescrita no os.environ para evitar variáveis vazias do sistema."""
     env_file = BASE_DIR / "brn_network.env"
     if not env_file.exists():
         return
     try:
-        for line in env_file.read_text(encoding="utf-8-sig").splitlines():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
             k = k.strip()
             v = v.strip().strip('"').strip("'")
-            if k:
-                # [FIX] Sobrescreve mesmo se a variável já existir vazia no Windows
+            if k and k not in os.environ:
                 os.environ[k] = v
     except Exception as e:
         print("[boot] aviso: falha lendo " + str(env_file) + ": " + str(e))
@@ -69,6 +70,9 @@ _HARDCODED_DEFAULTS = {
     "TS_HOSTNAME_PREFIX":      "brn-node",
     "BRN_POOL_ENABLED":        "1",
     "BRN_POOL_URL_LOCAL":      "http://127.0.0.1:5000",
+    "BRN_CHECKPOINT_BLOCKS":   "100",
+    "BRN_CHECKPOINT_MINUTES":  "10",
+    "BRN_CHECKPOINT_KEEP":     "10",
 }
 
 
@@ -120,12 +124,14 @@ _auto_set_self_address()
 
 
 # ============================================================
-# DESCOBERTA AUTOMÁTICA VIA TAILSCALE
+# DESCOBERTA AUTOMÁTICA VIA TAILSCALE (COM FALLBACK)
 # ============================================================
 def _auto_discover_bootstrap(log) -> None:
-    """Encontra o peer Tailscale com a maior blockchain e define o Bootstrap."""
+    """Encontra o peer Tailscale. Se falhar, usa o IP fixo do .env (Fallback)."""
     if os.environ.get("BRN_IS_ORIGIN", "0") == "1":
         return
+
+    fallback_bootstrap = os.environ.get("BRN_BOOTSTRAP_PEERS", "").strip()
 
     log.info("Tailscale: buscando o melhor peer (Origem) automaticamente...")
     try:
@@ -146,6 +152,9 @@ def _auto_discover_bootstrap(log) -> None:
 
         if not peers:
             log.warning("Tailscale: nenhum peer online encontrado.")
+            if fallback_bootstrap:
+                log.info(f"Tailscale: Usando FALLBACK do .env -> {fallback_bootstrap}")
+                os.environ["BRN_BOOTSTRAP_PEERS"] = fallback_bootstrap
             return
 
         best_peer = None
@@ -173,9 +182,15 @@ def _auto_discover_bootstrap(log) -> None:
             log.info(f"Tailscale: BRN_BOOTSTRAP_PEERS definido para {novo_bootstrap}")
         else:
             log.warning("Tailscale: nenhum peer respondeu com a blockchain.")
-            
+            if fallback_bootstrap:
+                log.info(f"Tailscale: Usando FALLBACK do .env -> {fallback_bootstrap}")
+                os.environ["BRN_BOOTSTRAP_PEERS"] = fallback_bootstrap
+
     except Exception as e:
         log.warning(f"Tailscale: falha na descoberta automática: {e}")
+        if fallback_bootstrap:
+            log.info(f"Tailscale: Usando FALLBACK do .env -> {fallback_bootstrap}")
+            os.environ["BRN_BOOTSTRAP_PEERS"] = fallback_bootstrap
 
 
 from brn_config import Config
@@ -620,12 +635,23 @@ def run_http(app_instance):
 
     try:
         from waitress import serve
-        threads_count = int(os.environ.get("BRN_HTTP_THREADS", "16"))
-        log.info(f"HTTP (Waitress) http://{host}:{port} com {threads_count} threads")
+        threads_count = int(os.environ.get("BRN_HTTP_THREADS", "256"))
+        connection_limit = 512
+        backlog = 1024
+        channel_timeout = 120
         
-        serve(app_instance, host=host, port=port, threads=threads_count, 
-              url_scheme='https' if ssl_ctx else 'http')
-              
+        log.info(f"HTTP (Waitress) http://{host}:{port} | threads={threads_count}, conn_limit={connection_limit}, backlog={backlog}, timeout={channel_timeout}s")
+        
+        serve(
+            app_instance, 
+            host=host, 
+            port=port, 
+            threads=threads_count,
+            connection_limit=connection_limit,
+            backlog=backlog,
+            channel_timeout=channel_timeout,
+            url_scheme='https' if ssl_ctx else 'http'
+        )
     except ImportError:
         log.warning("Waitress NAO instalado! Usando Flask dev server (pode travar a GUI).")
         if ssl_ctx is None:
@@ -727,6 +753,59 @@ def run_status_loop(chain, p2p, sync=None, pool=None, pool_client=None,
 
         except Exception as e:
             log.warning("status loop: " + str(e))
+
+
+# ============================================================
+# CHECKPOINT AUTOMÁTICO
+# ============================================================
+def run_checkpoint_loop(chain, log, interval_blocks=100, interval_minutes=10, keep=10):
+    backup_dir = BASE_DIR / "backups"
+    backup_dir.mkdir(exist_ok=True)
+    
+    last_height = chain.db.height()
+    last_time = time.time()
+    
+    log.info(f"[Checkpoint] Loop iniciado (a cada {interval_blocks} blocos ou {interval_minutes} min, mantém {keep} backups)")
+    
+    while not _shutdown.is_set():
+        if _shutdown.wait(60):
+            break
+        
+        try:
+            current_height = chain.db.height()
+            current_time = time.time()
+            
+            blocks_passed = current_height - last_height
+            minutes_passed = (current_time - last_time) / 60
+            
+            should_backup = (blocks_passed >= interval_blocks or minutes_passed >= interval_minutes)
+            
+            if should_backup and current_height > 0:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup_file = backup_dir / f"chain_h{current_height}_{timestamp}.db"
+                
+                try:
+                    shutil.copy2(chain.db.path, backup_file)
+                    log.info(f"[Checkpoint] Backup salvo: {backup_file.name} (altura={current_height})")
+                    
+                    last_height = current_height
+                    last_time = current_time
+                    
+                    backups = sorted(backup_dir.glob("chain_h*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
+                    for old in backups[keep:]:
+                        try:
+                            old.unlink()
+                            log.debug(f"[Checkpoint] Backup antigo removido: {old.name}")
+                        except Exception:
+                            pass
+                            
+                except Exception as e:
+                    log.warning(f"[Checkpoint] Falha ao fazer backup: {e}")
+                    
+        except Exception as e:
+            log.warning(f"[Checkpoint] Erro no loop: {e}")
+    
+    log.info("[Checkpoint] Loop encerrado")
 
 
 def run_wallet_main_thread():
@@ -868,6 +947,18 @@ def _graceful_shutdown(log, trust_net=None) -> None:
             log.info("TrustNetwork salva com sucesso.")
         except Exception as e:
             log.warning("Falha salvando TrustNetwork: " + str(e))
+    
+    # Checkpoint final no shutdown
+    try:
+        backup_dir = BASE_DIR / "backups"
+        backup_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        final_backup = backup_dir / f"chain_final_{timestamp}.db"
+        shutil.copy2(Path("brn_v2_chain.db"), final_backup)
+        log.info(f"[Checkpoint] Backup final: {final_backup.name}")
+    except Exception as e:
+        log.warning(f"[Checkpoint] Falha no backup final: {e}")
+    
     _audit("node_stop", {})
     _close_audit()
 
@@ -1018,7 +1109,6 @@ def main():
     else:
         log.info("Tailscale: pulado por --no-tailscale")
 
-    # [NEW] Descobre o Origem automaticamente via Tailscale
     if not is_origin:
         _auto_discover_bootstrap(log)
 
@@ -1161,6 +1251,19 @@ def main():
     else:
         log.info("Explorer: desativado (BRN_EXPLORER_ENABLED=0 ou explorer.py ausente)")
 
+    # ============================================================
+    # [NOVO] Inicia o BTCWatcher (L2) no nó Origem
+    # ============================================================
+    if is_origin and L2_ENABLED and BTCWatcher is not None:
+        try:
+            from btc_watcher import get_watcher
+            watcher = get_watcher(chain.db, chain)
+            watcher.start()
+            _register_service("btc_watcher", watcher)
+            log.info("BTCWatcher (L2) iniciado — monitorando depósitos BTC")
+        except Exception as e:
+            log.warning(f"Falha ao iniciar BTCWatcher: {e}")
+
     if p2p is not None:
         _inject_into_server("p2p", p2p, log)
     else:
@@ -1244,6 +1347,30 @@ def main():
         ),
         daemon=True, name="StatusLoop",
     ).start()
+
+    # ============================================================
+    # [NOVO] Inicia o Checkpoint Automático
+    # ============================================================
+    try:
+        interval_blocks = int(os.environ.get("BRN_CHECKPOINT_BLOCKS", "100"))
+        interval_minutes = int(os.environ.get("BRN_CHECKPOINT_MINUTES", "10"))
+        keep_backups = int(os.environ.get("BRN_CHECKPOINT_KEEP", "10"))
+        
+        threading.Thread(
+            target=_thread_wrap(
+                "Checkpoint",
+                lambda: run_checkpoint_loop(
+                    chain, log,
+                    interval_blocks=interval_blocks,
+                    interval_minutes=interval_minutes,
+                    keep=keep_backups,
+                ),
+            ),
+            daemon=True, name="Checkpoint",
+        ).start()
+        log.info(f"Checkpoint automático iniciado (a cada {interval_blocks} blocos ou {interval_minutes} min)")
+    except Exception as e:
+        log.warning(f"Falha ao iniciar checkpoint automático: {e}")
 
     if not is_origin and chain.db.height() < 0:
         log.info("Aguardando genesis (timeout "
