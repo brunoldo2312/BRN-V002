@@ -1,18 +1,22 @@
-"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.8.2)
+"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.9.0)
 ================================================================
+v3.9.0 (2026-10-26):
+  [NEW] Suporte a multi-sig dos Top 5 validadores (blockchain v9.4.0):
+        - consensus_validators() — lista os validadores ativos
+        - get_multi_sig_status() — quantas assinaturas são necessárias
+        - block_signatures(height) — assinaturas de um bloco específico
+        - mining_status() agora inclui validators_active e sigs_required
+  [FIX] _resolve_pool_url() restaura uso de BRN_POOL_URL:
+        - Se BRN_POOL_URL definido → usa ele (nós CLIENTE)
+        - Senão → usa API_BASE (nós ORIGEM com PoolManager local)
+        Isso corrige falha em clientes quando server.py não tem Pool Proxy.
+  [FIX] get_debug_info() inclui consensus info
 v3.8.2 (2026-10-23):
-  [NEW] Adicionado get_trust_stats() e get_trust_nodes() para a GUI.
-  [FIX] _resolve_pool_url() agora aponta para o próprio nó local
-        (API_BASE), aproveitando o Proxy do server.py v9.9.14 para
-        redirecionar os pedidos ao Origem (Ubuntu) de forma segura.
-v3.8.1 (2026-10-22):
-  [FIX CRÍTICO] sync_info() ainda ignorava {"error": ...} retornado
-                por _get() em falha de rede. Retornava cru o dict com
-                "error" (EN), que não casava com o check `"erro" in r`
-                do self-test. Agora traduz "error" -> "erro" primeiro.
-  [FIX] has_wallet() respeita secure_store.CURRENT_WALLET_ENC.
-  [FIX] create_and_unlock() exige senha com 8+ chars.
-  [FIX] pool_stop_mining() limpa _POOL_CLIENT após sucesso.
+  [NEW] get_trust_stats() e get_trust_nodes()
+  [FIX] _resolve_pool_url() aponta para API_BASE
+v3.8.1:
+  [FIX CRÍTICO] sync_info() traduz error -> erro
+  [FIX] has_wallet() respeita CURRENT_WALLET_ENC
 ================================================================
 """
 from __future__ import annotations
@@ -26,9 +30,8 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "3.8.2"
+__version__ = "3.9.0"
 
-# Import de requests no topo com fallback claro
 try:
     import requests
     _HAS_REQUESTS = True
@@ -53,7 +56,7 @@ _WALLET_SESSION: dict = {}
 
 
 # ============================================================
-# HTTP HELPERS (com retry)
+# HTTP HELPERS
 # ============================================================
 def _post(path: str, body: dict, timeout: float = None,
           retries: int = None) -> dict:
@@ -82,7 +85,7 @@ def _post(path: str, body: dict, timeout: float = None,
             last_err = f"connection: {e}"
         except Exception as e:
             last_err = str(e)
-            break  # erro não-transitório
+            break
 
         if attempt < r_n:
             log.debug("POST %s: retry %d/%d após %s", path, attempt + 1, r_n, last_err)
@@ -135,15 +138,13 @@ def _get(path: str, timeout: float = None,
 # WalletApi
 # ============================================================
 class WalletApi:
-    """API exposta ao pywebview via js_api."""
-
     def __init__(self):
         log.info("WalletApi v%s iniciada (API_BASE=%s)", __version__, API_BASE)
         if not _HAS_REQUESTS:
             log.warning("requests NÃO instalado — pip install requests")
 
     # ========================================================
-    # SESSÃO DA CARTEIRA
+    # SESSÃO
     # ========================================================
     def has_wallet(self) -> dict:
         try:
@@ -165,7 +166,6 @@ class WalletApi:
         try:
             from wallet import Wallet
             from secure_store import save_current_wallet
-
             w = Wallet()
             data = {
                 "address":     w.address,
@@ -175,7 +175,6 @@ class WalletApi:
             r = save_current_wallet(password, data)
             if not r.get("ok"):
                 return {"ok": False, "msg": "Erro ao salvar: " + str(r.get("msg", ""))}
-
             _WALLET_SESSION.update(data)
             log.info("Nova carteira criada: %s...", w.address[:16])
             return {"ok": True, "address": w.address}
@@ -264,6 +263,7 @@ class WalletApi:
                 "pool_enabled":         s.get("pool_enabled", False),
                 "fila_tamanho":         s.get("fila_tamanho", 0),
                 "rede_descentralizada": s.get("rede_descentralizada", False),
+                "validators_active":    s.get("validators_active", 0),
             }
         except Exception as e:
             return {"ok": False, "msg": str(e)}
@@ -300,7 +300,86 @@ class WalletApi:
             return {"erro": str(e)}
 
     # ========================================================
-    # CARTEIRA BÁSICA
+    # [NEW v3.9.0] MULTI-SIG / CONSENSO
+    # ========================================================
+    def consensus_validators(self) -> dict:
+        """
+        Lista os validadores ativos (Top 5) que precisam assinar cada bloco.
+        Requer server.py com /api/consensus/validators.
+
+        Retorna:
+            {ok, required_sigs, all_required, validators: [...]}
+        """
+        try:
+            r = _get("/api/consensus/validators", timeout=10.0)
+            if "error" in r:
+                return {
+                    "ok": False,
+                    "msg": r["error"],
+                    "required_sigs": 0,
+                    "all_required": True,
+                    "validators": [],
+                }
+            return r
+        except Exception as e:
+            return {
+                "ok": False,
+                "msg": str(e),
+                "required_sigs": 0,
+                "all_required": True,
+                "validators": [],
+            }
+
+    def block_signatures(self, height: int) -> dict:
+        """
+        Retorna as assinaturas coletadas para um bloco específico.
+        Requer server.py com /api/block/<height>/signatures.
+        """
+        try:
+            r = _get(f"/api/block/{int(height)}/signatures", timeout=10.0)
+            return r
+        except Exception as e:
+            return {"ok": False, "msg": str(e), "signatures": []}
+
+    def get_multi_sig_status(self) -> dict:
+        """
+        Resumo do estado de multi-sig: validadores ativos, assinaturas
+        necessárias, e se o bloco atual já tem todas.
+        """
+        try:
+            validators_resp = self.consensus_validators()
+            required = int(validators_resp.get("required_sigs", 0) or 0)
+            all_required = bool(validators_resp.get("all_required", True))
+
+            mining = self.mining_status()
+            height = int(mining.get("height", 0) or 0)
+
+            # Tenta pegar assinaturas do último bloco
+            last_sigs = 0
+            if height > 0:
+                sigs_resp = self.block_signatures(height)
+                last_sigs = int(sigs_resp.get("signatures_count", 0) or 0)
+
+            return {
+                "ok": True,
+                "validators_active": len(validators_resp.get("validators", [])),
+                "required_sigs":     required,
+                "all_required":      all_required,
+                "last_block_height": height,
+                "last_block_sigs":   last_sigs,
+                "is_multisig_active": required >= 1,
+                "last_block_ready":   last_sigs >= required if required > 0 else True,
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "msg": str(e),
+                "validators_active": 0,
+                "required_sigs": 0,
+            }
+
+    # ========================================================
+    # CARTEIRA
     # ========================================================
     def portfolio(self, address: str) -> dict:
         try:
@@ -341,9 +420,6 @@ class WalletApi:
                             "private_key": private_key,
                             "public_key":  public_key,
                         })
-                    else:
-                        log.warning("Falha persistindo carteira: %s",
-                                    save_result.get("msg"))
                 except Exception as e:
                     log.warning("Falha salvando carteira em disco: %s", e)
 
@@ -425,7 +501,7 @@ class WalletApi:
             return {"ok": False, "msg": str(e)}
 
     # ========================================================
-    # MINERAÇÃO (Miner local)
+    # MINERAÇÃO
     # ========================================================
     def start_mining(self, address: str, pubkey: str) -> dict:
         try:
@@ -444,7 +520,14 @@ class WalletApi:
 
     def mining_status(self) -> dict:
         try:
-            return _get("/api/miner/status", timeout=GET_TIMEOUT)
+            r = _get("/api/miner/status", timeout=GET_TIMEOUT)
+            # [NEW v3.9.0] Adiciona info de multi-sig se disponível
+            if "error" not in r:
+                # O server.py v9.9.13+ pode retornar validators_active
+                r.setdefault("validators_active", 0)
+                r.setdefault("signatures_required", 0)
+                r.setdefault("signatures_collected", 0)
+            return r
         except Exception as e:
             return {"running": False, "error": str(e)}
 
@@ -453,10 +536,16 @@ class WalletApi:
     # ========================================================
     def _resolve_pool_url(self) -> str:
         """
-        [FIX v3.8.2] Sempre aponta para o próprio nó local (API_BASE).
-        O server.py v9.9.14 agora tem o Proxy do Pool. 
-        Se for cliente, ele repassa para o Ubuntu automaticamente.
+        [FIX v3.9.0] Resolve a URL do pool corretamente:
+          1. Se BRN_POOL_URL definido → usa (nós CLIENTE)
+          2. Senão → usa API_BASE (nós ORIGEM com PoolManager local)
+
+        Isso corrige o bug do v3.8.2 que sempre usava API_BASE,
+        quebrando clientes quando o server.py não tinha Pool Proxy.
         """
+        env_pool = (os.environ.get("BRN_POOL_URL", "") or "").strip()
+        if env_pool:
+            return env_pool.rstrip("/")
         return API_BASE
 
     def pool_start_mining(self, address: str, pubkey: str) -> dict:
@@ -515,7 +604,6 @@ class WalletApi:
             if _POOL_CLIENT is None:
                 return {"ok": True, "running": False, "hashrate": 0.0, "shares_accepted": 0}
             try:
-                # O PoolClient.status() ja devolve job_share_diff (Vardiff)
                 return _POOL_CLIENT.status()
             except Exception as e:
                 return {"ok": False, "msg": str(e)}
@@ -533,7 +621,7 @@ class WalletApi:
             return {"ok": False, "msg": str(e)}
 
     # ========================================================
-    # TRUST SYSTEM (NOVO v3.8.2)
+    # TRUST SYSTEM
     # ========================================================
     def get_trust_stats(self) -> dict:
         try:
@@ -586,6 +674,12 @@ class WalletApi:
         }
 
     def get_debug_info(self) -> dict:
+        consensus_info = {}
+        try:
+            consensus_info = self.get_multi_sig_status()
+        except Exception:
+            pass
+
         return {
             "version":  __version__,
             "api_base": API_BASE,
@@ -596,6 +690,7 @@ class WalletApi:
                 _POOL_CLIENT is not None and _POOL_CLIENT.is_running()
             ),
             "pool_url_resolved": self._resolve_pool_url(),
+            "consensus": consensus_info,
             "env": {
                 "BRN_IS_ORIGIN":       os.environ.get("BRN_IS_ORIGIN", ""),
                 "BRN_POOL_URL":        os.environ.get("BRN_POOL_URL", ""),
@@ -636,7 +731,8 @@ def _self_test() -> int:
     r = api.node_status()
     if r.get("ok"):
         print(f"    height={r.get('height')} peers={r.get('peers')} "
-              f"diff={r.get('difficulty')} des={r.get('rede_descentralizada')}")
+              f"diff={r.get('difficulty')} des={r.get('rede_descentralizada')} "
+              f"validators={r.get('validators_active', 0)}")
     else:
         print(f"    [X] FALHOU: {r}")
 
@@ -649,16 +745,27 @@ def _self_test() -> int:
         print(f"    height={sync.get('height')} target={sync.get('target')} "
               f"percent={sync.get('percent')}%")
 
-    print("\n[4] get_version...")
+    print("\n[4] consensus_validators...")
+    r = api.consensus_validators()
+    print(f"    ok={r.get('ok')} required={r.get('required_sigs')} "
+          f"validators={len(r.get('validators', []))}")
+
+    print("\n[5] get_multi_sig_status...")
+    r = api.get_multi_sig_status()
+    print(f"    active={r.get('is_multisig_active')} "
+          f"required={r.get('required_sigs')} "
+          f"last_sigs={r.get('last_block_sigs')}")
+
+    print("\n[6] get_version...")
     print(f"    {api.get_version()}")
 
-    print("\n[5] get_debug_info...")
+    print("\n[7] get_debug_info...")
     info = api.get_debug_info()
     print(f"    wallet_locked={info['wallet_locked']} "
           f"pool_running={info['pool_client_running']}")
     print(f"    pool_url={info['pool_url_resolved']}")
 
-    print("\n[6] has_wallet...")
+    print("\n[8] has_wallet...")
     r = api.has_wallet()
     print(f"    exists={r.get('exists')}")
 
