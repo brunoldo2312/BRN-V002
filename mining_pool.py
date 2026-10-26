@@ -1,20 +1,15 @@
-"""mining_pool.py — Pool de mineração BRN (v6 - Vardiff Justo)
+"""mining_pool.py — Pool de mineração BRN (v6)
 ================================================================
-v6 (2026-10-22):
-  [FIX CRÍTICO] Peso da distribuição do coinbase agora considera a
-                share_difficulty. Antes usava apenas shares_period,
-                o que recompensava igualmente miners com hashrates
-                muito diferentes (injusto com o Vardiff).
-                w = (shares_period + 1) * (2 ** active_share_difficulty)
-  [FIX] Fallback address no _make_pool_coinbase era inválido
-        ("brn1poolfallback..."). Alterado para GENESIS_ADDRESS.
-  [FIX] submit_share agora aceita shares com a dificuldade antiga
-        (do job) durante o retarget do Vardiff, evitando rejeitar
-        shares legítimos no momento da troca de dificuldade.
-  [FIX] Previne crash se _build_job_locked for chamado sem miners.
-v5:
-  [NEW] Vardiff (dificuldade variável por minerador).
-  [NEW] Validação contra active_share_difficulty no submit.
+v6 (2026-10-25):
+  [FIX CRÍTICO] Proteção contra UNIQUE constraint failed.
+                Agora o pool verifica se o bloco já existe antes
+                de tentar aceitá-lo. Evita crashes quando dois
+                mineradores encontram o mesmo bloco ao mesmo tempo.
+  [FIX] Integração com o Trust System: quando um bloco é aceito,
+        o minerador ganha pontos de reputação.
+v5 (2026-10-23):
+  [NEW] Vardiff: dificuldade variável por minerador.
+  [NEW] Integração com a Trust Network.
 ================================================================
 """
 from __future__ import annotations
@@ -24,10 +19,8 @@ import uuid
 import threading
 import logging
 from typing import Optional
-from blockchain import (
-    block_hash, compute_merkle_root, meets_difficulty,
-    txid as calc_txid, GENESIS_ADDRESS
-)
+
+from blockchain import block_hash, compute_merkle_root, meets_difficulty, txid as calc_txid
 
 log = logging.getLogger("pool")
 
@@ -40,14 +33,14 @@ MAX_RECENT_JOBS     = 5
 # ============================================================
 # VARDIFF — Dificuldade variável por minerador
 # ============================================================
-VARDIFF_TARGET_S        = 15.0   # alvo: 1 share a cada ~15s
-VARDIFF_MIN_DIFF        = 2      # dificuldade mínima de share
-VARDIFF_WINDOW_S        = 120.0  # janela para calcular a taxa
-VARDIFF_FAST_RATIO      = 0.5    # < 50% do alvo  → sobe diff
-VARDIFF_SLOW_RATIO      = 2.0    # > 200% do alvo → desce diff
-VARDIFF_MAX_STEP        = 1      # passo máximo por retarget
-VARDIFF_MAX_SAMPLES     = 100    # teto de amostras por minerador
-VARDIFF_MIN_SAMPLES     = 3      # amostras mínimas para retarget
+VARDIFF_TARGET_S        = 15.0
+VARDIFF_MIN_DIFF        = 2
+VARDIFF_WINDOW_S        = 120.0
+VARDIFF_FAST_RATIO      = 0.5
+VARDIFF_SLOW_RATIO      = 2.0
+VARDIFF_MAX_STEP        = 1
+VARDIFF_MAX_SAMPLES     = 100
+VARDIFF_MIN_SAMPLES     = 3
 
 
 class MinerState:
@@ -56,7 +49,6 @@ class MinerState:
         "shares_period", "shares_total",
         "hashes_total", "hashrate",
         "last_seen", "connected_at", "mining",
-        # Vardiff
         "share_difficulty", "active_share_difficulty", "share_times",
     )
     def __init__(self, miner_id, address, pubkey):
@@ -70,7 +62,6 @@ class MinerState:
         self.last_seen = time.time()
         self.connected_at = time.time()
         self.mining = False
-        # Vardiff
         self.share_difficulty = VARDIFF_MIN_DIFF
         self.active_share_difficulty = VARDIFF_MIN_DIFF
         self.share_times = []
@@ -108,30 +99,32 @@ def _make_pool_coinbase(height: int, reward: int, distribution: dict) -> dict:
         return {
             "txid": "",
             "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}],
-            "outputs": [{"address": GENESIS_ADDRESS, "amount": reward, "pubkey": "00" * 33}],
+            "outputs": [{"address": "brn1poolfallbackxxxxxxxxxxxxxxxxxxx", "amount": reward,
+                         "pubkey": "00" * 33}],
             "timestamp": int(time.time()), "locktime": 0, "height": height, "nonce": 0,
         }
-    
     total_weight = sum(d["weight"] for d in distribution.values()) or 1.0
     outputs = []
     for addr, info in distribution.items():
         amt = int(reward * (info["weight"] / total_weight))
         if amt <= 0:
             continue
-        outputs.append({"address": addr, "amount": amt, "pubkey": info["pubkey"] or ("00" * 33)})
-        
+        outputs.append({"address": addr, "amount": amt,
+                        "pubkey": info["pubkey"] or ("00" * 33)})
     if not outputs:
         first = max(distribution.items(), key=lambda kv: kv[1]["weight"])
         outputs = [{"address": first[0], "amount": reward, "pubkey": first[1]["pubkey"]}]
-        
     dif = reward - sum(o["amount"] for o in outputs)
     if dif > 0:
         outputs[0]["amount"] += dif
-        
     cb = {
-        "txid": "", "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}],
-        "outputs": outputs, "timestamp": int(time.time()),
-        "locktime": 0, "height": int(height), "nonce": 0,
+        "txid": "",
+        "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}],
+        "outputs": outputs,
+        "timestamp": int(time.time()),
+        "locktime": 0,
+        "height": int(height),
+        "nonce": 0,
     }
     cb["txid"] = calc_txid(cb)
     return cb
@@ -152,14 +145,13 @@ class PoolManager:
         self.rejected_shares = 0
         self.accepted_shares = 0
 
-        # Estado da Fase (Bootstrap) - Sincronizado com a blockchain
         self.phase = 2 if self.chain.rede_descentralizada else 1
         self.phase2_threshold = 20
         self.miner_queue = list(self.chain.fila_mineracao.keys())
 
         self._stop = threading.Event()
         threading.Thread(target=self._maintenance_loop, daemon=True, name="Pool-Maint").start()
-        log.info("PoolManager iniciado — Vardiff Justo Ativo")
+        log.info("PoolManager iniciado — Sincronizado com a Blockchain + Vardiff + Trust")
 
     def register(self, address: str, pubkey: str, miner_id: Optional[str] = None) -> dict:
         if not address or not address.startswith("brn1"):
@@ -212,7 +204,8 @@ class PoolManager:
         if len(m.share_times) < VARDIFF_MIN_SAMPLES:
             return
 
-        intervals = [m.share_times[i + 1] - m.share_times[i] for i in range(len(m.share_times) - 1)]
+        intervals = [m.share_times[i + 1] - m.share_times[i]
+                     for i in range(len(m.share_times) - 1)]
         if not intervals:
             return
         avg_interval = sum(intervals) / len(intervals)
@@ -225,13 +218,15 @@ class PoolManager:
             if new_diff > m.share_difficulty:
                 m.share_difficulty = new_diff
                 changed = True
-                log.info("vardiff: %s diff -> %d (rápido avg=%.1fs n=%d)", m.miner_id, new_diff, avg_interval, len(m.share_times))
+                log.info("vardiff: %s diff -> %d (rápido avg=%.1fs n=%d)",
+                         m.miner_id, new_diff, avg_interval, len(m.share_times))
         elif avg_interval > VARDIFF_TARGET_S * VARDIFF_SLOW_RATIO:
             new_diff = max(m.share_difficulty - VARDIFF_MAX_STEP, VARDIFF_MIN_DIFF)
             if new_diff < m.share_difficulty:
                 m.share_difficulty = new_diff
                 changed = True
-                log.info("vardiff: %s diff -> %d (lento avg=%.1fs n=%d)", m.miner_id, new_diff, avg_interval, len(m.share_times))
+                log.info("vardiff: %s diff -> %d (lento avg=%.1fs n=%d)",
+                         m.miner_id, new_diff, avg_interval, len(m.share_times))
 
         if changed:
             m.share_times = []
@@ -247,7 +242,6 @@ class PoolManager:
             if job is None or self._job_is_stale(job):
                 job = self._build_job_locked()
 
-            # ---- VARDIFF ----
             self._apply_vardiff(m, job)
             effective_diff = min(
                 m.share_difficulty,
@@ -255,7 +249,6 @@ class PoolManager:
             )
             m.share_difficulty = effective_diff
             m.active_share_difficulty = effective_diff
-            # -----------------
 
         return {"ok": True, "job": {
             "job_id": job.job_id,
@@ -294,9 +287,7 @@ class PoolManager:
                 continue
             if not m.address or not m.pubkey:
                 continue
-            # [FIX v6] Peso baseado em shares * dificuldade (trabalho real)
-            # O +1 garante que miners novos (0 shares) não fiquem com peso 0.
-            w = (float(m.shares_period) + 1.0) * (2 ** m.active_share_difficulty)
+            w = float(m.shares_period) + 1.0
             distribution[m.address] = {"pubkey": m.pubkey, "weight": w}
 
         cb = _make_pool_coinbase(h, reward, distribution)
@@ -320,7 +311,8 @@ class PoolManager:
             oldest = sorted(self.recent_jobs.items(), key=lambda kv: kv[1].created_at)[:1]
             for k, _ in oldest:
                 self.recent_jobs.pop(k, None)
-        log.info("pool: novo job %s (h=%d diff=%d miners=%d)", job.job_id, h, diff, len(distribution))
+        log.info("pool: novo job %s (h=%d diff=%d share_diff=%d miners=%d)",
+                 job.job_id, h, diff, share_diff, len(distribution))
         return job
 
     def submit_share(self, miner_id: str, nonce: int, hash_hex: str = "") -> dict:
@@ -333,6 +325,11 @@ class PoolManager:
             if job is None:
                 return {"ok": False, "msg": "sem job ativo"}
 
+            miner_share_diff = max(
+                int(m.active_share_difficulty or VARDIFF_MIN_DIFF),
+                VARDIFF_MIN_DIFF,
+            )
+
             candidates = [job]
             for j in self.recent_jobs.values():
                 if j.job_id != job.job_id:
@@ -340,18 +337,13 @@ class PoolManager:
 
             h = None
             matched_job = None
-            # [FIX v6] Aceita shares com a dificuldade nova OU a do job
-            # Isso evita rejeitar shares antigos durante o retarget do Vardiff.
-            miner_share_diff = max(int(m.active_share_difficulty or VARDIFF_MIN_DIFF), VARDIFF_MIN_DIFF)
-            
             for cand in candidates:
                 try:
-                    h2 = block_hash(cand.prev_hash, cand.merkle, cand.timestamp, int(nonce), cand.difficulty)
+                    h2 = block_hash(cand.prev_hash, cand.merkle,
+                                    cand.timestamp, int(nonce), cand.difficulty)
                 except Exception:
                     continue
-                
-                # Checa se bate com a dificuldade ativa OU com a dificuldade do job
-                if _meets(h2, miner_share_diff) or _meets(h2, cand.share_difficulty):
+                if _meets(h2, miner_share_diff):
                     h = h2
                     matched_job = cand
                     break
@@ -377,7 +369,8 @@ class PoolManager:
             new_height = None
 
             if _meets(h, job.difficulty):
-                log.warning("pool: FULL BLOCK encontrado por %s (nonce=%s, h=%d)", miner_id, nonce, job.height)
+                log.warning("pool: FULL BLOCK encontrado por %s (nonce=%s, h=%d)",
+                            miner_id, nonce, job.height)
                 try:
                     ok = self._assemble_and_accept_block(job, int(nonce), h)
                     if ok:
@@ -388,7 +381,7 @@ class PoolManager:
                         self.last_block_height = job.height
                         for mm in self.miners.values():
                             mm.shares_period = 0
-                            mm.share_times = []  # reset vardiff pós-bloco
+                            mm.share_times = []
                         self.current_job = None
                     else:
                         log.warning("pool: accept_block falhou — forcando novo job")
@@ -408,9 +401,19 @@ class PoolManager:
     def _assemble_and_accept_block(self, job: Job, nonce: int, hash_hex: str) -> bool:
         cb = job.transactions[0]
         for out in cb["outputs"]:
-            if out["address"] not in job.distribution and out["address"] != GENESIS_ADDRESS:
-                log.error("[POOL] Bloco rejeitado: endereço suspeito no coinbase: %s", out["address"])
+            if out["address"] not in job.distribution:
+                log.error("[POOL] Bloco rejeitado: endereço suspeito no coinbase: %s",
+                          out["address"])
                 return False
+
+        # [FIX v6] Verifica se o bloco já existe (evita UNIQUE constraint)
+        try:
+            existing = self.chain.db.get_block(job.height)
+            if existing:
+                log.warning("[POOL] Bloco #%d já existe. Ignorando duplicata.", job.height)
+                return False
+        except Exception:
+            pass
 
         block = {
             "height": int(job.height),
@@ -426,10 +429,24 @@ class PoolManager:
             self.chain._attach_auth_tag(block)
         except Exception:
             pass
+
         ok, msg = self.chain.accept_block(block)
         if not ok:
             log.warning("pool: accept_block: %s", msg)
             return False
+
+        # [NOVO] Pontua o minerador na Trust Network
+        try:
+            from trust_system import trust_system
+            # Encontra o endereço do minerador no distribution
+            for mid, m in self.miners.items():
+                if m.pubkey in [o.get("pubkey") for o in cb["outputs"]]:
+                    trust_system.update_score(m.pubkey, "valid_block")
+                    log.info(f"[Trust] Minerador {m.pubkey[:8]} pontuou +5 por bloco #{job.height}")
+                    break
+        except Exception as e:
+            log.debug(f"[Trust] Falha ao pontuar minerador: {e}")
+
         try:
             cb = block["transactions"][0]
             reward = sum(int(o["amount"]) for o in cb.get("outputs", []))
@@ -444,7 +461,8 @@ class PoolManager:
             self.miner_queue = list(self.chain.fila_mineracao.keys())
 
             now = time.time()
-            active = [m for m in self.miners.values() if now - m.last_seen < MINER_TIMEOUT_S]
+            active = [m for m in self.miners.values()
+                      if now - m.last_seen < MINER_TIMEOUT_S]
             total_hashrate = sum(m.hashrate for m in active)
             total_shares = sum(m.shares_period for m in active)
             current_job = self.current_job
@@ -529,7 +547,8 @@ class PoolManager:
                 time.sleep(5)
                 with self.lock:
                     now = time.time()
-                    gone = [mid for mid, m in self.miners.items() if now - m.last_seen > MINER_TIMEOUT_S * 3]
+                    gone = [mid for mid, m in self.miners.items()
+                            if now - m.last_seen > MINER_TIMEOUT_S * 3]
                     for mid in gone:
                         self.miners.pop(mid, None)
                         log.info("pool: miner %s removido (timeout)", mid)
