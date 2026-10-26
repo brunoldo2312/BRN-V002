@@ -1,0 +1,33 @@
+@app.route("/api/consensus/validators", methods=["GET"])
+@require_rate_limit("status")
+def consensus_validators():
+    try:
+        chain = _get_chain()
+        trust = _get_trust_network()
+        if trust is None:
+            return jsonify({"ok": False, "msg": "TrustNetwork indisponível"}), 503
+        
+        top5 = trust.get_top_validators(count=5)
+        nodes = list(trust.nodes.values())
+        validators = [
+            {
+                "pubkey": n.public_key[:32] + "...",
+                "pubkey_full": n.public_key,
+                "node_id": n.node_id,
+                "address": n.address,
+                "trust_score": round(n.trust_score, 1),
+                "trust_level": n.trust_level,
+                "connected": n.connected,
+            }
+            for n in sorted(nodes, key=lambda n: -n.trust_score)
+            if n.public_key and not n.banned
+        ][:5]
+        
+        return jsonify({
+            "ok": True,
+            "required_sigs": len(top5),
+            "all_required": True,   # REQUIRE_ALL_SIGS=True
+            "validators": validators,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
