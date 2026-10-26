@@ -1,10 +1,14 @@
 """main.py — Entrypoint unificado do nó BRN (v13.6.10)
 ================================================================
 v13.6.10 (2026-10-25):
-  [FIX] Descoberta automática agora testa a porta P2P (6001) do peer
-        antes de selecioná-lo. Evita escolher nós com firewall bloqueado.
-  [NEW] Adicionado Fallback: se a descoberta automática falhar, usa
-        os IPs do BRN_FALLBACK_PEERS ou do bootstrap_peers.json.
+  [FIX] Descoberta automática agora respeita o .env (não sobrescreve
+        se BRN_BOOTSTRAP_PEERS estiver definido).
+  [FIX] Descoberta usa SEMPRE a porta 6001 para o peer remoto.
+  [FIX] Descoberta testa a porta P2P antes de escolher o peer.
+v13.6.9 (2026-10-24):
+  [NEW] Integração com trust_system.
+v13.6.8 (2026-10-23):
+  [NEW] Migração de Waitress para Uvicorn.
 ================================================================
 """
 from __future__ import annotations
@@ -17,14 +21,16 @@ import threading
 import time
 import json
 import subprocess
+import socket
 import urllib.request
 import urllib.error
-import socket
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 
-
+# ============================================================
+# CARREGAMENTO DE VARIÁVEIS DE AMBIENTE
+# ============================================================
 def _bootstrap_env() -> None:
     env_file = BASE_DIR / "brn_network.env"
     if not env_file.exists(): return
@@ -75,6 +81,9 @@ def _apply_hardcoded_defaults() -> int:
 _bootstrap_env()
 _applied = _apply_hardcoded_defaults()
 
+# ============================================================
+# AUTO-DETECÇÃO DE IP LOCAL (TAILSCALE / LAN)
+# ============================================================
 def _auto_set_self_address() -> None:
     if os.environ.get("BRN_SEU_ENDERECO"): return
     porta = os.environ.get("BRN_P2P_PORT", "6001")
@@ -100,7 +109,7 @@ _auto_set_self_address()
 
 
 # ============================================================
-# [FIX] DESCOBERTA AUTOMÁTICA VIA TAILSCALE (BLINDADA)
+# DESCOBERTA AUTOMÁTICA VIA TAILSCALE
 # ============================================================
 def _check_p2p_port(ip: str, port: int, timeout: float = 2.0) -> bool:
     """Testa se a porta P2P do peer está realmente aberta."""
@@ -113,6 +122,12 @@ def _check_p2p_port(ip: str, port: int, timeout: float = 2.0) -> bool:
 def _auto_discover_bootstrap(log) -> None:
     """Encontra o peer Tailscale com a maior blockchain e P2P acessível."""
     if os.environ.get("BRN_IS_ORIGIN", "0") == "1": return
+
+    # [FIX] Se o .env já tem um IP configurado, usa ele e não deixa o Tailscale sobrescrever
+    env_bootstrap = os.environ.get("BRN_BOOTSTRAP_PEERS", "").strip()
+    if env_bootstrap:
+        log.info(f"Tailscale: Usando BRN_BOOTSTRAP_PEERS fixo do .env: {env_bootstrap}")
+        return
 
     log.info("Tailscale: buscando o melhor peer (Origem) automaticamente...")
     try:
@@ -137,45 +152,42 @@ def _auto_discover_bootstrap(log) -> None:
         best_peer = None
         best_height = -1
         porta_http = int(os.environ.get("BRN_WEB_PORT", "5000"))
-        porta_p2p = int(os.environ.get("BRN_P2P_PORT", "6001"))
+        
+        # [FIX] O peer remoto SEMPRE vai usar a porta 6001 para P2P.
+        porta_p2p_origem = 6001 
 
         for p in peers:
             try:
-                # 1. Pergunta a altura via HTTP
                 url = f"http://{p['ip']}:{porta_http}/api/chain-info"
                 req = urllib.request.Request(url, headers={"User-Agent": "brn-boot/1.0"})
                 with urllib.request.urlopen(req, timeout=3) as resp:
                     info = json.loads(resp.read().decode("utf-8"))
                     h = int(info.get("height", -1))
                     
-                    # 2. Só seleciona se tiver altura maior E a porta P2P estiver aberta
                     if h > best_height:
-                        if _check_p2p_port(p['ip'], porta_p2p):
+                        if _check_p2p_port(p['ip'], porta_p2p_origem):
                             best_height = h
                             best_peer = p
                         else:
-                            log.warning(f"Tailscale: Peer {p['hostname']} ({p['ip']}) tem altura {h}, mas porta P2P {porta_p2p} fechada.")
+                            log.warning(f"Tailscale: Peer {p['hostname']} ({p['ip']}) tem altura {h}, mas porta P2P {porta_p2p_origem} fechada.")
             except Exception:
                 continue
 
         if best_peer:
-            novo_bootstrap = f"{best_peer['ip']}:{porta_p2p}"
+            novo_bootstrap = f"{best_peer['ip']}:{porta_p2p_origem}"
             os.environ["BRN_BOOTSTRAP_PEERS"] = novo_bootstrap
             log.info(f"Tailscale: Melhor peer VALIDADO -> {best_peer['hostname']} ({best_peer['ip']}) | Altura: {best_height}")
             log.info(f"Tailscale: BRN_BOOTSTRAP_PEERS definido para {novo_bootstrap}")
         else:
-            log.warning("Tailscale: nenhum peer respondeu na porta P2P. Tentando fallback...")
-            fallback = os.environ.get("BRN_FALLBACK_PEERS", "").strip()
-            if fallback:
-                os.environ["BRN_BOOTSTRAP_PEERS"] = fallback
-                log.info(f"Tailscale: Usando BRN_FALLBACK_PEERS={fallback}")
-            else:
-                log.warning("Tailscale: sem fallback configurado. O nó pode ficar isolado.")
+            log.warning("Tailscale: nenhum peer respondeu na porta P2P.")
             
     except Exception as e:
         log.warning(f"Tailscale: falha na descoberta automática: {e}")
 
 
+# ============================================================
+# IMPORTS
+# ============================================================
 from brn_config import Config
 from brn_logger import setup_logger, get_logger
 from version import VERSION, BUILD_DATE, GITHUB_USER, GITHUB_REPO
@@ -194,6 +206,7 @@ WEB_HOST_DEFAULT      = "127.0.0.1"
 EXPLORER_HOST_DEFAULT = "127.0.0.1"
 _running_services: list = []
 _services_lock = threading.Lock()
+
 
 def _resolve_auto_mine() -> bool:
     return (os.environ.get("BRN_AUTO_MINE", "").strip() == "1" or os.environ.get("BRN_MINER_ENABLED", "").strip() == "1")
@@ -264,6 +277,7 @@ if POOL_ENABLED:
     except Exception as _e: print(f"[AVISO] miner_pool_client indisponível: {_e}")
 
 def _pool_disponivel() -> bool: return bool(POOL_ENABLED and _POOL_MANAGER_AVAILABLE and PoolManager is not None)
+
 def _audit(event: str, data: dict = None) -> None:
     try:
         from security import audit_log
