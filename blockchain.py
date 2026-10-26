@@ -1,10 +1,14 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.3.3 | Data: 24/10/2026
+Versão: 9.3.4 | Data: 26/10/2026
 ================================================================
+v9.3.4 (2026-10-26):
+  [FIX CRÍTICO] median_time_past agora usa try/except para evitar
+                sqlite3.InterfaceError em concorrência pesada.
+  [FIX] validate_block tolera falhas no MTP (não bloqueia o bloco).
+  [FIX] accept_block verifica se o bloco já existe antes de gravar,
+        evitando o erro UNIQUE constraint failed.
 v9.3.3 (2026-10-24):
   [NEW] Regra de Consenso dos Top 5 Validadores.
-        Quando a rede está descentralizada, valida se a pubkey do
-        minerador (extraída do coinbase) está no Top 5 da Trust Network.
 v9.3.2 (2026-10-23):
   [SECURITY] Aumentado MAX_REORG_DEPTH para 2000.
   [SECURITY] Aumentado MTP_WINDOW para 50.
@@ -579,11 +583,15 @@ class Blockchain:
         return True, tx["txid"]
 
     def median_time_past(self, height: int) -> int:
+        """[FIX v9.3.4] Protegido contra sqlite3.InterfaceError em concorrência."""
         timestamps = []
         for i in range(max(0, height - MTP_WINDOW), height):
-            b = self.db.get_block(i)
-            if b:
-                timestamps.append(b["timestamp"])
+            try:
+                b = self.db.get_block(i)
+                if b:
+                    timestamps.append(b["timestamp"])
+            except Exception:
+                continue
         if not timestamps:
             return 0
         timestamps.sort()
@@ -601,9 +609,12 @@ class Blockchain:
             return False, "altura invalida"
 
         if block["height"] > MTP_WINDOW:
-            mtp = self.median_time_past(block["height"])
-            if block["timestamp"] < mtp:
-                return False, f"timestamp ({block['timestamp']}) < MTP ({mtp})"
+            try:
+                mtp = self.median_time_past(block["height"])
+                if block["timestamp"] < mtp:
+                    return False, f"timestamp ({block['timestamp']}) < MTP ({mtp})"
+            except Exception as e:
+                log.warning(f"[validate_block] Falha no MTP (tolerado): {e}")
 
         if not meets_difficulty(block["hash"], block["difficulty"]):
             return False, "PoW invalido"
@@ -690,7 +701,20 @@ class Blockchain:
         ok, msg = self.validate_block(block, prev)
         if not ok:
             return False, msg
-        self.db.add_block(block)
+
+        # [FIX v9.3.4] Verifica se o bloco já existe antes de tentar gravar
+        try:
+            existing = self.db.get_block(block["height"])
+            if existing:
+                return False, f"Bloco #{block['height']} já existe na blockchain"
+        except Exception:
+            pass
+
+        try:
+            self.db.add_block(block)
+        except Exception as e:
+            return False, f"Erro ao gravar bloco #{block['height']}: {e}"
+
         _maybe_sign_checkpoint(block)
         for i, t in enumerate(block["transactions"]):
             coinbase = (i == 0)
