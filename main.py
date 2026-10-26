@@ -1,16 +1,12 @@
 """main.py — Entrypoint unificado do nó BRN (v13.7.0)
 ================================================================
 v13.7.0 (2026-10-25):
-  [FIX] Lógica de descoberta corrigida. Agora o Tailscale tem
-        prioridade, mas se falhar, usa o BRN_BOOTSTRAP_PEERS do
-        .env como fallback (plano B).
+  [FIX CRÍTICO] _bootstrap_env agora força a sobrescrita de variáveis
+                de ambiente. Resolve o erro "SEGREDOS OBRIGATORIOS
+                AUSENTES" causado por variáveis vazias no Windows.
+  [NEW] Descoberta automática de Origem via Tailscale mantida.
 v13.6.9 (2026-10-24):
-  [NEW] Reintegrada a descoberta automática de Origem via Tailscale.
-  [FIX] Threads do Waitress agora lidas do .env (BRN_HTTP_THREADS).
-v13.6.7 (2026-10-23):
-  [NEW] Integração com o novo trust_system.py (PeerTrustSystem).
-v13.6.6 (2026-10-23):
-  [FIX] Substituído o Flask dev server por Waitress.
+  [NEW] Descoberta automática de Origem via Tailscale.
 ================================================================
 """
 from __future__ import annotations
@@ -23,27 +19,29 @@ import threading
 import time
 import json
 import subprocess
+import socket
 import urllib.request
 import urllib.error
-import socket
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 
 
 def _bootstrap_env() -> None:
+    """Lê o .env e FORÇA a sobrescrita no os.environ para evitar variáveis vazias do sistema."""
     env_file = BASE_DIR / "brn_network.env"
     if not env_file.exists():
         return
     try:
-        for line in env_file.read_text(encoding="utf-8").splitlines():
+        for line in env_file.read_text(encoding="utf-8-sig").splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
             k = k.strip()
             v = v.strip().strip('"').strip("'")
-            if k and k not in os.environ:
+            if k:
+                # [FIX] Sobrescreve mesmo se a variável já existir vazia no Windows
                 os.environ[k] = v
     except Exception as e:
         print("[boot] aviso: falha lendo " + str(env_file) + ": " + str(e))
@@ -122,15 +120,12 @@ _auto_set_self_address()
 
 
 # ============================================================
-# DESCOBERTA AUTOMÁTICA VIA TAILSCALE (COM FALLBACK)
+# DESCOBERTA AUTOMÁTICA VIA TAILSCALE
 # ============================================================
 def _auto_discover_bootstrap(log) -> None:
-    """Encontra o peer Tailscale. Se falhar, usa o IP fixo do .env (Fallback)."""
+    """Encontra o peer Tailscale com a maior blockchain e define o Bootstrap."""
     if os.environ.get("BRN_IS_ORIGIN", "0") == "1":
         return
-
-    # [FALLBACK] Guarda o valor do .env para usar se o Tailscale falhar
-    fallback_bootstrap = os.environ.get("BRN_BOOTSTRAP_PEERS", "").strip()
 
     log.info("Tailscale: buscando o melhor peer (Origem) automaticamente...")
     try:
@@ -151,9 +146,6 @@ def _auto_discover_bootstrap(log) -> None:
 
         if not peers:
             log.warning("Tailscale: nenhum peer online encontrado.")
-            if fallback_bootstrap:
-                log.info(f"Tailscale: Usando FALLBACK do .env -> {fallback_bootstrap}")
-                os.environ["BRN_BOOTSTRAP_PEERS"] = fallback_bootstrap
             return
 
         best_peer = None
@@ -181,15 +173,9 @@ def _auto_discover_bootstrap(log) -> None:
             log.info(f"Tailscale: BRN_BOOTSTRAP_PEERS definido para {novo_bootstrap}")
         else:
             log.warning("Tailscale: nenhum peer respondeu com a blockchain.")
-            if fallback_bootstrap:
-                log.info(f"Tailscale: Usando FALLBACK do .env -> {fallback_bootstrap}")
-                os.environ["BRN_BOOTSTRAP_PEERS"] = fallback_bootstrap
-
+            
     except Exception as e:
         log.warning(f"Tailscale: falha na descoberta automática: {e}")
-        if fallback_bootstrap:
-            log.info(f"Tailscale: Usando FALLBACK do .env -> {fallback_bootstrap}")
-            os.environ["BRN_BOOTSTRAP_PEERS"] = fallback_bootstrap
 
 
 from brn_config import Config
@@ -634,7 +620,6 @@ def run_http(app_instance):
 
     try:
         from waitress import serve
-        # [FIX] Lê as threads do .env (padrão 16 se não existir)
         threads_count = int(os.environ.get("BRN_HTTP_THREADS", "16"))
         log.info(f"HTTP (Waitress) http://{host}:{port} com {threads_count} threads")
         
@@ -1033,7 +1018,7 @@ def main():
     else:
         log.info("Tailscale: pulado por --no-tailscale")
 
-    # [NEW] Descobre o Origem automaticamente via Tailscale (ou fallback .env)
+    # [NEW] Descobre o Origem automaticamente via Tailscale
     if not is_origin:
         _auto_discover_bootstrap(log)
 
