@@ -1,7 +1,13 @@
 @echo off
 REM ============================================================
-REM   iniciar_cliente.bat - BRN Node CLIENTE (Windows) - v10
+REM   iniciar_cliente.bat - BRN Node CLIENTE (Windows) - v11
 REM ============================================================
+REM   v11:
+REM     [NEW] Instala automaticamente dependencias Python (waitress,
+REM           requests, flask, flask_cors, orjson, pywebview).
+REM     [NEW] Instala Tailscale automaticamente via Winget se faltar.
+REM ============================================================
+
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
@@ -22,7 +28,7 @@ goto parse_args
 :args_done
 
 echo ============================================================
-echo   BRN Node - CLIENTE (Windows) - v10
+echo   BRN Node - CLIENTE (Windows) - v11
 echo ============================================================
 echo.
 
@@ -31,6 +37,58 @@ where python >nul 2>&1
 if not errorlevel 1 set "PY=python"
 if "%PY%"=="" ( where py >nul 2>&1 & set "PY=py -3" )
 if "%PY%"=="" ( echo [ERRO] Python nao encontrado. & pause & exit /b 1 )
+set "PYTHONUNBUFFERED=1"
+
+REM ============================================================
+REM [NOVO v11] VERIFICA E INSTALA DEPENDENCIAS PYTHON
+REM ============================================================
+echo [*] Verificando dependencias do Python...
+
+REM 1. Waitress (Servidor HTTP)
+%PY% -c "import waitress" >nul 2>&1
+if errorlevel 1 (
+    echo [!] Waitress ausente. Instalando...
+    %PY% -m pip install waitress --quiet
+) else (
+    echo [ok] Waitress OK
+)
+
+REM 2. Requests (API da Carteira)
+%PY% -c "import requests" >nul 2>&1
+if errorlevel 1 (
+    echo [!] Requests ausente. Instalando...
+    %PY% -m pip install requests --quiet
+) else (
+    echo [ok] Requests OK
+)
+
+REM 3. Orjson (Banco de dados)
+%PY% -c "import orjson" >nul 2>&1
+if errorlevel 1 (
+    echo [!] Orjson ausente. Instalando...
+    %PY% -m pip install orjson --quiet
+) else (
+    echo [ok] Orjson OK
+)
+
+REM 4. Flask (Servidor do nó)
+%PY% -c "import flask, flask_cors" >nul 2>&1
+if errorlevel 1 (
+    echo [!] Flask ausente. Instalando...
+    %PY% -m pip install flask flask-cors --quiet
+) else (
+    echo [ok] Flask OK
+)
+
+REM 5. PyWebView (Carteira Gráfica)
+%PY% -c "import webview" >nul 2>&1
+if errorlevel 1 (
+    echo [!] PyWebView ausente. Instalando...
+    %PY% -m pip install pywebview --quiet
+) else (
+    echo [ok] PyWebView OK
+)
+echo.
 
 if not exist "brn_network.env" (
     echo [AVISO] brn_network.env nao existe - criando...
@@ -56,11 +114,10 @@ for /f "usebackq eol=# tokens=1,* delims==" %%A in ("brn_network.env") do (
     )
 )
 
-set "PYTHONUNBUFFERED=1"
 set "BRN_IS_ORIGIN=0"
 
 REM ============================================================
-REM [NOVO v10] INSTALACAO AUTOMATICA DO TAILSCALE
+REM INSTALACAO AUTOMATICA DO TAILSCALE
 REM ============================================================
 if "%SKIP_TAILSCALE%"=="0" (
     where tailscale >nul 2>&1
@@ -69,7 +126,6 @@ if "%SKIP_TAILSCALE%"=="0" (
         echo [*] Tentando instalar automaticamente via Winget...
         winget install -e --id Tailscale.Tailscale --silent --accept-source-agreements --accept-package-agreements
         
-        REM Atualiza o PATH para encontrar o tailscale sem reiniciar o CMD
         set "PATH=%PATH%;C:\Program Files\Tailscale"
         
         where tailscale >nul 2>&1
