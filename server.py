@@ -941,7 +941,352 @@ def _shutdown():
     log.info("encerrando server…")
     try: close_audit()
     except: pass
+# ============================================================
+# [PATCH v9.9.17] Endpoints críticos faltando
+# ============================================================
 
+@app.route("/api/miner/stop", methods=["POST"])
+@require_rate_limit("miner_stop")
+def miner_stop():
+    try:
+        from miner_loop import get_miner
+        m = get_miner(_get_chain())
+        ok, msg = m.stop()
+        audit_log("miner_stop_ok" if ok else "miner_stop_failed",
+                  {"ip": get_client_ip(), "msg": msg})
+        return jsonify({"ok": ok, "msg": msg, **m.status()})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/miner/status", methods=["GET"])
+def miner_status():
+    try:
+        from miner_loop import get_miner
+        chain = _get_chain()
+        st = get_miner(chain).status()
+
+        # Conta validadores ativos (Top 5) para multi-sig
+        validators_active = 0
+        trust = _get_trust_network()
+        if trust is not None:
+            try:
+                validators_active = len(trust.get_top_validators(count=5))
+            except Exception:
+                pass
+
+        return jsonify({
+            **st,
+            "height": chain.db.height(),
+            "difficulty": chain.current_difficulty(),
+            "validators_active": validators_active,
+            "signatures_required": validators_active,
+            "signatures_collected": st.get("signatures_collected", 0),
+            "rede_descentralizada": chain.rede_descentralizada,
+            "fila_tamanho": len(chain.fila_mineracao),
+        })
+    except Exception as e:
+        return jsonify({"running": False, "error": str(e)}), 200
+
+
+@app.route("/api/pool/disconnect", methods=["POST"])
+@require_rate_limit("pool_disconnect")
+def pool_disconnect():
+    pool = _get_pool_manager()
+    if pool is None:
+        return _proxy_pool_request("/api/pool/disconnect", "POST")
+    try:
+        data = request.get_json(force=True) or {}
+        miner_id = (data.get("miner_id") or "").strip()
+        if not miner_id:
+            return jsonify({"ok": False, "msg": "miner_id obrigatorio"}), 400
+        r = pool.disconnect(miner_id)
+        return jsonify(r)
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/sync-info", methods=["GET"])
+def sync_info():
+    result = {
+        "ok": True,
+        "sync": {"percent": 100.0, "height": 0, "target": 0, "peers": 0},
+        "miner_target": "",
+        "bridge": {"onramp_ativo": False, "taxa": 0, "btc_cofre": ""},
+    }
+    chain = _get_chain()
+    try:
+        local_h = chain.db.height()
+        result["sync"]["height"] = local_h
+    except Exception as e:
+        result["ok"] = False
+        result["erro"] = f"height: {e}"
+        return jsonify(result), 200
+
+    try:
+        result["sync"]["peers"] = chain.db.contar_peers(apenas_ativos=False)
+    except Exception:
+        result["sync"]["peers"] = 0
+
+    target_h = local_h
+    try:
+        todos = chain.db.listar_peers(apenas_ativos=False)
+        heights = [int(p.get("height", 0) or 0) for p in (todos or []) if isinstance(p, dict)]
+        if heights:
+            target_h = max([target_h] + heights)
+    except Exception:
+        pass
+    result["sync"]["target"] = target_h
+
+    try:
+        if target_h > 0:
+            result["sync"]["percent"] = min(100.0, round(local_h / target_h * 100, 2))
+    except Exception:
+        pass
+
+    try:
+        result["miner_target"] = chain.db.get_meta("miner_address") or ""
+    except Exception:
+        pass
+
+    try:
+        if L2_ENABLED and btc_config is not None:
+            result["bridge"]["onramp_ativo"] = True
+            result["bridge"]["taxa"] = int(getattr(btc_config, "BRN_PER_BTC", 0) or 0)
+            result["bridge"]["btc_cofre"] = getattr(btc_config, "BTC_RECEIVE_ADDRESS", "") or ""
+    except Exception:
+        pass
+
+    return jsonify(result), 200
+
+
+@app.route("/api/sync/status", methods=["GET"])
+def sync_status():
+    try:
+        sync = _get_sync_manager()
+        if sync is None:
+            chain = _get_chain()
+            h = chain.db.height()
+            return jsonify({
+                "ok": True, "synced": True, "syncing": False, "forking": False,
+                "progress": 100.0, "local_height": h, "target_height": h,
+                "blocos_faltando": 0, "eta_legivel": "sincronizado",
+                "last_error": "",
+            })
+        data = sync.get_status()
+
+        # [FIX] Fallback se retornar -1
+        local_h = int(data.get("local_height", 0))
+        if local_h < 0:
+            local_h = _get_chain().db.height()
+            data["local_height"] = local_h
+            data["synced"] = True
+            data["progress"] = 100.0
+
+        return jsonify({
+            "ok": True,
+            "synced": bool(data.get("synced", True)),
+            "syncing": bool(data.get("syncing", False)),
+            "forking": bool(data.get("forking", False)),
+            "progress": round(float(data.get("progress", 100.0)), 2),
+            "local_height": local_h,
+            "target_height": int(data.get("target_height", local_h)),
+            "blocos_faltando": max(0, int(data.get("target_height", local_h)) - local_h),
+            "eta_segundos": data.get("eta_segundos"),
+            "eta_legivel": data.get("eta_legivel", ""),
+            "active_peer": data.get("active_peer"),
+            "peers_known": int(data.get("peers_known", 0)),
+            "reorgs_total": int(data.get("reorgs_total", 0)),
+            "last_reorg_height": int(data.get("last_reorg_height", -1)),
+            "last_error": data.get("last_error", ""),
+        }), 200
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/faucet", methods=["POST"])
+@require_rate_limit("faucet")
+@_admin_required
+def faucet():
+    try:
+        data = request.get_json(force=True) or {}
+        addr = (data.get("address") or "").strip()
+        if not WalletManager.validate_address(addr):
+            return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
+
+        agora = time.time()
+        hist = _faucet_history.setdefault(addr, [])
+        hist[:] = [t for t in hist if agora - t < FAUCET_COOLDOWN_S]
+
+        if len(hist) >= FAUCET_MAX_PER_ADDRESS:
+            return jsonify({"ok": False, "msg": "Limite atingido."}), 429
+        if hist and agora - hist[-1] < FAUCET_COOLDOWN_S:
+            falta = int(FAUCET_COOLDOWN_S - (agora - hist[-1]))
+            return jsonify({"ok": False, "msg": f"Aguarde {falta}s."}), 429
+
+        miner_pubkey = _pubkey_from_db_or_payload(
+            addr, data.get("pubkey", ""), data.get("private_key", ""),
+        )
+        if not miner_pubkey:
+            return jsonify({"ok": False, "msg": "Pubkey desconhecida."}), 400
+
+        chain = _get_chain()
+        with CHAIN_LOCK:
+            block = chain.mine_block(addr, miner_pubkey)
+
+        if not block:
+            return jsonify({"ok": False, "msg": "Falha ao minerar."}), 500
+
+        hist.append(agora)
+        _saldo_cache_invalidate(addr)
+
+        reward_sats = 0
+        try:
+            cb = block["transactions"][0]
+            reward_sats = sum(o.get("amount", 0) for o in cb.get("outputs", [])
+                              if o.get("address") == addr)
+        except Exception:
+            pass
+
+        return jsonify({
+            "ok": True, "msg": f"Faucet enviado! +{reward_sats/1e8} BRN",
+            "txid": block["transactions"][0]["txid"],
+            "amount": reward_sats / 1e8,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/verificar-recebimento/<address>/<txid_str>", methods=["GET"])
+def verificar_recebimento(address, txid_str):
+    try:
+        if not WalletManager.validate_address(address):
+            return jsonify({"ok": False, "msg": "Endereco invalido"}), 400
+        if not txid_str or len(txid_str) != 64:
+            return jsonify({"ok": False, "msg": "TXID invalido"}), 400
+
+        chain = _get_chain()
+        mem_tx = chain.db.get_mempool_tx(txid_str)
+        if mem_tx:
+            valor = sum(o.get("amount", 0) for o in mem_tx.get("outputs", [])
+                        if o.get("address") == address)
+            return jsonify({
+                "ok": True, "chegou": False, "status": "pending",
+                "valor": valor, "confirmacoes": 0, "block_height": None,
+                "msg": "Transacao esta na mempool." if valor else "Endereco nao esta nos outputs.",
+            })
+
+        chain_tx, block_height = chain.db.get_tx_by_txid(txid_str)
+        if chain_tx is None:
+            return jsonify({
+                "ok": True, "chegou": False, "status": "not_found",
+                "valor": 0, "confirmacoes": 0, "block_height": None,
+                "msg": "TXID nao encontrado.",
+            })
+
+        valor = sum(o.get("amount", 0) for o in chain_tx.get("outputs", [])
+                    if o.get("address") == address)
+        altura = chain.db.height()
+        confs = max(0, altura - block_height)
+        chegou = valor > 0
+        return jsonify({
+            "ok": True, "chegou": chegou, "status": "confirmed",
+            "valor": valor, "confirmacoes": confs, "block_height": block_height,
+            "msg": f"Confirmado no bloco #{block_height} com {confs} confirmacoes." if chegou else "Endereco nao esta nos outputs.",
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/block/<int:height>", methods=["GET"])
+def api_get_block(height):
+    try:
+        block = _get_chain().db.get_block(height)
+        if block:
+            return jsonify(block)
+        return jsonify({"error": "Bloco não encontrado"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ============================================================
+# [NEW v9.9.17] Multi-sig / Top 5 validadores
+# ============================================================
+@app.route("/api/consensus/validators", methods=["GET"])
+@require_rate_limit("status")
+def consensus_validators():
+    try:
+        trust = _get_trust_network()
+        if trust is None:
+            return jsonify({"ok": False, "msg": "TrustNetwork indisponivel"}), 503
+
+        top5_pubkeys = trust.get_top_validators(count=5) if hasattr(trust, "get_top_validators") else []
+
+        # Encontra os NodeRecords que correspondem a essas pubkeys
+        nodes = list(trust.nodes.values()) if hasattr(trust, "nodes") else []
+        validators = []
+        for n in nodes:
+            if getattr(n, "public_key", "") in top5_pubkeys:
+                validators.append({
+                    "pubkey": n.public_key[:32] + "...",
+                    "pubkey_full": n.public_key,
+                    "node_id": n.node_id,
+                    "address": getattr(n, "address", ""),
+                    "trust_score": round(getattr(n, "trust_score", 0), 1),
+                    "trust_level": getattr(n, "trust_level", "new"),
+                    "connected": getattr(n, "connected", False),
+                })
+        validators.sort(key=lambda x: -x["trust_score"])
+
+        return jsonify({
+            "ok": True,
+            "required_sigs": len(top5_pubkeys),
+            "all_required": True,  # REQUIRE_ALL_SIGS no blockchain v9.4.0
+            "validators": validators[:5],
+        })
+    except Exception as e:
+        log.exception("consensus_validators falhou")
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/block/<int:height>/signatures", methods=["GET"])
+@require_rate_limit("status")
+def block_signatures(height):
+    try:
+        block = _get_chain().db.get_block(height)
+        if not block:
+            return jsonify({"ok": False, "msg": "Bloco não encontrado"}), 404
+
+        sigs = block.get("validators_sig", [])
+        if not isinstance(sigs, list):
+            sigs = []
+
+        return jsonify({
+            "ok": True,
+            "height": height,
+            "block_hash": block.get("hash", ""),
+            "signatures_count": len(sigs),
+            "signatures": [
+                {
+                    "pubkey": (s or {}).get("pubkey", "")[:32] + "...",
+                    "pubkey_full": (s or {}).get("pubkey", ""),
+                    "signature": (s or {}).get("signature", "")[:64] + "...",
+                }
+                for s in sigs
+            ],
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+# ============================================================
+# [FIX] /api/status com validators_active
+# ============================================================
+# SUBSTITUIR o retorno de /api/status (procure "fila_tamanho": len(chain.fila_mineracao))
+# Adicione esta linha no jsonify:
+#     "validators_active": (len(_get_trust_network().get_top_validators(5))
+#                           if _get_trust_network() and hasattr(_get_trust_network(), "get_top_validators")
+#                           else 0),
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
