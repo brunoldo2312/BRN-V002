@@ -1,11 +1,11 @@
 @echo off
 REM ============================================================
-REM   iniciar_cliente.bat - BRN Node CLIENTE (Windows) - v11
+REM   iniciar_cliente.bat - BRN Node CLIENTE (Windows) - v11.1
 REM ============================================================
-REM   v11:
-REM     [NEW] Instala automaticamente dependencias Python (waitress,
-REM           requests, flask, flask_cors, orjson, pywebview).
-REM     [NEW] Instala Tailscale automaticamente via Winget se faltar.
+REM   v11.1:
+REM     [NEW] Bloco de criação de emergência do brn_network.env
+REM           atualizado com TODAS as variáveis do modelo correto,
+REM           incluindo o ADMIN_TOKEN e CORS.
 REM ============================================================
 
 setlocal EnableDelayedExpansion
@@ -28,7 +28,7 @@ goto parse_args
 :args_done
 
 echo ============================================================
-echo   BRN Node - CLIENTE (Windows) - v11
+echo   BRN Node - CLIENTE (Windows) - v11.1
 echo ============================================================
 echo.
 
@@ -40,69 +40,103 @@ if "%PY%"=="" ( echo [ERRO] Python nao encontrado. & pause & exit /b 1 )
 set "PYTHONUNBUFFERED=1"
 
 REM ============================================================
-REM [NOVO v11] VERIFICA E INSTALA DEPENDENCIAS PYTHON
+REM VERIFICA E INSTALA DEPENDENCIAS PYTHON
 REM ============================================================
 echo [*] Verificando dependencias do Python...
 
-REM 1. Waitress (Servidor HTTP)
 %PY% -c "import waitress" >nul 2>&1
-if errorlevel 1 (
-    echo [!] Waitress ausente. Instalando...
-    %PY% -m pip install waitress --quiet
-) else (
-    echo [ok] Waitress OK
-)
+if errorlevel 1 ( echo [!] Waitress ausente. Instalando... & %PY% -m pip install waitress --quiet ) else ( echo [ok] Waitress OK )
 
-REM 2. Requests (API da Carteira)
 %PY% -c "import requests" >nul 2>&1
-if errorlevel 1 (
-    echo [!] Requests ausente. Instalando...
-    %PY% -m pip install requests --quiet
-) else (
-    echo [ok] Requests OK
-)
+if errorlevel 1 ( echo [!] Requests ausente. Instalando... & %PY% -m pip install requests --quiet ) else ( echo [ok] Requests OK )
 
-REM 3. Orjson (Banco de dados)
 %PY% -c "import orjson" >nul 2>&1
-if errorlevel 1 (
-    echo [!] Orjson ausente. Instalando...
-    %PY% -m pip install orjson --quiet
-) else (
-    echo [ok] Orjson OK
-)
+if errorlevel 1 ( echo [!] Orjson ausente. Instalando... & %PY% -m pip install orjson --quiet ) else ( echo [ok] Orjson OK )
 
-REM 4. Flask (Servidor do nó)
 %PY% -c "import flask, flask_cors" >nul 2>&1
-if errorlevel 1 (
-    echo [!] Flask ausente. Instalando...
-    %PY% -m pip install flask flask-cors --quiet
-) else (
-    echo [ok] Flask OK
-)
+if errorlevel 1 ( echo [!] Flask ausente. Instalando... & %PY% -m pip install flask flask-cors --quiet ) else ( echo [ok] Flask OK )
 
-REM 5. PyWebView (Carteira Gráfica)
 %PY% -c "import webview" >nul 2>&1
-if errorlevel 1 (
-    echo [!] PyWebView ausente. Instalando...
-    %PY% -m pip install pywebview --quiet
-) else (
-    echo [ok] PyWebView OK
-)
+if errorlevel 1 ( echo [!] PyWebView ausente. Instalando... & %PY% -m pip install pywebview --quiet ) else ( echo [ok] PyWebView OK )
 echo.
 
+REM ============================================================
+REM CRIA O .ENV DE EMERGENCIA (SE NAO EXISTIR)
+REM ============================================================
 if not exist "brn_network.env" (
-    echo [AVISO] brn_network.env nao existe - criando...
+    echo [AVISO] brn_network.env nao existe - criando com o modelo CORRETO...
     (
+        echo # ============================================================
+        echo # brn_network.env — Config do nó BRN (Máquina B - Windows Cliente)
+        echo # ============================================================
+        echo BRN_CORS_ORIGIN=*
+        echo.
+        echo # 1) SEGREDOS COMPARTILHADOS (DEVEM SER IDÊNTICOS A MÁQUINA ORIGEM)
         echo BRN_NETWORK_SECRET=9226edea8ba62bc1c6ae36883c0536c95b4c85642195465d6c4d9456abef20f9
+        echo BRN_NODE_PASSWORD=senha-no-temp-123
+        echo BRN_WALLET_SESSION_PASS=senha-forte-da-carteira-2026
+        echo BRN_WEB_PASS=senha-temp-123
+        echo.
+        echo # 2) ADMIN TOKEN
+        echo BRN_ADMIN_TOKEN=c745d36d524ea92148d8139731ad663f929fbbe08fb7f9b2234f9109fe1d2b24
+        echo.
+        echo # 3) DESCOBERTA DE PEERS
+        echo BRN_BOOTSTRAP_PEERS=100.111.253.8:6001
+        echo BRN_FALLBACK_PEERS=100.111.253.8:6001
+        echo BRN_TRACKER=
+        echo BRN_RENDEZVOUS_URL=
+        echo.
+        echo # 4) MODO DE OPERAÇÃO
         echo BRN_IS_ORIGIN=0
-        echo BRN_BOOTSTRAP_PEERS=
+        echo BRN_POOL_ENABLED=1
         echo BRN_POOL_URL=http://100.111.253.8:5000
+        echo.
+        echo # 5) CONSENSO
+        echo BRN_SYNC_BATCH=50
+        echo BRN_SYNC_BATCH_DELAY=0.06
+        echo BRN_SYNC_INTERVAL=5
+        echo.
+        echo # 6) P2P
         echo BRN_P2P_PORT=6002
+        echo BRN_P2P_AUTH=optional
+        echo BRN_P2P_AUTH_WINDOW=30
+        echo BRN_P2P_NONCE_CACHE=10000
+        echo BRN_RATE_LIMIT=200
+        echo BRN_UPNP=0
+        echo BRN_TCP_TIMEOUT=10.0
+        echo.
+        echo # 7) MINERAÇÃO
+        echo BRN_MINER_INTERVAL=30
+        echo BRN_ALLOW_SOLO_MINING=0
+        echo BRN_MIN_PEER_STABLE=1
+        echo.
+        echo # 8) HTTP / API
+        echo BRN_WEB_HOST=0.0.0.0
         echo BRN_WEB_PORT=5000
-        echo TS_AUTH_KEY=
+        echo BRN_EXPLORER_PORT=8080
+        echo BRN_EXPLORER_HOST=0.0.0.0
+        echo BRN_HTTP_THREADS=16
+        echo BRN_TRUSTED_PROXIES=
+        echo BRN_BEHIND_PROXY=0
+        echo BRN_HTTPS=0
+        echo.
+        echo # 9) AUDIT
+        echo BRN_AUDIT_ENABLED=1
+        echo BRN_AUDIT_LOG=audit.log
+        echo BRN_AUDIT_MAX_BYTES=52428800
+        echo.
+        echo # 10) VERIFY
+        echo BRN_SKIP_VERIFY=0
+        echo BRN_VERIFY_STRICT=0
+        echo BRN_LOG_LEVEL=INFO
+        echo.
+        echo # 14) PYTHON
+        echo PYTHONUNBUFFERED=1
     ) > brn_network.env
+    echo [ok] brn_network.env criado com o modelo correto.
 )
 
+REM Carrega o .env para a memoria do .bat
 for /f "usebackq eol=# tokens=1,* delims==" %%A in ("brn_network.env") do (
     set "K=%%A"
     set "V=%%B"
