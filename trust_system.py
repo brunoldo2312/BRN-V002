@@ -1,12 +1,14 @@
 """
-trust_system.py — Sistema de Reputação e Consenso do BRN (v4)
+trust_system.py — Sistema de Reputação e Consenso do BRN (v4.1)
 ================================================================
+v4.1 (2026-10-26):
+  [FIX CRÍTICO] sync_scores_from_peer agora checa a promoção automática.
+                Antes, um nó podia ter score 3000 e continuar como 'new'
+                porque a promoção só era checada no update_score.
 v4 (2026-10-25):
   [NEW] Salvamento automático a cada 30s em background.
   [NEW] get_top_validators() para a regra dos Top 5.
   [NEW] shutdown() para salvar no Ctrl+C.
-  [NEW] sync_scores_from_peer() para consenso global.
-  [FIX] Trava (lock) em todas as operações.
 ================================================================
 """
 import json
@@ -98,6 +100,9 @@ class PeerTrustSystem:
         if self._saver_thread and self._saver_thread.is_alive():
             self._saver_thread.join(timeout=3)
 
+    # ============================================================
+    # Manipulação de Dados
+    # ============================================================
     def ensure_peer_entry(self, public_key_hex: str):
         with self.lock:
             if public_key_hex not in self.peers:
@@ -157,17 +162,26 @@ class PeerTrustSystem:
             if peer["score"] >= TrustConfig.SCORE_THRESHOLD:
                 peer["status"] = "trusted"
                 peer["promoted_at"] = time.time()
-                log.info(f"🎉 PEER PROMOVIDO: {public_key_hex[:12]}... | Score: {peer['score']}")
+                log.info(f"🎉 PEER PROMOVIDO: {public_key_hex[:12]}... | Score: {peer['score']:.1f}")
 
     def sync_scores_from_peer(self, remote_scores: dict):
+        """[FIX v4.1] Agora promove o nó a trusted se o score passar de 100."""
         with self.lock:
             for pubkey, remote_score in remote_scores.items():
                 if remote_score > 10000 or remote_score < -1000:
                     continue
                 if pubkey in self.peers:
                     local_score = self.peers[pubkey]["score"]
+                    # Média ponderada (60% local, 40% remoto)
                     new_score = (local_score * 0.6) + (remote_score * 0.4)
                     self.peers[pubkey]["score"] = new_score
+                    
+                    # [FIX] Checa se o nó merece ser promovido após a atualização
+                    if TrustConfig.AUTO_PROMOTE and self.peers[pubkey]["status"] not in ("trusted", "banned"):
+                        if new_score >= TrustConfig.SCORE_THRESHOLD:
+                            self.peers[pubkey]["status"] = "trusted"
+                            self.peers[pubkey]["promoted_at"] = time.time()
+                            log.info(f"🎉 PEER PROMOVIDO (via sync): {pubkey[:12]}... | Score: {new_score:.1f}")
                 else:
                     self.ensure_peer_entry(pubkey)
                     self.peers[pubkey]["score"] = remote_score
