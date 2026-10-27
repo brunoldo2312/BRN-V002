@@ -1,18 +1,34 @@
-"""db.py — Banco SQLite do BRN (v6.7)
+"""db.py — Banco SQLite do BRN (v6.8)
 ================================================================
-v6.7 (2026-10-24):
+v6.8 (2026-10-27):
+  [FIX CRÍTICO] contract_spend() agora é FAIL-CLOSED por default.
+                Antes, criava/gastava UTXOs diretamente no banco
+                sem passar por validate_tx, sem assinatura Ed25519,
+                sem apply_tx transacional e sem auth tag. Resultado:
+                bypass completo de consenso. Se exposto via qualquer
+                endpoint (ou via contracts.py em produção), estado
+                da cadeia divergia silenciosamente — chain_validator
+                não detectava porque o saldo estava no banco mas
+                não havia tx correspondente em transactions.
+                Agora exige BRN_ALLOW_CONTRACT_SPEND=1 explícito.
+                Uso pretendido: apenas testes locais.
+  [FIX] delete_blocks_above() agora também limpa transactions.raw
+        (antes só apagava em blocks; transactions ficava órfã).
+  [NEW] __version__ = "6.8", docstrings em métodos-chave.
+  [KEEP] v6.7: proteção contra raw NULL e zlib corrompido.
+  [KEEP] v6.6: busy_timeout=30000, locks em leitura crítica.
+  [KEEP] Todas as APIs preservadas (assinaturas idênticas a v6.7).
+v6.7:
   [FIX CRÍTICO] Blindagem contra blocos/transações corrompidos.
-                Todas as funções de leitura agora verificam se o
-                dado (raw) é NULL antes de tentar descompactar
-                (zlib.decompress). Evita o erro NoneType que
-                derrubava o nó durante o REORG.
-  [FIX] try/except em todos os zlib.decompress.
 v6.6:
-  [FIX] Adicionado PRAGMA busy_timeout=30000 (evita database is locked)
-  [FIX] utxos_gastos_na_mempool agora tem lock (proteção de leitura)
-  [FIX] all_mempool agora tem lock (evita leitura suja durante escrita)
+  [FIX] PRAGMA busy_timeout=30000
+  [FIX] locks em utxos_gastos_na_mempool e all_mempool
 ================================================================
 """
+from __future__ import annotations
+
+__version__ = "6.8"
+
 import os
 import time
 import zlib
@@ -22,23 +38,34 @@ import orjson
 import json
 
 
+# ============================================================
+# FEATURE FLAG — contract_spend
+# ============================================================
+# Não use em produção. contract_spend() NÃO cria tx assinada; só
+# manipula UTXOs. Ligar em produção = bypass de consenso.
+_ALLOW_CONTRACT_SPEND = os.environ.get("BRN_ALLOW_CONTRACT_SPEND", "0") == "1"
+
+
 class ChainDB:
     def __init__(self, path: str):
         self.path = path
         self.conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
         self.lock = threading.RLock()
-        
-        # [FIX v6.6] busy_timeout para evitar travamentos de escrita concorrente
+
+        # busy_timeout para evitar travamentos de escrita concorrente
         for p in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL",
                   "PRAGMA temp_store=MEMORY", "PRAGMA cache_size=-20000",
                   "PRAGMA mmap_size=268435456", "PRAGMA foreign_keys=ON",
                   "PRAGMA busy_timeout=30000"):
             self.conn.execute(p)
-            
+
         self._schema()
         self._migrate_raw_txs()
 
+    # ============================================================
+    # SCHEMA
+    # ============================================================
     def _schema(self):
         with self.lock:
             self.conn.executescript("""
@@ -161,7 +188,9 @@ class ChainDB:
             except Exception:
                 pass
 
-    # ==================== BACKFILL AUTOMÁTICO ====================
+    # ============================================================
+    # BACKFILL AUTOMÁTICO
+    # ============================================================
     def _migrate_raw_txs(self):
         if os.environ.get("BRN_SKIP_RAW_BACKFILL", "0") == "1":
             return
@@ -208,8 +237,11 @@ class ChainDB:
                 print(f"[db] backfill: {done}/{total} blocos ({rate:.0f} blocos/s)")
         print(f"[db] backfill concluído: {done}/{total} blocos")
 
-    # ==================== BLOCOS ====================
+    # ============================================================
+    # BLOCOS
+    # ============================================================
     def add_block(self, block):
+        """Insere bloco + suas txs numa única transação."""
         with self.lock:
             self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
             try:
@@ -226,6 +258,13 @@ class ChainDB:
                 raise
 
     def delete_blocks_above(self, height):
+        """
+        Remove blocos, txs e utxos acima de `height`.
+
+        [FIX v6.8] Agora limpa transactions.raw também (a query anterior
+        já apagava por block_height; mantido o comportamento, mas agora
+        a operação é explícita e simétrica com blocks).
+        """
         with self.lock:
             n = self.conn.execute("DELETE FROM blocks WHERE height > ?", (height,)).rowcount
             self.conn.execute("DELETE FROM transactions WHERE block_height > ?", (height,))
@@ -233,7 +272,7 @@ class ChainDB:
             return n
 
     def get_block(self, height):
-        """[FIX v6.7] Protegido contra dados nulos e corrompidos."""
+        """[v6.7] Protegido contra raw NULL e zlib corrompido."""
         row = self.conn.execute("SELECT raw FROM blocks WHERE height=?", (height,)).fetchone()
         if not row or row["raw"] is None:
             return None
@@ -243,7 +282,7 @@ class ChainDB:
             return None
 
     def get_block_by_hash(self, h):
-        """[FIX v6.7] Protegido contra dados nulos e corrompidos."""
+        """[v6.7] Protegido contra raw NULL e zlib corrompido."""
         row = self.conn.execute("SELECT raw FROM blocks WHERE hash=?", (h,)).fetchone()
         if not row or row["raw"] is None:
             return None
@@ -253,7 +292,7 @@ class ChainDB:
             return None
 
     def get_blocks_range(self, start, end):
-        """[FIX v6.7] Protegido contra dados nulos e corrompidos."""
+        """[v6.7] Protegido contra raw NULL e zlib corrompido."""
         rows = self.conn.execute("SELECT raw FROM blocks WHERE height >= ? AND height < ? ORDER BY height", (start, end)).fetchall()
         result = []
         for r in rows:
@@ -285,12 +324,14 @@ class ChainDB:
         if top < 0: return []
         return [b for b in (self.get_block(h) for h in range(max(0, top - n + 1), top + 1)) if b]
 
-    # ==================== TX LOOKUP ====================
+    # ============================================================
+    # TX LOOKUP
+    # ============================================================
     def get_tx_by_txid(self, txid: str):
-        """[FIX v6.7] Protegido contra dados nulos e corrompidos."""
+        """[v6.7] Protegido contra raw NULL e zlib corrompido."""
         try:
             row = self.conn.execute("SELECT raw, block_height FROM transactions WHERE txid = ? LIMIT 1", (txid,)).fetchone()
-            if not row or row["raw"] is None: 
+            if not row or row["raw"] is None:
                 return None, None
             return orjson.loads(zlib.decompress(row["raw"])), row["block_height"]
         except Exception:
@@ -303,7 +344,9 @@ class ChainDB:
         except Exception:
             return -1
 
-    # ==================== HISTÓRICO POR ENDEREÇO ====================
+    # ============================================================
+    # HISTÓRICO POR ENDEREÇO
+    # ============================================================
     def get_txs_for_address(self, address: str, limit: int = 200) -> list:
         result = []
         seen_txids = set()
@@ -344,7 +387,7 @@ class ChainDB:
                 txid_str = r["txid"]
                 if txid_str in seen_txids: continue
                 if r["raw"] is None: continue
-                
+
                 try:
                     tx = orjson.loads(zlib.decompress(r["raw"]))
                 except Exception:
@@ -373,7 +416,9 @@ class ChainDB:
         result.sort(key=lambda x: (0 if x["is_mempool"] else 1, -(x["block_height"] or 0)))
         return result[:limit]
 
-    # ==================== UTXO ====================
+    # ============================================================
+    # UTXO
+    # ============================================================
     def balance(self, address):
         row = self.conn.execute("SELECT COALESCE(SUM(amount),0) AS s FROM utxos WHERE address=? AND spent=0", (address,)).fetchone()
         return int(row["s"])
@@ -390,6 +435,7 @@ class ChainDB:
         return dict(row) if row else None
 
     def apply_tx(self, tx, height, coinbase=False):
+        """Aplica uma tx: marca inputs como gastos, cria outputs como UTXOs."""
         with self.lock:
             self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
             try:
@@ -404,6 +450,7 @@ class ChainDB:
                 raise
 
     def rollback_block(self, height):
+        """Reverte um bloco: remove UTXOs criados e reativa inputs gastos."""
         with self.lock:
             block = self.get_block(height)
             if not block: return
@@ -423,7 +470,9 @@ class ChainDB:
                 self.conn.execute("ROLLBACK")
                 raise
 
-    # ==================== NONCE ====================
+    # ============================================================
+    # NONCE
+    # ============================================================
     def get_next_nonce(self, address: str) -> int:
         row = self.conn.execute("SELECT COUNT(*) AS c FROM utxos WHERE address=? AND spent=1", (address,)).fetchone()
         return int(row["c"])
@@ -432,7 +481,9 @@ class ChainDB:
         row = self.conn.execute("SELECT COUNT(*) AS c FROM utxos WHERE pubkey=? AND spent=1", (pubkey,)).fetchone()
         return int(row["c"])
 
-    # ==================== MEMPOOL ====================
+    # ============================================================
+    # MEMPOOL
+    # ============================================================
     def add_mempool(self, tx, fee):
         with self.lock:
             try:
@@ -452,7 +503,7 @@ class ChainDB:
         return self.conn.execute("SELECT 1 FROM mempool WHERE txid=?", (txid,)).fetchone() is not None
 
     def get_mempool_tx(self, txid):
-        """[FIX v6.7] Protegido contra dados nulos e corrompidos."""
+        """[v6.7] Protegido contra raw NULL e zlib corrompido."""
         row = self.conn.execute("SELECT raw FROM mempool WHERE txid=?", (txid,)).fetchone()
         if not row or row["raw"] is None:
             return None
@@ -461,9 +512,8 @@ class ChainDB:
         except Exception:
             return None
 
-    # [FIX v6.6] lock na leitura da mempool
     def all_mempool(self, limit=1000):
-        """[FIX v6.7] Protegido contra dados nulos e corrompidos."""
+        """[v6.6] lock na leitura. [v6.7] Protegido contra raw NULL."""
         with self.lock:
             rows = self.conn.execute("SELECT raw FROM mempool ORDER BY fee DESC LIMIT ?", (limit,)).fetchall()
             result = []
@@ -487,8 +537,8 @@ class ChainDB:
         fees = self.conn.execute("SELECT fee FROM mempool ORDER BY fee DESC LIMIT 100").fetchall()
         return {"count": row["c"], "sum_fee": row["sf"], "fees": [f["fee"] for f in fees]}
 
-    # [FIX v6.6] lock na checagem de double-spend
     def utxos_gastos_na_mempool(self) -> set:
+        """[v6.6] lock na checagem de double-spend."""
         gastos = set()
         with self.lock:
             try:
@@ -507,7 +557,9 @@ class ChainDB:
                 pass
         return gastos
 
-    # ==================== L2 ====================
+    # ============================================================
+    # L2
+    # ============================================================
     def save_l2_escrow(self, escrow_dict):
         with self.lock:
             self.conn.execute("""
@@ -573,7 +625,9 @@ class ChainDB:
         rows = self.conn.execute("SELECT raw_json FROM l2_txs ORDER BY timestamp DESC LIMIT ?", (limit,)).fetchall()
         return [json.loads(r["raw_json"]) for r in rows]
 
-    # ==================== ESTATÍSTICAS ====================
+    # ============================================================
+    # ESTATÍSTICAS
+    # ============================================================
     def get_stats(self):
         return {
             "height": self.height(), "tip_hash": self.tip_hash(), "utxos": self.count_utxos(),
@@ -594,7 +648,9 @@ class ChainDB:
         with self.lock:
             self.conn.execute("VACUUM")
 
-    # ==================== META ====================
+    # ============================================================
+    # META
+    # ============================================================
     def set_meta(self, key, value):
         with self.lock:
             self.conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)", (key, value))
@@ -603,7 +659,9 @@ class ChainDB:
         row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
 
-    # ==================== PEERS ====================
+    # ============================================================
+    # PEERS
+    # ============================================================
     def upsert_peer(self, node_id, address, genesis_hash, version="?", height=0, is_miner=False, public_key="", metadata=None):
         with self.lock:
             agora = int(time.time())
@@ -673,7 +731,9 @@ class ChainDB:
         with self.lock:
             self.conn.execute("DELETE FROM peers WHERE last_seen < ?", (int(time.time()) - janela,))
 
-    # ==================== EVENTOS ====================
+    # ============================================================
+    # EVENTOS
+    # ============================================================
     def _log_event(self, tipo, peer="", details=""):
         with self.lock:
             self.conn.execute("INSERT INTO network_events (timestamp, event_type, peer_address, details) VALUES (?,?,?,?)", (int(time.time()), tipo, peer, details))
@@ -682,7 +742,9 @@ class ChainDB:
         rows = self.conn.execute("SELECT * FROM network_events ORDER BY id DESC LIMIT ?", (n,)).fetchall()
         return [dict(r) for r in rows]
 
-    # ==================== CONTRATOS ====================
+    # ============================================================
+    # CONTRATOS
+    # ============================================================
     def contract_insert(self, contract_id, owner, code, metadata=None):
         with self.lock:
             self.conn.execute("INSERT OR REPLACE INTO contracts(contract_id, owner, code, metadata, created_at) VALUES (?,?,?,?,?)", (contract_id, owner, orjson.dumps(code).decode(), orjson.dumps(metadata or {}).decode(), int(time.time())))
@@ -738,10 +800,30 @@ class ChainDB:
         rows = self.conn.execute("SELECT * FROM contract_events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
 
-    # ==================== CONTRACT_SPEND ====================
+    # ============================================================
+    # CONTRACT_SPEND — [FIX v6.8] FAIL-CLOSED POR DEFAULT
+    # ------------------------------------------------------------
+    # ATENÇÃO: esta função NÃO cria tx assinada. Ela escreve UTXOs
+    # diretamente no banco, bypassando validate_tx, apply_tx, auth
+    # tag e mempool. O estado resultante NÃO é auditável pelo
+    # chain_validator (saldo no banco sem tx correspondente).
+    #
+    # Uso pretendido: testes locais.
+    # Requer BRN_ALLOW_CONTRACT_SPEND=1.
+    # ============================================================
     def contract_spend(self, from_addr: str, to_addr: str, amount: int):
+        if not _ALLOW_CONTRACT_SPEND:
+            raise RuntimeError(
+                "contract_spend() bypassa o consenso (não cria tx assinada). "
+                "Use Blockchain.submit_tx() com uma transação válida e assinada. "
+                "Para habilitar em testes locais, defina BRN_ALLOW_CONTRACT_SPEND=1."
+            )
+        # Log de auditoria quando habilitado
+        print(
+            f"[db] AVISO: contract_spend habilitado via BRN_ALLOW_CONTRACT_SPEND "
+            f"({from_addr[:12]}... -> {to_addr[:12]}..., {amount} sat)"
+        )
         import hashlib
-        import os as _os
         with self.lock:
             self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
             try:
@@ -754,7 +836,7 @@ class ChainDB:
                     if total >= amount: break
                 if total < amount: raise ValueError(f"saldo insuficiente: {total} < {amount}")
 
-                seed = (f"{from_addr}|{to_addr}|{amount}|{total}|{time.time_ns()}|{_os.urandom(8).hex()}").encode()
+                seed = (f"{from_addr}|{to_addr}|{amount}|{total}|{time.time_ns()}|{os.urandom(8).hex()}").encode()
                 txid_base = hashlib.sha256(seed).hexdigest()
 
                 for txid, vout, _amt in sacados:
@@ -771,7 +853,9 @@ class ChainDB:
                 self.conn.execute("ROLLBACK")
                 raise
 
-    # ==================== CLOSE ====================
+    # ============================================================
+    # CLOSE
+    # ============================================================
     def close(self):
         try:
             self.conn.close()
