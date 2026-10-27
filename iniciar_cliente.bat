@@ -1,245 +1,260 @@
 @echo off
 REM ============================================================
-REM   iniciar_cliente.bat - BRN Node CLIENTE (Windows) - v13.0
+REM   comeca.bat - BRN Node setup completo (v3.0)
+REM   Padrao: GUI (carteira grafica)
+REM   Flags:  --headless  --skip-sync  --skip-deps
 REM ============================================================
-REM   v13.0 (2026-10-26):
-REM     [FIX] where py robusto (antes PY ficava "py -3" fantasma)
-REM     [FIX] --no-gui agora realmente forca headless (era ignorado)
-REM     [FIX] --no-tailscale agora propaga para o main.py
-REM     [FIX] Verifica brn_tailscale_setup.py antes de rodar
-REM     [FIX] Template .env atualizado (bootstrap 100.70.107.15)
-REM     [NEW] --bootstrap <IP:PORTA> para trocar sem editar .env
-REM     [NEW] Header mostra FLAGS antes de rodar (debug)
-REM     [NEW] try/fail no pip install (nao silencia erro)
-REM ============================================================
-
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
-REM ===== DEFAULTS =====
-set "SKIP_TAILSCALE=0"
-set "FORCE_GUI=0"
-set "FORCE_NO_GUI=0"
-set "NO_POOL_CLIENT=1"
-set "BOOTSTRAP_OVERRIDE="
+REM Configura encoding UTF-8 no console
+chcp 65001 >nul 2>&1
+set "PYTHONIOENCODING=utf-8"
+set "PYTHONUTF8=1"
+set "PYTHONUNBUFFERED=1"
 
-REM ===== PARSE ARGS =====
+REM Padrao: GUI ativada
+set "FORCE_HEADLESS=0"
+set "SKIP_SYNC=0"
+set "SKIP_DEPS=0"
+
 :parse_args
 if "%~1"=="" goto args_done
-if /i "%~1"=="--skip-tailscale"  set "SKIP_TAILSCALE=1"
-if /i "%~1"=="--gui"             set "FORCE_GUI=1"
-if /i "%~1"=="--no-gui"          set "FORCE_NO_GUI=1"
-if /i "%~1"=="--no-pool-client"  set "NO_POOL_CLIENT=1"
-if /i "%~1"=="--pool-client"     set "NO_POOL_CLIENT=0"
-if /i "%~1"=="--bootstrap" (
-    if not "%~2"=="" set "BOOTSTRAP_OVERRIDE=%~2"
-    shift
-)
+if /i "%~1"=="--headless"      set "FORCE_HEADLESS=1"
+if /i "%~1"=="--gui"           set "FORCE_HEADLESS=0"
+if /i "%~1"=="--skip-sync"     set "SKIP_SYNC=1"
+if /i "%~1"=="--skip-deps"     set "SKIP_DEPS=1"
 shift
 goto parse_args
 :args_done
 
-REM ===== BANNER =====
+echo.
 echo ============================================================
-echo   BRN Node - CLIENTE (Windows) - v13.0
+echo   BRN Node - SETUP COMPLETO (v3.0)
+echo ============================================================
+echo   Pasta: %CD%
+echo   Data:  %DATE% %TIME%
+if "%FORCE_HEADLESS%"=="1" (
+    echo   Modo:  HEADLESS ^(sem GUI^)
+) else (
+    echo   Modo:  GUI ^(carteira grafica^)
+)
 echo ============================================================
 echo.
 
-REM ===== 1. FIND PYTHON (ROBUSTO) =====
+REM ============================================================
+REM 1. DETECTAR PYTHON
+REM ============================================================
+echo [1/7] Detectando Python...
 set "PY="
-where python >nul 2>&1
-if not errorlevel 1 goto py_python
-where py >nul 2>&1
-if not errorlevel 1 goto py_py_launcher
-goto py_not_found
-
-:py_python
-set "PY=python"
-goto py_ok
-
-:py_py_launcher
-set "PY=py -3"
-goto py_ok
-
-:py_not_found
-echo [ERRO] Python nao encontrado.
-echo        Instale em: https://www.python.org/downloads/
-echo        Marque "Add Python to PATH" na instalacao.
-pause
-exit /b 1
-
-:py_ok
-%PY% --version >nul 2>&1
-if errorlevel 1 (
-    echo [ERRO] "%PY%" nao funciona. Verifique a instalacao do Python.
+where python >nul 2>&1 && set "PY=python"
+if not defined PY where py >nul 2>&1 && set "PY=py -3"
+if not defined PY (
+    echo [ERRO] Python nao encontrado no PATH.
+    echo        Instale: https://www.python.org/downloads/
     pause
     exit /b 1
 )
+%PY% --version
 echo [ok] Python: %PY%
-set "PYTHONUNBUFFERED=1"
-
-REM ===== 2. DEPENDENCIAS =====
-echo.
-echo [*] Verificando dependencias Python...
-call :dep waitress
-call :dep requests
-call :dep orjson
-call :dep flask
-call :dep flask_cors
 echo.
 
-REM ===== 3. .ENV (CRIA SE NAO EXISTIR) =====
-if not exist "brn_network.env" call :create_env_template
+REM ============================================================
+REM 2. INSTALAR DEPENDENCIAS
+REM ============================================================
+if "%SKIP_DEPS%"=="1" goto deps_skip
 
-REM ===== 4. TAILSCALE =====
-if "%SKIP_TAILSCALE%"=="1" goto skip_tailscale
-where tailscale >nul 2>&1
-if errorlevel 1 (
-    echo [!] Tailscale nao instalado. Pulando descoberta global.
-    echo     Instale em: https://tailscale.com/download/windows
-    goto skip_tailscale
+echo [2/7] Instalando dependencias Python...
+
+%PY% -m pip install --quiet --upgrade pip 2>nul
+
+REM Deps core
+set "PKGS=flask flask-cors requests orjson waitress cryptography argon2-cffi mnemonic pymongo"
+REM Deps GUI (so se GUI ativada)
+if "%FORCE_HEADLESS%"=="0" (
+    set "PKGS=!PKGS! pywebview pythonnet"
 )
-if not exist "brn_tailscale_setup.py" (
-    echo [!] brn_tailscale_setup.py nao encontrado. Pulando.
-    goto skip_tailscale
+
+for %%P in (!PKGS!) do (
+    echo        - %%P
+    %PY% -m pip install --quiet %%P
+    if errorlevel 1 (
+        echo        [!] falhou, tentando --user...
+        %PY% -m pip install --quiet --user %%P
+        if errorlevel 1 (
+            echo        [X] %%P NAO instalado.
+            if /i "%%P"=="pywebview" (
+                echo        GUI nao vai funcionar. Use --headless.
+                set "FORCE_HEADLESS=1"
+            ) else (
+                echo        Abortando.
+                pause
+                exit /b 2
+            )
+        )
+    )
 )
-echo [*] Executando descoberta global via Tailscale...
-%PY% brn_tailscale_setup.py --auto
-if errorlevel 1 echo [!] brn_tailscale_setup.py falhou (continuando)
+
+echo [ok] Dependencias instaladas
 echo.
-:skip_tailscale
+:deps_skip
 
-REM ===== 5. VERIFICA ARQUIVOS ESSENCIAIS =====
-set "FALTA="
-for %%F in (
-    main.py server.py blockchain.py db.py crypto.py wallet.py
-    chain_validator.py checkpoints.py security.py secure_store.py
-    p2p_unified.py discovery_v2.py miner_loop.py sync_manager.py
-) do (
-    if not exist "%%F" set "FALTA=!FALTA! %%F"
+REM ============================================================
+REM 3. CRIAR .ENV (SE NAO EXISTIR)
+REM ============================================================
+echo [3/7] Configurando brn_network.env...
+
+if exist "brn_network.env" (
+    echo [ok] brn_network.env ja existe - mantendo
+    goto env_done
 )
-if not "%FALTA%"=="" (
-    echo [ERRO] Arquivos faltando:!FALTA!
+
+REM Conteudo ASCII puro - evita cp1252 do cmd >
+(
+echo # ============================================================
+echo # brn_network.env - BRN Node Config
+echo # ============================================================
+echo BRN_NETWORK_SECRET=9226edea8ba62bc1c6ae36883c0536c95b4c85642195465d6c4d9456abef20f9
+echo BRN_NODE_PASSWORD=senha-no-temp-123
+echo BRN_WALLET_SESSION_PASS=senha-forte-da-carteira-2026
+echo BRN_WEB_PASS=senha-temp-123
+echo BRN_BOOTSTRAP_PEERS=100.111.253.8:6001,192.168.0.12:6002
+echo BRN_POOL_URL=http://100.111.253.8:5000
+echo BRN_IS_ORIGIN=0
+echo BRN_POOL_ENABLED=1
+echo BRN_AUTO_MINE=0
+echo BRN_P2P_PORT=6002
+echo BRN_P2P_AUTH=optional
+echo BRN_UPNP=0
+echo BRN_WEB_HOST=0.0.0.0
+echo BRN_WEB_PORT=5000
+echo BRN_CORS_ORIGIN=*
+echo BRN_LOG_LEVEL=INFO
+echo BRN_AUDIT_ENABLED=1
+echo BRN_SKIP_VERIFY=0
+) > brn_network.env
+
+echo [ok] brn_network.env criado
+:env_done
+
+%PY% -c "from pathlib import Path; d=Path('brn_network.env').read_bytes(); print('[ok] .env sem BOM' if d[:3]!=b'\xef\xbb\xbf' else '[!] .env TEM BOM')"
+echo.
+
+REM ============================================================
+REM 4. VERIFICAR ARQUIVOS ESSENCIAIS + GUI
+REM ============================================================
+echo [4/7] Verificando arquivos...
+
+set "FALTANDO="
+for %%F in (main.py server.py blockchain.py db.py crypto.py wallet.py sync_manager.py chain_validator.py checkpoints.py p2p_unified.py discovery_v2.py secure_store.py) do (
+    if not exist "%%F" set "FALTANDO=!FALTANDO! %%F"
+)
+if not "!FALTANDO!"=="" (
+    echo [ERRO] Arquivos faltando:!FALTANDO!
     pause
-    exit /b 1
+    exit /b 3
 )
-echo [ok] Arquivos essenciais OK
+echo [ok] Arquivos essenciais presentes
 
-REM ===== 6. ROLE =====
-> "brn_role.txt" echo client
-echo [ok] Papel: CLIENTE
+REM Verificar arquivos da GUI
+if "%FORCE_HEADLESS%"=="0" (
+    set "GUI_OK=1"
+    if not exist "app_wallet_v3.py" (
+        echo [!] app_wallet_v3.py NAO encontrado
+        set "GUI_OK=0"
+    )
+    if not exist "index_wallet.html" (
+        echo [!] index_wallet.html NAO encontrado
+        set "GUI_OK=0"
+    )
+    if "!GUI_OK!"=="0" (
+        echo [!] GUI indisponivel - caindo para HEADLESS
+        set "FORCE_HEADLESS=1"
+    ) else (
+        echo [ok] Arquivos da GUI presentes
+    )
+)
+echo.
 
-REM ===== 7. GUI vs HEADLESS (CORRIGIDO) =====
+REM ============================================================
+REM 5. SINCRONIZAR BLOCKCHAIN
+REM ============================================================
+if "%SKIP_SYNC%"=="1" goto sync_skip
+
+echo [5/7] Verificando blockchain local...
+set "DB_HEIGHT=-1"
+for /f "delims=" %%H in ('%PY% -c "from db import ChainDB; d=ChainDB('brn_v2_chain.db'); print(d.height()); d.close()" 2^>nul') do set "DB_HEIGHT=%%H"
+
+echo        Altura local: !DB_HEIGHT!
+if not "!DB_HEIGHT!"=="-1" (
+    echo [ok] Blockchain ja sincronizada ^(altura !DB_HEIGHT!^)
+    goto sync_done
+)
+
+echo        DB vazio - sincronizando do Ubuntu...
+if not exist "sync_direct.py" (
+    echo [ERRO] sync_direct.py nao encontrado
+    echo        Crie o arquivo OU rode com --skip-sync
+    pause
+    exit /b 4
+)
+
+%PY% sync_direct.py http://100.111.253.8:5000
+if errorlevel 1 (
+    echo [X] Sync falhou
+    pause
+    exit /b 5
+)
+:sync_done
+echo.
+:sync_skip
+
+REM ============================================================
+REM 6. CRIAR CARTEIRA (SE NAO EXISTIR)
+REM ============================================================
+echo [6/7] Verificando carteira...
+
+if exist "current_wallet.enc" (
+    echo [ok] current_wallet.enc ja existe
+    goto wallet_done
+)
+
+echo        Criando carteira nova...
+%PY% -c "from wallet import Wallet, WalletManager; import os; w = Wallet.create(); pw = os.environ.get('BRN_WALLET_SESSION_PASS', 'senha-forte-da-carteira-2026'); r = WalletManager.save_current(w.address, w.priv_hex, w.pub_hex, pw); print('[ok] carteira criada:', w.address if r.get('ok') else 'FALHOU: ' + r.get('msg', '?'))"
+
+if errorlevel 1 (
+    echo [!] Falha ao criar carteira - continuara sem minerar
+)
+:wallet_done
+echo.
+
+REM ============================================================
+REM 7. RODAR main.py
+REM ============================================================
+echo [7/7] Iniciando BRN Node...
+echo.
+
 set "HEADLESS_FLAG=--headless"
+if "%FORCE_HEADLESS%"=="0" set "HEADLESS_FLAG="
 
-if "%FORCE_NO_GUI%"=="1" goto gui_decided
-if "%FORCE_GUI%"=="1" (
-    set "HEADLESS_FLAG="
-    goto gui_decided
+if "%FORCE_HEADLESS%"=="0" (
+    echo   MODO: GUI ^(carteira grafica^)
+) else (
+    echo   MODO: HEADLESS ^(API^/CLI apenas^)
 )
-
-REM Auto-detect: se pywebview existe, usa GUI
-%PY% -c "import webview" >nul 2>&1
-if not errorlevel 1 set "HEADLESS_FLAG="
-:gui_decided
-
-REM ===== 8. FLAGS =====
-set "POOL_CLIENT_FLAG="
-if "%NO_POOL_CLIENT%"=="0" set "POOL_CLIENT_FLAG=--pool-client"
-
-set "TAILSCALE_FLAG="
-if "%SKIP_TAILSCALE%"=="1" set "TAILSCALE_FLAG=--no-tailscale"
-
-REM ===== 9. BOOTSTRAP OVERRIDE (--bootstrap) =====
-if not "%BOOTSTRAP_OVERRIDE%"=="" (
-    echo [*] Aplicando bootstrap override: %BOOTSTRAP_OVERRIDE%
-    set "BRN_BOOTSTRAP_PEERS=%BOOTSTRAP_OVERRIDE%"
-)
-
-REM ===== 10. START =====
-echo.
 echo ============================================================
-echo   INICIANDO CLIENTE...
-echo ============================================================
-echo   HEADLESS_FLAG  : %HEADLESS_FLAG%
-echo   POOL_CLIENT    : %POOL_CLIENT_FLAG%
-echo   TAILSCALE_FLAG : %TAILSCALE_FLAG%
-echo   BOOTSTRAP      : %BOOTSTRAP_OVERRIDE%
+echo   %PY% main.py %HEADLESS_FLAG% --no-tailscale --skip-verify
 echo ============================================================
 echo.
 
-%PY% main.py %HEADLESS_FLAG% %POOL_CLIENT_FLAG% %TAILSCALE_FLAG%
+%PY% main.py %HEADLESS_FLAG% --no-tailscale --skip-verify
 set "RC=%ERRORLEVEL%"
 
 echo.
 if not "%RC%"=="0" (
     echo [X] main.py saiu com codigo %RC%
 ) else (
-    echo [ok] main.py encerrado normalmente
+    echo [ok] main.py encerrado
 )
 pause
 exit /b %RC%
-
-REM ============================================================
-REM SUBROTINAS
-REM ============================================================
-:dep
-%PY% -c "import %~1" >nul 2>&1
-if not errorlevel 1 (
-    echo [ok] %~1 OK
-    exit /b 0
-)
-echo [!] %~1 ausente. Instalando...
-%PY% -m pip install %~1 --quiet
-if errorlevel 1 (
-    echo [X] Falha ao instalar %~1
-    exit /b 1
-)
-echo [ok] %~1 instalado
-exit /b 0
-
-:create_env_template
-echo [AVISO] brn_network.env nao existe - criando template...
-(
-    echo # ============================================================
-    echo # brn_network.env - Config do no BRN - Windows Cliente
-    echo # EDITE OS VALORES ABAIXO ANTES DE RODAR!
-    echo # ============================================================
-    echo.
-    echo # 1 - SEGREDOS (devem ser IGUAIS ao ORIGEM)
-    echo BRN_NETWORK_SECRET=9226edea8ba62bc1c6ae36883c0536c95b4c85642195465d6c4d9456abef20f9
-    echo BRN_NODE_PASSWORD=senha-no-temp-123
-    echo BRN_WALLET_SESSION_PASS=senha-forte-da-carteira-2026
-    echo BRN_WEB_PASS=senha-temp-123
-    echo.
-    echo # 2 - DESCOBERTA DE PEERS (IP:PORTA do ORIGEM)
-    echo # Para Desktop-61ltr37 (chain 5026): 100.70.107.15:6002
-    echo # Para Ubuntu (chain 13862):         100.111.253.8:6001
-    echo BRN_BOOTSTRAP_PEERS=100.70.107.15:6002
-    echo BRN_POOL_URL=http://100.70.107.15:5000
-    echo.
-    echo # 3 - MODO
-    echo BRN_IS_ORIGIN=0
-    echo BRN_POOL_ENABLED=1
-    echo BRN_AUTO_MINE=0
-    echo.
-    echo # 4 - P2P
-    echo BRN_P2P_PORT=6002
-    echo BRN_P2P_AUTH=optional
-    echo BRN_UPNP=0
-    echo.
-    echo # 5 - HTTP
-    echo BRN_WEB_HOST=0.0.0.0
-    echo BRN_WEB_PORT=5000
-    echo BRN_CORS_ORIGIN=*
-    echo.
-    echo # 6 - LOG
-    echo BRN_LOG_LEVEL=INFO
-    echo BRN_AUDIT_ENABLED=1
-    echo BRN_SKIP_VERIFY=0
-    echo.
-    echo PYTHONUNBUFFERED=1
-) > brn_network.env
-echo [ok] brn_network.env criado
-echo [AVISO] EDITE o template antes de rodar ^(especialmente BRN_BOOTSTRAP_PEERS^)!
-exit /b 0
