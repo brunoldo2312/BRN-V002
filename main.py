@@ -1,26 +1,30 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.7.1)
+"""main.py — Entrypoint unificado do nó BRN (v13.8.0)
 ================================================================
+v13.8.0 (2026-10-27):
+  [NEW] run_http() agora usa waitress (producao) quando disponivel,
+        com fallback gracioso para Flask dev.
+        - BRN_USE_WAITRESS=1 (default) -> waitress
+        - BRN_USE_WAITRESS=0           -> Flask dev
+        - BRN_WAITRESS_THREADS=8       -> threads do waitress
+        - channel_timeout=120s, cleanup_interval=30s
+        Elimina o warning "development server" em producao.
 v13.7.1 (2026-10-27):
   [NEW] ForkGuard integrado ao boot:
           - fork_guard.get_fork_guard(chain, sync, p2p).start()
           - fork_guard.on_block_accepted() encadeado no
-            chain.on_block_mined (não substitui o broadcast P2P)
+            chain.on_block_mined (nao substitui o broadcast P2P)
           - fork_guard.stop_fork_guard() no shutdown
-        Antes, fork_guard.py existia, tinha auto-test, mas NUNCA
-        era instanciado. chain._fork_signal ficava eternamente
-        limpo — o miner nunca abortava por fork, mesmo quando
-        o ForkGuard detectava.
 v13.7.0 (2026-10-26):
-  [NEW] Integração completa com a regra multi-sig dos Top 5 validadores
+  [NEW] Integracao completa com a regra multi-sig dos Top 5 validadores
         (blockchain.py v9.4.0/v9.4.1):
           - chain.set_trust_net(trust_net)
           - chain.set_p2p(p2p)
           - chain.set_local_validator_sk(wallet_sk)
           - chain.set_sign_collector(_collect_sigs_via_p2p)
   [NEW] Coletor de assinaturas via P2P (request_block_signature).
-  [NEW] Carrega SK do validador local via secure_store após criar chain.
+  [NEW] Carrega SK do validador local via secure_store apos criar chain.
 v13.6.2:
-  [SECURITY] _HARDCODED_DEFAULTS sensíveis removidos.
+  [SECURITY] _HARDCODED_DEFAULTS sensiveis removidos.
   [FIX] _validate_required_secrets falha fechado.
   [FIX] chain.is_origin = is_origin.
   [NEW] Heartbeat peers.json no status loop.
@@ -62,7 +66,7 @@ def _bootstrap_env() -> None:
 
 
 # ============================================================
-# [SECURITY] APENAS defaults NÃO-SENSÍVEIS
+# [SECURITY] APENAS defaults NAO-SENSIVEIS
 # ============================================================
 _HARDCODED_DEFAULTS = {
     "BRN_BOOTSTRAP_PEERS":     "",
@@ -87,6 +91,8 @@ _HARDCODED_DEFAULTS = {
     "BRN_POOL_ENABLED":        "1",
     "BRN_POOL_URL_LOCAL":      "http://127.0.0.1:5000",
     "BRN_WEB_PASS":            "",
+    "BRN_USE_WAITRESS":        "1",
+    "BRN_WAITRESS_THREADS":    "8",
 }
 
 
@@ -102,7 +108,7 @@ def _apply_hardcoded_defaults() -> int:
 _bootstrap_env()
 _applied = _apply_hardcoded_defaults()
 if _applied:
-    print(f"[boot] defaults não-sensíveis aplicados: {_applied} variáveis")
+    print(f"[boot] defaults nao-sensiveis aplicados: {_applied} variaveis")
 
 
 from brn_config import Config
@@ -189,9 +195,9 @@ try:
     from btc_watcher import BTCWatcher
     from l2_manager import L2Manager
     L2_ENABLED = True
-    print("[L2] Módulos BTC carregados OK")
+    print("[L2] Modulos BTC carregados OK")
 except Exception as _e:
-    print("[AVISO] btc_watcher/l2_manager indisponível: " + str(_e))
+    print("[AVISO] btc_watcher/l2_manager indisponivel: " + str(_e))
 
 
 def _l2_disponivel() -> bool:
@@ -214,14 +220,14 @@ try:
     from miner_pool_client import PoolClient
     print("[Pool] PoolClient carregado OK")
 except Exception as _e:
-    print("[AVISO] miner_pool_client indisponível: " + str(_e))
+    print("[AVISO] miner_pool_client indisponivel: " + str(_e))
 
 if POOL_ENABLED:
     try:
         from mining_pool import PoolManager
         print("[Pool] PoolManager carregado OK")
     except Exception as _e:
-        print("[AVISO] mining_pool indisponível: " + str(_e))
+        print("[AVISO] mining_pool indisponivel: " + str(_e))
         POOL_ENABLED = False
 
 
@@ -303,11 +309,13 @@ def parse_args():
     p.add_argument("--pool-stats", action="store_true")
     p.add_argument("--gui", action="store_true")
     p.add_argument("--no-gui", action="store_true")
+    p.add_argument("--flask-dev", action="store_true",
+                   help="Forca Flask dev (ignora BRN_USE_WAITRESS)")
     return p.parse_args()
 
 
 # ============================================================
-# [SECURITY] Validação de segredos — FALHA FECHADO
+# [SECURITY] Validacao de segredos — FALHA FECHADO
 # ============================================================
 def _validate_required_secrets(log, is_origin: bool, wants_mining: bool) -> bool:
     critical = {
@@ -354,15 +362,15 @@ def _resolve_password(args) -> str:
     if args.password_file:
         p = Path(args.password_file)
         if not p.exists():
-            raise SystemExit("--password-file não encontrado")
+            raise SystemExit("--password-file nao encontrado")
         return p.read_text(encoding="utf-8").rstrip("\r\n")
     env = os.environ.get("BRN_NODE_PASSWORD")
     if env:
         return env
     if sys.stdin.isatty():
         import getpass
-        return getpass.getpass("Senha do nó (identidade Ed25519): ")
-    raise SystemExit("Senha do nó não informada.")
+        return getpass.getpass("Senha do no (identidade Ed25519): ")
+    raise SystemExit("Senha do no nao informada.")
 
 
 def _resolve_wallet_password() -> str:
@@ -378,7 +386,7 @@ def _resolve_wallet_password() -> str:
 def _load_validator_sk():
     """
     Carrega o SK do validador local (Wallet) para assinar blocos.
-    Retorna None se o nó não tem carteira ou não consegue decifrar.
+    Retorna None se o no nao tem carteira ou nao consegue decifrar.
     """
     try:
         from secure_store import load_current_wallet
@@ -402,8 +410,8 @@ def _load_validator_sk():
 # ============================================================
 def _make_sign_collector(p2p, trust_net):
     """
-    Retorna função que coleta assinaturas dos validadores via P2P.
-    Se o p2p não tem `request_block_signature`, retorna [] silencioso.
+    Retorna funcao que coleta assinaturas dos validadores via P2P.
+    Se o p2p nao tem `request_block_signature`, retorna [] silencioso.
     """
     def _collect(block: dict) -> list:
         if p2p is None or trust_net is None:
@@ -482,7 +490,7 @@ def load_or_create_node_identity(password: str, rotate: bool = False):
         set_node_id_hash(node_hash)
         variant = get_variant(node_hash)
         audit_log("exposure_log", {"variant": variant, "node_id": node_hash})
-        log.info(f"Teste A/B: Variante atribuída -> {variant}")
+        log.info(f"Teste A/B: Variante atribuida -> {variant}")
     except Exception as e:
         log.warning(f"Falha ao registrar A/B test: {e}")
 
@@ -522,7 +530,7 @@ def _verify_chain(chain) -> str:
     try:
         from chain_validator import verify_chain
     except ImportError:
-        get_logger("verify").info("chain_validator.py não disponível")
+        get_logger("verify").info("chain_validator.py nao disponivel")
         return VERIFY_ERROR
 
     log = get_logger("verify")
@@ -547,19 +555,19 @@ def _verify_chain(chain) -> str:
         if callable(summary_fn):
             log.info(f"OK {summary_fn()} ({dt:.2f}s)")
         else:
-            log.info(f"OK cadeia íntegra ({dt:.2f}s, {blocks} blocos)")
+            log.info(f"OK cadeia integra ({dt:.2f}s, {blocks} blocos)")
         for w in warns[:5]:
             log.warning("  " + str(w))
         return VERIFY_OK
 
-    log.error(f"CADEIA INVÁLIDA ({len(errs)} erros)")
+    log.error(f"CADEIA INVALIDA ({len(errs)} erros)")
     for e in errs[:10]:
         log.error("  - " + str(e))
     return VERIFY_INVALID
 
 
 # ============================================================
-# INJEÇÃO NO SERVER.PY
+# INJECAO NO SERVER.PY
 # ============================================================
 def _inject_into_server(what: str, obj, log) -> bool:
     setter_name = {
@@ -581,7 +589,7 @@ def _inject_into_server(what: str, obj, log) -> bool:
         log.info(f"[inject] {what} injetado em server.py")
         return True
     except ImportError as e:
-        log.warning(f"[inject] server.py indisponível ({what}): {e}")
+        log.warning(f"[inject] server.py indisponivel ({what}): {e}")
         return False
     except Exception as e:
         log.warning(f"[inject] {what} falhou: {e}")
@@ -615,20 +623,54 @@ def _init_http_server(chain, log):
 
 
 def run_http(app_instance):
+    """HTTP server — usa waitress em producao, fallback para Flask dev.
+
+    Env:
+        BRN_USE_WAITRESS=1|0       (default 1 = waitress)
+        BRN_WAITRESS_THREADS=8     (default 8)
+        BRN_HTTPS=1|0              (default 0)
+    """
     log = get_logger("http")
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
+    use_waitress = os.environ.get("BRN_USE_WAITRESS", "1") == "1"
+
     ssl_ctx = None
     if os.environ.get("BRN_HTTPS", "0") == "1":
         try:
             from security import ensure_self_signed_cert
             cert, key = ensure_self_signed_cert()
             ssl_ctx = (cert, key)
-            log.info("HTTPS https://" + WEB_HOST + ":" + str(port))
+            log.info("HTTPS habilitado")
         except Exception as e:
-            log.warning("Falha ao gerar cert HTTPS: " + str(e) + ". Caindo para HTTP.")
+            log.warning("HTTPS falhou: " + str(e) + " — caindo para HTTP")
             ssl_ctx = None
-    if ssl_ctx is None:
-        log.info("HTTP http://" + WEB_HOST + ":" + str(port))
+
+    if use_waitress:
+        try:
+            from waitress import serve
+            threads = int(os.environ.get("BRN_WAITRESS_THREADS", "8"))
+            log.info(
+                "HTTP waitress (producao) - http://" + WEB_HOST + ":" +
+                str(port) + " threads=" + str(threads)
+            )
+            kwargs = {
+                "host": WEB_HOST,
+                "port": port,
+                "threads": threads,
+                "channel_timeout": 120,
+                "cleanup_interval": 30,
+            }
+            if ssl_ctx:
+                kwargs["ssl_context"] = ssl_ctx
+            serve(app_instance, **kwargs)
+            return
+        except ImportError:
+            log.warning("waitress nao instalado (pip install waitress) — "
+                        "usando Flask dev")
+        except Exception as e:
+            log.warning("waitress falhou (" + str(e) + ") — usando Flask dev")
+
+    log.info("HTTP Flask dev - http://" + WEB_HOST + ":" + str(port))
     app_instance.run(
         host=WEB_HOST, port=port, threaded=True,
         debug=False, use_reloader=False, ssl_context=ssl_ctx,
@@ -718,14 +760,14 @@ def run_status_loop(chain, p2p, sync=None, pool=None, pool_client=None,
 def run_wallet_main_thread():
     try:
         if not os.environ.get("BRN_WEB_PASS"):
-            get_logger("wallet").error("BRN_WEB_PASS não definida")
+            get_logger("wallet").error("BRN_WEB_PASS nao definida")
             return
         from app_wallet_v3 import WalletApi
         import webview
         log = get_logger("wallet")
         index_path = BASE_DIR / "index_wallet.html"
         if not index_path.exists():
-            log.error("index_wallet.html não encontrado: " + str(index_path))
+            log.error("index_wallet.html nao encontrado: " + str(index_path))
             return
         api = WalletApi()
         webview.create_window(
@@ -749,7 +791,7 @@ def _setup_pool_client_local(chain, pool, log, disabled: bool, is_origin: bool):
         log.info("PoolClient: desativado por --no-pool-client")
         return None
     if PoolClient is None:
-        log.info("PoolClient: miner_pool_client indisponível")
+        log.info("PoolClient: miner_pool_client indisponivel")
         return None
 
     wallet_pass = _resolve_wallet_password()
@@ -767,7 +809,7 @@ def _setup_pool_client_local(chain, pool, log, disabled: bool, is_origin: bool):
             pub = (w.get("public_key") or w.get("pub_hex")
                    or w.get("pubkey") or "").strip()
         else:
-            log.info("PoolClient: current_wallet.enc não decifrou ("
+            log.info("PoolClient: current_wallet.enc nao decifrou ("
                      + str((w or {}).get("msg", "?")) + ")")
     except Exception as e:
         log.warning("PoolClient: falha lendo current_wallet: " + str(e))
@@ -791,24 +833,23 @@ def _setup_pool_client_local(chain, pool, log, disabled: bool, is_origin: bool):
                  + " pool=" + pool_url + ")")
         return pc
     except Exception as e:
-        log.warning("PoolClient: exceção: " + str(e))
+        log.warning("PoolClient: excecao: " + str(e))
         return None
 
 
 # ============================================================
-# [NEW v13.7.1] BROADCAST + FORKGUARD ENCADEADOS
+# BROADCAST + FORKGUARD ENCADEADOS
 # ============================================================
 def _setup_local_miner_broadcast(chain, p2p, log):
     """
     Encadeia callbacks em chain.on_block_mined:
       1) broadcast_block() via P2P (se p2p != None)
-      2) fork_guard.on_block_accepted() (se já iniciado)
-    Preserva callback anterior, se algum já estiver configurado.
+      2) fork_guard.on_block_accepted() (se ja iniciado)
+    Preserva callback anterior, se algum ja estiver configurado.
     """
     prev_cb = getattr(chain, "on_block_mined", None)
 
     def _on_local_block(block):
-        # 1) broadcast P2P
         if p2p is not None:
             try:
                 p2p.broadcast_block(block)
@@ -816,7 +857,6 @@ def _setup_local_miner_broadcast(chain, p2p, log):
                          + " propagado via P2P")
             except Exception as e:
                 log.debug("broadcast_block falhou: " + str(e))
-        # 2) ForkGuard resolve fork ativo quando um bloco novo entra
         try:
             from fork_guard import get_fork_guard
             fg = get_fork_guard()
@@ -824,7 +864,6 @@ def _setup_local_miner_broadcast(chain, p2p, log):
                 fg.on_block_accepted(block)
         except Exception as e:
             log.debug("fork_guard.on_block_accepted falhou: " + str(e))
-        # 3) callback anterior (se existia)
         if prev_cb is not None and prev_cb is not _on_local_block:
             try:
                 prev_cb(block)
@@ -858,14 +897,11 @@ def _stop_with_timeout(name: str, svc, timeout: float = 5.0, log=None) -> None:
     t.start()
     t.join(timeout)
     if t.is_alive() and log is not None:
-        log.warning("Serviço " + name + " não parou em " + str(timeout) + "s")
+        log.warning("Servico " + name + " nao parou em " + str(timeout) + "s")
 
 
 def _graceful_shutdown(log, trust_net=None) -> None:
-    log.info("Encerrando serviços...")
-    # [NEW v13.7.1] Para o ForkGuard ANTES dos serviços (ele depende
-    # de p2p/sync e usa chain._fork_signal, que precisa ser limpo
-    # antes de fechar o DB).
+    log.info("Encerrando servicos...")
     try:
         from fork_guard import stop_fork_guard
         if stop_fork_guard():
@@ -902,6 +938,11 @@ def _graceful_shutdown(log, trust_net=None) -> None:
 # ============================================================
 def main():
     args = parse_args()
+
+    # --flask-dev sobrescreve env (util para debug)
+    if args.flask_dev:
+        os.environ["BRN_USE_WAITRESS"] = "0"
+
     cfg = Config(args.config)
 
     if args.read_only:
@@ -928,7 +969,7 @@ def main():
     elif not args.l2:
         l2_mode = "off"
     else:
-        l2_mode = "INDISPONÍVEL"
+        l2_mode = "INDISPONIVEL"
 
     pool_mode = (
         "off" if args.no_pool
@@ -949,14 +990,14 @@ def main():
         return 0
     if args.status:
         print("=" * 64)
-        print(" BRN Node — Diagnóstico (v" + VERSION + ")")
+        print(" BRN Node — Diagnostico (v" + VERSION + ")")
         print("=" * 64)
         print(" Config    : " + cfg.source)
         print(" Web       : " + WEB_HOST + ":" + str(cfg["web_port"]))
         print(" Explorer  : " + EXPLORER_HOST + ":" + str(cfg["explorer_port"]))
         print(" P2P       : " + str(cfg["p2p_port"]))
-        print(" Pool      : " + ("SIM" if _pool_disponivel() else "não"))
-        print(" L2        : " + ("SIM" if _l2_disponivel() else "não"))
+        print(" Pool      : " + ("SIM" if _pool_disponivel() else "nao"))
+        print(" L2        : " + ("SIM" if _l2_disponivel() else "nao"))
         print(" Role      : " + ("ORIGEM" if is_origin else "CLIENTE"))
         print("=" * 64)
         return 0
@@ -966,7 +1007,7 @@ def main():
 
     missing = _check_required_modules()
     if missing:
-        log.error("Módulos obrigatórios faltando: " + ", ".join(missing))
+        log.error("Modulos obrigatorios faltando: " + ", ".join(missing))
         return 1
 
     wants_mining = bool(args.mine or AUTO_MINE or (not args.no_pool))
@@ -992,7 +1033,7 @@ def main():
         log.exception("Falha ao carregar identidade: " + str(e))
         return 1
 
-    log.info("Nó ID: " + node_pub[:16] + "...")
+    log.info("No ID: " + node_pub[:16] + "...")
 
     # ---- blockchain ----
     from blockchain import Blockchain
@@ -1013,8 +1054,8 @@ def main():
             try:
                 chain.set_trust_net(trust_net)
             except AttributeError:
-                chain.trust_net = trust_net  # fallback: atributo direto
-            log.info("TrustNetwork: " + str(len(trust_net.nodes)) + " nós carregados")
+                chain.trust_net = trust_net
+            log.info("TrustNetwork: " + str(len(trust_net.nodes)) + " nos carregados")
         except Exception as e:
             log.warning("TrustNetwork desativada: " + str(e))
             trust_net = None
@@ -1032,14 +1073,14 @@ def main():
         strict = os.environ.get("BRN_VERIFY_STRICT", "0") == "1"
         st = _verify_chain(chain)
         if st == VERIFY_INVALID and strict:
-            log.error("Abortando: cadeia inválida (BRN_VERIFY_STRICT=1)")
+            log.error("Abortando: cadeia invalida (BRN_VERIFY_STRICT=1)")
             try:
                 chain.db.close()
             except Exception:
                 pass
             return 2
         if st == VERIFY_ERROR:
-            log.warning("Verificação não conclusiva — seguindo com cautela")
+            log.warning("Verificacao nao conclusiva — seguindo com cautela")
 
     # ---- P2P ----
     p2p = None
@@ -1071,7 +1112,7 @@ def main():
         except Exception as e:
             log.warning(f"Falha injetando SK: {e}")
     else:
-        log.info("Validator SK não carregada — nó não vai assinar blocos")
+        log.info("Validator SK nao carregada — no nao vai assinar blocos")
 
     if p2p is not None and trust_net is not None:
         try:
@@ -1097,7 +1138,7 @@ def main():
             _register_service("sync", sync)
             log.info("Sync iniciado (full mode)")
         except ImportError as e:
-            log.warning("sync_manager indisponível: " + str(e))
+            log.warning("sync_manager indisponivel: " + str(e))
             sync = None
         except Exception as e:
             log.warning("Falha ao iniciar Sync: " + str(e))
@@ -1105,7 +1146,7 @@ def main():
     elif args.no_sync:
         log.info("Sync: pulado por --no-sync")
 
-    # ---- [NEW v13.7.1] ForkGuard ----
+    # ---- ForkGuard ----
     fork_guard_started = False
     if sync is not None or p2p is not None:
         try:
@@ -1119,7 +1160,7 @@ def main():
                          + "s)")
                 fork_guard_started = True
         except Exception as e:
-            log.warning("ForkGuard indisponível: " + str(e))
+            log.warning("ForkGuard indisponivel: " + str(e))
     else:
         log.info("ForkGuard: pulado (sem sync nem p2p)")
 
@@ -1144,9 +1185,9 @@ def main():
             daemon=True, name="HTTP",
         ).start()
     else:
-        log.error("HTTP não pôde ser inicializado — seguindo sem API")
+        log.error("HTTP nao pode ser inicializado — seguindo sem API")
 
-    # ---- Injeções no server.py ----
+    # ---- Injecoes no server.py ----
     if p2p is not None:
         _inject_into_server("p2p", p2p, log)
     else:
@@ -1180,13 +1221,13 @@ def main():
     if pool_client is not None:
         _register_service("pool_client", pool_client)
 
-    # ---- Broadcast local → P2P + ForkGuard ----
+    # ---- Broadcast local -> P2P + ForkGuard ----
     _setup_local_miner_broadcast(chain, p2p, log)
 
     # ---- Miner local ----
     quer_miner_local = bool(args.mine or AUTO_MINE)
     if quer_miner_local and (pool is not None or pool_client is not None):
-        log.warning("Miner local IGNORADO: pool/pool_client está ativo (evita forks).")
+        log.warning("Miner local IGNORADO: pool/pool_client esta ativo (evita forks).")
         quer_miner_local = False
 
     if quer_miner_local:
@@ -1258,9 +1299,10 @@ def main():
         "trust":       bool(trust_net),
         "validator_sk": bool(validator_sk),
         "fork_guard":  bool(fork_guard_started),
+        "http_server": "waitress" if os.environ.get("BRN_USE_WAITRESS") == "1" else "flask-dev",
     })
 
-    log.info("Nó pronto. Ctrl+C para encerrar.")
+    log.info("No pronto. Ctrl+C para encerrar.")
 
     # ---- GUI ou headless ----
     try:
@@ -1299,7 +1341,7 @@ def _on_signal(signum, frame):
     global _signal_count
     _signal_count += 1
     if _signal_count >= 2:
-        print("\n[!] Forçando saída.", file=sys.stderr)
+        print("\n[!] Forcando saida.", file=sys.stderr)
         os._exit(1)
     _shutdown.set()
 
