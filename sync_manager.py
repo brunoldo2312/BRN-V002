@@ -1,737 +1,621 @@
-"""
-sync_manager.py — Sincronização + Reorg automático (v8.4.3)
+"""chain_validator.py — Auditoria completa da cadeia BRN (v2.2)
 ================================================================
-v8.4.3 (2026-10-22):
-  [FIX CRÍTICO] _resolve_fork tentava importar
-                get_highest_checkpoint_height e validate_reorg_immutability
-                de blockchain.py (que NÃO existem lá). O ImportError
-                era engolido, fazendo a proteção de imutabilidade por
-                checkpoint falhar silenciosamente. Agora importa de
-                checkpoints.py diretamente.
-  [FIX] Loop de busca do ancestral comum agora faz break assim que
-        encontra, evitando ler o DB inteiro em vão.
-  [FIX] _fetch_chain_from agora aborta se receber lotes vazios
-        repetidos (evita loop infinito com peer bugado).
-v8.4.2:
-  [NEW] Imutabilidade por checkpoint. Reorg que tenta reverter
-        bloco <= último checkpoint é BLOQUEADO.
-  [FIX] _detect_fork retorna None se DB vazio (local_h < 1).
-v8.4.1:
-  [FIX] _fetch_chain_from aceita lotes menores que o pedido.
+v2.2 (2026-10-27):
+  [NEW] Verificação de validators_sig:
+        - Modo default (strict_validators=False): cada assinatura
+          em block["validators_sig"] é verificada criptograficamente
+          (Ed25519 sobre BLOCK_SIG_DOMAIN || hash). Não exige count
+          específico, porque trust_net é dinâmico e não há snapshot
+          histórico do set de validadores.
+        - Modo strict_validators=True: exige count >= required do
+          set atual E cada pubkey no set atual. Use quando souber
+          que o conjunto não mudou durante a janela auditada.
+  [NEW] verify_chain(chain, strict_validators=False) e
+        verify_range(chain, start, end, strict_validators=False)
+        aceitam o parâmetro.
+  [NEW] VerifyResult expõe validators_checked e strict_validators.
+  [NEW] Aviso quando validators_sig vazio mas trust_net tem
+        validadores (potencial fork/regressão, não erro estrutural).
+  [KEEP] v2.1: DB vazio não é cadeia inválida (warning).
+  [KEEP] _verify_pow usa meets_difficulty() do blockchain.py.
+  [KEEP] verify_range verifica merkle.
+  [KEEP] Compatível com Blockchain.verify_chain / verify_chain_dict
+         já plugados no blockchain.py.
 ================================================================
 """
 from __future__ import annotations
 
-import json
-import os
-import socket
-import time
-import threading
+import hashlib
 import logging
-from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+import time
 
-log = logging.getLogger("sync")
+from crypto import verify_ecdsa, sha256, double_sha256
 
-NETWORK_MAGIC      = b"BRN5"
-MAX_MSG_SIZE       = 8 * 1024 * 1024
-DEFAULT_TIMEOUT    = 10.0
-DEFAULT_BATCH_SIZE = int(os.environ.get("BRN_SYNC_BATCH", "50"))
-DEFAULT_INTERVAL_S = float(os.environ.get("BRN_SYNC_INTERVAL", "5"))
-BATCH_DELAY_S      = float(os.environ.get("BRN_SYNC_BATCH_DELAY", "0.06"))
+log = logging.getLogger("chain_validator")
 
-REORG_LOOKBACK       = int(os.environ.get("BRN_REORG_LOOKBACK", "500"))
-REORG_WORK_THRESHOLD = float(os.environ.get("BRN_REORG_WORK_THRESHOLD", "1.0"))
-REORG_FETCH_BATCH    = int(os.environ.get("BRN_REORG_FETCH_BATCH", "200"))
-REORG_MAX_FAILS      = int(os.environ.get("BRN_REORG_MAX_FAILS", "3"))
-REORG_COOLDOWN_S     = float(os.environ.get("BRN_REORG_COOLDOWN_S", "60"))
-
-try:
-    from blockchain import block_hash as _block_hash_fn, meets_difficulty as _meets_diff_fn
-    _HAS_HELPERS = True
-except ImportError:
-    _block_hash_fn = None
-    _meets_diff_fn = None
-    _HAS_HELPERS = False
-    log.warning("[sync] blockchain helpers ausentes")
+__version__ = "2.2"
 
 
-@dataclass
-class PeerStatus:
-    node_id: str
-    ip: str
-    port: int
-    height: int = 0
-    cumulative_work: int = 0
-    last_seen: float = field(default_factory=time.time)
-    latency_ms: float = 0.0
+# ============================================================
+# RESULTADO
+# ============================================================
+class VerifyResult:
+    def __init__(self):
+        self.valid = True
+        self.blocks_checked = 0
+        self.checkpoints_checked = 0
+        self.validators_checked = 0          # [NEW v2.2]
+        self.strict_validators = False       # [NEW v2.2]
+        self.warnings = []
+        self.errors = []
+        self.height = -1
+        self.duration = 0.0
 
-    @property
-    def addr(self) -> str:
-        return f"{self.ip}:{self.port}"
+    def summary(self) -> str:
+        if self.valid:
+            if self.height < 0:
+                return "cadeia vazia (aguardando genesis)"
+            extra = f" · {self.validators_checked} bloco(s) com sigs" if self.validators_checked else ""
+            return (f"cadeia OK · {self.blocks_checked} blocos · "
+                    f"{self.checkpoints_checked} checkpoints · "
+                    f"{self.duration:.2f}s{extra}")
+        return (f"cadeia INVALIDA · {len(self.errors)} erro(s) · "
+                f"{self.blocks_checked} blocos verificados")
+
+    def __bool__(self):
+        return self.valid
+
+    def to_dict(self) -> dict:
+        return {
+            "success":              self.valid,
+            "valid":                self.valid,
+            "height":               self.height,
+            "blocks_checked":       self.blocks_checked,
+            "verified":             self.blocks_checked,
+            "checkpoints_checked":  self.checkpoints_checked,
+            "validators_checked":   self.validators_checked,
+            "strict_validators":    self.strict_validators,
+            "warnings":             list(self.warnings),
+            "errors":               list(self.errors),
+            "duration_s":           round(self.duration, 3),
+        }
 
 
-@dataclass
-class SyncStatus:
-    mode: str = "full"
-    local_height: int = 0
-    target_height: int = 0
-    synced: bool = False
-    syncing: bool = False
-    progress: float = 0.0
-    active_peer: Optional[str] = None
-    peers_known: int = 0
-    peers_synced: int = 0
-    last_error: str = ""
-    forking: bool = False
-    reorgs_total: int = 0
-    last_reorg_height: int = -1
+# ============================================================
+# HELPERS BÁSICOS
+# ============================================================
+def _is_coinbase(tx: dict) -> bool:
+    if tx.get("type") == "coinbase" or tx.get("is_coinbase"):
+        return True
+    ins = tx.get("inputs") or []
+    return bool(ins and ins[0].get("txid") == "0" * 64)
 
 
-class ChainSyncManager:
-    def __init__(self, blockchain, db, p2p_manager,
-                 send_fn: Optional[Callable[[str, int, dict, float],
-                                             Optional[dict]]] = None):
-        self.chain = blockchain
-        self.db = db
-        self.p2p = p2p_manager
-        self._send_fn = send_fn
+def _target_from_difficulty(difficulty: int) -> int:
+    return int("0" * int(difficulty) + "f" * (64 - int(difficulty)), 16)
 
-        self.status = SyncStatus()
-        self.peers: Dict[str, PeerStatus] = {}
-        self.peer_lock = threading.Lock()
-        self.sync_lock = threading.Lock()
 
-        self.batch_size = DEFAULT_BATCH_SIZE
-        self.spv_headers_only = False
+def _meets_difficulty(h_hex: str, difficulty: int) -> bool:
+    try:
+        return int(h_hex, 16) <= _target_from_difficulty(difficulty)
+    except Exception:
+        return False
 
-        self._stop_sync = threading.Event()
-        self.sync_thread: Optional[threading.Thread] = None
 
-        self._has_save_header = hasattr(self.db, "save_header")
-
-        existing_sig = getattr(blockchain, "_fork_signal", None)
-        if existing_sig is None:
-            existing_sig = threading.Event()
-            try:
-                blockchain._fork_signal = existing_sig
-            except Exception:
-                pass
-        self._fork_signal = existing_sig
-
-        self._reorg_fails: Dict[str, dict] = {}
-        self._reorg_fails_lock = threading.Lock()
-
-    def set_sync_mode(self, mode: str = "full") -> None:
-        if mode not in ("full", "spv"):
-            raise ValueError("Modo inválido: use 'full' ou 'spv'")
-        if mode == "spv" and not self._has_save_header:
-            log.warning("Modo SPV sem db.save_header — caindo para FULL")
-            mode = "full"
-        self.spv_headers_only = (mode == "spv")
-        self.status.mode = mode
-
-    def register_peer(self, node_id: str, ip: str, port: int,
-                      height: int = 0, cumulative_work: int = 0) -> None:
-        if not node_id:
-            return
-        with self.peer_lock:
-            existing = self.peers.get(node_id)
-            if existing:
-                existing.height = height
-                existing.cumulative_work = cumulative_work
-                existing.last_seen = time.time()
-                existing.ip = ip
-                existing.port = port
-            else:
-                self.peers[node_id] = PeerStatus(
-                    node_id=node_id, ip=ip, port=port,
-                    height=height, cumulative_work=cumulative_work,
-                )
-            self.status.peers_known = len(self.peers)
-
-    def unregister_peer(self, node_id: str) -> None:
-        with self.peer_lock:
-            self.peers.pop(node_id, None)
-            self.status.peers_known = len(self.peers)
-        with self._reorg_fails_lock:
-            self._reorg_fails.pop(node_id, None)
-
-    def fork_in_progress(self) -> bool:
-        return self._fork_signal.is_set()
-
-    def _safe_height(self) -> int:
+def _verify_pow(block: dict) -> bool:
+    try:
         try:
-            h = int(self.chain.db.height())
-        except Exception:
-            return -1
-        return max(-1, h)
+            from blockchain import block_hash as _bh
+            h = _bh(block["prev_hash"], block["merkle"],
+                    block["timestamp"], block["nonce"], block["difficulty"])
+        except ImportError:
+            hdr = (f'{block["prev_hash"]}{block["merkle"]}'
+                   f'{block["timestamp"]}{block["nonce"]}{block["difficulty"]}')
+            h = double_sha256(hdr.encode()).hex()
 
-    def _local_work(self) -> int:
+        if h != block["hash"]:
+            return False
+
         try:
-            return int(self.chain.cumulative_work())
+            from blockchain import meets_difficulty as _md
+            return bool(_md(h, int(block["difficulty"])))
+        except ImportError:
+            return _meets_difficulty(h, int(block["difficulty"]))
+    except Exception:
+        return False
+
+
+# ============================================================
+# Merkle
+# ============================================================
+def _verify_merkle(block: dict) -> bool:
+    try:
+        txids = [t.get("txid", "") for t in block.get("transactions", [])]
+        if not txids:
+            return False
+        try:
+            from blockchain import compute_merkle_root as _mr
+            calc = _mr(txids)
+        except ImportError:
+            calc = _merkle_root_fallback(txids)
+        return calc == block.get("merkle", "")
+    except Exception:
+        return False
+
+
+def _merkle_root_fallback(txids: list) -> str:
+    if not txids:
+        return "0" * 64
+    layer = [bytes.fromhex(t) for t in txids]
+    while len(layer) > 1:
+        if len(layer) % 2:
+            layer.append(layer[-1])
+        layer = [sha256(layer[i] + layer[i + 1])
+                 for i in range(0, len(layer), 2)]
+    return layer[0].hex()
+
+
+# ============================================================
+# Coinbase
+# ============================================================
+def _verify_coinbase(cb: dict, height: int, chain) -> tuple:
+    ins = cb.get("inputs") or []
+    if not ins or ins[0].get("txid") != "0" * 64:
+        return False, "input nao e 0*64"
+
+    outs = cb.get("outputs") or []
+    if not outs:
+        return False, "coinbase sem outputs"
+
+    total = sum(int(o.get("amount", 0)) for o in outs)
+    try:
+        reward = chain.current_reward(height)
+        if total > reward:
+            return False, f"coinbase ({total}) > reward ({reward})"
+    except Exception:
+        pass
+
+    if height > 0:
+        for o in outs:
+            if not o.get("pubkey"):
+                return False, "output de coinbase sem pubkey"
+
+    return True, "ok"
+
+
+# ============================================================
+# Assinatura de tx
+# ============================================================
+def _verify_tx_signature(tx: dict, chain=None) -> bool:
+    if _is_coinbase(tx):
+        return True
+
+    inputs = tx.get("inputs") or []
+    if not inputs:
+        return False
+
+    try:
+        from blockchain import signing_hash as _sh
+        h = _sh(tx)
+    except Exception:
+        return False
+
+    for inp in inputs:
+        sig_hex = inp.get("signature", "")
+        pub_hex = inp.get("pubkey", "")
+        if not sig_hex or not pub_hex:
+            return False
+        try:
+            if not verify_ecdsa(bytes.fromhex(pub_hex),
+                                bytes.fromhex(sig_hex), h):
+                return False
         except Exception:
-            return 0
+            return False
+    return True
 
-    def _validate_chain_segment(
-        self, blocks: List[Dict], start_height: int, expected_prev_hash: str,
-    ) -> Tuple[bool, str]:
-        if not blocks:
-            return False, "lista de blocos vazia"
 
-        expected_h = start_height
-        prev = expected_prev_hash
-        for blk in blocks:
-            if not isinstance(blk, dict):
-                return False, f"bloco em #{expected_h} não é dict"
-
-            h = int(blk.get("height", -1))
-            if h != expected_h:
-                return False, f"height {h} != esperado {expected_h}"
-
-            if blk.get("prev_hash") != prev:
-                return False, f"prev_hash diverge em #{expected_h}"
-
-            if not _HAS_HELPERS:
-                prev = blk.get("hash", "")
-                expected_h += 1
-                continue
-
-            try:
-                h_calc = _block_hash_fn(
-                    blk["prev_hash"], blk["merkle"], blk["timestamp"],
-                    blk["nonce"], blk["difficulty"],
-                )
-            except KeyError as e:
-                return False, f"campo ausente em #{expected_h}: {e}"
-            except Exception as e:
-                return False, f"block_hash falhou em #{expected_h}: {e}"
-
-            if h_calc != blk.get("hash"):
-                return False, f"hash inválido em #{expected_h}"
-
-            try:
-                if not _meets_diff_fn(blk["hash"], blk["difficulty"]):
-                    return False, f"PoW insuficiente em #{expected_h}"
-            except Exception as e:
-                return False, f"meets_difficulty falhou em #{expected_h}: {e}"
-
-            prev = blk["hash"]
-            expected_h += 1
-
+# ============================================================
+# Auth tag HMAC
+# ============================================================
+def _verify_auth_tag(block: dict, chain) -> tuple:
+    try:
+        from blockchain import (AUTH_TAG_START_HEIGHT, verify_auth_tag)
+    except ImportError:
         return True, ""
 
-    def _peer_is_blocked(self, peer_id: str) -> bool:
-        with self._reorg_fails_lock:
-            entry = self._reorg_fails.get(peer_id)
-            if not entry:
-                return False
-            return entry.get("blocked_until", 0) > time.time()
+    require = getattr(chain, "require_auth_tag", False)
+    secret = getattr(chain, "network_secret", "") or ""
 
-    def _peer_record_fail(self, peer_id: str) -> None:
-        now = time.time()
-        with self._reorg_fails_lock:
-            entry = self._reorg_fails.setdefault(peer_id, {
-                "fails": 0, "blocked_until": 0, "first_fail": now
-            })
-            entry["fails"] += 1
-            entry["last_fail"] = now
-            if entry["fails"] >= REORG_MAX_FAILS:
-                entry["blocked_until"] = now + REORG_COOLDOWN_S
-                log.warning(
-                    f"[REORG] peer {peer_id[:12]} com {entry['fails']} "
-                    f"falhas seguidas — cooldown por {REORG_COOLDOWN_S:.0f}s"
-                )
+    if not require or not secret:
+        return True, ""
 
-    def _peer_record_success(self, peer_id: str) -> None:
-        with self._reorg_fails_lock:
-            self._reorg_fails.pop(peer_id, None)
+    h = int(block["height"])
+    tag = block.get("auth_tag")
 
-    def _detect_fork(self) -> Optional[PeerStatus]:
-        local_work = self._local_work()
-        local_h = self._safe_height()
+    if h > AUTH_TAG_START_HEIGHT:
+        if not tag:
+            return False, "sem auth_tag"
+        if not verify_auth_tag(h, block["hash"], tag, secret):
+            return False, "auth_tag invalido"
+    else:
+        if tag and not verify_auth_tag(h, block["hash"], tag, secret):
+            return False, "auth_tag invalido em bloco legado"
 
-        if local_h < 1:
-            return None
+    return True, ""
 
-        best = None
-        best_work = local_work
 
-        with self.peer_lock:
-            snapshot = list(self.peers.values())
-
-        for p in snapshot:
-            if p.height <= local_h:
-                continue
-            if p.cumulative_work == 0 and local_work > 0:
-                continue
-            if self._peer_is_blocked(p.node_id):
-                continue
-            threshold_factor = 1.0 + (REORG_WORK_THRESHOLD / 100.0)
-            if p.cumulative_work > best_work * threshold_factor:
-                best = p
-                best_work = p.cumulative_work
-
-        if best is not None:
-            log.warning(
-                f"[REORG] detectado: peer {best.node_id[:12]} "
-                f"h={best.height} work={best.cumulative_work} | "
-                f"local h={local_h} work={local_work}"
-            )
-        return best
-
-    def _fetch_chain_from(self, peer: PeerStatus, start: int, end: int,
-                          strict: bool = True) -> Optional[List[Dict]]:
-        all_blocks = []
-        cursor = start
-        empties = 0
-
-        while cursor < end:
-            batch_end = min(cursor + REORG_FETCH_BATCH, end)
-            try:
-                resp = self._do_send(
-                    peer.ip, peer.port,
-                    {"type": "get_blocks_range",
-                     "start": cursor, "end": batch_end},
-                    DEFAULT_TIMEOUT * 2,
-                )
-            except Exception as e:
-                log.warning(f"_fetch_chain_from({cursor}-{batch_end}): {e}")
-                return None if strict else all_blocks
-
-            if not resp or "blocks" not in resp:
-                return None if strict else all_blocks
-
-            batch = resp["blocks"]
-            if not isinstance(batch, list):
-                return None if strict else all_blocks
-            
-            # [FIX v8.4.3] Se o peer devolver lote vazio, aborta
-            if not batch:
-                empties += 1
-                if empties >= 2:
-                    log.warning(f"[REORG] peer {peer.node_id[:12]} devolveu lote vazio 2x. Abortando.")
-                    return None if strict else all_blocks
-                continue
-
-            all_blocks.extend(batch)
-            cursor += len(batch)
-            empties = 0
-
-        return all_blocks
-
-    def _resolve_fork(self, peer: PeerStatus) -> bool:
-        peer_id = peer.node_id
-        if self._peer_is_blocked(peer_id):
-            return False
-
-        with self.sync_lock:
-            local_h = self._safe_height()
-            if peer.height <= local_h:
-                log.debug(
-                    f"[REORG] ignorando — peer_h={peer.height} <= "
-                    f"local_h={local_h}"
-                )
-                return False
-
-            log.warning(
-                f"[REORG] resolvendo fork com {peer_id[:12]} "
-                f"(peer_h={peer.height} work={peer.cumulative_work}, "
-                f"local_h={local_h} work={self._local_work()})"
-            )
-
-            self.status.forking = True
-            self._fork_signal.set()
-
-            try:
-                target_h = peer.height
-                start = max(0, local_h - REORG_LOOKBACK)
-                end = target_h + 1
-
-                log.info(f"[REORG] baixando #{start}...#{target_h} do peer")
-                all_blocks = self._fetch_chain_from(
-                    peer, start, end, strict=True
-                )
-
-                if all_blocks is None:
-                    log.warning("[REORG] download falhou (strict)")
-                    self._peer_record_fail(peer_id)
-                    return False
-                if not all_blocks:
-                    log.warning("[REORG] nenhum bloco recebido")
-                    self._peer_record_fail(peer_id)
-                    return False
-
-                common_h = -1
-                common_hash = ""
-                sorted_by_h = sorted(
-                    all_blocks, key=lambda b: int(b.get("height", -1)),
-                    reverse=True,
-                )
-                
-                # [FIX v8.4.3] Busca otimizada pelo ancestral comum
-                for blk in sorted_by_h:
-                    h = int(blk.get("height", -1))
-                    if h < 0:
-                        continue
-                    local_blk = self.db.get_block(h)
-                    if local_blk and local_blk["hash"] == blk.get("hash"):
-                        common_h = h
-                        common_hash = blk["hash"]
-                        break
-
-                if common_h < 0:
-                    log.warning(
-                        f"[REORG] sem ancestral comum nos últimos "
-                        f"{len(all_blocks)} blocos"
-                    )
-                    self._peer_record_fail(peer_id)
-                    return False
-
-                new_blocks = sorted(
-                    [
-                        b for b in all_blocks
-                        if common_h < int(b.get("height", -1)) <= target_h
-                    ],
-                    key=lambda b: int(b.get("height", -1)),
-                )
-
-                if not new_blocks:
-                    log.warning(
-                        f"[REORG] nenhum bloco novo (comum={common_h})"
-                    )
-                    self._peer_record_fail(peer_id)
-                    return False
-
-                # [FIX CRÍTICO v8.4.3] Imutabilidade por checkpoints usando
-                # checkpoints.py (não blockchain.py)
-                try:
-                    from checkpoints import load_checkpoints, verify_checkpoint
-                    cps = load_checkpoints()
-                    if cps:
-                        cp_heights = [int(h) for h in cps.keys()]
-                        highest_cp = max(cp_heights) if cp_heights else -1
-                        
-                        if highest_cp >= 0 and common_h < highest_cp:
-                            log.error(
-                                f"[REORG] BLOQUEADO: ancestral comum #{common_h} < "
-                                f"checkpoint #{highest_cp}. Blocos <= #{highest_cp} sao IMUTAVEIS."
-                            )
-                            self._peer_record_fail(peer_id)
-                            return False
-                        
-                        # Valida assinatura dos checkpoints que estão sendo reescritos
-                        for cp_h, cp_data in cps.items():
-                            if int(cp_h) > common_h:
-                                if not verify_checkpoint(cp_data):
-                                    log.error(f"[REORG] BLOQUEADO: checkpoint #{cp_h} tem assinatura inválida.")
-                                    self._peer_record_fail(peer_id)
-                                    return False
-                                
-                                # Verifica se o hash da nova cadeia bate com o checkpoint
-                                blk_match = next((b for b in new_blocks if int(b["height"]) == int(cp_h)), None)
-                                if blk_match and blk_match["hash"] != cp_data["hash"]:
-                                    log.error(f"[REORG] BLOQUEADO: novo bloco #{cp_h} viola checkpoint assinado.")
-                                    self._peer_record_fail(peer_id)
-                                    return False
-                except ImportError:
-                    pass
-
-                ok, motivo = self._validate_chain_segment(
-                    new_blocks,
-                    start_height=common_h + 1,
-                    expected_prev_hash=common_hash,
-                )
-                if not ok:
-                    log.warning(
-                        f"[REORG] cadeia nova INVÁLIDA — peer malicioso? "
-                        f"{motivo}"
-                    )
-                    self._peer_record_fail(peer_id)
-                    return False
-
-                log.warning(
-                    f"[REORG] ancestral #{common_h}, "
-                    f"nova cadeia com {len(new_blocks)} blocos (validada)"
-                )
-
-                if not hasattr(self.chain, "reorg_to"):
-                    log.error("[REORG] blockchain sem método reorg_to()")
-                    self._peer_record_fail(peer_id)
-                    return False
-
-                ok, msg = self.chain.reorg_to(new_blocks)
-                if ok:
-                    self.status.reorgs_total += 1
-                    self.status.last_reorg_height = common_h
-                    log.warning(f"[REORG] OK — fork resolvido em #{common_h} ({msg})")
-                    self._peer_record_success(peer_id)
-                    return True
-                else:
-                    log.warning(f"[REORG] reorg_to falhou: {msg}")
-                    self._peer_record_fail(peer_id)
-                    return False
-
-            except Exception as e:
-                log.exception(f"[REORG] exceção: {e}")
-                self._peer_record_fail(peer_id)
-                return False
-            finally:
-                self.status.forking = False
-                self._fork_signal.clear()
-
-    def _refresh_peers_from_p2p(self) -> int:
-        p2p = self.p2p
-        if p2p is None:
-            return 0
-        count = 0
-        disc = getattr(p2p, "discovery", None)
-        if disc is not None and hasattr(disc, "listar_peers_com_altura"):
-            try:
-                for p in disc.listar_peers_com_altura() or []:
-                    addr = p.get("address", "")
-                    if not addr or ":" not in addr:
-                        continue
-                    ip, _, port_s = addr.rpartition(":")
-                    try:
-                        port = int(port_s)
-                    except ValueError:
-                        continue
-                    height = int(p.get("height", 0) or 0)
-                    work = int(p.get("work", 0) or 0)
-                    self.register_peer(addr, ip, port, height, work)
-                    count += 1
-            except Exception as e:
-                log.debug(f"_refresh_peers_from_p2p: {e}")
-        return count
-
-    def _do_send(self, ip: str, port: int, msg: dict,
-                 timeout: float = DEFAULT_TIMEOUT) -> Optional[dict]:
-        if self._send_fn is not None:
-            try:
-                return self._send_fn(ip, port, msg, timeout)
-            except Exception:
-                return None
+# ============================================================
+# [NEW v2.2] Assinaturas de validador do bloco
+# ============================================================
+def _get_chain_validators(chain) -> list:
+    """
+    Obtém o set de validadores ativos da chain, se disponível.
+    Retorna [] se trust_net ausente ou vazio → modo bootstrap.
+    """
+    fn = getattr(chain, "_get_active_validators", None)
+    if callable(fn):
         try:
-            from p2p_unified import P2PClient
-            resp, _ = P2PClient.send_message(ip, port, msg, timeout=timeout)
-            return resp
+            return list(fn() or [])
         except Exception as e:
-            log.debug(f"P2PClient falhou: {e}")
-            return None
-
-    def request_block_batch(self, peer: PeerStatus,
-                            start_height: int, count: int) -> List[Dict]:
-        payload = {
-            "type": "get_blocks_range",
-            "start": start_height,
-            "end": start_height + count,
-        }
-        resp = self._do_send(peer.ip, peer.port, payload, DEFAULT_TIMEOUT)
-        if not resp or "blocks" not in resp:
+            log.debug(f"_get_active_validators falhou: {e}")
             return []
-        blocks = resp["blocks"]
-        return blocks if isinstance(blocks, list) else []
+    return []
 
-    def _block_exists(self, height: int) -> bool:
+
+def _required_sigs_for(chain, validators: list) -> int:
+    """Quanto o bloco precisa ter, segundo a config da chain."""
+    if not validators:
+        return 0
+    fn = getattr(chain, "_required_signatures", None)
+    if callable(fn):
         try:
-            return self.db.get_block(height) is not None
+            return int(fn(validators))
         except Exception:
-            return False
+            pass
+    # Fallback: espelha o default do blockchain.py
+    import os
+    if os.environ.get("BRN_REQUIRE_ALL_SIGS", "1") == "1":
+        return len(validators)
+    try:
+        q = float(os.environ.get("BRN_VALIDATOR_QUORUM", "0.67"))
+    except ValueError:
+        q = 0.67
+    import math
+    return max(1, min(len(validators), math.ceil(len(validators) * q)))
 
-    def apply_block_batch(self, blocks: List[Dict]) -> Tuple[int, int]:
-        applied = 0
-        failed = 0
-        for block_data in blocks:
-            try:
-                h = block_data.get("height")
-                if h is not None and self._block_exists(h):
-                    applied += 1
-                    continue
-                ok, msg = self.chain.accept_block(block_data)
-                if ok:
-                    applied += 1
-                else:
-                    log.warning(f"accept_block #{h}: {msg}")
-                    failed += 1
-                    break
-            except Exception as e:
-                log.warning(f"aplicar #{block_data.get('height')}: {e}")
-                failed += 1
-                break
-        return applied, failed
 
-    def sync_with_peer(self, peer: PeerStatus) -> bool:
-        local_h = self._safe_height()
-        self.status.local_height = local_h
-        self.status.target_height = peer.height
-        self.status.last_error = ""
-
-        if local_h >= peer.height:
-            self.status.synced = True
-            return True
-
-        if local_h >= 0:
-            peer_block = self._fetch_chain_from(
-                peer, local_h, local_h + 1, strict=True
-            )
-            if peer_block is None or not peer_block:
-                self._peer_record_fail(peer.node_id)
-                self.status.last_error = f"peer não devolveu bloco #{local_h}"
-                return False
-            local_block = self.db.get_block(local_h)
-            if local_block and peer_block[0].get("hash") != local_block["hash"]:
-                log.debug(
-                    f"sync_with_peer: fork detectado em #{local_h}, "
-                    f"deixando _detect_fork resolver"
-                )
-                return False
-
-        while not self._stop_sync.is_set():
-            local_h = self._safe_height()
-            if local_h >= peer.height:
-                break
-
-            current = local_h + 1
-            end = min(current + self.batch_size - 1, peer.height)
-            count = end - current + 1
-
-            blocks = self.request_block_batch(peer, current, count)
-            if not blocks:
-                self.status.last_error = f"lote {current}..{end} vazio"
-                if self._stop_sync.wait(timeout=2):
-                    break
-                continue
-
-            applied, failed = self.apply_block_batch(blocks)
-
-            self.status.local_height = self._safe_height()
-            target = max(1, self.status.target_height)
-            self.status.progress = min(100.0, self.status.local_height / target * 100.0)
-
-            log.info(
-                f"Sync {self.status.local_height}/{peer.height} "
-                f"({self.status.progress:.1f}%) — +{applied} ok, {failed} falhas"
-            )
-
-            if applied == 0:
-                break
-            if failed > 0:
-                break
-            if self._stop_sync.wait(timeout=BATCH_DELAY_S):
-                break
-
-        if not self._stop_sync.is_set():
-            self.status.synced = (self._safe_height() >= peer.height)
-        return self.status.synced
-
-    def start_sync_loop(self) -> None:
-        if self.sync_lock.locked():
-            log.debug("sync loop já está rodando")
-            return
-        self._stop_sync.clear()
-        self.status.syncing = True
-
-        def _loop():
-            try:
-                while not self._stop_sync.is_set():
-                    try:
-                        self._refresh_peers_from_p2p()
-
-                        fork_peer = self._detect_fork()
-                        if fork_peer is not None:
-                            self._resolve_fork(fork_peer)
-                            continue
-
-                        best = self._best_peer_by_work()
-                        if best is not None:
-                            self.status.active_peer = best.node_id
-                            self.sync_with_peer(best)
-                        else:
-                            self.status.synced = True
-                            self.status.local_height = self._safe_height()
-                            self.status.target_height = self.status.local_height
-                    except Exception as e:
-                        log.warning(f"sync loop erro: {e}")
-                        self.status.last_error = str(e)
-                    if self._stop_sync.wait(timeout=DEFAULT_INTERVAL_S):
-                        break
-            finally:
-                self.status.syncing = False
-                self.status.active_peer = None
-
-        self.sync_thread = threading.Thread(
-            target=_loop, daemon=True, name="ChainSync"
-        )
-        self.sync_thread.start()
-        log.info("ChainSyncManager v8.4.3 iniciado")
-
-    def _best_peer_by_work(self) -> Optional[PeerStatus]:
-        local_h = self._safe_height()
-        local_work = self._local_work()
-        with self.peer_lock:
-            candidates = [
-                p for p in self.peers.values()
-                if p.height > local_h
-                and not self._peer_is_blocked(p.node_id)
-                and (p.cumulative_work > 0 or local_work == 0)
-            ]
-        if not candidates:
-            return None
-        return max(candidates, key=lambda p: (p.cumulative_work, p.height))
-
-    def stop(self) -> None:
-        self._stop_sync.set()
-        if self.sync_thread and self.sync_thread.is_alive():
-            self.sync_thread.join(timeout=5)
-
-    def get_status(self) -> Dict:
-        local = self._safe_height()
-        target = local
-        active = None
-        with self.peer_lock:
-            peers = list(self.peers.values())
-        for p in peers:
-            if p.height > target:
-                target = p.height
-                active = p.addr
-        progress = 100.0 if target <= 0 else min(100.0, local / target * 100.0)
-        synced = (local >= target and target >= 0)
-        blocked = []
-        with self._reorg_fails_lock:
-            now = time.time()
-            for pid, entry in self._reorg_fails.items():
-                if entry.get("blocked_until", 0) > now:
-                    blocked.append({
-                        "peer": pid[:12],
-                        "seconds_left": int(entry["blocked_until"] - now),
-                        "fails": entry.get("fails", 0),
-                    })
-        return {
-            "mode":                self.status.mode,
-            "local_height":        local,
-            "target_height":       target,
-            "synced":              synced,
-            "syncing":             self.status.syncing or self.status.forking,
-            "forking":             self.status.forking,
-            "reorgs_total":        self.status.reorgs_total,
-            "last_reorg_height":   self.status.last_reorg_height,
-            "progress":            round(progress, 2),
-            "active_peer":         active,
-            "peers_known":         len(peers),
-            "peers_synced":        sum(1 for p in peers if p.height <= local),
-            "last_error":          self.status.last_error,
-            "blocos_faltando":     max(0, target - local),
-            "blocos_por_segundo":  0.0,
-            "velocidade_media":    0.0,
-            "eta_segundos":        None,
-            "peers_in_cooldown":   blocked,
-        }
-
-    def __enter__(self):
-        self.start_sync_loop()
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        self.stop()
+def _verify_block_sig(pubkey_hex: str, block: dict, sig_hex: str) -> bool:
+    """
+    Verifica Ed25519 sobre BLOCK_SIG_DOMAIN || hash.
+    Usa a mesma função do blockchain.py (compatibilidade total).
+    """
+    try:
+        from blockchain import verify_block_signature
+        return bool(verify_block_signature(pubkey_hex, block, sig_hex))
+    except ImportError:
+        # Fallback mínimo: se blockchain.py não importar, falha fechado
         return False
+
+
+def _verify_validator_sigs(
+    block: dict, chain, strict: bool = False
+) -> tuple:
+    """
+    Verifica block["validators_sig"].
+
+    strict=False (default):
+        - Cada assinatura é Ed25519 válida sobre o hash do bloco.
+        - Não exige count mínimo (trust_net é dinâmico).
+        - Não exige que pubkey esteja no top-5 atual (pode ter mudado).
+
+    strict=True:
+        - Exige count >= _required_signatures(current_validators).
+        - Exige cada pubkey no set atual.
+
+    Retorna (ok, msg, count_validas).
+    Blocos antigos (sem campo) → OK com count=0.
+    """
+    sigs = block.get("validators_sig")
+    if not isinstance(sigs, list):
+        return False, "validators_sig nao e lista", 0
+
+    if not sigs:
+        # Sem assinaturas: aceitar estruturalmente.
+        # Aviso (não erro) é emitido pelo chamador se trust_net tem validadores.
+        return True, "", 0
+
+    # Deduplica por pubkey
+    seen: set = set()
+    valid_count = 0
+    for entry in sigs:
+        if not isinstance(entry, dict):
+            return False, "entrada de validators_sig nao e dict", valid_count
+        pubkey = (entry.get("pubkey") or "").strip()
+        signature = (entry.get("signature") or "").strip()
+        if not pubkey or not signature:
+            return False, "entry sem pubkey/signature", valid_count
+        if pubkey in seen:
+            continue
+        seen.add(pubkey)
+        if _verify_block_sig(pubkey, block, signature):
+            valid_count += 1
+        else:
+            # Com strict=True: erro. Com strict=False: erro também —
+            # assinatura inválida é sempre corrupção/ataque.
+            return (
+                False,
+                f"assinatura invalida de {pubkey[:16]} em #{block.get('height')}",
+                valid_count,
+            )
+
+    if strict:
+        validators = _get_chain_validators(chain)
+        if validators:
+            vset = set(validators)
+            not_in_set = [p for p in seen if p not in vset]
+            if not_in_set:
+                return (
+                    False,
+                    f"pubkey fora do set atual em #{block.get('height')}: "
+                    f"{', '.join(p[:12] for p in not_in_set[:3])}",
+                    valid_count,
+                )
+            required = _required_sigs_for(chain, validators)
+            if valid_count < required:
+                return (
+                    False,
+                    f"#{block.get('height')}: {valid_count}/{required} "
+                    f"assinaturas (strict)",
+                    valid_count,
+                )
+
+    return True, "", valid_count
+
+
+# ============================================================
+# AUDITORIA COMPLETA
+# ============================================================
+def verify_chain(chain, strict_validators: bool = False) -> VerifyResult:
+    t0 = time.time()
+    r = VerifyResult()
+    r.strict_validators = strict_validators
+
+    # ---------- altura ----------
+    try:
+        h = chain.db.height()
+    except Exception as e:
+        r.valid = False
+        r.errors.append(f"nao consegui ler altura: {e}")
+        r.duration = time.time() - t0
+        return r
+
+    r.height = h
+    if h < 0:
+        # DB vazio não é CADEIA INVÁLIDA. É cliente aguardando genesis.
+        r.warnings.append("Banco não contém blocos (aguardando genesis)")
+        r.duration = time.time() - t0
+        return r
+
+    # ---------- checkpoints ----------
+    checkpoints = {}
+    verify_checkpoint = None
+    try:
+        from checkpoints import load_checkpoints, verify_checkpoint as _vc
+        checkpoints = load_checkpoints()
+        verify_checkpoint = _vc
+        r.checkpoints_checked = len(checkpoints)
+    except ImportError:
+        r.warnings.append("checkpoints.py nao disponivel")
+    except Exception as e:
+        r.warnings.append(f"erro carregando checkpoints: {e}")
+
+    # ---------- validadores ativos (para warning) ----------
+    active_validators = _get_chain_validators(chain)
+
+    # ---------- varredura ----------
+    prev = None
+    for i in range(0, h + 1):
+        try:
+            block = chain.db.get_block(i)
+        except Exception as e:
+            r.valid = False
+            r.errors.append(f"bloco {i}: erro lendo do DB: {e}")
+            break
+
+        if not block:
+            r.valid = False
+            r.errors.append(f"bloco {i} ausente no DB")
+            prev = None
+            continue
+
+        r.blocks_checked += 1
+
+        # ---------- encadeamento ----------
+        if prev is not None:
+            if block["prev_hash"] != prev["hash"]:
+                r.valid = False
+                r.errors.append(f"bloco {i}: prev_hash nao bate")
+            if int(block["timestamp"]) < int(prev["timestamp"]):
+                r.warnings.append(f"bloco {i}: timestamp regressivo")
+
+        # ---------- PoW (genesis isento) ----------
+        if i > 0:
+            if not _verify_pow(block):
+                r.valid = False
+                r.errors.append(f"bloco {i}: PoW invalido")
+
+        # ---------- merkle ----------
+        if not _verify_merkle(block):
+            r.valid = False
+            r.errors.append(f"bloco {i}: merkle root nao bate")
+
+        # ---------- checkpoint ----------
+        cp = checkpoints.get(str(i))
+        if cp and verify_checkpoint is not None:
+            try:
+                if not verify_checkpoint(cp):
+                    r.valid = False
+                    r.errors.append(f"bloco {i}: checkpoint invalido")
+                elif cp.get("hash") != block.get("hash"):
+                    r.valid = False
+                    r.errors.append(f"bloco {i}: checkpoint hash != bloco")
+            except Exception as e:
+                r.warnings.append(f"bloco {i}: checkpoint erro {e}")
+
+        # ---------- auth tag ----------
+        ok_at, msg_at = _verify_auth_tag(block, chain)
+        if not ok_at:
+            r.valid = False
+            r.errors.append(f"bloco {i}: {msg_at}")
+
+        # ---------- validators_sig [NEW v2.2] ----------
+        ok_vs, msg_vs, count_vs = _verify_validator_sigs(
+            block, chain, strict=strict_validators
+        )
+        if count_vs > 0:
+            r.validators_checked += 1
+        if not ok_vs:
+            r.valid = False
+            r.errors.append(f"bloco {i}: {msg_vs}")
+        elif count_vs == 0 and active_validators and i > 0:
+            # Bloco sem sigs mas a chain TEM validadores ativos.
+            # Não é erro estrutural (pode ser bloco legado pré-v9.4.0,
+            # ou bloco bootstrap), mas é sinal de alerta.
+            r.warnings.append(
+                f"bloco {i}: validators_sig vazio, mas trust_net tem "
+                f"{len(active_validators)} validador(es) ativo(s)"
+            )
+
+        # ---------- transações ----------
+        txs = block.get("transactions") or []
+        if not txs:
+            r.valid = False
+            r.errors.append(f"bloco {i}: sem transacoes")
+        else:
+            cb = txs[0]
+            if not _is_coinbase(cb):
+                r.valid = False
+                r.errors.append(f"bloco {i}: primeira tx nao e coinbase")
+            else:
+                ok_cb, msg_cb = _verify_coinbase(cb, i, chain)
+                if not ok_cb:
+                    r.valid = False
+                    r.errors.append(f"bloco {i}: coinbase invalida — {msg_cb}")
+
+            for tx in txs[1:]:
+                if _is_coinbase(tx):
+                    r.valid = False
+                    r.errors.append(f"bloco {i}: coinbase em posicao invalida")
+                    continue
+                if not _verify_tx_signature(tx, chain):
+                    r.valid = False
+                    tid = tx.get("txid", "?")[:16]
+                    r.errors.append(f"bloco {i}: assinatura invalida em tx {tid}")
+
+        prev = block
+
+        if len(r.errors) >= 200:
+            r.errors.append("... (truncado em 200 erros)")
+            break
+
+    r.duration = time.time() - t0
+    if not r.valid:
+        log.warning("verify_chain: cadeia INVALIDA — %s", r.summary())
+    return r
+
+
+# ============================================================
+# API DICT / RANGE / FORK
+# ============================================================
+def verify_chain_dict(chain, strict_validators: bool = False) -> dict:
+    return verify_chain(chain, strict_validators=strict_validators).to_dict()
+
+
+def verify_range(
+    chain, start: int, end: int, strict_validators: bool = False
+) -> dict:
+    r = VerifyResult()
+    r.strict_validators = strict_validators
+    prev = chain.db.get_block(start - 1) if start > 0 else None
+    for i in range(start, end + 1):
+        b = chain.db.get_block(i)
+        if not b:
+            r.valid = False
+            r.errors.append(f"bloco {i} ausente")
+            prev = None
+            continue
+        r.blocks_checked += 1
+
+        if prev is not None and b["prev_hash"] != prev["hash"]:
+            r.valid = False
+            r.errors.append(f"bloco {i}: prev_hash nao bate")
+
+        if i > 0 and not _verify_pow(b):
+            r.valid = False
+            r.errors.append(f"bloco {i}: PoW invalido")
+
+        if not _verify_merkle(b):
+            r.valid = False
+            r.errors.append(f"bloco {i}: merkle root nao bate")
+
+        # [NEW v2.2] validators_sig
+        ok_vs, msg_vs, count_vs = _verify_validator_sigs(
+            b, chain, strict=strict_validators
+        )
+        if count_vs > 0:
+            r.validators_checked += 1
+        if not ok_vs:
+            r.valid = False
+            r.errors.append(f"bloco {i}: {msg_vs}")
+
+        prev = b
+    return r.to_dict()
+
+
+def find_fork_point(chain_a, chain_b, max_depth: int = 1000) -> int:
+    h = min(chain_a.db.height(), chain_b.db.height())
+    for i in range(h, max(-1, h - max_depth), -1):
+        ba = chain_a.db.get_block(i)
+        bb = chain_b.db.get_block(i)
+        if ba and bb and ba["hash"] == bb["hash"]:
+            return i
+    return -1
+
+
+# ============================================================
+# AUTO-TESTE
+# ============================================================
+if __name__ == "__main__":
+    import sys
+
+    path = sys.argv[1] if len(sys.argv) > 1 else "brn_v2_chain.db"
+    strict = "--strict" in sys.argv
+
+    print(f"Auditando {path}... (strict_validators={strict})")
+
+    try:
+        from blockchain import Blockchain
+        bc = Blockchain(path, auto_genesis=False)
+    except Exception as e:
+        print(f"Erro ao abrir blockchain: {e}")
+        sys.exit(1)
+
+    r = verify_chain(bc, strict_validators=strict)
+    print(f"  height              : {r.height}")
+    print(f"  blocks_checked      : {r.blocks_checked}")
+    print(f"  checkpoints_checked : {r.checkpoints_checked}")
+    print(f"  validators_checked  : {r.validators_checked}")
+    print(f"  strict_validators   : {r.strict_validators}")
+    print(f"  duration            : {r.duration:.2f}s")
+    print(f"  valid               : {r.valid}")
+    print(f"  summary             : {r.summary()}")
+    if r.warnings:
+        print(f"  warnings ({len(r.warnings)}):")
+        for w in r.warnings[:5]:
+            print(f"    - {w}")
+    if r.errors:
+        print(f"  errors ({len(r.errors)}):")
+        for e in r.errors[:10]:
+            print(f"    - {e}")
+
+    sys.exit(0 if r.valid else 2)
