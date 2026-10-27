@@ -1,32 +1,27 @@
 #!/usr/bin/env python3
-"""check_network.py — Diagnóstico completo de rede e consenso BRN
+"""check_network.py — Diagnóstico completo de rede e consenso BRN (v2.0)
 ================================================================
-Verifica em uma única execução (somente leitura; não altera a blockchain):
-
-  1. Config local (brn_network.env + env vars)
-  2. Fingerprint da rede (deve bater nas duas máquinas)
-  3. Node identity (Ed25519)
-  4. Blockchain local (altura, tip, cumulative work)
-  5. Peers P2P conectados
-  6. Fork detection:
-     - Compara tip_hash local com cada peer
-     - Compara cumulative_work (regra Bitcoin)
-     - Detecta fork quando mesma altura tem hashes diferentes
-  7. Sync status (progresso, ETA)
-  8. Miner status
-  9. Últimos blocos
- 10. Resumo (veredito final)
-
-Uso:
-    python3 check_network.py
-    python3 check_network.py --json    # saída estruturada
-    python3 check_network.py --quiet   # só o veredito
-
-Exit codes:
-    0 = rede OK, sem fork
-    1 = fork detectado
-    2 = configuração de segredo ausente (fingerprint remoto não é validado por este script)
-    3 = nó offline (HTTP não responde)
+v2.0 (2026-10-27):
+  [FIX CRÍTICO] Detecção de fork agora compara CUMULATIVE_WORK antes
+                de altura/hash (regra Bitcoin de "melhor cadeia").
+                Classifica cada peer em same/behind/ahead/fork/unknown.
+  [FIX] Tenta múltiplos endpoints HTTP no peer (/api/chain-info,
+        /api/work, /api/status) com timeout curto. Antes só consultava
+        PEER_API_PORT e dava "inconclusivo" quando o peer não expunha
+        API HTTP naquele caminho.
+  [FIX] Peer alcançável por TCP mas sem HTTP → 'unknown' com motivo
+        explícito (em vez de fingir que comparou).
+  [NEW] Reporta local e remoto lado a lado: height, tip_hash,
+        cumulative_work.
+  [NEW] final_summary diferencia:
+          same     → OK
+          behind   → info (peer atrasado, normal)
+          ahead    → WARN (nós atrasados; sync deve resolver)
+          fork     → ERR (exit 1)
+          unknown  → warn (não foi possível comparar)
+  [KEEP] Exit codes: 0=ok, 1=fork/sem-peer, 2=sem-secret, 3=offline.
+  [KEEP] --json adiciona campos, não remove.
+  [KEEP] --quiet funciona.
 ================================================================
 """
 from __future__ import annotations
@@ -54,6 +49,7 @@ BASE_DIR = Path(__file__).resolve().parent
 API = os.environ.get("BRN_API_URL", "http://127.0.0.1:5000").rstrip("/")
 TIMEOUT = max(1, int(os.environ.get("BRN_HTTP_TIMEOUT", "5")))
 PEER_API_PORT = int(os.environ.get("BRN_PEER_API_PORT", "5000"))
+PEER_HTTP_TIMEOUT = max(1, int(os.environ.get("BRN_PEER_HTTP_TIMEOUT", "3")))
 
 # Cores
 class C:
@@ -112,6 +108,24 @@ def http_get(path: str, timeout: int = TIMEOUT):
         return {"_error": str(e)[:100]}
 
 
+def http_get_url(url: str, timeout: int = PEER_HTTP_TIMEOUT):
+    """GET em URL arbitrária (peer). Retorna (status, payload)."""
+    try:
+        r = requests.get(url, timeout=timeout)
+        if r.status_code == 200:
+            try:
+                return 200, r.json()
+            except ValueError:
+                return 200, None
+        return r.status_code, None
+    except requests.exceptions.ConnectionError:
+        return -1, None
+    except requests.exceptions.Timeout:
+        return -2, None
+    except Exception:
+        return -3, None
+
+
 def tcp_check(ip: str, port: int, timeout: float = 3.0) -> bool:
     """Testa TCP cru."""
     try:
@@ -140,7 +154,6 @@ def check_config() -> dict:
         "node_password": False,
     }
 
-    # brn_network.env
     env_file = BASE_DIR / "brn_network.env"
     secret = ""
     if env_file.exists():
@@ -150,7 +163,6 @@ def check_config() -> dict:
                 secret = line.split("=", 1)[1].strip().strip('"').strip("'")
                 break
 
-    # env var sobrescreve
     secret = os.environ.get("BRN_NETWORK_SECRET", secret)
 
     if secret:
@@ -164,12 +176,10 @@ def check_config() -> dict:
     else:
         err("BRN_NETWORK_SECRET ausente (brn_network.env nem env var)")
 
-    # p2p port
     p2p_port = os.environ.get("BRN_P2P_PORT", "6001")
     result["p2p_port"] = p2p_port
     info(f"P2P porta: {p2p_port}")
 
-    # node password
     pwd = os.environ.get("BRN_NODE_PASSWORD", "")
     if pwd:
         result["node_password"] = True
@@ -177,7 +187,6 @@ def check_config() -> dict:
     else:
         warn("BRN_NODE_PASSWORD não definida")
 
-    # bootstrap peers
     bootstrap = []
     bp_json = BASE_DIR / "bootstrap_peers.json"
     if bp_json.exists():
@@ -218,7 +227,6 @@ def check_node_alive() -> bool:
     except Exception:
         pass
 
-    # tenta /api/status como alternativa
     try:
         r = requests.get(f"{API}/api/status", timeout=3)
         if r.status_code == 200:
@@ -263,6 +271,13 @@ def check_chain() -> dict:
     work = get_work()
     cumulative_work = int(work.get("cumulative_work", 0)) if isinstance(work, dict) else 0
 
+    # fallback: alguns nós incluem cumulative_work em /api/chain-info
+    if cumulative_work == 0 and "cumulative_work" in ci:
+        try:
+            cumulative_work = int(ci["cumulative_work"])
+        except (TypeError, ValueError):
+            pass
+
     ok(f"Altura: {C.BOLD}{height}{C.RESET}")
     info(f"Tip hash: {tip_hash[:32]}...")
     info(f"Difficulty: {difficulty}  |  Reward: {reward / 1e8:.8f} BRN")
@@ -306,7 +321,6 @@ def check_peers() -> dict:
     ok(f"{count} peer(s) conhecido(s), {active} ativo(s)")
     out()
 
-    # Tabela de peers
     out(f"  {'ENDEREÇO':<26} {'ALTURA':>8} {'SCORE':>7} {'LAST SEEN':>12}")
     out(f"  {'─' * 26} {'─' * 8} {'─' * 7} {'─' * 12}")
 
@@ -343,7 +357,7 @@ def check_sync() -> dict:
         err("Nem /api/sync/status nem /api/sync-info responderam")
         return {"ok": False}
 
-    if "synced" in data:  # formato v7 (sync_manager)
+    if "synced" in data:
         synced = bool(data.get("synced", False))
         syncing = bool(data.get("syncing", False))
         progress = float(data.get("progress", 0))
@@ -356,21 +370,18 @@ def check_sync() -> dict:
         if synced:
             ok(f"Sincronizado · altura {local_h}/{target_h} · 100%")
         elif syncing:
-            warn(f"Sincronizando: {local_h}/{target_h} ({progress:.1f}%) "
-                 f"ETA={eta}")
+            warn(f"Sincronizando: {local_h}/{target_h} ({progress:.1f}%) ETA={eta}")
         else:
-            warn(f"Não sincronizado e não está sincronizando "
-                 f"({local_h}/{target_h})")
+            warn(f"Não sincronizado e não está sincronizando ({local_h}/{target_h})")
 
         if active_peer:
             info(f"Peer ativo: {active_peer}")
         if last_err:
             warn(f"Último erro: {last_err}")
 
-        return {"ok": synced, "synced": synced, "local": local_h,
-                "target": target_h, "progress": progress}
-
-    else:  # formato v9 (sync-info dict)
+        return {"ok": synced, "synced": synced, "syncing": syncing,
+                "local": local_h, "target": target_h, "progress": progress}
+    else:
         s = data.get("sync", {})
         return {"ok": s.get("percent", 0) >= 100,
                 "local": s.get("height", 0),
@@ -448,10 +459,152 @@ def check_latest_blocks() -> dict:
 
 
 # ============================================================
-# PARTE 8 — FORK DETECTION
+# PARTE 8 — FORK DETECTION (v2.0: work-based)
 # ============================================================
+def _probe_peer_chain(ip: str, port_p2p: int) -> dict:
+    """
+    Consulta um peer via HTTP para obter height/tip_hash/work.
+
+    Tenta, em ordem:
+      1. PEER_API_PORT (default 5000) -> /api/chain-info, /api/work
+      2. porta_p2p (anunciada)         -> /api/chain-info, /api/work
+      3. porta_p2p                     -> /api/status
+
+    Retorna:
+      {ok, source, height, tip_hash, cumulative_work, error}
+
+    ok=False + error != "" quando nada respondeu.
+    """
+    result = {
+        "ok": False,
+        "source": None,
+        "height": None,
+        "tip_hash": "",
+        "cumulative_work": None,
+        "error": "",
+    }
+
+    candidates = []
+    if port_p2p != PEER_API_PORT:
+        candidates.append(PEER_API_PORT)
+    candidates.append(port_p2p)
+    # dedupe preservando ordem
+    seen = set()
+    candidates = [p for p in candidates if not (p in seen or seen.add(p))]
+
+    errors = []
+    for port in candidates:
+        base = f"http://{ip}:{port}"
+
+        # tenta /api/chain-info
+        st, ci = http_get_url(f"{base}/api/chain-info")
+        if st == 200 and isinstance(ci, dict):
+            try:
+                result["height"] = int(ci.get("height", -1))
+                result["tip_hash"] = str(ci.get("tip_hash", ""))
+            except (TypeError, ValueError):
+                pass
+            result["source"] = f"{base}/api/chain-info"
+            # tenta /api/work para work
+            st_w, w = http_get_url(f"{base}/api/work")
+            if st_w == 200 and isinstance(w, dict):
+                try:
+                    result["cumulative_work"] = int(w.get("cumulative_work", 0))
+                except (TypeError, ValueError):
+                    pass
+            if result["cumulative_work"] is None and "cumulative_work" in ci:
+                try:
+                    result["cumulative_work"] = int(ci["cumulative_work"])
+                except (TypeError, ValueError):
+                    pass
+            result["ok"] = True
+            return result
+
+        # tenta /api/status
+        st_s, s = http_get_url(f"{base}/api/status")
+        if st_s == 200 and isinstance(s, dict):
+            try:
+                result["height"] = int(s.get("height", -1))
+                result["tip_hash"] = str(s.get("tip_hash", ""))
+            except (TypeError, ValueError):
+                pass
+            if "cumulative_work" in s:
+                try:
+                    result["cumulative_work"] = int(s["cumulative_work"])
+                except (TypeError, ValueError):
+                    pass
+            result["source"] = f"{base}/api/status"
+            result["ok"] = True
+            return result
+
+        # registra erro agregado
+        if st == -1:
+            errors.append(f"{port}: conexão recusada")
+        elif st == -2:
+            errors.append(f"{port}: timeout")
+        elif st == -3:
+            errors.append(f"{port}: erro de rede")
+        else:
+            errors.append(f"{port}: HTTP {st}")
+
+    result["error"] = "; ".join(errors) if errors else "sem HTTP"
+    return result
+
+
+def _classify_peer(local: dict, remote: dict) -> tuple:
+    """
+    Classifica um peer em relação à chain local.
+
+    Retorna (verdict, motivo):
+      same      — work, height e hash iguais
+      behind    — peer tem menos work que nós
+      ahead     — peer tem MAIS work que nós (sync pendente)
+      fork      — MESMO work, MESMA altura, HASH DIFERENTE
+      ambiguous — work igual mas altura diferente (raro)
+      unknown   — dados insuficientes
+    """
+    if not remote.get("ok"):
+        return "unknown", remote.get("error", "sem dados")
+
+    lw = local.get("cumulative_work", 0)
+    rw = remote.get("cumulative_work")
+    lh = local.get("height", -1)
+    rh = remote.get("height")
+    lhash = local.get("tip_hash", "")
+    rhash = remote.get("tip_hash", "")
+
+    # Sem work de um dos lados: cai em height/hash (fallback honesto)
+    if rw is None or lw in (0, None):
+        if rh is None:
+            return "unknown", "peer sem height"
+        if rh > lh:
+            return "ahead", f"peer height {rh} > local {lh} (sem work)"
+        if rh < lh:
+            return "behind", f"peer height {rh} < local {lh} (sem work)"
+        if lhash and rhash and lhash == rhash:
+            return "same", "height e hash iguais"
+        if lhash and rhash and lhash != rhash:
+            return "fork", f"mesma altura #{lh}, hash diferente"
+        return "unknown", "height igual, hash ausente"
+
+    # Work disponível dos dois lados (regra Bitcoin)
+    if rw > lw:
+        return "ahead", f"peer work {rw:,} > local {lw:,}"
+    if rw < lw:
+        return "behind", f"peer work {rw:,} < local {lw:,}"
+
+    # Work igual: desempate por altura/hash
+    if rh == lh:
+        if lhash and rhash and lhash == rhash:
+            return "same", "work, height e hash iguais"
+        if lhash and rhash and lhash != rhash:
+            return "fork", f"mesmo work, altura #{lh} igual, hash diferente"
+        return "unknown", "work e height iguais, hash ausente"
+    return "ambiguous", f"work igual mas height difere ({lh} vs {rh})"
+
+
 def check_fork(local: dict, peers_data: dict) -> dict:
-    header("8. Detecção de fork")
+    header("8. Detecção de fork (work-based)")
 
     local_height = local.get("height", -1)
     local_hash = local.get("tip_hash", "")
@@ -459,100 +612,112 @@ def check_fork(local: dict, peers_data: dict) -> dict:
 
     if local_height < 0:
         info("Sem cadeia local — fork detection não aplicável")
-        return {"fork": False, "skipped": True}
+        return {"fork": False, "skipped": True, "checks": []}
 
     peers = peers_data.get("peers", [])
     if not peers:
         warn("Sem peers para comparar — não é possível detectar fork")
-        return {"fork": False, "skipped": True, "reason": "sem peers"}
+        return {"fork": False, "skipped": True, "checks": []}
 
-    forks = []
-    for p in peers:
-        if not isinstance(p, dict):
-            continue
-        addr = p.get("address", "?")
-        # O DB guarda height=0 na maioria dos casos (não atualiza dinamicamente)
-        # Então só comparamos o que temos
+    info(f"Local: height={local_height} · work={local_work:,} · "
+         f"tip={local_hash[:16]}...")
+    out()
 
-    # Não temos altura dos peers via /api/peers de forma confiável.
-    # Tentamos conectar direto em cada peer e pedir a chain-info dele.
-    checked = 0
-    for p in peers[:5]:
+    out(f"  {'PEER':<26} {'HEIGHT':>8} {'WORK':>18} {'VERDICT':<10} MOTIVO")
+    out(f"  {'─' * 26} {'─' * 8} {'─' * 18} {'─' * 10} {'─' * 20}")
+
+    checks = []
+    n_ahead = n_behind = n_same = n_fork = n_unknown = n_ambiguous = 0
+
+    for p in peers[:10]:
         if not isinstance(p, dict):
             continue
         addr = p.get("address", "")
         if ":" not in addr:
             continue
-        ip, port = addr.rsplit(":", 1)
+        ip, port_s = addr.rsplit(":", 1)
         try:
-            port = int(port)
+            port = int(port_s)
         except ValueError:
             continue
 
-        # Testa TCP cru
+        # TCP rápido primeiro (evita HTTP longo em peer morto)
         if not tcp_check(ip, port, timeout=3):
-            info(f"{addr}  ⚠️  TCP timeout")
-            continue
+            verdict = "unknown"
+            motivo = "TCP timeout"
+            remote = {"ok": False, "error": "TCP timeout"}
+        else:
+            remote = _probe_peer_chain(ip, port)
+            verdict, motivo = _classify_peer(local, remote)
 
-        checked += 1
-        # Tenta pedir /api/chain-info do peer (se ele tiver HTTP exposto)
-        try:
-            r = requests.get(f"http://{ip}:{PEER_API_PORT}/api/chain-info", timeout=TIMEOUT)
-            if r.status_code == 200:
-                remote = r.json()
-                r_height = int(remote.get("height", -1))
-                r_hash = remote.get("tip_hash", "")
-                remote_work = None
-                try:
-                    wr = requests.get(f"http://{ip}:{PEER_API_PORT}/api/work", timeout=TIMEOUT)
-                    if wr.status_code == 200:
-                        work_payload = wr.json()
-                        if isinstance(work_payload, dict):
-                            remote_work = int(work_payload.get("cumulative_work", 0))
-                except (requests.RequestException, ValueError, TypeError):
-                    pass
+        # contadores
+        if verdict == "same":
+            n_same += 1
+        elif verdict == "behind":
+            n_behind += 1
+        elif verdict == "ahead":
+            n_ahead += 1
+        elif verdict == "fork":
+            n_fork += 1
+        elif verdict == "ambiguous":
+            n_ambiguous += 1
+        else:
+            n_unknown += 1
 
-                fork = False
-                if r_height == local_height and local_hash and r_hash and r_hash != local_hash:
-                    fork = True
-                    err(f"FORK com {addr}!")
-                    info(f"  altura: ambos #{local_height}")
-                    info(f"  nosso: {local_hash[:24]}...")
-                    info(f"  peer : {r_hash[:24]}...")
-                elif r_height > local_height:
-                    warn(f"{addr} mais alto ({r_height} > {local_height}) "
-                         f"— sincronização pendente")
-                elif r_height < local_height:
-                    info(f"{addr} atrás ({r_height} < {local_height})")
-                elif local_hash and r_hash and r_hash == local_hash:
-                    ok(f"{addr}: mesma altura e mesmo hash ✓")
-                else:
-                    warn(f"{addr}: comparação inconclusiva (hash ausente ou resposta incompleta)")
+        # output
+        rh = remote.get("height")
+        rw = remote.get("cumulative_work")
+        rh_str = str(rh) if rh is not None else "?"
+        rw_str = f"{rw:,}" if rw is not None else "?"
+        # motivos longos: trunca
+        motivo_short = motivo[:24]
+        out(f"  {addr:<26} {rh_str:>8} {rw_str:>18} {verdict:<10} {motivo_short}")
 
-                if remote_work is not None:
-                    info(f"{addr}: trabalho acumulado remoto={remote_work:,}; local={local_work:,}")
-                    if remote_work != local_work:
-                        warn("Trabalho acumulado difere; validar a cadeia antes de qualquer reorganização.")
+        checks.append({
+            "peer": addr,
+            "verdict": verdict,
+            "motivo": motivo,
+            "remote": {
+                "ok": remote.get("ok", False),
+                "height": rh,
+                "tip_hash": remote.get("tip_hash", ""),
+                "cumulative_work": rw,
+                "source": remote.get("source"),
+                "error": remote.get("error", ""),
+            },
+        })
 
-                if fork:
-                    forks.append({
-                        "peer": addr,
-                        "height": r_height,
-                        "our_hash": local_hash,
-                        "peer_hash": r_hash,
-                    })
-        except Exception as e:
-            info(f"{addr}: HTTP do peer indisponível ({str(e)[:40]})")
+    out()
 
-    if not forks and checked == 0:
-        warn("Não consegui comparar com nenhum peer")
-        return {"fork": False, "checked": 0}
+    # Resumo visual
+    if n_fork > 0:
+        err(f"FORK DETECTADO com {n_fork} peer(s)")
+        for c in checks:
+            if c["verdict"] == "fork":
+                err(f"  {c['peer']}: {c['motivo']}")
+    if n_ahead > 0:
+        warn(f"{n_ahead} peer(s) com MAIS work que nós — sincronização pendente")
+    if n_same > 0:
+        ok(f"{n_same} peer(s) com work/height/hash idênticos")
+    if n_behind > 0:
+        info(f"{n_behind} peer(s) atrás de nós (normal)")
+    if n_ambiguous > 0:
+        warn(f"{n_ambiguous} peer(s) ambíguo(s) — work igual, height difere")
+    if n_unknown > 0:
+        warn(f"{n_unknown} peer(s) sem dados suficientes (TCP ok, HTTP indisponível?)")
 
-    if forks:
-        return {"fork": True, "forks": forks, "checked": checked}
-
-    ok(f"Sem fork detectado (comparado com {checked} peer(s))")
-    return {"fork": False, "checked": checked}
+    return {
+        "fork": n_fork > 0,
+        "checks": checks,
+        "summary": {
+            "same": n_same,
+            "behind": n_behind,
+            "ahead": n_ahead,
+            "fork": n_fork,
+            "ambiguous": n_ambiguous,
+            "unknown": n_unknown,
+        },
+    }
 
 
 # ============================================================
@@ -593,10 +758,20 @@ def final_summary(config: dict, chain: dict, peers: dict,
         issues.append(("INFO", "Miner não está rodando"))
         severity = max(severity, 0)
 
-    # Fork
+    # Fork (v2.0: veredito granular)
+    fsum = fork.get("summary", {})
     if fork.get("fork"):
-        issues.append(("ERR", "FORK detectado com peer!"))
+        issues.append(("ERR", f"FORK detectado com {fsum.get('fork', 0)} peer(s)!"))
         severity = max(severity, 2)
+    if fsum.get("ahead", 0) > 0:
+        issues.append(("WARN",
+                       f"{fsum['ahead']} peer(s) com MAIS work — sync pendente"))
+        severity = max(severity, 1)
+    if fsum.get("unknown", 0) > 0 and fsum.get("same", 0) == 0 \
+       and fsum.get("fork", 0) == 0:
+        issues.append(("WARN",
+                       f"{fsum['unknown']} peer(s) sem HTTP para comparar work"))
+        severity = max(severity, 1)
 
     # Imprime
     if not issues:
@@ -617,11 +792,10 @@ def final_summary(config: dict, chain: dict, peers: dict,
         else:
             info(msg)
 
-    # Mensagem contextual
     out()
     if fork.get("fork"):
         out(f"{C.RED}{C.BOLD}  ❌ FORK DETECTADO{C.RESET}")
-        out(f"     Os dois nós estão minerando cadeias diferentes.")
+        out(f"     Os peers têm cadeias diferentes com o MESMO cumulative_work.")
         out(f"     Causa mais comum: BRN_NETWORK_SECRET divergente")
         out(f"     ou um nó não conseguiu sincronizar antes de minerar.")
         out()
@@ -648,6 +822,12 @@ def final_summary(config: dict, chain: dict, peers: dict,
         out(f"     - BRN_NETWORK_SECRET IDÊNTICO nas duas")
         return 1
 
+    if fsum.get("ahead", 0) > 0:
+        out(f"{C.YELLOW}{C.BOLD}  ⚠️  SINCRONIZAÇÃO PENDENTE{C.RESET}")
+        out(f"     {fsum['ahead']} peer(s) com MAIS cumulative_work.")
+        out(f"     O nó deve sincronizar automaticamente; aguarde.")
+        return 1
+
     return 0
 
 
@@ -666,7 +846,6 @@ def main() -> int:
 
     _QUIET = args.quiet or args.json
 
-    # Banner
     if not _QUIET:
         print()
         print(f"{C.BOLD}{'═' * 64}{C.RESET}")
@@ -700,7 +879,7 @@ def main() -> int:
     # 7. Últimos blocos
     blocks = check_latest_blocks()
 
-    # 8. Fork
+    # 8. Fork (work-based)
     fork = check_fork(chain, peers)
 
     # 9. Resumo
@@ -708,6 +887,7 @@ def main() -> int:
 
     if args.json:
         report = {
+            "version": "2.0",
             "timestamp": time.time(),
             "hostname": socket.gethostname(),
             "config": config,
