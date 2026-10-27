@@ -92,7 +92,7 @@ _HARDCODED_DEFAULTS = {
     "BRN_POOL_URL_LOCAL":      "http://127.0.0.1:5000",
     "BRN_WEB_PASS":            "",
     "BRN_USE_WAITRESS":        "1",
-    "BRN_WAITRESS_THREADS":    "8",
+    "BRN_WAITRESS_THREADS":    "256",
 }
 
 
