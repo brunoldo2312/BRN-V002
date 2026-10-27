@@ -1,6 +1,22 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.4.0 | Data: 26/10/2026
+Versão: 9.4.1 | Data: 26/10/2026
 ================================================================
+v9.4.1 (2026-10-27):
+  [FIX] _get_active_validators() NÃO usa mais fila_mineracao como
+        fallback. A fila é bootstrap de mineração, não conjunto de
+        consenso. Sem trust_net → modo bootstrap (sem multi-sig).
+  [NEW] REQUIRE_ALL_SIGS configurável via BRN_REQUIRE_ALL_SIGS.
+        Quando 0, exige quórum BRN_VALIDATOR_QUORUM (default 0.67).
+  [NEW] SIG_COLLECT_TIMEOUT (BRN_SIG_COLLECT_TIMEOUT, default 10s)
+        para o _sign_collector via ThreadPoolExecutor.
+  [FIX] _collect_signatures() verifica cada assinatura antes de
+        incluir na lista (descarta lixo do coletor externo).
+  [FIX] Snapshot ÚNICO de validadores em mine_block_interruptible:
+        coleta, validação e accept_block usam o MESMO conjunto,
+        evitando divergência se trust_net mudar durante o PoW.
+  [FIX] set_local_validator_sk() valida entrada (Wallet | hex | None)
+        e nunca engole erro silenciosamente.
+  [NEW] state_snapshot() expõe require_all_sigs e validator_quorum.
 v9.4.0 (2026-10-26):
   [NEW] REGRA MULTI-SIG DOS TOP VALIDADORES:
         - Bloco precisa ter assinatura de TODOS os validadores ativos.
@@ -21,10 +37,12 @@ from __future__ import annotations
 
 import os
 import time
+import math
 import hmac
 import json
 import hashlib
 import logging
+from typing import Optional
 
 import orjson
 
@@ -57,9 +75,24 @@ CHECKPOINT_INTERVAL   = 1000
 MTP_WINDOW            = 50
 FILA_MAX_MINERADORES  = 20
 
+# ============================================================
 # Multi-sig dos validadores
-MAX_VALIDATORS       = 5
-REQUIRE_ALL_SIGS     = True   # True = TODOS os validadores precisam assinar
+# ------------------------------------------------------------
+# BRN_REQUIRE_ALL_SIGS=1 (default): exige assinatura de TODOS os validadores
+# BRN_REQUIRE_ALL_SIGS=0           : exige quórum BRN_VALIDATOR_QUORUM
+# BRN_VALIDATOR_QUORUM (default 0.67 = 2/3)
+# BRN_SIG_COLLECT_TIMEOUT (default 10s)
+# ============================================================
+MAX_VALIDATORS       = int(os.environ.get("BRN_MAX_VALIDATORS", "5"))
+REQUIRE_ALL_SIGS     = os.environ.get("BRN_REQUIRE_ALL_SIGS", "1") == "1"
+VALIDATOR_QUORUM     = float(os.environ.get("BRN_VALIDATOR_QUORUM", "0.67"))
+SIG_COLLECT_TIMEOUT  = float(os.environ.get("BRN_SIG_COLLECT_TIMEOUT", "10"))
+
+# Validação defensiva
+if not (0.0 < VALIDATOR_QUORUM <= 1.0):
+    VALIDATOR_QUORUM = 0.67
+if SIG_COLLECT_TIMEOUT <= 0:
+    SIG_COLLECT_TIMEOUT = 10.0
 
 GENESIS_PREV      = "0" * 64
 GENESIS_TIMESTAMP = 1700000000
@@ -150,7 +183,7 @@ def _maybe_sign_checkpoint(block) -> None:
 
 
 # ============================================================
-# [NEW v9.4.0] Assinatura de blocos (multi-sig)
+# Assinatura de blocos (multi-sig)
 # ============================================================
 def signing_hash_block(block: dict) -> bytes:
     """Mensagem assinada pelos validadores: domínio || hash do bloco."""
@@ -383,7 +416,7 @@ class Blockchain:
         self.on_block_mined = None
         self._fork_signal = None
 
-        # [NEW v9.4.0] Injetados pelo main.py
+        # Injetados pelo main.py
         self.trust_net = None
         self.p2p = None
         self._sign_collector = None
@@ -413,9 +446,38 @@ class Blockchain:
     def set_p2p(self, p2p):
         self.p2p = p2p
 
-    def set_local_validator_sk(self, sk):
-        """sk é um Wallet() ou hex."""
-        self._local_validator_sk = sk
+    # [FIX v9.4.1] set_local_validator_sk valida entrada
+    def set_local_validator_sk(self, sk) -> None:
+        """
+        sk: Wallet() | hex string (64 chars) | None.
+        Nunca engole erro silencioso: em caso de problema, loga e zera.
+        """
+        if sk is None:
+            self._local_validator_sk = None
+            return
+        try:
+            from wallet import Wallet
+            if isinstance(sk, Wallet):
+                self._local_validator_sk = sk
+                log.info("[SIG] chave local de validador configurada (Wallet)")
+                return
+            if isinstance(sk, str):
+                h = sk.strip()
+                if len(h) != 64 or any(c not in "0123456789abcdefABCDEF" for c in h):
+                    log.warning("[SIG] set_local_validator_sk: hex inválido")
+                    self._local_validator_sk = None
+                    return
+                self._local_validator_sk = Wallet(private_key_hex=h)
+                log.info("[SIG] chave local de validador configurada (hex)")
+                return
+            log.warning(
+                f"[SIG] set_local_validator_sk: tipo não suportado "
+                f"({type(sk).__name__}); ignorando"
+            )
+            self._local_validator_sk = None
+        except Exception as e:
+            log.warning(f"[SIG] set_local_validator_sk falhou: {e}")
+            self._local_validator_sk = None
 
     def set_sign_collector(self, cb):
         """cb(block) -> list[{pubkey, signature}]"""
@@ -697,44 +759,65 @@ class Blockchain:
         return timestamps[len(timestamps) // 2]
 
     # ============================================================
-    # [NEW v9.4.0] VALIDAÇÃO MULTI-SIG DOS TOP VALIDADORES
+    # [FIX v9.4.1] VALIDAÇÃO MULTI-SIG DOS TOP VALIDADORES
     # ============================================================
     def _get_active_validators(self) -> list:
         """
-        Retorna lista de pubkeys dos validadores ativos.
-        1. Tenta trust_net.get_top_validators(count=5)
-        2. Se vazio, cai no fallback (fila ou genesis)
+        Retorna pubkeys dos validadores ativos, ordenadas.
+
+        Fonte ÚNICA de verdade: trust_net.get_top_validators().
+        NÃO usa fila_mineracao como fallback — a fila é bootstrap de
+        mineração, não conjunto de consenso.
+
+        Se trust_net estiver vazio/indisponível → retorna [] →
+        modo bootstrap (consenso multi-sig NÃO é aplicado).
         """
         trust = self.trust_net
-        if trust is not None:
-            try:
-                top = trust.get_top_validators(count=MAX_VALIDATORS)
-                if top:
-                    return list(top)
-            except Exception as e:
-                log.warning(f"[VALIDATORS] get_top_validators falhou: {e}")
-        # Fallback: se ninguém no trust_net, usa a fila (bootstrap)
-        if self.fila_mineracao:
-            return list(self.fila_mineracao.values())
-        # Sem ninguém: aceita qualquer (modo bootstrap puro)
-        return []
+        if trust is None:
+            return []
+        try:
+            top = trust.get_top_validators(count=MAX_VALIDATORS)
+            if not top:
+                return []
+            # Ordenar + dedupe → determinismo entre peers
+            return sorted({p for p in top if p})
+        except Exception as e:
+            log.warning(f"[VALIDATORS] get_top_validators falhou: {e}")
+            return []
 
-    def _validate_validators_sig(self, block: dict) -> tuple:
+    def _required_signatures(self, validators: list) -> int:
+        """Quantas assinaturas o bloco precisa para ser aceito."""
+        n = len(validators)
+        if n == 0:
+            return 0
+        if REQUIRE_ALL_SIGS:
+            return n
+        need = max(1, math.ceil(n * VALIDATOR_QUORUM))
+        return min(need, n)
+
+    def _validate_validators_sig(
+        self, block: dict, validators: Optional[list] = None
+    ) -> tuple:
         """
-        Verifica a regra multi-sig dos top validadores:
-          - Se N validadores ativos, bloco precisa de N assinaturas.
-          - Se N=0, aceita (bootstrap).
+        Verifica a regra multi-sig dos validadores.
+
+        `validators` pode ser passado explicitamente (snapshot do minerador)
+        para evitar divergência entre coleta e validação.
         """
-        validators = self._get_active_validators()
+        if validators is None:
+            validators = self._get_active_validators()
         if not validators:
-            return True, ""
+            return True, ""  # bootstrap
 
-        required = len(validators)
+        required = self._required_signatures(validators)
+
         sigs = block.get("validators_sig", [])
         if not isinstance(sigs, list):
             return False, "validators_sig inválido"
 
-        valid_pubkeys = set()
+        valid_set = set(validators)
+        valid_pubkeys: set = set()
+
         for entry in sigs:
             if not isinstance(entry, dict):
                 continue
@@ -742,29 +825,28 @@ class Blockchain:
             signature = (entry.get("signature") or "").strip()
             if not pubkey or not signature:
                 continue
-            if pubkey not in validators:
+            if pubkey not in valid_set:
+                log.warning(f"[SIG] pubkey fora do set: {pubkey[:16]}")
                 continue
             if pubkey in valid_pubkeys:
-                continue  # duplicado
+                continue
             if verify_block_signature(pubkey, block, signature):
                 valid_pubkeys.add(pubkey)
+            else:
+                log.warning(f"[SIG] assinatura inválida de {pubkey[:16]}")
 
         got = len(valid_pubkeys)
-        if REQUIRE_ALL_SIGS:
-            if got < required:
-                missing = [p[:12] + "…" for p in validators if p not in valid_pubkeys]
-                return False, (
-                    f"Bloco #{block['height']} precisa de {required} assinaturas, "
-                    f"tem {got}. Faltam: {', '.join(missing[:3])}"
-                )
-            return True, ""
-        else:
-            need = (required // 2) + 1  # maioria
-            if got < need:
-                return False, f"precisa de {need}/{required} assinaturas, tem {got}"
-            return True, ""
+        if got < required:
+            missing = [p[:12] + "…" for p in validators if p not in valid_pubkeys]
+            return False, (
+                f"Bloco #{block['height']} precisa de {required}/{len(validators)} "
+                f"assinaturas, tem {got}. Faltam: {', '.join(missing[:5])}"
+            )
+        return True, ""
 
-    def validate_block(self, block: dict, prev_block=None) -> tuple:
+    def validate_block(
+        self, block: dict, prev_block=None, validators: Optional[list] = None
+    ) -> tuple:
         if block["height"] == 0 and prev_block is None:
             if (self.genesis_expected_hash and block["hash"] != self.genesis_expected_hash):
                 return False, f"genesis nao corresponde ao esperado"
@@ -797,7 +879,7 @@ class Blockchain:
             return False, msg_cp
 
         # ---- Multi-sig dos validadores ----
-        ok_sig, msg_sig = self._validate_validators_sig(block)
+        ok_sig, msg_sig = self._validate_validators_sig(block, validators=validators)
         if not ok_sig:
             return False, msg_sig
 
@@ -844,9 +926,11 @@ class Blockchain:
             return False, "coinbase acima do permitido"
         return True, "ok"
 
-    def accept_block(self, block: dict) -> tuple:
+    def accept_block(
+        self, block: dict, validators: Optional[list] = None
+    ) -> tuple:
         prev = self.db.get_block_by_hash(block["prev_hash"])
-        ok, msg = self.validate_block(block, prev)
+        ok, msg = self.validate_block(block, prev, validators=validators)
         if not ok:
             return False, msg
 
@@ -893,39 +977,85 @@ class Blockchain:
             print(f"[on_block_mined] callback falhou: {e}")
 
     # ============================================================
-    # [NEW v9.4.0] COLETA DE ASSINATURAS
+    # [FIX v9.4.1] COLETA DE ASSINATURAS COM VERIFICAÇÃO E TIMEOUT
     # ============================================================
-    def _collect_signatures(self, block: dict) -> list:
+    def _collect_signatures(
+        self, block: dict, validators: Optional[list] = None
+    ) -> list:
         """
         Coleta assinaturas dos validadores ativos para o bloco.
-        Retorna lista de {pubkey, signature}.
+
+        - Assina localmente se este nó é validador.
+        - Consulta _sign_collector com timeout (BRN_SIG_COLLECT_TIMEOUT).
+        - Verifica cada assinatura antes de incluir.
         """
-        validators = self._get_active_validators()
+        if validators is None:
+            validators = self._get_active_validators()
         if not validators:
-            return []  # bootstrap: sem validação
+            return []
 
-        sigs = []
-        seen = set()
+        valid_set = set(validators)
+        sigs: list = []
+        seen: set = set()
 
-        # 1) Assinatura local (se o nó é validador)
+        # ---- 1) Assinatura local (se este nó é validador) ----
         local_sk = self._local_validator_sk
         if local_sk is not None:
             entry = sign_block_as_validator(block, local_sk)
-            if entry and entry.get("pubkey") in validators:
-                sigs.append(entry)
-                seen.add(entry["pubkey"])
-
-        # 2) Coletor externo (P2P)
-        if self._sign_collector is not None:
-            try:
-                extra = self._sign_collector(block)
-                for entry in extra or []:
-                    pk = (entry or {}).get("pubkey", "")
-                    if pk and pk in validators and pk not in seen:
+            if not entry:
+                log.warning("[SIG] assinatura local falhou (chave inválida?)")
+            else:
+                pk = entry.get("pubkey", "")
+                if pk in valid_set:
+                    if verify_block_signature(pk, block, entry.get("signature", "")):
                         sigs.append(entry)
                         seen.add(pk)
+                    else:
+                        log.warning(f"[SIG] assinatura local inválida ({pk[:16]})")
+                elif pk:
+                    log.info(
+                        f"[SIG] pubkey local {pk[:16]} não é validador ativo — "
+                        f"assinatura descartada"
+                    )
+
+        # ---- 2) Coletor externo, com timeout ----
+        if self._sign_collector is not None:
+            extra: list = []
+            try:
+                from concurrent.futures import (
+                    ThreadPoolExecutor, TimeoutError as FutTimeout,
+                )
+                with ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="sig-collect"
+                ) as pool:
+                    fut = pool.submit(self._sign_collector, block)
+                    try:
+                        extra = fut.result(timeout=SIG_COLLECT_TIMEOUT) or []
+                    except FutTimeout:
+                        log.warning(
+                            f"[SIG] _sign_collector timeout após "
+                            f"{SIG_COLLECT_TIMEOUT:.1f}s"
+                        )
             except Exception as e:
                 log.warning(f"[SIG] _sign_collector falhou: {e}")
+
+            for entry in extra:
+                if not isinstance(entry, dict):
+                    continue
+                pk = (entry.get("pubkey") or "").strip()
+                sg = (entry.get("signature") or "").strip()
+                if not pk or not sg:
+                    continue
+                if pk not in valid_set:
+                    log.warning(f"[SIG] coletor devolveu pubkey desconhecida: {pk[:16]}")
+                    continue
+                if pk in seen:
+                    continue
+                if verify_block_signature(pk, block, sg):
+                    sigs.append(entry)
+                    seen.add(pk)
+                else:
+                    log.warning(f"[SIG] coletor devolveu assinatura inválida: {pk[:16]}")
 
         return sigs
 
@@ -934,9 +1064,18 @@ class Blockchain:
             raise ValueError("mine_block: miner_pubkey é obrigatória")
         return self.mine_block_interruptible(miner_address, miner_pubkey, None)
 
-    def mine_block_interruptible(self, miner_address: str, miner_pubkey: str, should_continue=None, progress_cb=None) -> dict:
+    def mine_block_interruptible(
+        self, miner_address: str, miner_pubkey: str,
+        should_continue=None, progress_cb=None
+    ) -> dict:
         if not miner_pubkey:
             raise ValueError("mine_block_interruptible: miner_pubkey é obrigatória")
+
+        # [FIX v9.4.1] Snapshot ÚNICO de validadores.
+        # Garante que coleta, validação e accept_block usem o MESMO conjunto,
+        # mesmo que trust_net seja atualizado por outra thread no meio.
+        validators = self._get_active_validators()
+
         height = self.db.height() + 1
         reward = self.current_reward(height)
         diff = self.current_difficulty()
@@ -983,17 +1122,18 @@ class Blockchain:
         }
         self._attach_auth_tag(block)
 
-        # ---- Coleta de assinaturas dos validadores ----
-        sigs = self._collect_signatures(block)
+        # ---- Coleta de assinaturas dos validadores (snapshot) ----
+        sigs = self._collect_signatures(block, validators=validators)
         block["validators_sig"] = sigs
 
-        # ---- Valida multi-sig antes de aceitar ----
-        ok_sig, msg_sig = self._validate_validators_sig(block)
+        # ---- Valida multi-sig antes de aceitar (mesmo snapshot) ----
+        ok_sig, msg_sig = self._validate_validators_sig(block, validators=validators)
         if not ok_sig:
             log.warning(f"[MINER] bloco #{height} REJEITADO (multi-sig): {msg_sig}")
             return None
 
-        ok, msg = self.accept_block(block)
+        # accept_block usa o mesmo snapshot → sem revalidação contraditória
+        ok, msg = self.accept_block(block, validators=validators)
         if ok:
             self._fire_block_mined(block)
             return block
@@ -1001,6 +1141,10 @@ class Blockchain:
         return None
 
     def state_snapshot(self) -> dict:
+        try:
+            n_validators = len(self._get_active_validators())
+        except Exception:
+            n_validators = -1
         return {
             "height": self.get_latest_height(),
             "tip_hash": self.db.tip_hash(),
@@ -1010,7 +1154,9 @@ class Blockchain:
             "checkpoints": len(_checkpoints),
             "rede_descentralizada": self.rede_descentralizada,
             "fila_tamanho": len(self.fila_mineracao),
-            "validators_active": len(self._get_active_validators()),
+            "validators_active": n_validators,
+            "require_all_sigs": REQUIRE_ALL_SIGS,
+            "validator_quorum": VALIDATOR_QUORUM,
         }
 
 
