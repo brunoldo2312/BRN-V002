@@ -1,26 +1,35 @@
-"""backup_auto.py - Backup rotativo do DB do BRN (v3)
+"""backup_auto.py - Backup rotativo do DB do BRN (v4)
 ================================================================
+v4 (2026-10-27):
+  [FIX CRÍTICO] Backup agora usa sqlite3.Connection.backup() em vez
+                de shutil.copy2. Isso garante um snapshot CONSISTENTE
+                do DB mesmo com o nó escrevendo em paralelo (WAL,
+                transações em andamento, checkpoint automático).
+                O copy2 antigo podia gerar backup corrompido se a
+                escrita caísse entre páginas.
+  [FIX] WAL e SHM do destino NÃO são copiados manualmente: a API
+        de backup os incorpora no arquivo principal. Arquivos
+        residuais (se existirem após close) são removidos.
+  [FIX] Se o SQLite não conseguir abrir o DB (arquivo corrompido),
+        ABORTA em vez de copiar cego. Backup de arquivo corrompido
+        com nome de backup é pior que falha explícita.
+  [KEEP] Retry automático em Windows (ERR_LOCK_VIOLATION).
+  [KEEP] Verificação de integridade com PRAGMA integrity_check.
+  [KEEP] fsync antes do rename.
+  [KEEP] Preserva permissões 0600 em POSIX.
+  [KEEP] Limpa .tmp órfãos de runs anteriores.
+  [KEEP] CLI: --once (default), --list, --info, --verify <file>.
+  [NEW] Mostra duração + tamanho + espaço livre + resultado verify.
 v3 (2026-10-22):
-  [NEW] Configuravel via env vars:
-        BRN_DB_FILE (default brn_v2_chain.db)
-        BRN_BACKUP_DIR (default backups)
-        BRN_MAX_BACKUPS (default 10)
-        BRN_BACKUP_RETRIES (default 3)
-  [NEW] Limpa arquivos .tmp orfaos de runs anteriores (crash recovery)
-  [NEW] Verifica integridade do backup com sqlite PRAGMA integrity_check
-  [NEW] Retry automatico em Windows (ERR_LOCK_VIOLATION) — 3 tentativas
-  [NEW] CLI: --once (default), --list, --info, --verify <file>
-  [NEW] Estatisticas: tamanho, tempo, espaco em disco livre
-  [FIX] fsync antes do rename (garante dados no disco)
-  [FIX] Preserva permissoes 0600 em POSIX
-  [FIX] Erros nao abortam o loop (retorna False, nao levanta)
+  [NEW] Configurável via env vars:
+        BRN_DB_FILE, BRN_BACKUP_DIR, BRN_MAX_BACKUPS,
+        BRN_BACKUP_RETRIES, BRN_BACKUP_RETRY_DELAY, BRN_BACKUP_VERIFY
 ================================================================
 """
 from __future__ import annotations
 
 import argparse
 import glob
-import json
 import os
 import shutil
 import sqlite3
@@ -70,31 +79,6 @@ def _fsync_file(path: str) -> None:
         pass
 
 
-def _copy_with_retry(src: str, dst: str, retries: int = BACKUP_RETRIES) -> bool:
-    """
-    Copia arquivo com retry em Windows file lock.
-    Retorna True em sucesso, False se esgotar tentativas.
-    """
-    last_err = None
-    for attempt in range(1, retries + 1):
-        try:
-            shutil.copy2(src, dst)
-            return True
-        except (PermissionError, OSError) as e:
-            last_err = e
-            # WinError 32 = ERROR_SHARING_VIOLATION
-            winerr = getattr(e, "winerror", None)
-            if winerr == 32 or isinstance(e, PermissionError):
-                if attempt < retries:
-                    _log(f"file lock (tentativa {attempt}/{retries}): {e}", "WARN")
-                    time.sleep(RETRY_DELAY_S * attempt)
-                    continue
-            raise
-    if last_err:
-        raise last_err
-    return False
-
-
 def _verify_sqlite(path: str) -> tuple[bool, str]:
     """Verifica integridade do backup com PRAGMA integrity_check."""
     try:
@@ -103,7 +87,6 @@ def _verify_sqlite(path: str) -> tuple[bool, str]:
             row = conn.execute("PRAGMA integrity_check").fetchone()
             result = row[0] if row else "?"
             if result == "ok":
-                # Conta blocos para sanity check
                 try:
                     n = conn.execute("SELECT COUNT(*) FROM blocks").fetchone()[0]
                     h = conn.execute("SELECT MAX(height) FROM blocks").fetchone()[0]
@@ -117,58 +100,134 @@ def _verify_sqlite(path: str) -> tuple[bool, str]:
         return False, f"erro: {e}"
 
 
-# ============================================================
-# BACKUP ATÔMICO
-# ============================================================
-def _copy_db_atomic(src: str, dst: str) -> None:
+def _verify_is_readonly(path: str) -> tuple[bool, str]:
     """
-    Copia o DB + WAL + SHM de forma atomica.
-    fsync antes do rename. Preserva permissoes.
+    Abre o arquivo em modo read-only para confirmar que o SQLite
+    consegue lê-lo sem recuperação pendente. Não faz integrity_check
+    (que já é feito em _verify_sqlite).
     """
-    dst_wal = dst + "-wal"
-    dst_shm = dst + "-shm"
-    tmp = dst + ".tmp"
-    tmp_wal = dst_wal + ".tmp"
-    tmp_shm = dst_shm + ".tmp"
-
-    # 1) Copia para .tmp (com retry no source)
-    _copy_with_retry(src, tmp)
-    _fsync_file(tmp)
-
-    src_wal = src + "-wal"
-    src_shm = src + "-shm"
-
-    if os.path.exists(src_wal):
-        _copy_with_retry(src_wal, tmp_wal)
-        _fsync_file(tmp_wal)
-
-    if os.path.exists(src_shm):
-        _copy_with_retry(src_shm, tmp_shm)
-        _fsync_file(tmp_shm)
-
-    # 2) Renomeia (atômico em ambos OS)
-    os.replace(tmp, dst)
-    if os.path.exists(tmp_wal):
-        os.replace(tmp_wal, dst_wal)
-    if os.path.exists(tmp_shm):
-        os.replace(tmp_shm, dst_shm)
-
-    # 3) Permissoes restritas (POSIX)
-    if os.name != "nt":
+    try:
+        p = Path(path).resolve()
+        uri = p.as_uri()
+        sep = "&" if "?" in uri else "?"
+        conn = sqlite3.connect(f"{uri}{sep}mode=ro", uri=True, timeout=10.0)
         try:
-            os.chmod(dst, 0o600)
-            for p in (dst_wal, dst_shm):
-                if os.path.exists(p):
-                    os.chmod(p, 0o600)
-        except Exception:
+            conn.execute("SELECT 1").fetchone()
+        finally:
+            conn.close()
+        return True, "leitura OK"
+    except Exception as e:
+        return False, f"nao abre read-only: {e}"
+
+
+# ============================================================
+# BACKUP ATÔMICO VIA SQLite API
+# ============================================================
+def _backup_sqlite_atomic(
+    src: str, dst: str, retries: int = BACKUP_RETRIES
+) -> None:
+    """
+    Backup consistente do DB via sqlite3.Connection.backup().
+
+    - Escreve em dst.tmp (SQLite cria o arquivo).
+    - fsync no arquivo final antes do rename.
+    - Permissões 0600 em POSIX.
+    - os.replace() para renomear atomicamente.
+
+    Retry automático para locks (Windows ERR_LOCK_VIOLATION, "busy",
+    "locked"). Em erro definitivo, limpa .tmp parcial e propaga.
+    """
+    dst_tmp = dst + ".tmp"
+    residues = (dst_tmp, dst_tmp + "-wal", dst_tmp + "-shm")
+
+    # Cleanup de qualquer resíduo antes da primeira tentativa
+    for p in residues:
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError:
             pass
 
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            # Source: RW mode permite WAL recovery se necessário.
+            # Nunca escrevemos no source, só lemos via backup().
+            src_conn = sqlite3.connect(src, timeout=30.0)
+            try:
+                dst_conn = sqlite3.connect(dst_tmp, timeout=30.0)
+                try:
+                    src_conn.backup(dst_conn)
+                finally:
+                    dst_conn.close()
+            finally:
+                src_conn.close()
+
+            # Força dados no disco antes do rename
+            _fsync_file(dst_tmp)
+
+            # Permissões restritas (POSIX)
+            if os.name != "nt":
+                try:
+                    os.chmod(dst_tmp, 0o600)
+                except OSError:
+                    pass
+
+            # Rename atômico
+            os.replace(dst_tmp, dst)
+
+            # Remove WAL/SHM residuais do destino (se houver)
+            for ext in ("-wal", "-shm"):
+                p = dst + ext
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except OSError:
+                    pass
+            return
+
+        except (sqlite3.Error, OSError) as e:
+            last_err = e
+            winerr = getattr(e, "winerror", None)
+            msg = str(e).lower()
+            is_retryable = (
+                winerr == 32
+                or isinstance(e, PermissionError)
+                or "locked" in msg
+                or "busy" in msg
+            )
+            if is_retryable and attempt < retries:
+                _log(
+                    f"lock no SQLite backup (tentativa {attempt}/{retries}): {e}",
+                    "WARN",
+                )
+                time.sleep(RETRY_DELAY_S * attempt)
+                for p in residues:
+                    try:
+                        if os.path.exists(p):
+                            os.remove(p)
+                    except OSError:
+                        pass
+                continue
+
+            # Não retentável OU esgotou tentativas: limpar e propagar
+            for p in residues:
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except OSError:
+                    pass
+            raise
+
+    if last_err:
+        raise last_err
+
 
 # ============================================================
-# CLEANUP DE .TMP ORFAOS
+# CLEANUP DE .TMP ÓRFÃOS
 # ============================================================
 def _cleanup_stale_tmp() -> int:
-    """Remove .tmp orfaos de runs anteriores (crash recovery)."""
+    """Remove .tmp órfãos de runs anteriores (crash recovery)."""
     if not os.path.isdir(BACKUP_DIR):
         return 0
     removed = 0
@@ -203,36 +262,54 @@ def backup() -> bool:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     dest = os.path.join(BACKUP_DIR, f"chain_{ts}.db")
 
-    # 3) Copia atomica
+    # 3) Backup consistente via API SQLite
     try:
-        _copy_db_atomic(DB_FILE, dest)
+        _backup_sqlite_atomic(DB_FILE, dest)
     except Exception as e:
-        _log(f"copia falhou: {e}", "ERROR")
+        _log(f"backup SQLite falhou: {e}", "ERROR")
         # Cleanup parcial
-        for f in (dest + ".tmp", dest + "-wal.tmp", dest + "-shm.tmp"):
+        for p in (dest + ".tmp", dest + "-wal", dest + "-shm"):
             try:
-                if os.path.exists(f):
-                    os.remove(f)
-            except Exception:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
                 pass
         return False
 
     dt = time.time() - t0
-    size = os.path.getsize(dest)
+    try:
+        size = os.path.getsize(dest)
+    except OSError:
+        size = 0
 
-    # 4) Verifica integridade
+    # 4) Verificação: read-only abrir + integrity_check
     verify_msg = ""
     if VERIFY_INTEGRITY:
-        ok, verify_msg = _verify_sqlite(dest)
-        if not ok:
-            _log(f"verificacao falhou: {verify_msg}", "ERROR")
-            # Remove o backup corrompido
+        # 4a) Confirma que abre read-only (pega arquivo meio-escrito)
+        ok_ro, msg_ro = _verify_is_readonly(dest)
+        if not ok_ro:
+            _log(f"verificacao read-only falhou: {msg_ro}", "ERROR")
             try:
                 os.remove(dest)
                 for ext in ("-wal", "-shm"):
-                    if os.path.exists(dest + ext):
-                        os.remove(dest + ext)
-            except Exception:
+                    p = dest + ext
+                    if os.path.exists(p):
+                        os.remove(p)
+            except OSError:
+                pass
+            return False
+
+        # 4b) PRAGMA integrity_check
+        ok, verify_msg = _verify_sqlite(dest)
+        if not ok:
+            _log(f"verificacao falhou: {verify_msg}", "ERROR")
+            try:
+                os.remove(dest)
+                for ext in ("-wal", "-shm"):
+                    p = dest + ext
+                    if os.path.exists(p):
+                        os.remove(p)
+            except OSError:
                 pass
             return False
 
@@ -243,9 +320,12 @@ def backup() -> bool:
     except Exception:
         free_str = "?"
 
-    _log(f"OK: {dest} ({_human_size(size)}, {dt:.2f}s, verify={verify_msg}, free={free_str})")
+    _log(
+        f"OK: {dest} ({_human_size(size)}, {dt:.2f}s, "
+        f"verify={verify_msg}, free={free_str})"
+    )
 
-    # 6) Remove antigos
+    # 6) Remove antigos (rotação)
     backups = sorted(
         [b for b in glob.glob(os.path.join(BACKUP_DIR, "chain_*.db"))
          if ".tmp" not in b]
@@ -255,8 +335,9 @@ def backup() -> bool:
         try:
             os.remove(old)
             for ext in ("-wal", "-shm"):
-                if os.path.exists(old + ext):
-                    os.remove(old + ext)
+                p = old + ext
+                if os.path.exists(p):
+                    os.remove(p)
             _log(f"removido antigo: {os.path.basename(old)}")
         except Exception:
             pass
@@ -295,31 +376,31 @@ def _cmd_list() -> int:
 
 
 def _cmd_info() -> int:
-    print(f"DB_FILE         = {os.path.abspath(DB_FILE)}")
-    print(f"BACKUP_DIR      = {os.path.abspath(BACKUP_DIR)}")
-    print(f"MAX_BACKUPS     = {MAX_BACKUPS}")
-    print(f"BACKUP_RETRIES  = {BACKUP_RETRIES}")
+    print(f"DB_FILE          = {os.path.abspath(DB_FILE)}")
+    print(f"BACKUP_DIR       = {os.path.abspath(BACKUP_DIR)}")
+    print(f"MAX_BACKUPS      = {MAX_BACKUPS}")
+    print(f"BACKUP_RETRIES   = {BACKUP_RETRIES}")
+    print(f"RETRY_DELAY_S    = {RETRY_DELAY_S}")
     print(f"VERIFY_INTEGRITY = {VERIFY_INTEGRITY}")
     print()
 
     if os.path.exists(DB_FILE):
         st = os.stat(DB_FILE)
         mod = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-        print(f"DB existe       = sim ({_human_size(st.st_size)}, mod {mod})")
-        # WAL/SHM
+        print(f"DB existe        = sim ({_human_size(st.st_size)}, mod {mod})")
         for ext in ("-wal", "-shm"):
             if os.path.exists(DB_FILE + ext):
                 s = os.stat(DB_FILE + ext)
-                print(f"  {ext:<5}          = {_human_size(s.st_size)}")
+                print(f"  {ext:<5}           = {_human_size(s.st_size)}")
     else:
-        print(f"DB existe       = NAO")
+        print(f"DB existe        = NAO")
 
     n = len(glob.glob(os.path.join(BACKUP_DIR, "chain_*.db"))) if os.path.isdir(BACKUP_DIR) else 0
-    print(f"Backups         = {n}")
+    print(f"Backups          = {n}")
 
     try:
         df = shutil.disk_usage(BACKUP_DIR if os.path.isdir(BACKUP_DIR) else ".")
-        print(f"Espaco livre    = {_human_size(df.free)} de {_human_size(df.total)}")
+        print(f"Espaco livre     = {_human_size(df.free)} de {_human_size(df.total)}")
     except Exception:
         pass
     return 0
@@ -330,12 +411,19 @@ def _cmd_verify(path: str) -> int:
         print(f"ARQUIVO NAO ENCONTRADO: {path}")
         return 1
     print(f"Verificando {path} ({_human_size(os.path.getsize(path))})...")
+
+    ok_ro, msg_ro = _verify_is_readonly(path)
+    if not ok_ro:
+        print(f"  [X] read-only: {msg_ro}")
+        return 1
+    print(f"  [ok] read-only: {msg_ro}")
+
     ok, msg = _verify_sqlite(path)
     if ok:
-        print(f"OK: {msg}")
+        print(f"  [ok] integrity: {msg}")
         return 0
     else:
-        print(f"FALHOU: {msg}")
+        print(f"  [X] integrity: {msg}")
         return 1
 
 
