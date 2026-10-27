@@ -1,25 +1,30 @@
-"""btc_watcher.py — Monitor de depósitos BTC para o L2
+"""btc_watcher.py — Monitor de depósitos BTC para o L2 (v2.0)
 ================================================================
-Thread daemon que:
-  1. Consulta o endereço BTC configurado em btc_config.py
-  2. Detecta depósitos com confirmações >= BTC_MIN_CONFIRMATIONS
-  3. Casa com escrows OPEN (por valor)
-  4. Anti-replay via db.is_btc_txid_used()
-  5. Chama L2Manager.apply_btc_deposit() para liberar BRN via mineração
-
-RPCs usados (em ordem de fallback):
-  - https://blockstream.info/api
-  - https://mempool.space/api
-
-API usada por main.py v12.5:
-    w = BTCWatcher(chain.db, chain)
-    w.start()   # daemon thread
-    w.stop()
-
-Requer:
-    btc_config.py
-    l2_manager.py
-    requests
+v2.0 (2026-10-27):
+  [FIX CRÍTICO] Overpayment agora é ACEITO. Antes, exigir valor
+                exato (`value != expected`) travava os fundos do
+                usuário que enviou a mais, sem crédito BRN e sem
+                reconciliação. Agora: value >= expected → credita
+                expected_sats em BRN, registra btc_actual_sats e
+                btc_overpaid_sats na escrow para reembolso manual.
+  [FIX CRÍTICO] tip_height ausente → confs=0 (retry no próximo ciclo).
+                Antes usava confs=min_confs, assumindo confirmações
+                que podiam não existir. Isso podia creditar BRN para
+                tx ainda não suficientemente confirmada.
+  [FIX] Verificação defensiva "txid em outra escrow" agora usa set
+        pré-computado por ciclo (era full scan por par escrow×tx).
+  [FIX] apply_btc_deposit recebe btc_amount_sats=expected_sats
+        (valor combinado), não o real. Evita crédito inflado.
+  [NEW] Log explícito de underpayment (antes era silencioso).
+  [NEW] Escrow overpaid recebe btc_actual_sats, btc_overpaid_sats,
+        btc_overpaid_at — visível em /api/l2/escrows para reconciliação.
+  [KEEP] Anti-replay fail-closed (return em erro de DB).
+  [KEEP] RPCs em ordem de fallback (blockstream → mempool.space).
+  [KEEP] API: BTCWatcher(db, blockchain).start() / .stop() / .status()
+v1.0:
+  - Thread daemon que monitora endereço BTC, detecta depósitos com
+    >= BTC_MIN_CONFIRMATIONS, casa com escrows OPEN por valor, e
+    libera BRN via L2Manager.apply_btc_deposit().
 ================================================================
 """
 from __future__ import annotations
@@ -89,7 +94,6 @@ class BTCWatcher(threading.Thread):
         self.running = True
         log.info(f"{LOG_PREFIX} iniciado")
 
-        # espera 5s no boot para o resto subir
         if self._stop_evt.wait(5):
             return
 
@@ -115,31 +119,27 @@ class BTCWatcher(threading.Thread):
     # Uma checagem
     # ============================================================
     def _check_once(self):
-        # 1. Quais escrows estão abertos?
+        # 1. Expira escrows vencidos
         try:
             open_escrows = self.db.get_l2_escrows(status="OPEN")
         except Exception as e:
             log.debug(f"{LOG_PREFIX} get_l2_escrows: {e}")
             return
 
-        # 2. Primeiro expira os vencidos (mantém a lista limpa)
         now = int(time.time())
         for e in open_escrows:
             try:
                 if int(e.get("expires_at", 0)) <= now:
-                    self.db.update_l2_escrow_status(
-                        e["escrow_id"], "EXPIRED")
-                    log.info(f"{LOG_PREFIX} escrow expirado: "
-                             f"{e['escrow_id']}")
+                    self.db.update_l2_escrow_status(e["escrow_id"], "EXPIRED")
+                    log.info(f"{LOG_PREFIX} escrow expirado: {e['escrow_id']}")
             except Exception:
                 continue
 
-        # Recarrega só os que ainda estão abertos
+        # 2. Recarrega só os OPEN
         try:
             open_escrows = self.db.get_l2_escrows(status="OPEN")
         except Exception:
             return
-
         if not open_escrows:
             return
 
@@ -148,55 +148,78 @@ class BTCWatcher(threading.Thread):
         if not txs:
             return
 
-        # 4. Match com escrows
+        # 4. [NEW v2.0] Pré-computa txids já usados em outras escrows.
+        # Antes era um full scan por (escrow, tx). Agora 1 query por ciclo.
+        closed_txids: set = set()
+        try:
+            for r in self.db.get_l2_escrows():
+                tid = r.get("btc_txid")
+                if tid and r.get("status") != "OPEN":
+                    closed_txids.add(tid)
+        except Exception as e:
+            log.error(f"{LOG_PREFIX} falha ao indexar escrows fechadas: {e}")
+            # fail-closed: sem índice, não casa nada neste ciclo
+            return
+
+        # 5. Match
         for escrow in open_escrows:
-            self._try_match(escrow, txs)
+            self._try_match(escrow, txs, closed_txids)
 
     # ============================================================
     # Casa escrow com txs BTC
     # ============================================================
-    def _try_match(self, escrow: dict, txs: list):
+    def _try_match(self, escrow: dict, txs: list, closed_txids: set):
         expected_sats = int(escrow.get("btc_expected_sats", 0) or 0)
         if expected_sats <= 0:
             return
 
-        # Não aceitar pagamento abaixo do valor combinado: o crédito BRN
-        # é fixo por ordem e tolerar subpagamento criaria crédito sem lastro.
         for btc_tx in txs:
             txid = btc_tx.get("txid", "")
             if not txid:
                 continue
 
-            # Anti-replay: essa tx já foi processada?
+            # Anti-replay: já processado por nós?
             try:
                 if self.db.is_btc_txid_used(txid):
                     continue
             except Exception as exc:
-                # Falha fechada: sem verificação anti-replay, não processa depósito.
-                log.error(f"{LOG_PREFIX} anti-replay indisponível; ignorando tx: {exc}")
+                # Fail-closed: sem anti-replay não processa depósito.
+                log.error(
+                    f"{LOG_PREFIX} anti-replay indisponível; "
+                    f"abortando ciclo para escrow {escrow.get('escrow_id')}: {exc}"
+                )
                 return
 
-            # Defesa adicional para bancos antigos que ainda não preencheram btc_used.
-            try:
-                rows = self.db.get_l2_escrows()
-                if any(r.get("btc_txid") == txid and
-                       r.get("status") != "OPEN" for r in rows):
-                    continue
-            except Exception as exc:
-                log.error(f"{LOG_PREFIX} não foi possível verificar txid em escrows: {exc}")
-                return
-
-            # A ordem é cotada por valor fixo: exige o valor exato para evitar
-            # atribuir um pagamento parcial ou ambíguo a uma ordem.
-            if int(btc_tx.get("value_sats", 0)) != expected_sats:
+            # Defesa adicional (agora com set pré-computado)
+            if txid in closed_txids:
                 continue
 
+            actual_sats = int(btc_tx.get("value_sats", 0))
+
+            # [FIX v2.0] UNDERPAYMENT: rejeita com log claro
+            if actual_sats < expected_sats:
+                log.info(
+                    f"{LOG_PREFIX} tx {txid[:16]}... VISTA mas UNDERPAID: "
+                    f"{actual_sats} < {expected_sats} (escrow {escrow['escrow_id'][:12]}...)"
+                )
+                continue
+
+            # [FIX v2.0] OVERPAYMENT: aceita, credita só o combinado
+            overpaid_sats = actual_sats - expected_sats
+            if overpaid_sats > 0:
+                log.warning(
+                    f"{LOG_PREFIX} tx {txid[:16]}... OVERPAID em "
+                    f"{overpaid_sats} sats (escrow {escrow['escrow_id'][:12]}...). "
+                    f"Creditando apenas {expected_sats} sats; registrar reembolso."
+                )
+
             # Confirmações suficientes?
-            if btc_tx["confirmations"] < self.min_confs:
+            confs = int(btc_tx.get("confirmations", 0))
+            if confs < self.min_confs:
                 log.debug(
                     f"{LOG_PREFIX} tx {txid[:16]}... com apenas "
-                    f"{btc_tx['confirmations']} confs "
-                    f"(min {self.min_confs})")
+                    f"{confs} confs (min {self.min_confs})"
+                )
                 continue
 
             # ═══════════════════════════════════════════════════
@@ -204,13 +227,15 @@ class BTCWatcher(threading.Thread):
             # ═══════════════════════════════════════════════════
             log.info("")
             log.info(f"{LOG_PREFIX} ════════ BTC CONFIRMADO ════════")
-            log.info(f"{LOG_PREFIX} escrow:  {escrow['escrow_id']}")
-            log.info(f"{LOG_PREFIX} txid:    {txid}")
-            log.info(f"{LOG_PREFIX} valor:   {btc_tx['value_sats']/1e8} BTC")
-            log.info(f"{LOG_PREFIX} confs:   {btc_tx['confirmations']}")
-            log.info(f"{LOG_PREFIX} buyer:   {escrow['buyer']}")
-            log.info(f"{LOG_PREFIX} BRN:     "
-                     f"{escrow['brn_amount']/1e8} BRN")
+            log.info(f"{LOG_PREFIX} escrow:    {escrow['escrow_id']}")
+            log.info(f"{LOG_PREFIX} txid:      {txid}")
+            log.info(f"{LOG_PREFIX} recebido:  {actual_sats/1e8} BTC")
+            log.info(f"{LOG_PREFIX} esperado:  {expected_sats/1e8} BTC")
+            if overpaid_sats > 0:
+                log.info(f"{LOG_PREFIX} overpaid:  {overpaid_sats/1e8} BTC (registrar)")
+            log.info(f"{LOG_PREFIX} confs:     {confs}")
+            log.info(f"{LOG_PREFIX} buyer:     {escrow['buyer']}")
+            log.info(f"{LOG_PREFIX} BRN:       {escrow['brn_amount']/1e8} BRN")
             log.info(f"{LOG_PREFIX} ═════════════════════════════════")
             log.info("")
 
@@ -219,21 +244,57 @@ class BTCWatcher(threading.Thread):
                 continue
 
             try:
+                # [FIX v2.0] credita o valor combinado, não o real
                 r = self.l2.apply_btc_deposit(
                     escrow_id=escrow["escrow_id"],
                     btc_txid=txid,
-                    btc_amount_sats=int(btc_tx["value_sats"]),
+                    btc_amount_sats=expected_sats,
                 )
                 if r.get("ok"):
-                    log.info(f"{LOG_PREFIX} L2 tx: {r.get('txid', '?')[:16]}..."
-                             f" → mempool aguardando mineração")
+                    log.info(
+                        f"{LOG_PREFIX} L2 tx: {r.get('txid', '?')[:16]}... "
+                        f"→ mempool aguardando mineração"
+                    )
+                    # [NEW v2.0] registra auditoria de overpayment
+                    if overpaid_sats > 0:
+                        self._record_overpayment(
+                            escrow_id=escrow["escrow_id"],
+                            actual_sats=actual_sats,
+                            overpaid_sats=overpaid_sats,
+                            txid=txid,
+                        )
                 else:
                     log.warning(f"{LOG_PREFIX} apply falhou: {r.get('msg')}")
             except Exception as e:
                 log.exception(f"{LOG_PREFIX} apply_btc_deposit: {e}")
 
-            # só casa uma vez por escrow
-            return
+            return  # só casa uma vez por escrow
+
+    def _record_overpayment(
+        self, escrow_id: str, actual_sats: int,
+        overpaid_sats: int, txid: str
+    ) -> None:
+        """
+        [NEW v2.0] Grava btc_actual_sats / btc_overpaid_sats na escrow.
+        Não altera status nem créditos — só auditoria para reembolso manual.
+        Chamado APÓS apply_btc_deposit OK (para não sobrescrever status).
+        """
+        try:
+            e = self.db.get_l2_escrow_by_id(escrow_id)
+            if not e:
+                log.warning(f"{LOG_PREFIX} não achei escrow {escrow_id} para auditoria")
+                return
+            e["btc_actual_sats"]   = actual_sats
+            e["btc_overpaid_sats"] = overpaid_sats
+            e["btc_overpaid_at"]   = int(time.time())
+            e["btc_overpaid_txid"] = txid
+            self.db.save_l2_escrow(e)
+            log.info(
+                f"{LOG_PREFIX} overpayment registrado: escrow {escrow_id[:12]}... "
+                f"+{overpaid_sats} sats"
+            )
+        except Exception as exc:
+            log.error(f"{LOG_PREFIX} falha ao registrar overpayment: {exc}")
 
     # ============================================================
     # Consulta endereço BTC
@@ -252,7 +313,6 @@ class BTCWatcher(threading.Thread):
     def _fetch_from(self, base: str) -> list:
         """Consulta /address/<addr>/txs em um RPC. Retorna lista normalizada."""
         base = base.rstrip("/")
-        # Ajusta testnet/mainnet
         if self.network == "testnet" and "blockstream" in base:
             url = f"{base.replace('/api', '/testnet/api')}/address/{self.btc_address}/txs"
         elif self.network == "testnet" and "mempool" in base:
@@ -268,12 +328,11 @@ class BTCWatcher(threading.Thread):
         if not isinstance(data, list):
             return []
 
-        # altura atual da rede (para calcular confirmações)
+        # tip height para calcular confirmações
         tip_height = self._fetch_tip_height(base)
 
         out = []
         for tx in data[:50]:
-            # soma o que caiu no nosso endereço
             val = 0
             for vout in tx.get("vout", []):
                 if vout.get("scriptpubkey_address") == self.btc_address:
@@ -287,7 +346,13 @@ class BTCWatcher(threading.Thread):
                 if tip_height:
                     confs = max(0, tip_height - status["block_height"] + 1)
                 else:
-                    confs = self.min_confs  # fallback conservador
+                    # [FIX v2.0] fail-safe: sem tip, trata como não confirmado
+                    confs = 0
+                    log.warning(
+                        f"{LOG_PREFIX} tip_height indisponível; "
+                        f"tx {tx['txid'][:16]}... tratada como NÃO confirmada "
+                        f"(retry no próximo ciclo)"
+                    )
 
             out.append({
                 "txid":           tx["txid"],
@@ -318,18 +383,18 @@ class BTCWatcher(threading.Thread):
     # ============================================================
     def status(self) -> dict:
         return {
-            "running":          self.running,
-            "btc_address":      self.btc_address,
-            "network":          self.network,
-            "min_confs":        self.min_confs,
-            "poll_s":           self.poll_s,
-            "l2_available":     self.l2 is not None,
-            "rpcs":             self.rpcs,
+            "running":      self.running,
+            "btc_address":  self.btc_address,
+            "network":      self.network,
+            "min_confs":    self.min_confs,
+            "poll_s":       self.poll_s,
+            "l2_available": self.l2 is not None,
+            "rpcs":         self.rpcs,
         }
 
 
 # ============================================================
-# HELPER — iniciar como singleton simples
+# HELPER — singleton simples
 # ============================================================
 _watcher = None
 _lock = threading.Lock()
@@ -360,24 +425,25 @@ if __name__ == "__main__":
             return False
         def update_l2_escrow_status(self, eid, status, btc_txid=None):
             pass
+        def get_l2_escrow_by_id(self, eid):
+            return None
+        def save_l2_escrow(self, e):
+            pass
 
     class FakeChain:
         pass
 
     w = BTCWatcher(FakeDB(), FakeChain())
 
-    # 1. Config lida
     print(f"  [info] address  : {w.btc_address}")
     print(f"  [info] network  : {w.network}")
     print(f"  [info] min_confs: {w.min_confs}")
     print(f"  [info] rpcs     : {len(w.rpcs)}")
 
-    # 2. Status
     st = w.status()
     print(f"  [info] status   : {st['running']}, l2={st['l2_available']}")
     assert "btc_address" in st
 
-    # 3. Fetch com endereço falso (espera lista vazia ou erro tratado)
     if not w.btc_address or w.btc_address.startswith("bc1qSEU_"):
         print("  [skip] endereco placeholder — pulando fetch")
     else:
