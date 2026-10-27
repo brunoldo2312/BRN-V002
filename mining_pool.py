@@ -1,15 +1,34 @@
-"""mining_pool.py — Pool de mineração BRN (v6)
+"""mining_pool.py — Pool de mineração BRN (v6.1)
 ================================================================
+v6.1 (2026-10-27):
+  [FIX CRÍTICO] Unifica a fonte de reputação no consenso.
+                Antes:
+                  - pool usava trust_system.py      (peer_trust_data.json)
+                  - consenso usava trust_network.py (trust_network.json)
+                Resultado: pool pontuava em uma fonte que o consenso
+                NÃO lia → multi-sig sempre em modo bootstrap, e
+                reputação de mineradores do pool nunca afetava a
+                lista de validadores.
+                Agora:
+                  - register(): registra o minerador em chain.trust_net
+                    (garante que public_key fique conhecida pelo consenso)
+                  - _assemble_and_accept_block(): credita o bloco via
+                    chain.trust_net.record_block_validated()
+                Fallback: se chain.trust_net for None (pool rodando
+                sem main.py), tenta trust_system legado; se nem isso
+                existir, apenas loga debug e segue.
+  [NEW] Log único no __init__ informando qual fonte de trust está ativa.
+  [NEW] Helpers _register_in_trust() e _credit_miner_in_trust()
+        encapsulam a escolha entre as duas fontes.
+  [KEEP] Toda a lógica de mineração, Vardiff, aceitação de bloco,
+         guarda de UNIQUE constraint e proteção contra endereço
+         suspeito no coinbase está inalterada.
 v6 (2026-10-25):
   [FIX CRÍTICO] Proteção contra UNIQUE constraint failed.
-                Agora o pool verifica se o bloco já existe antes
-                de tentar aceitá-lo. Evita crashes quando dois
-                mineradores encontram o mesmo bloco ao mesmo tempo.
-  [FIX] Integração com o Trust System: quando um bloco é aceito,
-        o minerador ganha pontos de reputação.
+  [FIX] Integração com o Trust System (agora unificado em v6.1).
 v5 (2026-10-23):
   [NEW] Vardiff: dificuldade variável por minerador.
-  [NEW] Integração com a Trust Network.
+  [NEW] Integração com a Trust Network (agora unificado em v6.1).
 ================================================================
 """
 from __future__ import annotations
@@ -149,10 +168,87 @@ class PoolManager:
         self.phase2_threshold = 20
         self.miner_queue = list(self.chain.fila_mineracao.keys())
 
+        # [NEW v6.1] Informa qual fonte de trust está ativa
+        _trust = getattr(self.chain, "trust_net", None)
+        if _trust is not None:
+            log.info("PoolManager: usando chain.trust_net (unificado com consenso)")
+        else:
+            try:
+                from trust_system import trust_system as _legacy  # noqa: F401
+                log.warning("PoolManager: chain.trust_net ausente — usando "
+                            "trust_system LEGADO (repare: main.py deve criar "
+                            "TrustNetwork e chamar chain.set_trust_net)")
+            except Exception:
+                log.warning("PoolManager: sem trust network — reputação de "
+                            "mineradores desabilitada neste pool")
+
         self._stop = threading.Event()
         threading.Thread(target=self._maintenance_loop, daemon=True, name="Pool-Maint").start()
-        log.info("PoolManager iniciado — Sincronizado com a Blockchain + Vardiff + Trust")
+        log.info("PoolManager iniciado — Blockchain + Vardiff + Trust unificado")
 
+    # ============================================================
+    # [NEW v6.1] Helpers de integração com o trust network
+    # ============================================================
+    def _register_in_trust(self, miner_id: str, address: str, pubkey: str) -> None:
+        """
+        Registra/atualiza a pubkey do minerador no trust network
+        usado pelo consenso. Primário: chain.trust_net (TrustNetwork).
+        Fallback: trust_system legado.
+        """
+        trust = getattr(self.chain, "trust_net", None)
+        if trust is not None:
+            try:
+                trust.register_node(miner_id, address, pubkey)
+                return
+            except Exception as e:
+                log.warning("[Pool] register_node falhou em trust_net: %s", e)
+                return
+        # Fallback legado
+        try:
+            from trust_system import trust_system as _legacy
+            _legacy.ensure_peer_entry(pubkey)
+        except Exception:
+            pass
+
+    def _credit_miner_in_trust(self, cb: dict, height: int) -> None:
+        """
+        Identifica o minerador cujo pubkey aparece no coinbase e
+        credita o bloco no trust network. Primário: chain.trust_net.
+        Fallback: trust_system legado.
+        """
+        output_pubkeys = {o.get("pubkey") for o in cb.get("outputs", []) if o.get("pubkey")}
+        if not output_pubkeys:
+            return
+
+        trust = getattr(self.chain, "trust_net", None)
+        if trust is not None:
+            for mid, m in self.miners.items():
+                if m.pubkey in output_pubkeys:
+                    try:
+                        trust.record_block_validated(mid, height)
+                        log.info("[Trust] %s creditado por bloco #%d",
+                                 m.pubkey[:8], height)
+                    except Exception as e:
+                        log.warning("[Trust] record_block_validated falhou "
+                                    "para %s: %s", mid, e)
+                    return
+            return
+
+        # Fallback legado
+        try:
+            from trust_system import trust_system as _legacy
+            for mid, m in self.miners.items():
+                if m.pubkey in output_pubkeys:
+                    _legacy.update_score(m.pubkey, "valid_block")
+                    log.info("[Trust-legacy] %s creditado por bloco #%d",
+                             m.pubkey[:8], height)
+                    return
+        except Exception:
+            pass
+
+    # ============================================================
+    # Registro de mineradores
+    # ============================================================
     def register(self, address: str, pubkey: str, miner_id: Optional[str] = None) -> dict:
         if not address or not address.startswith("brn1"):
             return {"ok": False, "msg": "address invalido"}
@@ -175,6 +271,10 @@ class PoolManager:
 
             self.phase = 2 if self.chain.rede_descentralizada else 1
             self.miner_queue = list(self.chain.fila_mineracao.keys())
+
+            # [NEW v6.1] Registra no trust network usado pelo consenso
+            self._register_in_trust(miner_id, address, pubkey)
+
         return {"ok": True, "miner_id": miner_id}
 
     def heartbeat(self, miner_id: str, hashrate: float = 0.0, hashes_total: int = 0) -> dict:
@@ -406,7 +506,7 @@ class PoolManager:
                           out["address"])
                 return False
 
-        # [FIX v6] Verifica se o bloco já existe (evita UNIQUE constraint)
+        # Verifica se o bloco já existe (evita UNIQUE constraint)
         try:
             existing = self.chain.db.get_block(job.height)
             if existing:
@@ -435,17 +535,8 @@ class PoolManager:
             log.warning("pool: accept_block: %s", msg)
             return False
 
-        # [NOVO] Pontua o minerador na Trust Network
-        try:
-            from trust_system import trust_system
-            # Encontra o endereço do minerador no distribution
-            for mid, m in self.miners.items():
-                if m.pubkey in [o.get("pubkey") for o in cb["outputs"]]:
-                    trust_system.update_score(m.pubkey, "valid_block")
-                    log.info(f"[Trust] Minerador {m.pubkey[:8]} pontuou +5 por bloco #{job.height}")
-                    break
-        except Exception as e:
-            log.debug(f"[Trust] Falha ao pontuar minerador: {e}")
+        # [NEW v6.1] Credita o minerador no trust network usado pelo consenso
+        self._credit_miner_in_trust(cb, job.height)
 
         try:
             cb = block["transactions"][0]
