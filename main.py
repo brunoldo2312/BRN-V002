@@ -1,26 +1,29 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.7.0)
+"""main.py — Entrypoint unificado do nó BRN (v13.7.1)
 ================================================================
+v13.7.1 (2026-10-27):
+  [NEW] ForkGuard integrado ao boot:
+          - fork_guard.get_fork_guard(chain, sync, p2p).start()
+          - fork_guard.on_block_accepted() encadeado no
+            chain.on_block_mined (não substitui o broadcast P2P)
+          - fork_guard.stop_fork_guard() no shutdown
+        Antes, fork_guard.py existia, tinha auto-test, mas NUNCA
+        era instanciado. chain._fork_signal ficava eternamente
+        limpo — o miner nunca abortava por fork, mesmo quando
+        o ForkGuard detectava.
 v13.7.0 (2026-10-26):
   [NEW] Integração completa com a regra multi-sig dos Top 5 validadores
-        (blockchain.py v9.4.0):
+        (blockchain.py v9.4.0/v9.4.1):
           - chain.set_trust_net(trust_net)
           - chain.set_p2p(p2p)
           - chain.set_local_validator_sk(wallet_sk)
           - chain.set_sign_collector(_collect_sigs_via_p2p)
   [NEW] Coletor de assinaturas via P2P (request_block_signature).
-        Se o p2p não tiver o método (versão antiga), cai em fallback
-        silencioso (só assinatura local).
   [NEW] Carrega SK do validador local via secure_store após criar chain.
-  [INFO] Se o nó não tem carteira, roda sem assinar (bootstrap).
 v13.6.2:
   [SECURITY] _HARDCODED_DEFAULTS sensíveis removidos.
   [FIX] _validate_required_secrets falha fechado.
   [FIX] chain.is_origin = is_origin.
-  [FIX] miner.start(..., is_origin=is_origin).
   [NEW] Heartbeat peers.json no status loop.
-v13.6.1:
-  [FIX] _l2_disponivel() retorna bool.
-  [FIX] _inject_into_server loga ImportError.
 ================================================================
 """
 from __future__ import annotations
@@ -370,7 +373,7 @@ def _resolve_wallet_password() -> str:
 
 
 # ============================================================
-# [NEW v13.7.0] SK DO VALIDADOR LOCAL
+# SK DO VALIDADOR LOCAL
 # ============================================================
 def _load_validator_sk():
     """
@@ -395,20 +398,17 @@ def _load_validator_sk():
 
 
 # ============================================================
-# [NEW v13.7.0] COLETOR DE ASSINATURAS VIA P2P
+# COLETOR DE ASSINATURAS VIA P2P
 # ============================================================
 def _make_sign_collector(p2p, trust_net):
     """
     Retorna função que coleta assinaturas dos validadores via P2P.
-
-    Se o p2p não tem `request_block_signature` (versão antiga),
-    retorna [] silenciosamente (só a assinatura local conta).
+    Se o p2p não tem `request_block_signature`, retorna [] silencioso.
     """
     def _collect(block: dict) -> list:
         if p2p is None or trust_net is None:
             return []
 
-        # Se só temos 1 validador (nós), a assinatura local basta
         try:
             validators = trust_net.get_top_validators(count=5)
         except Exception:
@@ -416,7 +416,6 @@ def _make_sign_collector(p2p, trust_net):
         if len(validators) <= 1:
             return []
 
-        # Se o p2p não suporta, avisa uma vez e retorna vazio
         if not hasattr(p2p, "request_block_signature"):
             return []
 
@@ -476,7 +475,6 @@ def load_or_create_node_identity(password: str, rotate: bool = False):
         )
         log.info("Identidade nova criada: " + pub_hex[:16] + "... (" + str(NODE_ID_PATH) + ")")
 
-    # Injeção do Teste A/B
     try:
         from ab_test import get_variant, get_node_id_hash
         from security import set_node_id_hash, audit_log
@@ -696,7 +694,6 @@ def run_status_loop(chain, p2p, sync=None, pool=None, pool_client=None,
                     pass
             log.info(msg)
 
-            # Heartbeat peers.json
             agora = time.time()
             if agora - last_peers_hb >= PEERS_HB_INTERVAL:
                 last_peers_hb = agora
@@ -799,26 +796,47 @@ def _setup_pool_client_local(chain, pool, log, disabled: bool, is_origin: bool):
 
 
 # ============================================================
-# BROADCAST
+# [NEW v13.7.1] BROADCAST + FORKGUARD ENCADEADOS
 # ============================================================
 def _setup_local_miner_broadcast(chain, p2p, log):
-    if p2p is None:
-        log.info("chain.on_block_mined: P2P desligado — broadcast inativo")
-        return False
-    try:
-        def _on_local_block(block):
+    """
+    Encadeia callbacks em chain.on_block_mined:
+      1) broadcast_block() via P2P (se p2p != None)
+      2) fork_guard.on_block_accepted() (se já iniciado)
+    Preserva callback anterior, se algum já estiver configurado.
+    """
+    prev_cb = getattr(chain, "on_block_mined", None)
+
+    def _on_local_block(block):
+        # 1) broadcast P2P
+        if p2p is not None:
             try:
                 p2p.broadcast_block(block)
                 log.info("miner local: bloco #" + str(block.get("height"))
                          + " propagado via P2P")
             except Exception as e:
                 log.debug("broadcast_block falhou: " + str(e))
-        chain.on_block_mined = _on_local_block
-        log.info("chain.on_block_mined ligado ao P2P")
-        return True
-    except Exception as e:
-        log.warning("Falha ligando on_block_mined: " + str(e))
-        return False
+        # 2) ForkGuard resolve fork ativo quando um bloco novo entra
+        try:
+            from fork_guard import get_fork_guard
+            fg = get_fork_guard()
+            if fg is not None:
+                fg.on_block_accepted(block)
+        except Exception as e:
+            log.debug("fork_guard.on_block_accepted falhou: " + str(e))
+        # 3) callback anterior (se existia)
+        if prev_cb is not None and prev_cb is not _on_local_block:
+            try:
+                prev_cb(block)
+            except Exception as e:
+                log.debug("prev on_block_mined falhou: " + str(e))
+
+    chain.on_block_mined = _on_local_block
+    if p2p is not None:
+        log.info("chain.on_block_mined ligado ao P2P + ForkGuard")
+    else:
+        log.info("chain.on_block_mined ligado ao ForkGuard (P2P off)")
+    return True
 
 
 # ============================================================
@@ -845,6 +863,16 @@ def _stop_with_timeout(name: str, svc, timeout: float = 5.0, log=None) -> None:
 
 def _graceful_shutdown(log, trust_net=None) -> None:
     log.info("Encerrando serviços...")
+    # [NEW v13.7.1] Para o ForkGuard ANTES dos serviços (ele depende
+    # de p2p/sync e usa chain._fork_signal, que precisa ser limpo
+    # antes de fechar o DB).
+    try:
+        from fork_guard import stop_fork_guard
+        if stop_fork_guard():
+            log.info("ForkGuard parado")
+    except Exception as e:
+        log.debug("stop_fork_guard falhou: " + str(e))
+
     with _services_lock:
         services = list(_running_services)
     for name, svc in reversed(services):
@@ -982,7 +1010,6 @@ def main():
     if _HAS_TRUST:
         try:
             trust_net = TrustNetwork(str(BASE_DIR / "trust_network.json"))
-            # [NEW v13.7.0] Injeta no chain (setter com log)
             try:
                 chain.set_trust_net(trust_net)
             except AttributeError:
@@ -1025,7 +1052,6 @@ def main():
             p2p.start()
             _register_service("p2p", p2p)
             log.info("P2P iniciado na porta " + str(cfg["p2p_port"]))
-            # [NEW v13.7.0] Injeta P2P no chain
             try:
                 chain.set_p2p(p2p)
             except AttributeError:
@@ -1034,7 +1060,7 @@ def main():
             log.error("Falha ao iniciar P2P: " + str(e))
             p2p = None
 
-    # ---- [NEW v13.7.0] SK do validador local + coletor de assinaturas ----
+    # ---- SK do validador local + coletor de assinaturas ----
     validator_sk = _load_validator_sk()
     if validator_sk is not None:
         try:
@@ -1078,6 +1104,24 @@ def main():
             sync = None
     elif args.no_sync:
         log.info("Sync: pulado por --no-sync")
+
+    # ---- [NEW v13.7.1] ForkGuard ----
+    fork_guard_started = False
+    if sync is not None or p2p is not None:
+        try:
+            from fork_guard import get_fork_guard
+            fg = get_fork_guard(chain, sync, p2p)
+            if fg is not None:
+                fg.start()
+                _register_service("fork_guard", fg)
+                log.info("ForkGuard iniciado (check a cada "
+                         + str(int(os.environ.get("BRN_FORK_CHECK_S", "3")))
+                         + "s)")
+                fork_guard_started = True
+        except Exception as e:
+            log.warning("ForkGuard indisponível: " + str(e))
+    else:
+        log.info("ForkGuard: pulado (sem sync nem p2p)")
 
     # ---- Pool server ----
     pool = None
@@ -1136,7 +1180,7 @@ def main():
     if pool_client is not None:
         _register_service("pool_client", pool_client)
 
-    # ---- Broadcast local → P2P ----
+    # ---- Broadcast local → P2P + ForkGuard ----
     _setup_local_miner_broadcast(chain, p2p, log)
 
     # ---- Miner local ----
@@ -1213,6 +1257,7 @@ def main():
         "p2p":         bool(p2p),
         "trust":       bool(trust_net),
         "validator_sk": bool(validator_sk),
+        "fork_guard":  bool(fork_guard_started),
     })
 
     log.info("Nó pronto. Ctrl+C para encerrar.")
