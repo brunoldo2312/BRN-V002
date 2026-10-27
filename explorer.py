@@ -1,14 +1,30 @@
 """
-explorer.py — Backend do Explorer + Painéis + Block Explorer (v3.1)
+explorer.py — Backend do Explorer + Painéis + Block Explorer (v3.2)
 ================================================================
+v3.2 (2026-10-27):
+  [FIX] API_BASE agora respeita BRN_API_URL (antes era hardcoded
+        em http://127.0.0.1:5000). Se BRN_WEB_PORT mudar ou o
+        explorer rodar em outra máquina, o proxy /api/* quebrava
+        silenciosamente sem essa config.
+  [FIX] API_TIMEOUT agora respeita BRN_EXPLORER_API_TIMEOUT
+        (default 15s). Antes era hardcoded e não dava para ajustar
+        em peers lentos / CI.
+  [NEW] Log no __main__ mostra a API de destino (facilita debug).
+  [KEEP] Todos os templates HTML e rotas do Block Explorer
+         inalterados.
+  [KEEP] /dashboard, /panel, /monitor inalterados.
+  [KEEP] /api/<path>-proxy (compat) inalterado.
 v3.1 (2026-10-23):
-  [NEW] Proxy Genérico para /api/*. Agora o explorer.html pode chamar
-        /api/trust/nodes ou /api/status sem erros de CORS.
-  [NEW] Rota /dashboard para servir o explorer.html (Monitor de Rede).
-  [KEEP] Block Explorer clássico (/) gerado via Python.
-  [KEEP] Servidor dos arquivos estáticos panel.html e monitor.html.
+  [NEW] Proxy genérico para /api/*.
+  [NEW] Rota /dashboard para explorer.html.
+  [KEEP] Block Explorer clássico (/).
+  [KEEP] panel.html e monitor.html.
 ================================================================
 """
+from __future__ import annotations
+
+__version__ = "3.2"
+
 from flask import Flask, render_template_string, request, jsonify, send_file
 import sqlite3
 import zlib
@@ -22,7 +38,16 @@ from pathlib import Path
 app = Flask(__name__)
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = str(BASE_DIR / "brn_v2_chain.db")
-API_BASE = "http://127.0.0.1:5000" # Porta do server.py
+
+# ============================================================
+# [FIX v3.2] Configurável via env
+# ============================================================
+API_BASE = os.environ.get("BRN_API_URL", "http://127.0.0.1:5000").rstrip("/")
+
+try:
+    API_TIMEOUT = max(1.0, float(os.environ.get("BRN_EXPLORER_API_TIMEOUT", "15")))
+except (TypeError, ValueError):
+    API_TIMEOUT = 15.0
 
 # ============================================================
 # TEMPLATES HTML (Block Explorer Clássico)
@@ -193,7 +218,7 @@ def get_latest_txs(n=10):
     for r in rows:
         tx = orjson.loads(zlib.decompress(r["raw"]))
         if tx["inputs"][0]["txid"] == "0"*64:
-            continue 
+            continue
         val = sum(o["amount"] for o in tx["outputs"]) / 1e8
         out.append({
             "txid": tx["txid"],
@@ -218,26 +243,26 @@ def block_detail(height):
     conn.close()
     if not row:
         return "Bloco não encontrado", 404
-    
+
     b = orjson.loads(zlib.decompress(row["raw"]))
     b["time"] = datetime.fromtimestamp(b["timestamp"]).strftime("%d/%m/%Y %H:%M:%S")
     for tx in b["transactions"]:
         tx["value"] = f"{sum(o['amount'] for o in tx['outputs'])/1e8:.8f}"
-    
+
     return render_template_string(BLOCK_HTML, block=b)
 
 @app.route("/address/<address>")
 def address_detail(address):
     if not address.startswith("brn1"):
         return "Endereço inválido", 400
-    
+
     conn = get_db()
     row = conn.execute("SELECT SUM(amount) as s FROM utxos WHERE address=? AND spent=0", (address,)).fetchone()
     balance = (row["s"] or 0) / 1e8
-    
+
     row2 = conn.execute("SELECT SUM(amount) as s FROM utxos WHERE address=?", (address,)).fetchone()
     total_received = (row2["s"] or 0) / 1e8
-    
+
     txs = []
     rows = conn.execute("SELECT txid, amount, spent, block_height FROM utxos WHERE address=? ORDER BY block_height DESC LIMIT 50", (address,)).fetchall()
     seen_txids = set()
@@ -251,7 +276,7 @@ def address_detail(address):
             "status": "confirmed",
             "block_height": r["block_height"]
         })
-        
+
     conn.close()
     return render_template_string(ADDRESS_HTML, address=address, balance=f"{balance:.8f}", total_received=f"{total_received:.8f}", txs=txs)
 
@@ -301,25 +326,28 @@ def serve_monitor():
 @app.route("/api/<path:path>", methods=["GET", "POST", "OPTIONS"])
 def api_proxy(path):
     """
-    Repassa qualquer requisição /api/* para o nó principal (porta 5000).
+    Repassa qualquer requisição /api/* para o nó principal.
+    O destino é controlado por BRN_API_URL (default: 127.0.0.1:5000).
     Isso evita erros de CORS e centraliza as chamadas.
     """
     if request.method == "OPTIONS":
         return "", 200
-        
+
     target_url = f"{API_BASE}/api/{path}"
-    
+
     try:
         if request.method == "POST":
             data = request.get_json(silent=True) or {}
-            r = requests.post(target_url, json=data, timeout=15)
+            r = requests.post(target_url, json=data, timeout=API_TIMEOUT)
         else:
-            r = requests.get(target_url, params=request.args, timeout=15)
-            
+            r = requests.get(target_url, params=request.args, timeout=API_TIMEOUT)
+
         return jsonify(r.json()), r.status_code
-        
+
     except requests.exceptions.ConnectionError:
-        return jsonify({"ok": False, "error": "Nó principal offline (:5000)"}), 502
+        return jsonify({"ok": False, "error": f"Nó principal offline ({API_BASE})"}), 502
+    except requests.exceptions.Timeout:
+        return jsonify({"ok": False, "error": f"Timeout ao contactar {API_BASE} ({API_TIMEOUT}s)"}), 504
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -338,4 +366,5 @@ if __name__ == "__main__":
     print(f"  → Dashboard:      http://127.0.0.1:{port}/dashboard")
     print(f"  → Monitor:        http://127.0.0.1:{port}/monitor")
     print(f"  → Painel:         http://127.0.0.1:{port}/panel")
+    print(f"  → API backend:    {API_BASE} (timeout={API_TIMEOUT}s)")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
