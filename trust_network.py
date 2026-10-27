@@ -1,5 +1,18 @@
-"""trust_network.py — Rede de confiança e reputação do BRN (v2)
+"""trust_network.py — Rede de confiança e reputação do BRN (v3.0)
 ================================================================
+v3.0 (2026-10-27):
+  [NEW] get_top_validators(count) — retorna PUBKEYS HEX Ed25519
+        dos top validadores por trust_score. É a fonte lida por
+        blockchain._get_active_validators() para a regra multi-sig
+        dos Top N (v9.4.1).
+        - Filtra banned e public_key vazia.
+        - Ordena por (-trust_score, public_key) para determinismo
+          entre peers (evita divergência de ordem → fork por regra
+          de assinatura).
+        - Loga warning quando retorna menos que `count`.
+  [KEEP] get_validator_list() — API antiga (retorna dicts com
+        address, para uso informativo no /api/trust/validators).
+        NÃO é usada pelo consenso.
 v2 (2026-10-19):
   [FIX] RLock em todas as operações (thread-safe com P2P + miner + HTTP).
   [FIX] get_validator_list() não dá KeyError com validators órfãos.
@@ -12,6 +25,8 @@ v2 (2026-10-19):
 ================================================================
 """
 from __future__ import annotations
+
+__version__ = "3.0"
 
 import json
 import logging
@@ -63,32 +78,32 @@ class NodeRecord:
     address: str
     public_key: str
     peer_addr: str = ""
-    
+
     trust_score: float = INITIAL_TRUST_SCORE
     trust_level: str = "new"
-    
+
     first_seen: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
     connected: bool = False
     total_online_hours: float = 0.0
     last_connect_time: Optional[float] = None
-    
+
     blocks_validated: int = 0
     blocks_proposed: int = 0
     shares_submitted: int = 0
     valid_shares: int = 0
     invalid_shares: int = 0
     rewards_distributed: int = 0
-    
+
     penalties: List[Dict] = field(default_factory=list)
     total_penalties: int = 0
     banned: bool = False
     ban_reason: str = ""
-    
+
     is_validator: bool = False
     validator_since: Optional[float] = None
     votes_received: int = 0
-    
+
     uptime_score: float = 100.0
     success_rate: float = 100.0
 
@@ -137,7 +152,7 @@ class TrustNetwork:
         self.last_decay_time: float = time.time()
         self._last_rotation_height: int = 0
 
-        # [FIX] Thread safety
+        # Thread safety
         self._lock = threading.RLock()
         self._dirty = False
         self._last_flush = 0.0
@@ -211,6 +226,10 @@ class TrustNetwork:
                 n.last_seen = time.time()
                 if peer_addr:
                     n.peer_addr = peer_addr
+                # [FIX v3] Atualiza public_key se antes estava vazia
+                if not n.public_key and public_key:
+                    n.public_key = public_key
+                    self._mark_dirty()
                 return n
 
             n = NodeRecord(
@@ -305,7 +324,6 @@ class TrustNetwork:
             else:
                 n.invalid_shares += 1
                 self._adjust_score(node_id, PENALTY_SUSPICIOUS_RATE, "share inválida")
-            # [FIX] success_rate agora usa contadores corretos
             if n.shares_submitted > 0:
                 n.success_rate = round(
                     (n.valid_shares / n.shares_submitted) * 100.0, 1
@@ -393,13 +411,23 @@ class TrustNetwork:
         self._mark_dirty()
 
     # ========================================================
-    # VALIDADORES (INFORMATIVO — NÃO SUBSTITUI PoW)
+    # VALIDADORES
+    # --------------------------------------------------------
+    # ATENÇÃO — DOIS MÉTODOS COM SEMÂNTICAS DIFERENTES:
+    #
+    #   get_top_validators(count)  → PUBKEYS HEX (usado pelo consenso
+    #                                 em blockchain._get_active_validators)
+    #   get_validator_list()       → DICTS informativos para API HTTP
+    #
+    # Não confundir. O consenso precisa de pubkey (para verificar
+    # assinatura Ed25519). A API precisa de address/score (para UI).
     # ========================================================
     def select_validators(self, current_block_height: int) -> List[str]:
         """
-        Retorna candidatos a validador ordenados por confiança.
+        Retorna node_ids dos candidatos a validador por rotação.
         NOTA: no BRN atual (PoW), isto é apenas INFORMATIVO.
-        Não bloqueia mineração nem consenso.
+        Não bloqueia mineração nem consenso. O consenso usa
+        get_top_validators() para obter as PUBKEYS.
         """
         with self._lock:
             if (current_block_height - self._last_rotation_height
@@ -414,7 +442,7 @@ class TrustNetwork:
                 self.active_validators.clear()
                 self._mark_dirty()
                 return []
-            candidates.sort(key=lambda n: (-n.trust_score, -n.total_online_hours))
+            candidates.sort(key=lambda n: (-n.trust_score, n.node_id))
             selected = candidates[:MAX_VALIDATORS]
             ids = [n.node_id for n in selected]
             self.active_validators = set(ids)
@@ -431,14 +459,79 @@ class TrustNetwork:
         with self._lock:
             return node_id in self.active_validators
 
-    def get_validator_list(self) -> List[Dict]:
+    def get_top_validators(self, count: int = 5) -> List[str]:
+        """
+        [NEW v3.0] Retorna PUBKEYS HEX Ed25519 dos top `count`
+        validadores por trust_score.
+
+        Usado por blockchain._get_active_validators() para a regra
+        multi-sig dos Top N (blockchain v9.4.1).
+
+        Regras:
+          - Filtra nós banned.
+          - Filtra nós sem public_key (não podem assinar).
+          - Ordena por (-trust_score, public_key) — determinístico
+            entre peers (pubkey é identidade estável; score pode
+            oscilar ligeiramente por timing de heartbeat).
+          - Deduplica pubkeys (dois node_id com mesma pubkey = 1).
+          - Retorna [] se ninguém qualifica (modo bootstrap).
+        """
+        try:
+            n_target = max(1, int(count))
+        except (TypeError, ValueError):
+            n_target = 5
+
         with self._lock:
-            # [FIX] Filtra órfãos ANTES do sort
+            cands = [
+                n for n in self.nodes.values()
+                if not n.banned and n.public_key
+            ]
+            # Sort determinístico: score desc, pubkey asc (tiebreak)
+            cands.sort(key=lambda n: (-n.trust_score, n.public_key))
+
+            out: List[str] = []
+            seen_pk: Set[str] = set()
+            for n in cands:
+                pk = (n.public_key or "").strip().lower()
+                if not pk or pk in seen_pk:
+                    continue
+                seen_pk.add(pk)
+                out.append(pk)
+                if len(out) >= n_target:
+                    break
+
+            n_found = len(out)
+            if n_found == 0:
+                log.warning(
+                    "[TrustNetwork] get_top_validators: NENHUM validador "
+                    "qualificado (nodes=%d, com pubkey=%d). "
+                    "Consenso multi-sig ficará em modo bootstrap.",
+                    len(self.nodes),
+                    sum(1 for x in self.nodes.values() if x.public_key),
+                )
+            elif n_found < n_target:
+                log.info(
+                    "[TrustNetwork] get_top_validators: %d/%d (só há %d "
+                    "nós com pubkey não-banidos)",
+                    n_found, n_target,
+                    sum(1 for x in self.nodes.values()
+                        if x.public_key and not x.banned),
+                )
+
+            return out
+
+    def get_validator_list(self) -> List[Dict]:
+        """
+        API informativa — retorna dicts com address/score para UI.
+        NÃO é usada pelo consenso (o consenso usa get_top_validators).
+        """
+        with self._lock:
             ids = [nid for nid in self.active_validators if nid in self.nodes]
             return [
                 {
                     "node_id": nid,
                     "address": self.nodes[nid].address,
+                    "public_key": self.nodes[nid].public_key,
                     "trust_score": round(self.nodes[nid].trust_score, 1),
                     "trust_level": self.nodes[nid].trust_level,
                     "uptime_score": round(self.nodes[nid].uptime_score, 1),
@@ -472,12 +565,12 @@ class TrustNetwork:
                 min_idx = levels.index(min_level)
             out = []
             for n in sorted(self.nodes.values(), key=lambda x: -x.trust_score):
-                # [FIX] Precedência com parênteses explícitos
                 if (not n.banned or min_level == "banned") and \
                    levels.index(n.trust_level) >= min_idx:
                     out.append({
                         "node_id": n.node_id,
                         "address": n.address,
+                        "public_key": n.public_key,
                         "trust_score": round(n.trust_score, 1),
                         "trust_level": n.trust_level,
                         "connected": n.connected,
@@ -503,11 +596,13 @@ class TrustNetwork:
             ativos = [n for n in self.nodes.values() if not n.banned and n.connected]
             validos = [n for n in self.nodes.values() if not n.banned]
             avg = (sum(n.trust_score for n in validos) / max(1, len(validos)))
+            n_with_pk = sum(1 for n in validos if n.public_key)
             return {
                 "total_nodes": len(self.nodes),
                 "connected_nodes": len(ativos),
                 "banned_nodes": sum(1 for n in self.nodes.values() if n.banned),
                 "validators_count": len(self.active_validators),
+                "nodes_with_pubkey": n_with_pk,
                 "avg_trust": round(avg, 1),
                 "top_validators": self.get_validator_list()[:5],
             }
