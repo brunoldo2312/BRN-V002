@@ -1,11 +1,36 @@
 #!/usr/bin/env python3
-"""
-sync_all_peers.py — Sincroniza de TODOS os peers, um a um (v2.0)
+"""sync_all_peers.py — Sincroniza de TODOS os peers, um a um (v2.1)
 
-Novidades v2.0:
-  - --only          : ignora auto-descoberta (Tailscale/env/json) e usa SÓ os --peer passados.
-  - --peer          : especifica manualmente a URL ou IP:PORTA do peer.
-  - --target-height : só sincroniza se a altura do peer for EXATAMENTE esta.
+================================================================
+v2.1 (2026-10-27):
+  [FIX CRÍTICO] import_blocks agora usa Blockchain.accept_block()
+                em vez de db.add_block() + db.apply_tx() direto.
+                Isso ativa TODA a validação de consenso:
+                  - PoW (meets_difficulty)
+                  - merkle root
+                  - auth_tag HMAC
+                  - coinbase <= reward + fees
+                  - checkpoint (se presente)
+                  - validators_sig (se trust injetado)
+                  - assinaturas Ed25519 das txs
+                Antes, blocos forjados/corrompidos de qualquer peer
+                entravam no DB local sem verificação.
+  [FIX] Falha em accept_block para o loop imediatamente (evita
+        buraco na cadeia). Próximo sync continua do ponto correto.
+  [NEW] --strict: injeta trust_network.json na chain de import
+        para FORÇAR validação multi-sig.
+  [NEW] --db PATH: sincroniza um DB alternativo (testes/restore).
+  [NEW] Log claro de motivo de rejeição (msg do accept_block).
+  [KEEP] Toda a lógica de descoberta (tailscale/env/json/manual)
+         e merge_peers inalteradas.
+  [KEEP] --only, --peer, --target-height, --dry-run, --batch,
+         --http-port, --min-height.
+v2.0:
+  - --only, --peer, --target-height.
+  - Auto-descoberta via tailscale/env/json.
+v1.x:
+  - Descoberta + download + import direto no DB (bypass).
+================================================================
 
 Exemplos:
   # Forçar sincronização APENAS do desktop-61ltr37 (altura 5026):
@@ -13,6 +38,12 @@ Exemplos:
 
   # Testar sem baixar:
   python sync_all_peers.py --only --peer 100.70.107.15:5000 --dry-run
+
+  # Sincronizar com validação multi-sig estrita:
+  python sync_all_peers.py --strict
+
+  # Sincronizar um DB alternativo:
+  python sync_all_peers.py --db backups/chain_20261027_120000.db
 
   # Modo antigo (auto-descoberta, maior altura):
   python sync_all_peers.py
@@ -34,9 +65,15 @@ except ImportError:
     print('[X] Falta: pip install requests')
     sys.exit(1)
 
+__version__ = "2.1"
+
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / 'brn_network.env'
 DB_PATH = BASE_DIR / 'brn_v2_chain.db'
+
+
+def log(msg: str):
+    print(msg, flush=True)
 
 
 # ============================================================
@@ -199,13 +236,11 @@ def probe_peer(peer: dict, http_port: int = 5000) -> dict:
     result['utxos'] = 0
     result['error'] = ''
 
-    # 1. TCP
     if not tcp_check(ip, http_port):
         result['error'] = f'TCP {ip}:{http_port} fechado'
         return result
     result['tcp_ok'] = True
 
-    # 2. HTTP /api/status
     status = http_get_status(ip, http_port)
     if not status:
         result['error'] = 'HTTP /api/status falhou'
@@ -254,7 +289,7 @@ def download_from_peer(ip: str, port: int, remote_height: int,
             time.sleep(2)
 
         if not blocks:
-            print(f'  [X] Lote {start}..{end-1} falhou após 3 tentativas')
+            log(f'  [X] Lote {start}..{end-1} falhou após 3 tentativas')
             return all_blocks
 
         all_blocks.extend(blocks)
@@ -263,7 +298,7 @@ def download_from_peer(ip: str, port: int, remote_height: int,
         pct = (downloaded / total) * 100
         rate = len(all_blocks) / max(0.1, elapsed)
         eta = (remote_height - downloaded) / max(0.1, rate) if rate > 0 else 0
-        print(f'  [{downloaded}/{total}] {pct:.1f}% | {rate:.0f} bl/s | ETA {eta:.0f}s')
+        log(f'  [{downloaded}/{total}] {pct:.1f}% | {rate:.0f} bl/s | ETA {eta:.0f}s')
 
         if len(blocks) < actual_batch:
             break
@@ -271,37 +306,84 @@ def download_from_peer(ip: str, port: int, remote_height: int,
     return all_blocks
 
 
-def import_blocks(blocks: list[dict], db_path: str) -> tuple[int, int]:
-    """Importa blocos no DB. Retorna (importados, altura_final)."""
-    from db import ChainDB
+# ============================================================
+# 4. [FIX v2.1] IMPORT VIA accept_block — valida consenso completo
+# ============================================================
+def import_blocks(blocks: list[dict], db_path: str,
+                  strict_validators: bool = False) -> tuple[int, int]:
+    """
+    Importa blocos baixados usando Blockchain.accept_block().
 
-    db = ChainDB(db_path)
-    before = db.height()
+    Comportamento:
+      - Pula blocos que já existem no DB local (height ocupado).
+      - Cada bloco é validado pelo consenso (PoW, merkle, auth_tag,
+        coinbase-limit, checkpoint, validators_sig se strict).
+      - Se um bloco é rejeitado, PARA. Não tenta "pular" — o próximo
+        bloco dependeria do anterior, então a cadeia ficaria inválida.
+
+    Retorna (importados, altura_final).
+    """
+    try:
+        from blockchain import Blockchain
+    except ImportError as e:
+        log(f'  [X] blockchain.py indisponível: {e}')
+        return (0, -1)
+
+    bc = Blockchain(str(db_path), auto_genesis=False)
+
+    # [NEW v2.1] --strict: injeta trust para forçar multi-sig
+    if strict_validators:
+        try:
+            from trust_network import TrustNetwork
+            trust_path = BASE_DIR / 'trust_network.json'
+            if trust_path.exists():
+                tn = TrustNetwork(str(trust_path))
+                bc.set_trust_net(tn)
+                n_v = len(bc._get_active_validators()) if hasattr(
+                    bc, '_get_active_validators') else 0
+                log(f'  [strict] trust injetado ({n_v} validador(es) ativo(s))')
+            else:
+                log('  [strict] trust_network.json não existe — modo bootstrap')
+        except Exception as e:
+            log(f'  [!] --strict falhou ao injetar trust: {e} (seguindo bootstrap)')
+
+    before = bc.db.height()
     imported = 0
 
-    for block in blocks:
-        h = block.get('height')
-        if h is None or db.get_block(h) is not None:
-            continue
-        try:
-            db.add_block(block)
-            for i, tx in enumerate(block.get('transactions', [])):
-                db.apply_tx(tx, h, coinbase=(i == 0))
-            imported += 1
-        except Exception as e:
-            print(f'  [X] Erro no bloco #{h}: {e}')
-            break
+    try:
+        for block in blocks:
+            h = block.get('height')
+            if h is None:
+                log('  [!] bloco sem campo height — ignorando')
+                continue
+            try:
+                if bc.db.get_block(h) is not None:
+                    continue
+            except Exception:
+                pass
 
-    after = db.height()
-    db.close()
+            ok, msg = bc.accept_block(block)
+            if not ok:
+                log(f'  [X] bloco #{h} rejeitado: {msg}')
+                break
+            imported += 1
+    finally:
+        after = bc.db.height()
+        try:
+            bc.db.close()
+        except Exception:
+            pass
+
     return imported, after
 
 
 # ============================================================
-# 4. Orquestrador
+# 5. Orquestrador
 # ============================================================
 def main():
-    ap = argparse.ArgumentParser(description='Sincroniza de todos os peers')
+    ap = argparse.ArgumentParser(
+        description='Sincroniza de todos os peers usando consenso (accept_block).'
+    )
     ap.add_argument('--http-port', type=int, default=5000,
                     help='Porta HTTP dos peers (default: 5000)')
     ap.add_argument('--min-height', type=int, default=1,
@@ -310,29 +392,39 @@ def main():
                     help='Blocos por requisição (default: 100)')
     ap.add_argument('--dry-run', action='store_true',
                     help='Só testa peers, não baixa')
-    
-    # Novos argumentos v2.0
+
     ap.add_argument('--only', action='store_true',
                     help='Usa SÓ os --peer passados (ignora auto-descoberta)')
     ap.add_argument('--peer', action='append', default=[],
                     help='IP:PORTA ou URL do peer (ex: 100.70.107.15:5000)')
     ap.add_argument('--target-height', type=int, default=None,
                     help='Só sincroniza se a altura do peer for EXATAMENTE esta')
+    ap.add_argument('--strict', action='store_true',
+                    help='Força validação multi-sig (injeta trust_network.json)')
+    ap.add_argument('--db', type=str, default=None,
+                    help='DB alternativo (default: brn_v2_chain.db)')
     args = ap.parse_args()
 
-    print('=' * 70)
-    print(' SYNC DE TODOS OS PEERS (v2.0)')
+    db_path = Path(args.db) if args.db else DB_PATH
+
+    log('=' * 70)
+    log(f' SYNC DE TODOS OS PEERS (v{__version__})')
+    log(' MODO: consenso ativo (accept_block)')
+    if args.strict:
+        log(' MODO: --strict (multi-sig obrigatório)')
     if args.only:
-        print(' MODO: --only (SÓ peers especificados manualmente)')
+        log(' MODO: --only (SÓ peers especificados manualmente)')
     if args.target_height is not None:
-        print(f' FILTRO: altura EXATA = {args.target_height}')
-    print('=' * 70)
+        log(f' FILTRO: altura EXATA = {args.target_height}')
+    if args.db:
+        log(f' DB: {db_path}')
+    log('=' * 70)
 
     # 1. Descobrir peers
     if args.only:
         all_peers = [parse_manual_peer(p) for p in args.peer]
         if not all_peers:
-            print('\n[X] --only passado, mas nenhum --peer especificado.')
+            log('\n[X] --only passado, mas nenhum --peer especificado.')
             return 1
     else:
         env = load_env()
@@ -340,87 +432,97 @@ def main():
         env_peers = discover_from_env(env)
         json_peers = discover_from_json_files()
         manual_peers = [parse_manual_peer(p) for p in args.peer]
-        
+
         all_peers = merge_peers(ts_peers, env_peers, json_peers, manual_peers)
 
-    print(f'\n[1] Peers descobertos: {len(all_peers)}')
+    log(f'\n[1] Peers descobertos: {len(all_peers)}')
     for p in all_peers:
-        print(f'  - {p["name"]:<35} {p["ip"]:<18} [{p["source"]}]')
+        log(f'  - {p["name"]:<35} {p["ip"]:<18} [{p["source"]}]')
 
     # 2. Testar cada peer
-    print(f'\n[2] Testando {len(all_peers)} peers em HTTP:{args.http_port}...')
+    log(f'\n[2] Testando {len(all_peers)} peers em HTTP:{args.http_port}...')
     probed = []
     for p in all_peers:
-        print(f'  Testando {p["name"]} ({p["ip"]})...', end=' ', flush=True)
+        log(f'  Testando {p["name"]} ({p["ip"]})...')
         result = probe_peer(p, args.http_port)
         probed.append(result)
         if result['http_ok']:
-            print(f'OK — altura={result["height"]}, utxos={result["utxos"]}')
+            log(f'    OK — altura={result["height"]}, utxos={result["utxos"]}')
         elif result['tcp_ok']:
-            print(f'TCP OK mas HTTP falhou')
+            log(f'    TCP OK mas HTTP falhou')
         else:
-            print(f'FALHOU ({result["error"]})')
+            log(f'    FALHOU ({result["error"]})')
 
     # 3. Filtrar peers válidos (HTTP ok + altura > local)
-    local_height = -1
     try:
         from db import ChainDB
-        db = ChainDB(DB_PATH)
+        db = ChainDB(str(db_path))
         local_height = db.height()
         db.close()
-    except Exception:
-        pass
+    except Exception as e:
+        log(f'[!] Falha lendo DB local: {e}')
+        local_height = -1
 
     valid = [p for p in probed if p['http_ok'] and p['height'] > local_height]
 
-    # Aplicar filtro de altura exata, se fornecido
     if args.target_height is not None:
         valid = [p for p in valid if p['height'] == args.target_height]
-        
+
     valid.sort(key=lambda p: p['height'], reverse=True)
 
-    print(f'\n[3] Altura local: {local_height}')
-    print(f'    Peers válidos: {len(valid)}')
+    log(f'\n[3] Altura local: {local_height}')
+    log(f'    Peers válidos: {len(valid)}')
     for p in valid:
-        print(f'  - {p["name"]:<35} {p["ip"]:<18} altura={p["height"]}')
+        log(f'  - {p["name"]:<35} {p["ip"]:<18} altura={p["height"]}')
 
     if not valid:
         if args.target_height is not None:
-            print(f'\n[X] Nenhum peer atende aos critérios (altura exata = {args.target_height} e altura > local).')
+            log(f'\n[X] Nenhum peer atende aos critérios '
+                f'(altura exata = {args.target_height} e altura > local).')
         else:
-            print('\n[X] Nenhum peer tem blockchain mais alta que a local.')
+            log('\n[X] Nenhum peer tem blockchain mais alta que a local.')
         return 1
 
     if args.dry_run:
-        print('\n[DRY-RUN] Sairia agora.')
+        log('\n[DRY-RUN] Sairia agora.')
         return 0
 
     # 4. Tentar cada peer (do mais alto para o mais baixo)
-    print('\n[4] Tentando download...')
+    log('\n[4] Baixando e validando...')
     for peer in valid:
-        print(f'\n--- Tentando {peer["name"]} ({peer["ip"]}) altura={peer["height"]} ---')
+        log(f'\n--- Tentando {peer["name"]} ({peer["ip"]}) altura={peer["height"]} ---')
         try:
             blocks = download_from_peer(
                 peer['ip'], args.http_port,
                 peer['height'], local_height, args.batch
             )
         except Exception as e:
-            print(f'  [X] Erro: {e}')
+            log(f'  [X] Erro: {e}')
             continue
 
         if not blocks:
-            print(f'  [X] Nenhum bloco baixado')
+            log(f'  [X] Nenhum bloco baixado')
             continue
 
-        print(f'\n[*] Baixados {len(blocks)} blocos. Importando...')
-        imported, final_h = import_blocks(blocks, str(DB_PATH))
-        print(f'[OK] {imported} blocos importados. Altura final: {final_h}')
+        log(f'\n[*] Baixados {len(blocks)} blocos. Importando via accept_block...')
+        imported, final_h = import_blocks(
+            blocks, str(db_path), strict_validators=args.strict
+        )
+        log(f'[RESULTADO] {imported} importado(s). Altura final: {final_h}')
 
         if final_h >= peer['height']:
-            print(f'\n[✓] Sincronizado com sucesso via {peer["ip"]}!')
+            log(f'\n[✓] Sincronizado com sucesso via {peer["ip"]}!')
             return 0
 
-    print('\n[X] Não foi possível sincronizar de nenhum peer.')
+        if imported == 0:
+            log('  [!] Nenhum bloco importado — tentando próximo peer')
+            continue
+
+        if final_h < peer['height']:
+            log(f'  [!] Parcial ({final_h}/{peer["height"]}) — '
+                f'rejeição em algum bloco. Tentando próximo peer.')
+
+    log('\n[X] Não foi possível sincronizar de nenhum peer.')
     return 1
 
 
