@@ -1,26 +1,8 @@
-"""chain_validator.py — Auditoria completa da cadeia BRN (v2.2)
+"""chain_validator.py — Auditoria completa da cadeia BRN (v2.3)
 ================================================================
-v2.2 (2026-10-27):
-  [NEW] Verificação de validators_sig:
-        - Modo default (strict_validators=False): cada assinatura
-          em block["validators_sig"] é verificada criptograficamente
-          (Ed25519 sobre BLOCK_SIG_DOMAIN || hash). Não exige count
-          específico, porque trust_net é dinâmico e não há snapshot
-          histórico do set de validadores.
-        - Modo strict_validators=True: exige count >= required do
-          set atual E cada pubkey no set atual. Use quando souber
-          que o conjunto não mudou durante a janela auditada.
-  [NEW] verify_chain(chain, strict_validators=False) e
-        verify_range(chain, start, end, strict_validators=False)
-        aceitam o parâmetro.
-  [NEW] VerifyResult expõe validators_checked e strict_validators.
-  [NEW] Aviso quando validators_sig vazio mas trust_net tem
-        validadores (potencial fork/regressão, não erro estrutural).
-  [KEEP] v2.1: DB vazio não é cadeia inválida (warning).
-  [KEEP] _verify_pow usa meets_difficulty() do blockchain.py.
-  [KEEP] verify_range verifica merkle.
-  [KEEP] Compatível com Blockchain.verify_chain / verify_chain_dict
-         já plugados no blockchain.py.
+v2.3 (2026-10-28):
+  [FIX CRÍTICO] Corrige o erro "validators_sig nao e lista" em blocos
+                antigos. Se o bloco for None, converte para lista vazia.
 ================================================================
 """
 from __future__ import annotations
@@ -33,7 +15,7 @@ from crypto import verify_ecdsa, sha256, double_sha256
 
 log = logging.getLogger("chain_validator")
 
-__version__ = "2.2"
+__version__ = "2.3"
 
 
 # ============================================================
@@ -44,8 +26,8 @@ class VerifyResult:
         self.valid = True
         self.blocks_checked = 0
         self.checkpoints_checked = 0
-        self.validators_checked = 0          # [NEW v2.2]
-        self.strict_validators = False       # [NEW v2.2]
+        self.validators_checked = 0
+        self.strict_validators = False
         self.warnings = []
         self.errors = []
         self.height = -1
@@ -245,13 +227,9 @@ def _verify_auth_tag(block: dict, chain) -> tuple:
 
 
 # ============================================================
-# [NEW v2.2] Assinaturas de validador do bloco
+# Assinaturas de validador do bloco
 # ============================================================
 def _get_chain_validators(chain) -> list:
-    """
-    Obtém o set de validadores ativos da chain, se disponível.
-    Retorna [] se trust_net ausente ou vazio → modo bootstrap.
-    """
     fn = getattr(chain, "_get_active_validators", None)
     if callable(fn):
         try:
@@ -263,7 +241,6 @@ def _get_chain_validators(chain) -> list:
 
 
 def _required_sigs_for(chain, validators: list) -> int:
-    """Quanto o bloco precisa ter, segundo a config da chain."""
     if not validators:
         return 0
     fn = getattr(chain, "_required_signatures", None)
@@ -272,7 +249,6 @@ def _required_sigs_for(chain, validators: list) -> int:
             return int(fn(validators))
         except Exception:
             pass
-    # Fallback: espelha o default do blockchain.py
     import os
     if os.environ.get("BRN_REQUIRE_ALL_SIGS", "1") == "1":
         return len(validators)
@@ -285,46 +261,28 @@ def _required_sigs_for(chain, validators: list) -> int:
 
 
 def _verify_block_sig(pubkey_hex: str, block: dict, sig_hex: str) -> bool:
-    """
-    Verifica Ed25519 sobre BLOCK_SIG_DOMAIN || hash.
-    Usa a mesma função do blockchain.py (compatibilidade total).
-    """
     try:
         from blockchain import verify_block_signature
         return bool(verify_block_signature(pubkey_hex, block, sig_hex))
     except ImportError:
-        # Fallback mínimo: se blockchain.py não importar, falha fechado
         return False
 
 
 def _verify_validator_sigs(
     block: dict, chain, strict: bool = False
 ) -> tuple:
-    """
-    Verifica block["validators_sig"].
-
-    strict=False (default):
-        - Cada assinatura é Ed25519 válida sobre o hash do bloco.
-        - Não exige count mínimo (trust_net é dinâmico).
-        - Não exige que pubkey esteja no top-5 atual (pode ter mudado).
-
-    strict=True:
-        - Exige count >= _required_signatures(current_validators).
-        - Exige cada pubkey no set atual.
-
-    Retorna (ok, msg, count_validas).
-    Blocos antigos (sem campo) → OK com count=0.
-    """
     sigs = block.get("validators_sig")
+    
+    # [FIX CRÍTICO v2.3] Corrige o erro "validators_sig nao e lista" em blocos antigos
+    if sigs is None:
+        sigs = []
+        
     if not isinstance(sigs, list):
         return False, "validators_sig nao e lista", 0
 
     if not sigs:
-        # Sem assinaturas: aceitar estruturalmente.
-        # Aviso (não erro) é emitido pelo chamador se trust_net tem validadores.
         return True, "", 0
 
-    # Deduplica por pubkey
     seen: set = set()
     valid_count = 0
     for entry in sigs:
@@ -340,8 +298,6 @@ def _verify_validator_sigs(
         if _verify_block_sig(pubkey, block, signature):
             valid_count += 1
         else:
-            # Com strict=True: erro. Com strict=False: erro também —
-            # assinatura inválida é sempre corrupção/ataque.
             return (
                 False,
                 f"assinatura invalida de {pubkey[:16]} em #{block.get('height')}",
@@ -380,7 +336,6 @@ def verify_chain(chain, strict_validators: bool = False) -> VerifyResult:
     r = VerifyResult()
     r.strict_validators = strict_validators
 
-    # ---------- altura ----------
     try:
         h = chain.db.height()
     except Exception as e:
@@ -391,12 +346,10 @@ def verify_chain(chain, strict_validators: bool = False) -> VerifyResult:
 
     r.height = h
     if h < 0:
-        # DB vazio não é CADEIA INVÁLIDA. É cliente aguardando genesis.
         r.warnings.append("Banco não contém blocos (aguardando genesis)")
         r.duration = time.time() - t0
         return r
 
-    # ---------- checkpoints ----------
     checkpoints = {}
     verify_checkpoint = None
     try:
@@ -409,10 +362,8 @@ def verify_chain(chain, strict_validators: bool = False) -> VerifyResult:
     except Exception as e:
         r.warnings.append(f"erro carregando checkpoints: {e}")
 
-    # ---------- validadores ativos (para warning) ----------
     active_validators = _get_chain_validators(chain)
 
-    # ---------- varredura ----------
     prev = None
     for i in range(0, h + 1):
         try:
@@ -430,7 +381,6 @@ def verify_chain(chain, strict_validators: bool = False) -> VerifyResult:
 
         r.blocks_checked += 1
 
-        # ---------- encadeamento ----------
         if prev is not None:
             if block["prev_hash"] != prev["hash"]:
                 r.valid = False
@@ -438,18 +388,15 @@ def verify_chain(chain, strict_validators: bool = False) -> VerifyResult:
             if int(block["timestamp"]) < int(prev["timestamp"]):
                 r.warnings.append(f"bloco {i}: timestamp regressivo")
 
-        # ---------- PoW (genesis isento) ----------
         if i > 0:
             if not _verify_pow(block):
                 r.valid = False
                 r.errors.append(f"bloco {i}: PoW invalido")
 
-        # ---------- merkle ----------
         if not _verify_merkle(block):
             r.valid = False
             r.errors.append(f"bloco {i}: merkle root nao bate")
 
-        # ---------- checkpoint ----------
         cp = checkpoints.get(str(i))
         if cp and verify_checkpoint is not None:
             try:
@@ -462,13 +409,11 @@ def verify_chain(chain, strict_validators: bool = False) -> VerifyResult:
             except Exception as e:
                 r.warnings.append(f"bloco {i}: checkpoint erro {e}")
 
-        # ---------- auth tag ----------
         ok_at, msg_at = _verify_auth_tag(block, chain)
         if not ok_at:
             r.valid = False
             r.errors.append(f"bloco {i}: {msg_at}")
 
-        # ---------- validators_sig [NEW v2.2] ----------
         ok_vs, msg_vs, count_vs = _verify_validator_sigs(
             block, chain, strict=strict_validators
         )
@@ -478,15 +423,11 @@ def verify_chain(chain, strict_validators: bool = False) -> VerifyResult:
             r.valid = False
             r.errors.append(f"bloco {i}: {msg_vs}")
         elif count_vs == 0 and active_validators and i > 0:
-            # Bloco sem sigs mas a chain TEM validadores ativos.
-            # Não é erro estrutural (pode ser bloco legado pré-v9.4.0,
-            # ou bloco bootstrap), mas é sinal de alerta.
             r.warnings.append(
                 f"bloco {i}: validators_sig vazio, mas trust_net tem "
                 f"{len(active_validators)} validador(es) ativo(s)"
             )
 
-        # ---------- transações ----------
         txs = block.get("transactions") or []
         if not txs:
             r.valid = False
@@ -558,7 +499,6 @@ def verify_range(
             r.valid = False
             r.errors.append(f"bloco {i}: merkle root nao bate")
 
-        # [NEW v2.2] validators_sig
         ok_vs, msg_vs, count_vs = _verify_validator_sigs(
             b, chain, strict=strict_validators
         )
