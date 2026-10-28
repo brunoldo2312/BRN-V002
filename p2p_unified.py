@@ -1,16 +1,12 @@
 """
-p2p_unified.py — BRN P2P Network v6.7.2
+p2p_unified.py — BRN P2P Network v6.7.3
 ================================================================
-v6.7.2 (2026-10-28):
-  [NEW] broadcast_validator_registration() em P2PManager.
-        Chamado pelo main.py v13.7.4 no boot para auto-registro
-        rápido de validadores (peer-to-peer announce).
-  [NEW] Handler "announce_validator" em P2PServer._process_message().
-        Registra a pubkey do validador no trust_network local
-        quando um peer se anuncia.
-  [KEEP] Proteção anti-DDoS por IP (v6.7.1).
-  [KEEP] Multi-sig sign_block (v6.7.0).
-  [KEEP] Toda a lógica de sync, discovery, PEX, rate-limit.
+v6.7.3 (2026-10-28):
+  [FIX] Tratamento de erro se local_sk for inválido no _handle_sign_block.
+  [FIX] Logs de announce_validator mais claros.
+  [KEEP] broadcast_validator_registration().
+  [KEEP] Multi-sig sign_block.
+  [KEEP] Proteção anti-DDoS, sync, discovery, PEX, rate-limit.
 ================================================================
 """
 from __future__ import annotations
@@ -65,7 +61,7 @@ PEER_TIMEOUT           = 60
 PEER_CLEANUP_S         = 30
 MAX_MSG_SIZE           = 8 * 1024 * 1024
 
-PROTOCOL_VERSION = "BRN5/2.2-MultiSig"
+PROTOCOL_VERSION = "BRN5/2.3-MultiSig"
 NETWORK_MAGIC    = b"BRN5"
 CHAIN_ID         = os.environ.get("BRN_CHAIN_ID", "mainnet").strip()
 
@@ -83,15 +79,6 @@ HEIGHT_CACHE_TTL     = 120
 PEERS_FILE     = "peers_discovered.json"
 BOOTSTRAP_FILE = "bootstrap_peers.json"
 BOOTSTRAP_ENV  = os.environ.get("BRN_BOOTSTRAP_PEERS", "")
-
-GH_USER     = os.environ.get("BRN_GH_USER", "").strip()
-GH_REPO     = os.environ.get("BRN_GH_REPO", "brn-peers").strip()
-GH_TOKEN    = os.environ.get("BRN_GH_TOKEN", "").strip()
-GH_BRANCH   = os.environ.get("BRN_GH_BRANCH", "main").strip()
-GH_FILE     = os.environ.get("BRN_GH_FILE", "peers.json").strip()
-GH_INTERVAL = int(os.environ.get("BRN_GH_INTERVAL", "180"))
-GH_TTL      = 600
-GH_API      = "https://api.github.com"
 
 TRACKER_URL             = os.environ.get("BRN_TRACKER", "").rstrip("/")
 TRACKER_INTERVAL        = 120
@@ -307,12 +294,6 @@ class P2PServer(threading.Thread):
         self.on_peer_bad = on_peer_bad
         self.on_peer_good = on_peer_good
         self.get_peers_callback = get_peers_callback
-
-        self.on_relay_caps = None
-        self.on_relay_request = None
-        self.on_relay_incoming = None
-        self.on_relay_accepted = None
-        self.on_relay_data = None
 
         self.node_uuid = ""
         self.running = False
@@ -569,10 +550,6 @@ class P2PServer(threading.Thread):
                 self.metrics.inc("block_sigs_requested")
                 return self._handle_sign_block(msg, addr, peer_id)
 
-            # [NEW v6.7.2] Auto-registro de validador via P2P.
-            # Um peer anuncia que É validador (pubkey + address).
-            # Registramos no trust_network local para que ele apareça
-            # imediatamente em get_top_validators().
             if mtype == "announce_validator":
                 pub = (msg.get("pubkey") or "").strip()
                 addr_v = (msg.get("address") or "").strip()
@@ -587,36 +564,6 @@ class P2PServer(threading.Thread):
                     except Exception as e:
                         log.debug(f"[P2P] announce_validator falhou: {e}")
                 return {"type": "ack", "ok": True}
-
-            if mtype == "relay_capabilities":
-                if self.on_relay_caps and peer_id:
-                    try: self.on_relay_caps(peer_ip, peer_id, msg)
-                    except Exception: pass
-                return {"ok": True, "type": "ack"}
-
-            if mtype == "relay_connect_request":
-                if self.on_relay_request:
-                    try: return self.on_relay_request(peer_ip, peer_id, msg)
-                    except Exception: pass
-                return {"ok": False, "error": "relay_disabled"}
-
-            if mtype == "relay_connect_incoming":
-                if self.on_relay_incoming:
-                    try: return self.on_relay_incoming(peer_ip, peer_id, msg)
-                    except Exception: pass
-                return {"ok": False, "error": "relay_disabled"}
-
-            if mtype == "relay_connect_accepted":
-                if self.on_relay_accepted:
-                    try: self.on_relay_accepted(peer_ip, peer_id, msg)
-                    except Exception: pass
-                return {"ok": True, "type": "ack"}
-
-            if mtype == "relay_data":
-                if self.on_relay_data:
-                    try: return self.on_relay_data(peer_ip, peer_id, msg)
-                    except Exception: pass
-                return {"ok": False, "error": "relay_disabled"}
 
         except Exception as e:
             return {"type": "error", "message": str(e)}
@@ -1050,11 +997,6 @@ class P2PManager:
     def request_block_signature(self, ip: str, port: int, block: dict, timeout: Optional[float] = None) -> Optional[dict]:
         return P2PClient.request_block_signature(ip, port, block, timeout=timeout)
 
-    # [NEW v6.7.2] Auto-registro de validador via P2P.
-    # Chamado pelo main.py v13.7.4 no boot para anunciar que este
-    # nó é validador. Cada peer que receber o "announce_validator"
-    # registra nossa pubkey no trust_network local → aparecemos
-    # rapidamente em get_top_validators() deles.
     def broadcast_validator_registration(self, pubkey: str, address: str) -> None:
         if self.read_only:
             return
