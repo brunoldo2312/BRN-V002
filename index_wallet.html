@@ -2,7 +2,7 @@
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
-<title>BRN Wallet v3.12</title>
+<title>BRN Wallet v3.13</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -362,12 +362,13 @@
           <tr>
             <th>Endereço</th>
             <th>Altura</th>
-            <th>Reputação (Trust)</th>
+            <th>Pontuação (Score)</th>
+            <th>Status</th>
             <th>Última vez</th>
           </tr>
         </thead>
         <tbody id="tbodyPeers">
-          <tr><td colspan="4" style="color:#8b949e;">—</td></tr>
+          <tr><td colspan="5" style="color:#8b949e;">—</td></tr>
         </tbody>
       </table>
     </div>
@@ -491,7 +492,6 @@
       <div class="row">
         <button class="btn p" id="bMinerar">⛏️ Minerar Local</button>
         <button class="btn p" id="bMinerarPool" style="background:#1f6feb;border-color:#388bfd;">🌐 Minerar Pool</button>
-        <button class="btn" id="bFaucet">🚰 Faucet</button>
       </div>
 
       <div class="mining-box" id="miningInfo">
@@ -632,7 +632,7 @@
     </div>
   </div>
 
-  <div class="footer">BRN Wallet v3.12 · ponte pywebview · <span id="apiLbl">—</span></div>
+  <div class="footer">BRN Wallet v3.13 · ponte pywebview · <span id="apiLbl">—</span></div>
 </div>
 
 <script>
@@ -829,7 +829,7 @@ async function refreshSyncInfo() {
 // ============================================================
 async function refreshPeers() {
   try {
-    // [FIX v3.12] Puxa do novo Trust System
+    // [FIX v3.13] Puxa do novo Trust System
     const s = await api("get_trust_nodes");
     
     // Se o Trust System ainda não tiver dados, usa o DB antigo
@@ -849,11 +849,17 @@ async function refreshPeers() {
       summary.innerHTML = "";
     } else {
       let trusted = 0, banned = 0;
+      let maxScore = 0;
+      
       for (const p of peers) {
         if (p.status === "trusted") trusted++;
         else if (p.status === "banned") banned++;
+        
+        const sc = p.trust_score != null ? p.trust_score : (p.score || 0);
+        if (sc > maxScore) maxScore = sc;
       }
-      let html = "";
+      
+      let html = `<span class="pill" style="background:#1f2d1f;color:#7ee787;" title="Maior pontuação da rede">Top: ${maxScore.toFixed(1)} pts</span>`;
       if (trusted > 0) html += `<span class="pill" style="background:#0d2818;color:#7ee787;">${trusted} confiável(eis)</span>`;
       if (banned > 0) html += `<span class="pill err">${banned} banido(s)</span>`;
       summary.innerHTML = html;
@@ -880,6 +886,9 @@ async function refreshPeers() {
       const h = p.height || 0; 
       const status = p.status || "new";
       
+      // Pega a pontuação correta (trust_score ou score)
+      const score = p.trust_score != null ? p.trust_score : (p.score || 0);
+      
       let statusHtml = `<span class="badge">${status.toUpperCase()}</span>`;
       if (status === "trusted") statusHtml = `<span class="badge trusted">✓ CONFIÁVEL</span>`;
       else if (status === "banned") statusHtml = `<span class="badge banned">✗ BANIDO</span>`;
@@ -887,6 +896,7 @@ async function refreshPeers() {
       tr.innerHTML = `
         <td><code>${addr}</code></td>
         <td>${h}</td>
+        <td><b style="color:#e3b341; font-size: 1.1em;">${Number(score).toFixed(1)} pts</b></td>
         <td>${statusHtml}</td>
         <td>${fmtAgo(p.last_seen)}</td>
       `;
@@ -1540,7 +1550,7 @@ async function updateMiningUI() {
       $("poolSharesTotal").textContent = pst.shares_submitted || 0;
       $("poolBlocks").textContent     = pst.blocks_found || 0;
       
-      // [NEW v3.12] Vardiff Display
+      // [NEW v3.13] Vardiff Display
       const sd = pst.job_share_diff != null ? pst.job_share_diff : "—";
       $("poolShareDiff").textContent  = sd;
 
@@ -1785,7 +1795,6 @@ function configEventos() {
   $("bEnviar").onclick     = enviar;
   $("bMinerar").onclick    = minerar;
   $("bMinerarPool").onclick = minerarPool;
-  $("bFaucet").onclick     = faucet;
   $("bVerificar").onclick  = verificarTx;
   $("bVerificarMeu").onclick = function() {
     if (wallet.address) {
