@@ -1,19 +1,23 @@
 """offramp_manager.py — Gerencia ordens BRN → BTC (OFFRAMP)
 ================================================================
+v1.2 (2026-10-28):
+  [FIX CRÍTICO] Fator 1e8 aplicado 2× no cálculo de sats BTC.
+                brn_amount_sats / rate JÁ RETORNA SATOSHIS BTC,
+                mas o código multiplicava por 1e8 de novo:
+                  quote(10.000.000 BRN_sats)  # 0.1 BRN
+                  → net_btc = 980  (interpretado como "980 BTC")
+                  → net_sats = 980 * 1e8 = 98.000.000.000 sats
+                  → valor real: 0.0000098 BTC (fator 1e8 de erro!)
+                Agora usa variáveis explicitamente nomeadas
+                (`*_btc_sats`) para tornar a unidade à prova de erro.
+                Auto-teste foi reforçado com assertions sobre o
+                valor em sats BTC (não só "não falhou").
 v1.1 (2026-10-28):
-  [FIX] _check_confirmation: import requests movido para o topo.
-        Antes estourava NameError no primeiro ciclo de confirmação.
-  [FIX] _process_pending: try/except por escrow individual — um escrow
-        com dados corrompidos não trava a fila inteira.
-  [FIX] list_orders retorna cópias (dict(e)) em vez de referências
-        mutáveis — evitar mutação acidental pelo caller.
-  [NEW] Retry logic no envio BTC (3 tentativas com backoff curto).
-  [NEW] Rate-limit com limpeza de memória (dict _rate_last não cresce
-        indefinidamente).
-  [NEW] status_desc amigável nos escrows retornados.
-  [KEEP] Fluxo: OPEN → BRN_LOCKED → BTC_SENT → RELEASED
-                        ↘ FAILED / EXPIRED / CANCELLED
-  [KEEP] WIF nunca logada. Tx assinada em memória.
+  [FIX] _check_confirmation: import requests no topo.
+  [FIX] _process_pending: try/except por escrow individual.
+  [FIX] list_orders retorna cópia.
+  [NEW] Retry de broadcast (3 tentativas).
+  [NEW] Rate-limit com TTL para evitar memory leak.
 ================================================================
 """
 from __future__ import annotations
@@ -27,28 +31,27 @@ import requests
 
 log = logging.getLogger("offramp")
 
-# Limites de taxa BTC (dust threshold Bitcoin é 546 sats)
+# Dust threshold Bitcoin
 DUST_SATS = 546
 
-# Rate-limit default: 1 saque a cada 60s por endereço
+# Rate-limit default
 DEFAULT_RATE_S = 60
 
-# TTL do rate-limit (limpa entradas antigas do _rate_last)
+# TTL de entradas do rate-limit
 RATE_ENTRY_TTL_S = 3600
 
 # Retry do broadcast BTC
 BTC_SEND_RETRIES = 3
 BTC_SEND_RETRY_DELAY_S = 3.0
 
-# Descrições amigáveis de status
 STATUS_DESCRIPTIONS = {
-    "OPEN":         "Aguardando bloqueio de BRN",
-    "BRN_LOCKED":   "BRN bloqueado — enviando BTC",
-    "BTC_SENT":     "BTC enviado — aguardando confirmação",
-    "RELEASED":     "Concluído — BTC confirmado",
-    "FAILED":       "Falhou — BRN será reembolsado",
-    "EXPIRED":      "Expirado (24h sem ação)",
-    "CANCELLED":    "Cancelado pelo usuário",
+    "OPEN":       "Aguardando bloqueio de BRN",
+    "BRN_LOCKED": "BRN bloqueado — enviando BTC",
+    "BTC_SENT":   "BTC enviado — aguardando confirmação",
+    "RELEASED":   "Concluído — BTC confirmado",
+    "FAILED":     "Falhou — BRN será reembolsado",
+    "EXPIRED":    "Expirado (TTL sem ação)",
+    "CANCELLED":  "Cancelado pelo usuário",
 }
 
 
@@ -62,15 +65,20 @@ class OfframpManager:
     Gerencia o ciclo de vida completo de ordens BRN → BTC.
 
     Estados:
-        OPEN         — criado, aguardando o bloqueio de BRN (server faz isso)
-        BRN_LOCKED   — BRN enviado para o cofre BRN, pronto p/ envio BTC
-        BTC_SENT     — BTC broadcast feito, aguardando confirmação
-        RELEASED     — BTC confirmado on-chain (ordem finalizada)
-        FAILED       — erro no envio BTC (BRN deve ser reembolsado manualmente)
-        EXPIRED      — TTL expirou antes do envio de BTC
-        CANCELLED    — usuário cancelou antes do lock BRN
+        OPEN → BRN_LOCKED → BTC_SENT → RELEASED
+                ↘ FAILED / EXPIRED / CANCELLED
 
-    Worker (thread) processa BRN_LOCKED → BTC_SENT → RELEASED automaticamente.
+    Unidades (IMPORTANTE):
+        - *brn_sats*  = unidades mínimas de BRN (1 BRN = 1e8 sats)
+        - *btc_sats*  = unidades mínimas de BTC (1 BTC = 1e8 sats)
+        - rate        = "1 BTC = X BRN" (X inteiro, ex: 10000)
+
+        Portanto:
+            1 BRN_sat = 1/rate  BTC_sats
+            N BRN_sats = N / rate  BTC_sats
+
+        O NUNCA aplicamos 1e8 após dividir por `rate`, porque a
+        divisão já entrega o valor em satoshis BTC.
     """
 
     def __init__(self, db, blockchain, btc_sender,
@@ -86,6 +94,10 @@ class OfframpManager:
             raise OfframpError("db obrigatório")
         if blockchain is None:
             raise OfframpError("blockchain obrigatório")
+        if rate_brn_per_btc <= 0:
+            raise OfframpError(f"rate_brn_per_btc invalido: {rate_brn_per_btc}")
+        if not (0 <= fee_pct < 100):
+            raise OfframpError(f"fee_pct invalido: {fee_pct}")
 
         self.db = db
         self.bc = blockchain
@@ -100,17 +112,62 @@ class OfframpManager:
         self.poll_interval_s = max(1.0, float(poll_interval_s))
 
         self._lock = threading.RLock()
-        self._rate_last: dict = {}     # buyer → ts do último create
+        self._rate_last: dict = {}
         self._stop = threading.Event()
         self._thread = None
 
         log.info(
             f"[OFFRAMP] init: rate={self.rate} fee={self.fee_pct}% "
-            f"min={self.min_brn_sats/1e8:.8f}BRN max={self.max_brn_sats/1e8:.8f}BRN "
+            f"minBRN={self.min_brn_sats/1e8:.8f} maxBRN={self.max_brn_sats/1e8:.8f} "
             f"minBTC={self.min_btc_sats}sats "
             f"cofreBTC={self.sender.get_address()[:16]}… "
             f"cofreBRN={self.treasury_brn[:16] if self.treasury_brn else '(vazio)'}…"
         )
+
+    # ============================================================
+    # CONVERSÃO (unidade única de verdade)
+    # ============================================================
+    def _brn_sats_to_btc_sats(self, brn_amount_sats: int) -> dict:
+        """
+        Conversão canônica BRN_sats → BTC_sats.
+
+        Retorna dict:
+            gross_btc_sats : valor bruto em satoshis BTC
+            fee_btc_sats   : taxa em satoshis BTC
+            net_btc_sats   : valor líquido em satoshis BTC
+            net_btc        : valor líquido em BTC unidades (para display)
+            fee_btc        : taxa em BTC unidades
+            gross_btc      : bruto em BTC unidades
+
+        NOTA: `brn_amount_sats / rate` JÁ RETORNA SATOSHIS BTC.
+        Nunca multiplique por 1e8 aqui — use 1e8 só para converter
+        sats → BTC unidades (display).
+        """
+        if brn_amount_sats <= 0:
+            raise OfframpError("brn_amount_sats deve ser > 0")
+
+        gross_btc_sats = brn_amount_sats / self.rate
+        fee_btc_sats = gross_btc_sats * self.fee_pct / 100.0
+        net_btc_sats_f = gross_btc_sats - fee_btc_sats
+        net_btc_sats = int(net_btc_sats_f)
+
+        # Arredondamento defensivo: se por algum motivo virar negativo
+        # (rate/fee absurdos), força 0 e avisa.
+        if net_btc_sats < 0:
+            log.warning(
+                f"[OFFRAMP] net_btc_sats negativo ({net_btc_sats}) — "
+                f"brn={brn_amount_sats} rate={self.rate} fee={self.fee_pct}%"
+            )
+            net_btc_sats = 0
+
+        return {
+            "gross_btc_sats": int(gross_btc_sats),
+            "fee_btc_sats":   int(fee_btc_sats),
+            "net_btc_sats":   net_btc_sats,
+            "gross_btc":      round(gross_btc_sats / 1e8, 8),
+            "fee_btc":        round(fee_btc_sats / 1e8, 8),
+            "net_btc":        round(net_btc_sats / 1e8, 8),
+        }
 
     # ============================================================
     # CICLO DE VIDA
@@ -141,7 +198,6 @@ class OfframpManager:
                 break
 
     def _process_pending(self) -> None:
-        # Limpa _rate_last antigo (evita memory leak)
         now = int(time.time())
         with self._lock:
             for addr in list(self._rate_last.keys()):
@@ -183,20 +239,29 @@ class OfframpManager:
             if not fresh or fresh.get("status") != "BRN_LOCKED":
                 return
 
-            brn_amount = int(fresh.get("brn_amount") or 0)
-            if brn_amount <= 0:
+            brn_amount_sats = int(fresh.get("brn_amount") or 0)
+            if brn_amount_sats <= 0:
                 self._mark(fresh["escrow_id"], "FAILED", "brn_amount<=0")
                 return
 
-            gross_btc = brn_amount / self.rate
-            fee_btc = gross_btc * self.fee_pct / 100.0
-            net_btc = gross_btc - fee_btc
-            net_sats = int(net_btc * 1e8)
+            try:
+                amounts = self._brn_sats_to_btc_sats(brn_amount_sats)
+            except OfframpError as e:
+                self._mark(fresh["escrow_id"], "FAILED", str(e))
+                return
 
-            if net_sats < self.min_btc_sats:
+            net_btc_sats = amounts["net_btc_sats"]
+
+            if net_btc_sats < self.min_btc_sats:
                 self._mark(
                     fresh["escrow_id"], "FAILED",
-                    f"net {net_sats} < min {self.min_btc_sats}",
+                    f"net {net_btc_sats} sats < min {self.min_btc_sats}",
+                )
+                return
+            if net_btc_sats < DUST_SATS:
+                self._mark(
+                    fresh["escrow_id"], "FAILED",
+                    f"net {net_btc_sats} sats < dust {DUST_SATS}",
                 )
                 return
 
@@ -205,12 +270,12 @@ class OfframpManager:
                 self._mark(fresh["escrow_id"], "FAILED", "btc_dest vazio")
                 return
 
-            # Retry do broadcast (até 3 tentativas)
+            # Retry do broadcast
             last_err = ""
             result = None
             for attempt in range(1, BTC_SEND_RETRIES + 1):
                 try:
-                    r = self.sender.send(dest, net_sats, priority="halfHourFee")
+                    r = self.sender.send(dest, net_btc_sats, priority="halfHourFee")
                 except Exception as e:
                     last_err = str(e)
                     log.warning(
@@ -233,18 +298,22 @@ class OfframpManager:
                     time.sleep(BTC_SEND_RETRY_DELAY_S)
 
             if result is None:
-                self._mark(fresh["escrow_id"], "FAILED", last_err or "send falhou")
+                self._mark(
+                    fresh["escrow_id"], "FAILED",
+                    last_err or "send falhou",
+                )
                 return
 
             fresh["status"] = "BTC_SENT"
             fresh["btc_txid"] = result["txid"]
-            fresh["btc_sent_sats"] = net_sats
+            fresh["btc_sent_sats"] = net_btc_sats
             fresh["btc_fee_sats"] = int(result.get("fee_sats") or 0)
             fresh["btc_sent_at"] = int(time.time())
             self.db.save_l2_escrow(fresh)
             log.info(
                 f"[OFFRAMP] OK escrow={fresh['escrow_id']} "
-                f"net={net_sats} sats txid={result['txid'][:16]}…"
+                f"net={net_btc_sats} sats ({net_btc_sats/1e8:.8f} BTC) "
+                f"txid={result['txid'][:16]}…"
             )
 
     def _check_confirmation(self, escrow: dict) -> None:
@@ -277,25 +346,22 @@ class OfframpManager:
             log.warning(f"[OFFRAMP] _mark falhou: {exc}")
 
     # ============================================================
-    # API PÚBLICA — COTAÇÃO
+    # COTAÇÃO
     # ============================================================
     def quote(self, brn_amount_sats: int) -> dict:
         if not isinstance(brn_amount_sats, int) or brn_amount_sats <= 0:
             raise OfframpError("brn_amount_sats deve ser int > 0")
 
-        gross_btc = brn_amount_sats / self.rate
-        fee_btc = gross_btc * self.fee_pct / 100.0
-        net_btc = gross_btc - fee_btc
-        net_sats = int(net_btc * 1e8)
+        amounts = self._brn_sats_to_btc_sats(brn_amount_sats)
 
         return {
             "brn_amount":    brn_amount_sats / 1e8,
             "brn_sats":      brn_amount_sats,
-            "btc_gross":     round(gross_btc, 8),
+            "btc_gross":     amounts["gross_btc"],
             "fee_percent":   self.fee_pct,
-            "btc_fee":       round(fee_btc, 8),
-            "btc_net":       round(net_btc, 8),
-            "btc_net_sats":  net_sats,
+            "btc_fee":       amounts["fee_btc"],
+            "btc_net":       amounts["net_btc"],
+            "btc_net_sats":  amounts["net_btc_sats"],
             "rate":          f"1 BTC = {self.rate} BRN",
             "min_brn":       self.min_brn_sats / 1e8,
             "max_brn":       self.max_brn_sats / 1e8,
@@ -306,7 +372,7 @@ class OfframpManager:
         }
 
     # ============================================================
-    # API PÚBLICA — CRIAÇÃO E CONTROLE
+    # CRIAÇÃO E CONTROLE
     # ============================================================
     def create_escrow(self, buyer_brn: str, brn_amount_sats: int,
                       btc_dest: str) -> dict:
@@ -333,7 +399,7 @@ class OfframpManager:
                 return {"ok": False,
                         "msg": f"aguarde {faltam}s entre saques"}
 
-        # Valida endereço BTC para a rede do cofre
+        # Valida endereço BTC
         try:
             from bitcoinlib.keys import Address
             addr = Address(btc_dest, network=self.sender.network)
@@ -341,17 +407,20 @@ class OfframpManager:
         except Exception as e:
             return {"ok": False, "msg": f"endereco BTC invalido: {e}"}
 
-        # Calcula net BTC
-        gross_btc = brn_amount_sats / self.rate
-        fee_btc = gross_btc * self.fee_pct / 100.0
-        net_btc = gross_btc - fee_btc
-        net_sats = int(net_btc * 1e8)
-        if net_sats < self.min_btc_sats:
+        # Calcula valores em sats BTC
+        try:
+            amounts = self._brn_sats_to_btc_sats(brn_amount_sats)
+        except OfframpError as e:
+            return {"ok": False, "msg": str(e)}
+
+        net_btc_sats = amounts["net_btc_sats"]
+        if net_btc_sats < self.min_btc_sats:
             return {"ok": False,
-                    "msg": f"net BTC {net_sats} abaixo do minimo {self.min_btc_sats}"}
-        if net_sats < DUST_SATS:
+                    "msg": (f"net BTC {net_btc_sats} sats abaixo do minimo "
+                            f"{self.min_btc_sats}")}
+        if net_btc_sats < DUST_SATS:
             return {"ok": False,
-                    "msg": f"net BTC {net_sats} < dust threshold {DUST_SATS}"}
+                    "msg": f"net BTC {net_btc_sats} sats < dust {DUST_SATS}"}
 
         escrow_id = "off_" + uuid.uuid4().hex[:16]
         now = int(time.time())
@@ -362,7 +431,7 @@ class OfframpManager:
             "buyer":             buyer_brn,
             "brn_amount":        brn_amount_sats,
             "btc_dest":          btc_dest_clean,
-            "btc_expected_sats": net_sats,
+            "btc_expected_sats": net_btc_sats,
             "btc_address":       self.sender.get_address(),
             "btc_txid":          "",
             "status":            "OPEN",
@@ -378,7 +447,6 @@ class OfframpManager:
         return {"ok": True, "escrow": escrow}
 
     def mark_brn_locked(self, escrow_id: str, brn_txid: str) -> dict:
-        """Chamado pelo server após a tx BRN ser aceita na mempool."""
         if not brn_txid or len(brn_txid) != 64:
             return {"ok": False, "msg": "brn_txid invalido"}
         with self._lock:
@@ -426,7 +494,6 @@ class OfframpManager:
                 continue
             if status and e.get("status") != status:
                 continue
-            # Retorna cópia + status_desc amigável
             item = dict(e)
             item["status_desc"] = STATUS_DESCRIPTIONS.get(
                 e.get("status", ""), e.get("status", "")
@@ -437,20 +504,20 @@ class OfframpManager:
     def stats(self) -> dict:
         orders = self.list_orders()
         out = {
-            "total":        len(orders),
-            "open":         0,
-            "brn_locked":   0,
-            "btc_sent":     0,
-            "released":     0,
-            "failed":       0,
-            "expired":      0,
-            "cancelled":    0,
-            "cofre_btc":    self.sender.get_address(),
+            "total":          len(orders),
+            "open":           0,
+            "brn_locked":     0,
+            "btc_sent":       0,
+            "released":       0,
+            "failed":         0,
+            "expired":        0,
+            "cancelled":      0,
+            "cofre_btc":      self.sender.get_address(),
             "cofre_btc_sats": 0,
-            "cofre_brn":    self.treasury_brn,
-            "network":      self.sender.network,
-            "rate":         f"1 BTC = {self.rate} BRN",
-            "fee_percent":  self.fee_pct,
+            "cofre_brn":      self.treasury_brn,
+            "network":        self.sender.network,
+            "rate":           f"1 BTC = {self.rate} BRN",
+            "fee_percent":    self.fee_pct,
         }
         for o in orders:
             st = (o.get("status") or "").lower()
@@ -472,7 +539,7 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    print("Testando OfframpManager (dry-run, sem envio BTC)...")
+    print("Testando OfframpManager v1.2 (dry-run, sem envio BTC)...")
 
     class FakeDB:
         def __init__(self):
@@ -495,6 +562,10 @@ if __name__ == "__main__":
         def get_balance(self):
             return 1_000_000  # 0.01 BTC
         def send(self, dest, amount_sats, priority="halfHourFee"):
+            # REGISTRA o que foi enviado para o teste verificar
+            FakeSender.last_send = {
+                "dest": dest, "amount_sats": amount_sats,
+            }
             return {
                 "ok": True,
                 "txid": "f" * 64,
@@ -507,69 +578,120 @@ if __name__ == "__main__":
     db = FakeDB()
     sender = FakeSender()
 
+    # rate=10000 → 1 BTC = 10.000 BRN
+    # 5 BRN = 500_000_000 brn_sats → 50.000 sats BTC (0.0005 BTC)
+    # 50.000 sats > min_btc_sats=5000 ✓
     off = OfframpManager(
         db=db,
-        blockchain=object(),  # não usado no dry-run
+        blockchain=object(),
         btc_sender=sender,
         rate_brn_per_btc=10000,
         fee_pct=2.0,
-        min_brn_sats=1_000_000,      # 0.01 BRN
-        max_brn_sats=100_000_000_000, # 1000 BRN
+        min_brn_sats=100_000_000,       # 1 BRN
+        max_brn_sats=100_000_000_000,   # 1000 BRN
         min_btc_sats=5000,
         ttl_s=1800,
         treasury_brn="brn1faketreasury000000000000000000000",
     )
 
-    # 1) Quote
-    q = off.quote(10_000_000)  # 0.1 BRN
-    print(f"  [info] quote: {q['brn_amount']} BRN -> {q['btc_net']} BTC "
-          f"(fee {q['fee_percent']}%)")
-    assert q["btc_net_sats"] > 0
+    failures = []
+    def check(name, cond, detail=""):
+        if cond:
+            print(f"  [ok]   {name}")
+        else:
+            print(f"  [FAIL] {name} — {detail}")
+            failures.append(name)
 
-    # 2) create_escrow
-    r = off.create_escrow(
+    # ---- 1) Quote: 5 BRN deve dar 0.0005 BTC (50.000 sats) ----
+    q = off.quote(500_000_000)  # 5 BRN
+    check("quote.brn_amount == 5.0", q["brn_amount"] == 5.0, f"got {q['brn_amount']}")
+    check("quote.btc_gross ≈ 0.0005",
+          abs(q["btc_gross"] - 0.0005) < 1e-10, f"got {q['btc_gross']}")
+    check("quote.btc_fee ≈ 0.00001",
+          abs(q["btc_fee"] - 0.00001) < 1e-10, f"got {q['btc_fee']}")
+    check("quote.btc_net ≈ 0.00049",
+          abs(q["btc_net"] - 0.00049) < 1e-10, f"got {q['btc_net']}")
+    check("quote.btc_net_sats == 49000",
+          q["btc_net_sats"] == 49000, f"got {q['btc_net_sats']}")
+
+    # ---- 2) Quote: 0.1 BRN é MENOS que 5000 sats → será rejeitado em create ----
+    q_small = off.quote(10_000_000)  # 0.1 BRN
+    check("quote(0.1 BRN).btc_net_sats == 980",
+          q_small["btc_net_sats"] == 980, f"got {q_small['btc_net_sats']}")
+    check("quote(0.1 BRN).btc_net < min_btc_sats",
+          q_small["btc_net_sats"] < off.min_btc_sats,
+          f"{q_small['btc_net_sats']} < {off.min_btc_sats}? NÃO!")
+
+    # ---- 3) create_escrow com 0.1 BRN deve REJEITAR ----
+    r_small = off.create_escrow(
         "brn1fakebuyer000000000000000000000000000",
         10_000_000,  # 0.1 BRN
         "bc1qfakedest00000000000000000000000000000",
     )
-    assert r["ok"], f"create_escrow falhou: {r}"
-    escrow_id = r["escrow"]["escrow_id"]
-    print(f"  [ok] create_escrow: {escrow_id}")
+    check("create_escrow(0.1 BRN) é rejeitado",
+          not r_small["ok"], f"deveria rejeitar; passou com {r_small}")
 
-    # 3) marca BRN_LOCKED
-    r2 = off.mark_brn_locked(escrow_id, "a" * 64)
-    assert r2["ok"], f"mark_brn_locked falhou: {r2}"
-    print("  [ok] mark_brn_locked")
-
-    # 4) simula worker processando (envia BTC)
-    off._process_pending()
-    e = db.get_l2_escrow_by_id(escrow_id)
-    assert e["status"] == "BTC_SENT", f"esperado BTC_SENT, veio {e['status']}"
-    assert e["btc_txid"] == "f" * 64
-    print(f"  [ok] _send_btc -> BTC_SENT (txid={e['btc_txid'][:16]}…)")
-
-    # 5) rate-limit deve bloquear 2o create do mesmo buyer
-    r3 = off.create_escrow(
+    # ---- 4) create_escrow com 5 BRN deve PASSAR ----
+    r_ok = off.create_escrow(
         "brn1fakebuyer000000000000000000000000000",
-        10_000_000,
+        500_000_000,  # 5 BRN
         "bc1qfakedest00000000000000000000000000000",
     )
-    assert not r3["ok"], "rate-limit deveria bloquear"
-    print(f"  [ok] rate-limit: {r3['msg']}")
+    check("create_escrow(5 BRN) é aceito",
+          r_ok["ok"], f"deveria aceitar; erro={r_ok.get('msg')}")
+    if r_ok["ok"]:
+        escrow = r_ok["escrow"]
+        check("escrow.btc_expected_sats == 49000",
+              escrow["btc_expected_sats"] == 49000,
+              f"got {escrow['btc_expected_sats']}")
+        escrow_id = escrow["escrow_id"]
 
-    # 6) list_orders
+        # ---- 5) mark_brn_locked ----
+        r2 = off.mark_brn_locked(escrow_id, "a" * 64)
+        check("mark_brn_locked OK", r2["ok"])
+
+        # ---- 6) _process_pending envia BTC com valor CORRETO ----
+        FakeSender.last_send = None
+        off._process_pending()
+        e_after = db.get_l2_escrow_by_id(escrow_id)
+        check("escrow virou BTC_SENT",
+              e_after["status"] == "BTC_SENT",
+              f"got {e_after['status']}")
+        check("btc_sent_sats == 49000 (não 98 bilhões)",
+              e_after.get("btc_sent_sats") == 49000,
+              f"got {e_after.get('btc_sent_sats')}")
+        check("sender.send chamado com amount=49000",
+              FakeSender.last_send and FakeSender.last_send["amount_sats"] == 49000,
+              f"got {FakeSender.last_send}")
+
+        # ---- 7) rate-limit ----
+        r3 = off.create_escrow(
+            "brn1fakebuyer000000000000000000000000000",
+            500_000_000,
+            "bc1qfakedest00000000000000000000000000000",
+        )
+        check("rate-limit bloqueia 2o create",
+              not r3["ok"], f"deveria bloquear; passou com {r3}")
+
+    # ---- 8) list_orders com status_desc ----
     orders = off.list_orders()
-    assert len(orders) == 1
-    assert orders[0]["status_desc"] == "BTC enviado — aguardando confirmação"
-    print(f"  [ok] list_orders: {len(orders)} ordem, desc='{orders[0]['status_desc']}'")
+    check("list_orders retorna 1 ordem", len(orders) == 1)
+    if orders:
+        check("status_desc amigável",
+              orders[0]["status_desc"] == "BTC enviado — aguardando confirmação",
+              f"got {orders[0]['status_desc']}")
 
-    # 7) stats
+    # ---- 9) stats ----
     st = off.stats()
-    assert st["total"] == 1
-    assert st["btc_sent"] == 1
-    print(f"  [ok] stats: {st}")
+    check("stats.total == 1", st["total"] == 1)
+    check("stats.btc_sent == 1", st["btc_sent"] == 1)
 
     print()
     print("=" * 60)
-    print(" OfframpManager v1.1 OK.")
+    if failures:
+        print(f" FALHAS: {len(failures)} teste(s)")
+        for f in failures:
+            print(f"   - {f}")
+        raise SystemExit(1)
+    print(" OfframpManager v1.2 OK — todos os testes passaram.")
     print("=" * 60)
