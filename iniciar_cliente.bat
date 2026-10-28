@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================
-REM   iniciar_cliente.bat - BRN Node Auto-Setup (v4.0)
+REM   iniciar_cliente.bat - BRN Node Auto-Setup (v4.1 - FastAPI)
 REM   Fluxo: Deps -> Tailscale -> Sync -> GUI (Carteira)
 REM ============================================================
 setlocal EnableDelayedExpansion
@@ -14,6 +14,7 @@ set "PYTHONUNBUFFERED=1"
 
 set "SKIP_DEPS=0"
 set "SKIP_SYNC=0"
+set "FORCE_HEADLESS=0"
 
 :parse_args
 if "%~1"=="" goto args_done
@@ -26,10 +27,15 @@ goto parse_args
 
 echo.
 echo ============================================================
-echo   BRN Node - AUTO SETUP E INICIALIZACAO (v4.0)
+echo   BRN Node - AUTO SETUP E INICIALIZACAO (v4.1)
 echo ============================================================
 echo   Pasta: %CD%
 echo   Data:  %DATE% %TIME%
+if "%FORCE_HEADLESS%"=="1" (
+    echo   Modo:  HEADLESS ^(API^)
+) else (
+    echo   Modo:  GUI ^(Carteira Grafica^)
+)
 echo ============================================================
 echo.
 
@@ -41,7 +47,6 @@ where python >nul 2>&1
 if errorlevel 1 (
     echo [ERRO] Python nao encontrado no PATH.
     echo        Instale em: https://www.python.org/downloads/
-    echo        Marque "Add Python to PATH".
     pause
     exit /b 1
 )
@@ -50,12 +55,13 @@ echo [ok] Python encontrado.
 echo.
 
 REM ============================================================
-REM 2. INSTALAR DEPENDENCIAS
+REM 2. INSTALAR DEPENDENCIAS (Incluindo FastAPI/Uvicorn)
 REM ============================================================
 if "%SKIP_DEPS%"=="1" goto deps_skip
 
 echo [2/5] Verificando e instalando dependencias...
-set "PKGS=flask flask-cors requests orjson waitress cryptography argon2-cffi mnemonic pymongo pywebview pythonnet"
+REM Lista de pacotes essenciais atualizada
+set "PKGS=flask flask-cors fastapi uvicorn requests orjson waitress cryptography argon2-cffi mnemonic pymongo pywebview pythonnet"
 
 for %%P in (!PKGS!) do (
     python -c "import %%P" >nul 2>&1
@@ -108,15 +114,14 @@ if not "!DB_HEIGHT!"=="-1" (
     goto sync_done
 )
 
-echo        DB vazio - sincronizando do Ubuntu...
+echo        DB vazio - tentando sincronizar via HTTP...
 if exist "sync_direct.py" (
     python sync_direct.py http://100.111.253.8:5000
     if errorlevel 1 (
-        echo [AVISO] sync_direct falhou. O main.py tentara sync automatico via HTTP.
+        echo [AVISO] sync_direct falhou. O main.py tentara sync automatico.
     )
 ) else (
-    echo [INFO] sync_direct.py nao encontrado.
-    echo [INFO] O main.py v2.0 fara o sync automatico via HTTP.
+    echo [INFO] sync_direct.py nao encontrado. Sync automatico no main.py.
 )
 :sync_done
 echo.
@@ -125,7 +130,7 @@ echo.
 REM ============================================================
 REM 5. INICIAR CARTEIRA GRAFICA
 REM ============================================================
-echo [5/5] Iniciando Carteira Grafica...
+echo [5/5] Iniciando BRN Node...
 echo.
 
 REM Cria a carteira se nao existir
@@ -134,14 +139,17 @@ if not exist "current_wallet.enc" (
     python -c "from wallet import Wallet, WalletManager; import os; w = Wallet.create(); pw = os.environ.get('BRN_WALLET_SESSION_PASS', 'senha-forte-da-carteira-2026'); WalletManager.save_current(w.address, w.priv_hex, w.pub_hex, pw)"
 )
 
+set "HEADLESS_FLAG=--headless"
+if "%FORCE_HEADLESS%"=="0" set "HEADLESS_FLAG="
+
 echo ============================================================
-echo   ABRINDO GUI...
+echo   INICIANDO O NO...
+echo   python main.py %HEADLESS_FLAG% --skip-verify
 echo ============================================================
 echo.
 
-REM Roda o main.py SEM --headless para abrir a GUI
-REM O --skip-verify acelera o boot inicial
-python main.py --skip-verify
+REM Roda o main.py (que agora usa FastAPI/Uvicorn internamente)
+python main.py %HEADLESS_FLAG% --skip-verify
 
 if errorlevel 1 (
     echo [X] O programa saiu com erro.
