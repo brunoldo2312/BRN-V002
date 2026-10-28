@@ -1,95 +1,84 @@
-"""sync_manager.py — ChainSyncManager do BRN (v1.0)
+"""sync_manager.py — Sincronizador automático de blockchain (v2.0)
 ================================================================
-Reconstruído a partir de main.py v13.7.1 + server.py v9.9.17 +
-fork_guard.py v2.0, após detectar que o sync_manager.py no disco
-foi SOBRESCRITO com o conteúdo de chain_validator.py v2.2.
+Versão HTTP — funciona de QUALQUER lugar (LAN, Tailscale, internet).
 
-Interface consumida por:
-  - main.py:       ChainSyncManager(chain, db, p2p)
-                   .set_sync_mode("full")
-                   .start_sync_loop()
-                   .stop()
-  - server.py:     .get_status()  → dict com 13 chaves
-  - fork_guard.py: .peer_lock (RLock)
-                   .peers      (dict[addr → PeerStatus])
+Substitui a versão P2P anterior que dependia de multicast/UDP.
+O P2P continua para transações, mas o sync da blockchain é feito
+via HTTP (porta 5000), que é universal e à prova de firewall.
 
-PeerStatus tem .addr, .height, .tip_hash, .last_seen, .work — todos
-os campos que fork_guard.py usa via getattr().
+Como funciona:
+  1. Lê peers de bootstrap_peers.json + BRN_BOOTSTRAP_PEERS
+  2. GET /api/chain-info em cada peer para ver a altura
+  3. Se peer tem mais blocos: GET /api/blocks?start=N&limit=100
+  4. Valida cada bloco com chain.accept_block() (PoW, merkle, auth)
+  5. Repete a cada SYNC_INTERVAL segundos
 
-Env:
-  BRN_SYNC_INTERVAL       default 15s   intervalo entre ciclos
-  BRN_SYNC_BATCH          default 100   blocos por requisição
-  BRN_SYNC_PEER_TIMEOUT   default 10s   timeout por peer
-  BRN_SYNC_REORG_DEPTH    default 200   profundidade máxima de reorg
-  BRN_SYNC_PEER_STALE     default 300s  peer morto após
+Compatível com fork_guard.py (PeerStatus tem .addr e .height).
 ================================================================
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
 import time
-from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
+
+try:
+    import requests
+    _HAS_REQUESTS = True
+except ImportError:
+    _HAS_REQUESTS = False
 
 log = logging.getLogger("sync_manager")
 
+BASE_DIR = Path(__file__).resolve().parent
 
-SYNC_INTERVAL   = float(os.environ.get("BRN_SYNC_INTERVAL", "15"))
-SYNC_BATCH      = int(os.environ.get("BRN_SYNC_BATCH", "100"))
-PEER_TIMEOUT    = float(os.environ.get("BRN_SYNC_PEER_TIMEOUT", "10"))
-REORG_MAX_DEPTH = int(os.environ.get("BRN_SYNC_REORG_DEPTH", "200"))
-PEER_STALE_S    = float(os.environ.get("BRN_SYNC_PEER_STALE", "300"))
-
-MAX_REORGS_PER_SYNC = 3
+# Configurações
+SYNC_INTERVAL = float(os.environ.get("BRN_SYNC_INTERVAL", "15"))
+SYNC_BATCH = int(os.environ.get("BRN_SYNC_BATCH", "100"))
+PEER_HTTP_TIMEOUT = float(os.environ.get("BRN_SYNC_PEER_TIMEOUT", "10"))
+HTTP_PORT = int(os.environ.get("BRN_PEER_HTTP_PORT", "5000"))
+MAX_RETRIES = int(os.environ.get("BRN_SYNC_RETRIES", "3"))
 
 
 # ============================================================
-# PEER STATUS (interface para fork_guard)
+# PEER STATUS (compatível com fork_guard.py)
 # ============================================================
-@dataclass
 class PeerStatus:
-    """Estado observado de um peer. Atualizado pelo loop de sync."""
-    addr: str
-    height: int = -1
-    tip_hash: str = ""
-    work: int = 0
-    last_seen: float = 0.0
-    last_error: str = ""
-    failures: int = 0
-    verified: bool = False
+    """Estado observado de um peer. fork_guard usa .addr e .height."""
+
+    def __init__(self, addr: str):
+        self.addr = addr
+        self.height = -1
+        self.tip_hash = ""
+        self.work = 0
+        self.last_seen = 0.0
+        self.last_error = ""
+        self.failures = 0
+        self.verified = False
 
     @property
     def alive(self) -> bool:
-        return self.last_seen > 0 and (time.time() - self.last_seen) < PEER_STALE_S
-
-    def update_from_chain_height(self, resp: dict) -> None:
-        self.height = int(resp.get("height", -1))
-        self.tip_hash = str(resp.get("hash", ""))
-        self.work = int(resp.get("work", 0))
-        self.last_seen = time.time()
-        self.failures = 0
-        self.last_error = ""
+        return self.last_seen > 0 and (time.time() - self.last_seen) < 300
 
 
 # ============================================================
 # CHAIN SYNC MANAGER
 # ============================================================
 class ChainSyncManager:
-    """Sincroniza a blockchain com peers via P2P, com reorg automático."""
+    """Sincroniza a blockchain via HTTP. Funciona de qualquer lugar."""
 
-    def __init__(self, chain, db, p2p):
-        if chain is None or db is None or p2p is None:
-            raise ValueError("chain, db e p2p sao obrigatorios")
-
+    def __init__(self, chain, db, p2p=None):
         self.chain = chain
         self.db = db
         self.p2p = p2p
 
         # Interface exigida por fork_guard.py
         self.peer_lock = threading.RLock()
-        self.peers: dict[str, PeerStatus] = {}
+        self.peers: dict = {}
 
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -102,21 +91,16 @@ class ChainSyncManager:
         self._reorgs_total = 0
         self._last_reorg_height = -1
         self._last_error = ""
-        self._current_progress = 100.0
-        self._current_local = 0
         self._current_target = 0
 
-        log.info("ChainSyncManager inicializado (modo=%s)", self._mode)
+        if not _HAS_REQUESTS:
+            log.error("requests nao instalado - sync HTTP indisponivel")
+
+        log.info("ChainSyncManager v2.0 (HTTP) inicializado")
 
     # ============================================================
     # CICLO DE VIDA
     # ============================================================
-    def set_sync_mode(self, mode: str) -> None:
-        if mode not in ("full", "pull", "off"):
-            raise ValueError(f"modo invalido: {mode}")
-        self._mode = mode
-        log.info("sync_mode = %s", mode)
-
     def start_sync_loop(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
@@ -125,7 +109,7 @@ class ChainSyncManager:
             target=self._loop, daemon=True, name="ChainSync",
         )
         self._thread.start()
-        log.info("ChainSync loop iniciado (interval=%.1fs)", SYNC_INTERVAL)
+        log.info("ChainSync loop iniciado (HTTP, interval=%.0fs)", SYNC_INTERVAL)
 
     def stop(self) -> None:
         self._stop.set()
@@ -133,49 +117,12 @@ class ChainSyncManager:
             self._thread.join(timeout=5)
         log.info("ChainSync parado")
 
-    # ============================================================
-    # STATUS (formato exigido por server.py)
-    # ============================================================
-    def get_status(self) -> dict:
-        local_h = self._safe_height()
-        with self._state_lock:
-            syncing = self._syncing
-            forking = self._forking
-            target_h = max(self._current_target, local_h)
-            if target_h > 0:
-                progress = min(100.0, (local_h / target_h) * 100.0)
-            else:
-                progress = 100.0
-            synced = local_h >= target_h
-
-            active_peer = self._active_peer
-            reorgs = self._reorgs_total
-            last_reorg = self._last_reorg_height
-            last_error = self._last_error
-
-        with self.peer_lock:
-            peers_known = sum(1 for p in self.peers.values() if p.alive)
-
-        eta_s = None
-        eta_str = "sincronizado"
-        if not synced and syncing:
-            eta_str = "calculando..."
-
-        return {
-            "synced": synced,
-            "syncing": syncing,
-            "forking": forking,
-            "progress": round(progress, 2),
-            "local_height": local_h,
-            "target_height": target_h,
-            "eta_segundos": eta_s,
-            "eta_legivel": eta_str,
-            "active_peer": active_peer,
-            "peers_known": peers_known,
-            "reorgs_total": reorgs,
-            "last_reorg_height": last_reorg,
-            "last_error": last_error,
-        }
+    def set_sync_mode(self, mode: str) -> None:
+        if mode not in ("full", "pull", "off"):
+            log.warning("sync_mode invalido: %s", mode)
+            return
+        self._mode = mode
+        log.info("sync_mode = %s", mode)
 
     # ============================================================
     # LOOP PRINCIPAL
@@ -196,29 +143,26 @@ class ChainSyncManager:
                 break
 
     def _sync_once(self) -> None:
+        if not _HAS_REQUESTS:
+            return
+
         self._refresh_peer_list()
 
         best = self._probe_peers()
         if best is None:
-            with self._state_lock:
-                self._current_target = self._safe_height()
-                self._current_progress = 100.0
-                self._syncing = False
             return
 
         local_h = self._safe_height()
         if best.height <= local_h:
             with self._state_lock:
                 self._current_target = best.height
-                self._current_progress = 100.0
-                self._syncing = False
                 self._active_peer = None
+                self._last_error = ""
             return
 
         with self._state_lock:
             self._syncing = True
             self._active_peer = best.addr
-            self._current_local = local_h
             self._current_target = best.height
 
         try:
@@ -231,29 +175,52 @@ class ChainSyncManager:
     # PEERS
     # ============================================================
     def _refresh_peer_list(self) -> None:
-        try:
-            addrs = list(self.p2p.discovery.listar_peers() or [])
-        except Exception as e:
-            log.debug("listar_peers falhou: %s", e)
-            return
+        addrs = set()
 
-        now = time.time()
+        # 1. bootstrap_peers.json
+        try:
+            bp = BASE_DIR / "bootstrap_peers.json"
+            if bp.exists():
+                data = json.loads(bp.read_text(encoding="utf-8-sig"))
+                if isinstance(data, list):
+                    for x in data:
+                        x = str(x).strip()
+                        if x:
+                            addrs.add(x)
+                elif isinstance(data, dict):
+                    for x in data.get("peers", []):
+                        x = str(x).strip()
+                        if x:
+                            addrs.add(x)
+        except Exception as e:
+            log.debug("bootstrap_peers.json: %s", e)
+
+        # 2. Env var
+        for p in os.environ.get("BRN_BOOTSTRAP_PEERS", "").split(","):
+            p = p.strip()
+            if p:
+                addrs.add(p)
+
+        # 3. p2p.discovery (se disponível, como fallback)
+        if self.p2p is not None:
+            try:
+                disc = getattr(self.p2p, "discovery", None)
+                if disc and hasattr(disc, "listar_peers"):
+                    for x in disc.listar_peers() or []:
+                        x = str(x).strip()
+                        if x:
+                            addrs.add(x)
+            except Exception:
+                pass
+
         with self.peer_lock:
             for addr in addrs:
                 if not addr or ":" not in addr:
                     continue
                 if addr not in self.peers:
                     self.peers[addr] = PeerStatus(addr=addr)
-            dead = [
-                a for a, p in self.peers.items()
-                if p.last_seen > 0 and (now - p.last_seen) > PEER_STALE_S * 2
-            ]
-            for a in dead:
-                del self.peers[a]
 
     def _probe_peers(self) -> Optional[PeerStatus]:
-        from p2p_unified import P2PClient
-
         with self.peer_lock:
             addrs = list(self.peers.keys())
 
@@ -261,38 +228,48 @@ class ChainSyncManager:
         for addr in addrs:
             if ":" not in addr:
                 continue
-            try:
-                ip, port_s = addr.rsplit(":", 1)
-                port = int(port_s)
-            except ValueError:
-                continue
+            ip = addr.rpartition(":")[0]
 
             try:
-                resp, _ = P2PClient.get_chain_height(
-                    ip, port, timeout=PEER_TIMEOUT,
+                r = requests.get(
+                    f"http://{ip}:{HTTP_PORT}/api/chain-info",
+                    timeout=PEER_HTTP_TIMEOUT,
+                    proxies={"http": None, "https": None},
+                    headers={"User-Agent": "brn-sync/2.0"},
                 )
+                if r.status_code != 200:
+                    with self.peer_lock:
+                        p = self.peers.get(addr)
+                        if p:
+                            p.failures += 1
+                            p.last_error = f"HTTP {r.status_code}"
+                    continue
+
+                data = r.json()
+                height = int(data.get("height", -1))
+                tip = str(data.get("tip_hash", ""))
+                work = int(data.get("cumulative_work", 0) or 0)
+
+                with self.peer_lock:
+                    p = self.peers.get(addr)
+                    if p:
+                        p.height = height
+                        p.tip_hash = tip
+                        p.work = work
+                        p.last_seen = time.time()
+                        p.failures = 0
+                        p.last_error = ""
+
+                if height >= 0:
+                    if best is None or height > best.height:
+                        best = self.peers.get(addr)
             except Exception as e:
                 with self.peer_lock:
                     p = self.peers.get(addr)
                     if p:
                         p.failures += 1
-                        p.last_error = str(e)
+                        p.last_error = str(e)[:80]
                 continue
-
-            if not resp:
-                with self.peer_lock:
-                    p = self.peers.get(addr)
-                    if p:
-                        p.failures += 1
-                continue
-
-            with self.peer_lock:
-                p = self.peers.get(addr)
-                if p is None:
-                    continue
-                p.update_from_chain_height(resp)
-                if best is None or p.height > best.height:
-                    best = p
 
         return best
 
@@ -300,158 +277,75 @@ class ChainSyncManager:
     # SINCRONIZAÇÃO
     # ============================================================
     def _sync_from_peer(self, peer: PeerStatus) -> None:
-        from p2p_unified import P2PClient
-
-        try:
-            ip, port_s = peer.addr.rsplit(":", 1)
-            port = int(port_s)
-        except ValueError:
-            return
-
+        ip = peer.addr.rpartition(":")[0]
         target_h = peer.height
-        applied = 0
-        reorg_count = 0
+        cursor = self._safe_height() + 1
+        imported = 0
         t0 = time.time()
 
-        cursor = self._safe_height() + 1
+        if cursor > target_h:
+            return
+
+        log.info("sync %s: baixando %d-%d", peer.addr, cursor, target_h)
+
         while cursor <= target_h and not self._stop.is_set():
             end = min(cursor + SYNC_BATCH, target_h + 1)
-            try:
-                resp, _ = P2PClient.get_blocks_range(
-                    ip, port, cursor, end,
-                    timeout=PEER_TIMEOUT * 2,
-                )
-            except Exception as e:
-                with self._state_lock:
-                    self._last_error = f"get_blocks_range: {e}"
-                return
 
-            if not resp or "blocks" not in resp:
-                with self._state_lock:
-                    self._last_error = "resposta invalida (sem blocks)"
-                return
-
-            lote = resp.get("blocks") or []
-            if not lote:
-                break
-
-            reorg_triggered = False
-            for blk in lote:
+            blocks = None
+            for attempt in range(MAX_RETRIES):
                 if self._stop.is_set():
                     return
-                h = blk.get("height", -1)
-                current_h = self._safe_height()
-                if h <= current_h:
-                    continue  # já temos
-                if h != current_h + 1:
-                    if self._mode == "full" and self._try_reorg(ip, port, peer):
-                        reorg_triggered = True
+                try:
+                    r = requests.get(
+                        f"http://{ip}:{HTTP_PORT}/api/blocks"
+                        f"?start={cursor}&limit={SYNC_BATCH}",
+                        timeout=30,
+                        proxies={"http": None, "https": None},
+                        headers={"User-Agent": "brn-sync/2.0"},
+                    )
+                    if r.status_code == 200:
+                        blocks = r.json().get("blocks", [])
                         break
-                    with self._state_lock:
-                        self._last_error = (
-                            f"bloco fora de ordem: recebido #{h}, "
-                            f"esperado #{current_h + 1}"
-                        )
-                    return
+                    log.debug("batch %d-%d HTTP %d", cursor, end, r.status_code)
+                except Exception as e:
+                    log.debug("batch %d-%d tentativa %d: %s",
+                              cursor, end, attempt + 1, e)
+                time.sleep(1)
 
+            if not blocks:
+                log.warning("falha ao baixar batch %d-%d de %s",
+                            cursor, end, peer.addr)
+                with self._state_lock:
+                    self._last_error = f"batch {cursor}-{end} falhou"
+                return
+
+            for blk in blocks:
+                if self._stop.is_set():
+                    return
                 try:
                     ok, msg = self.chain.accept_block(blk)
                 except Exception as e:
                     ok, msg = False, str(e)
-
                 if not ok:
-                    if self._mode == "full" and self._try_reorg(ip, port, peer):
-                        reorg_triggered = True
-                        break
+                    log.warning("bloco #%s rejeitado: %s",
+                                blk.get("height"), msg)
                     with self._state_lock:
-                        self._last_error = f"#{h}: {msg}"
+                        self._last_error = f"#{blk.get('height')}: {msg}"
                     return
+                imported += 1
 
-                applied += 1
+            cursor = end
 
-            if reorg_triggered:
-                reorg_count += 1
-                if reorg_count > MAX_REORGS_PER_SYNC:
-                    with self._state_lock:
-                        self._last_error = (
-                            f"mais de {MAX_REORGS_PER_SYNC} reorgs no mesmo sync"
-                        )
-                    return
-                cursor = self._safe_height() + 1
-            else:
-                cursor = end
+            # Log de progresso
+            elapsed = time.time() - t0
+            if elapsed > 0:
+                rate = imported / elapsed
+                pct = (cursor - 1) / target_h * 100 if target_h > 0 else 100
+                if imported % 500 == 0 or cursor > target_h:
+                    log.info("sync %s: %d/%d (%.1f%%) — %.0f bl/s",
+                             peer.addr, cursor - 1, target_h, pct, rate)
 
-            with self._state_lock:
-                self._current_local = self._safe_height()
-                if target_h > 0:
-                    self._current_progress = min(
-                        100.0,
-                        (self._current_local / target_h) * 100.0,
-                    )
-
-        with self._state_lock:
-            self._current_progress = 100.0
-            self._current_local = self._safe_height()
-            self._current_target = target_h
-            self._active_peer = None
-
-        if applied > 0:
-            log.info(
-                "sync OK: +%d blocos em %.1fs (h=%d, peer=%s)",
-                applied, time.time() - t0,
-                self._safe_height(), peer.addr,
-            )
-
-    # ============================================================
-    # REORG
-    # ============================================================
-    def _try_reorg(self, ip: str, port: int, peer: PeerStatus) -> bool:
-        if self._mode != "full":
-            return False
-
-        try:
-            from reorg import reorg_to
-            from p2p_unified import P2PClient
-        except ImportError:
-            return False
-
-        with self._state_lock:
-            self._forking = True
-        log.warning("tentando reorg com %s", peer.addr)
-
-        try:
-            local_h = self._safe_height()
-            # Baixa no máximo REORG_MAX_DEPTH*2 + 50 blocos para trás
-            start = max(0, local_h - REORG_MAX_DEPTH * 2 - 50)
-            resp, _ = P2PClient.get_blocks_range(
-                ip, port, start, peer.height + 1,
-                timeout=PEER_TIMEOUT * 3,
-            )
-            if not resp or "blocks" not in resp:
-                return False
-
-            result = reorg_to(
-                self.chain, resp["blocks"],
-                max_depth=REORG_MAX_DEPTH,
-            )
-            ok, msg = result.to_tuple()
-            if ok:
-                with self._state_lock:
-                    self._reorgs_total += 1
-                    self._last_reorg_height = int(
-                        getattr(result, "fork_height", -1)
-                    )
-                log.warning("reorg OK: %s", msg)
-                return True
-
-            log.warning("reorg falhou: %s", msg)
-            return False
-        except Exception as e:
-            log.exception("reorg exception: %s", e)
-            return False
-        finally:
-            with self._state_lock:
-                self._forking = False
+        log.info("sync %s: +%d blocos (h=%d)", peer.addr, imported, self._safe_height())
 
     # ============================================================
     # HELPERS
@@ -461,3 +355,28 @@ class ChainSyncManager:
             return int(self.chain.db.height())
         except Exception:
             return -1
+
+    def get_status(self) -> dict:
+        local_h = self._safe_height()
+        with self._state_lock:
+            target_h = max(self._current_target, local_h)
+            if target_h > 0:
+                progress = min(100.0, (local_h / target_h) * 100.0)
+            else:
+                progress = 100.0
+            synced = local_h >= target_h
+            return {
+                "synced": synced,
+                "syncing": self._syncing,
+                "forking": self._forking,
+                "progress": round(progress, 2),
+                "local_height": local_h,
+                "target_height": target_h,
+                "eta_segundos": None,
+                "eta_legivel": "sincronizado" if synced else "sincronizando...",
+                "active_peer": self._active_peer,
+                "peers_known": len(self.peers),
+                "reorgs_total": self._reorgs_total,
+                "last_reorg_height": self._last_reorg_height,
+                "last_error": self._last_error,
+            }
