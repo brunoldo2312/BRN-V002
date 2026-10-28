@@ -1,10 +1,10 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.7.2)
+"""main.py — Entrypoint unificado do nó BRN (v13.7.3)
 ================================================================
-v13.7.2 (2026-10-28):
-  [NEW] Auto-registro P2P de validadores:
-        - Ao carregar a Validator SK, o nó chama
-          p2p.broadcast_validator_registration() para avisar
-          todos os peers que ele é um validador.
+v13.7.3 (2026-10-28):
+  [NEW] Migração do servidor HTTP para FastAPI + Uvicorn.
+        - O Flask legado é montado dentro do FastAPI via WSGIMiddleware.
+        - O Uvicorn gerencia o event loop (usando uvloop no Linux).
+        - Resolve gargalos de concorrência e timeouts na GUI.
 ================================================================
 """
 from __future__ import annotations
@@ -19,6 +19,7 @@ import json
 import subprocess
 import urllib.request
 from pathlib import Path
+
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -41,6 +42,9 @@ def _bootstrap_env() -> None:
         print("[boot] aviso: falha lendo " + str(env_file) + ": " + str(e))
 
 
+# ============================================================
+# [SECURITY] APENAS defaults NÃO-SENSÍVEIS
+# ============================================================
 _HARDCODED_DEFAULTS = {
     "BRN_BOOTSTRAP_PEERS":     "",
     "BRN_IS_ORIGIN":           "0",
@@ -144,6 +148,7 @@ def _check_required_modules() -> list:
         "secure_store", "chain_validator", "checkpoints",
         "p2p_auth", "p2p_cipher", "p2p_secure", "p2p_unified",
         "discovery_v2", "miner_loop", "trust_network",
+        "server_fastapi", "fastapi", "uvicorn"
     ]
     missing = []
     for m in required:
@@ -562,9 +567,10 @@ def _inject_into_server(what: str, obj, log) -> bool:
 # ============================================================
 def _init_http_server(chain, log):
     try:
-        from server import app as http_app, set_chain, auto_registrar_carteira_atual
+        from server import set_chain, auto_registrar_carteira_atual
+        from server_fastapi import app as http_app
     except Exception as e:
-        log.error("Falha importando server.py: " + str(e))
+        log.error("Falha importando servidores (Flask/FastAPI): " + str(e))
         return None
     try:
         set_chain(chain)
@@ -586,22 +592,24 @@ def _init_http_server(chain, log):
 def run_http(app_instance):
     log = get_logger("http")
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    ssl_ctx = None
-    if os.environ.get("BRN_HTTPS", "0") == "1":
+    
+    try:
+        import uvicorn
+        log.info(f"HTTP Uvicorn (FastAPI) - http://{WEB_HOST}:{port}")
+        uvicorn.run(
+            app_instance, 
+            host=WEB_HOST, 
+            port=port, 
+            log_level="warning",
+            proxy_headers=True
+        )
+    except ImportError:
+        log.warning("Uvicorn nao instalado. Caindo para Waitress...")
         try:
-            from security import ensure_self_signed_cert
-            cert, key = ensure_self_signed_cert()
-            ssl_ctx = (cert, key)
-            log.info("HTTPS https://" + WEB_HOST + ":" + str(port))
-        except Exception as e:
-            log.warning("Falha ao gerar cert HTTPS: " + str(e) + ". Caindo para HTTP.")
-            ssl_ctx = None
-    if ssl_ctx is None:
-        log.info("HTTP http://" + WEB_HOST + ":" + str(port))
-    app_instance.run(
-        host=WEB_HOST, port=port, threaded=True,
-        debug=False, use_reloader=False, ssl_context=ssl_ctx,
-    )
+            from waitress import serve
+            serve(app_instance, host=WEB_HOST, port=port, threads=256)
+        except ImportError:
+            app_instance.run(host=WEB_HOST, port=port, threaded=True)
 
 
 def run_explorer():
