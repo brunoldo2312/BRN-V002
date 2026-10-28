@@ -1,10 +1,20 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.7.3)
+"""main.py — Entrypoint unificado do nó BRN (v13.7.4)
 ================================================================
-v13.7.3 (2026-10-28):
-  [NEW] Migração do servidor HTTP para FastAPI + Uvicorn.
-        - O Flask legado é montado dentro do FastAPI via WSGIMiddleware.
-        - O Uvicorn gerencia o event loop (usando uvloop no Linux).
-        - Resolve gargalos de concorrência e timeouts na GUI.
+v13.7.4 (2026-10-28):
+  [FIX] broadcast_validator_registration agora é safe-call. Antes,
+        a chamada direta a p2p.broadcast_validator_registration(...)
+        caía em AttributeError silenciosamente (método não existia
+        no p2p_unified.py v6.7.1). Agora tenta chamar o método se
+        existir; se não existir, loga um INFO informativo.
+  [NEW] BRN_FORCE_HEADLESS=1 força headless mesmo se config.json
+        ou --gui estiverem setados. Útil para CI e automação.
+  [NEW] BRN_UVICORN_WORKERS controla o número de processos Uvicorn
+        (default 1). Com >1, usa a string de import (exigência do
+        Uvicorn para multiprocessing).
+  [KEEP] Migração Flask→FastAPI via WSGIMiddleware.
+  [KEEP] ForkGuard, SyncManager, PoolManager, PoolClient, TrustNet.
+  [KEEP] Compatível com crypto.py v3.0 (Schnorr BIP-340) sem mudanças
+        no main.py — a troca é transparente via wallet.py.
 ================================================================
 """
 from __future__ import annotations
@@ -68,6 +78,8 @@ _HARDCODED_DEFAULTS = {
     "BRN_POOL_ENABLED":        "1",
     "BRN_POOL_URL_LOCAL":      "http://127.0.0.1:5000",
     "BRN_WEB_PASS":            "",
+    "BRN_FORCE_HEADLESS":      "0",
+    "BRN_UVICORN_WORKERS":     "1",
 }
 
 
@@ -592,17 +604,36 @@ def _init_http_server(chain, log):
 def run_http(app_instance):
     log = get_logger("http")
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    
+
+    try:
+        workers = max(1, int(os.environ.get("BRN_UVICORN_WORKERS", "1")))
+    except (TypeError, ValueError):
+        workers = 1
+
     try:
         import uvicorn
-        log.info(f"HTTP Uvicorn (FastAPI) - http://{WEB_HOST}:{port}")
-        uvicorn.run(
-            app_instance, 
-            host=WEB_HOST, 
-            port=port, 
-            log_level="warning",
-            proxy_headers=True
-        )
+
+        if workers > 1:
+            # Multiprocessing exige string de import (não o objeto)
+            log.info(f"HTTP Uvicorn (FastAPI, {workers} workers) - "
+                     f"http://{WEB_HOST}:{port}")
+            uvicorn.run(
+                "server_fastapi:app",
+                host=WEB_HOST,
+                port=port,
+                workers=workers,
+                log_level="warning",
+                proxy_headers=True,
+            )
+        else:
+            log.info(f"HTTP Uvicorn (FastAPI) - http://{WEB_HOST}:{port}")
+            uvicorn.run(
+                app_instance,
+                host=WEB_HOST,
+                port=port,
+                log_level="warning",
+                proxy_headers=True,
+            )
     except ImportError:
         log.warning("Uvicorn nao instalado. Caindo para Waitress...")
         try:
@@ -882,6 +913,10 @@ def main():
     if args.log_file:
         cfg.data["log_file"] = args.log_file
 
+    # [NEW v13.7.4] Força headless via env var (útil para automação/CI)
+    if os.environ.get("BRN_FORCE_HEADLESS", "0") == "1":
+        cfg.data["headless"] = True
+
     cfg.apply_to_env()
     log = setup_logger(level=cfg["log_level"],
                        log_file=cfg["log_file"] or None)
@@ -1034,12 +1069,26 @@ def main():
             chain.set_local_validator_sk(validator_sk)
             log.info(f"Validator SK carregada: {validator_sk.pub_hex[:16]}...")
 
-            # [NOVO v13.7.2] Auto-registro P2P: Avisa a rede que somos validadores
+            # [FIX v13.7.4] safe-call: só chama se o método existir.
+            # Antes a chamada direta caía em AttributeError silencioso
+            # (o método não existe no p2p_unified.py v6.7.1).
             if p2p is not None:
-                p2p.broadcast_validator_registration(
-                    pubkey=validator_sk.pub_hex,
-                    address=validator_sk.address
-                )
+                try:
+                    if hasattr(p2p, "broadcast_validator_registration"):
+                        p2p.broadcast_validator_registration(
+                            pubkey=validator_sk.pub_hex,
+                            address=validator_sk.address,
+                        )
+                        log.info("Auto-registro P2P: announce_validator enviado")
+                    else:
+                        log.info(
+                            "Auto-registro P2P: broadcast_validator_registration "
+                            "não implementado em P2PManager (opcional)"
+                        )
+                except Exception as e:
+                    log.warning(
+                        "Auto-registro P2P falhou (não é fatal): " + str(e)
+                    )
 
         except AttributeError:
             chain._local_validator_sk = validator_sk
