@@ -1,67 +1,179 @@
-"""db.py — Banco SQLite do BRN (v6.8)
+"""db.py — Banco SQLite do BRN (v7.0 - Writer Queue + Batch Commits)
 ================================================================
-v6.8 (2026-10-27):
-  [FIX CRÍTICO] contract_spend() agora é FAIL-CLOSED por default.
-                Antes, criava/gastava UTXOs diretamente no banco
-                sem passar por validate_tx, sem assinatura Ed25519,
-                sem apply_tx transacional e sem auth tag. Resultado:
-                bypass completo de consenso. Se exposto via qualquer
-                endpoint (ou via contracts.py em produção), estado
-                da cadeia divergia silenciosamente — chain_validator
-                não detectava porque o saldo estava no banco mas
-                não havia tx correspondente em transactions.
-                Agora exige BRN_ALLOW_CONTRACT_SPEND=1 explícito.
-                Uso pretendido: apenas testes locais.
-  [FIX] delete_blocks_above() agora também limpa transactions.raw
-        (antes só apagava em blocks; transactions ficava órfã).
-  [NEW] __version__ = "6.8", docstrings em métodos-chave.
-  [KEEP] v6.7: proteção contra raw NULL e zlib corrompido.
-  [KEEP] v6.6: busy_timeout=30000, locks em leitura crítica.
-  [KEEP] Todas as APIs preservadas (assinaturas idênticas a v6.7).
-v6.7:
-  [FIX CRÍTICO] Blindagem contra blocos/transações corrompidos.
-v6.6:
-  [FIX] PRAGMA busy_timeout=30000
-  [FIX] locks em utxos_gastos_na_mempool e all_mempool
+v7.0 (2026-10-28):
+  [PERF] WRITER QUEUE: escritas vão para uma fila processada por
+         uma única thread dedicada. Threads chamadoras apenas
+         enfileiram e aguardam o resultado (Future). Elimina
+         'database is locked' na camada de aplicação.
+  [PERF] BATCH COMMITS: dentro da thread writer, operações
+         consecutivas (batch-safe) são agrupadas em uma única
+         transação. Reduz drasticamente as sincronizações com disco.
+  [PERF] PRAGMAs: synchronous=NORMAL, cache_size=-64000,
+         busy_timeout=5000, mmap_size=256MB.
+  [KEEP] Todas as APIs públicas existentes (assinaturas idênticas).
+  [KEEP] WAL, isolation_level=None, RLock de leitura.
 ================================================================
 """
 from __future__ import annotations
 
-__version__ = "6.8"
+__version__ = "7.0"
 
 import os
 import time
 import zlib
 import sqlite3
 import threading
+import queue
+import concurrent.futures
 import orjson
 import json
+import logging
 
+log = logging.getLogger("db")
 
-# ============================================================
-# FEATURE FLAG — contract_spend
-# ============================================================
-# Não use em produção. contract_spend() NÃO cria tx assinada; só
-# manipula UTXOs. Ligar em produção = bypass de consenso.
 _ALLOW_CONTRACT_SPEND = os.environ.get("BRN_ALLOW_CONTRACT_SPEND", "0") == "1"
+
+# Batch config
+_BATCH_MAX_OPS      = int(os.environ.get("BRN_DB_BATCH_MAX", "50"))
+_BATCH_MAX_WAIT_MS  = int(os.environ.get("BRN_DB_BATCH_WAIT_MS", "100"))
+_QUEUE_MAX          = int(os.environ.get("BRN_DB_QUEUE_MAX", "2000"))
+_QUEUE_PUT_TIMEOUT  = float(os.environ.get("BRN_DB_QUEUE_PUT_TIMEOUT", "5.0"))
+_FUTURE_TIMEOUT     = float(os.environ.get("BRN_DB_FUTURE_TIMEOUT", "60.0"))
+
+
+class _WriteOp:
+    """Uma operação de escrita enfileirada."""
+    __slots__ = ("fn", "args", "kwargs", "batch_safe", "future")
+
+    def __init__(self, fn, args, kwargs, batch_safe):
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+        self.batch_safe = batch_safe
+        self.future = concurrent.futures.Future()
 
 
 class ChainDB:
     def __init__(self, path: str):
         self.path = path
-        self.conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self.conn = sqlite3.connect(
+            path, check_same_thread=False, isolation_level=None,
+        )
         self.conn.row_factory = sqlite3.Row
         self.lock = threading.RLock()
 
-        # busy_timeout para evitar travamentos de escrita concorrente
-        for p in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL",
-                  "PRAGMA temp_store=MEMORY", "PRAGMA cache_size=-20000",
-                  "PRAGMA mmap_size=268435456", "PRAGMA foreign_keys=ON",
-                  "PRAGMA busy_timeout=30000"):
+        # PRAGMAs otimizados
+        for p in (
+            "PRAGMA journal_mode=WAL",
+            "PRAGMA synchronous=NORMAL",
+            "PRAGMA temp_store=MEMORY",
+            "PRAGMA cache_size=-64000",
+            "PRAGMA mmap_size=268435456",
+            "PRAGMA foreign_keys=ON",
+            "PRAGMA busy_timeout=5000",
+        ):
             self.conn.execute(p)
 
         self._schema()
-        self._migrate_raw_txs()
+        self._migrate_raw_txs()  # síncrono no init, antes do writer
+
+        # Fila de escrita + thread dedicada
+        self._write_queue: queue.Queue = queue.Queue(maxsize=_QUEUE_MAX)
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop, daemon=True, name="DB-Writer",
+        )
+        self._writer_thread.start()
+
+    # ============================================================
+    # FILA DE ESCRITA
+    # ============================================================
+    def _enqueue(self, fn, *args, batch_safe: bool = False, **kwargs):
+        op = _WriteOp(fn, args, kwargs, batch_safe)
+        try:
+            self._write_queue.put(op, timeout=_QUEUE_PUT_TIMEOUT)
+        except queue.Full:
+            raise RuntimeError(
+                f"DB write queue cheia ({_QUEUE_MAX}); sistema sobrecarregado."
+            )
+        return op.future.result(timeout=_FUTURE_TIMEOUT)
+
+    def _writer_loop(self) -> None:
+        """Consome a fila, agrupando operações batch-safe em transações."""
+        while True:
+            try:
+                first = self._write_queue.get()
+            except Exception:
+                continue
+            if first is None:
+                return  # sentinel de shutdown
+
+            batch = [first]
+            # Tenta pegar mais rápido (até max ou até timeout curto)
+            deadline = time.time() + (_BATCH_MAX_WAIT_MS / 1000.0)
+            while len(batch) < _BATCH_MAX_OPS:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                try:
+                    op = self._write_queue.get(timeout=remaining)
+                    if op is None:
+                        batch.append(None)
+                        break
+                    batch.append(op)
+                except queue.Empty:
+                    break
+
+            shutdown = None in batch
+            ops = [op for op in batch if op is not None]
+            try:
+                self._execute_ops(ops)
+            except Exception as e:
+                log.error(f"DB writer falhou: {e}")
+            if shutdown:
+                return
+
+    def _execute_ops(self, ops: list) -> None:
+        """Agrupa batch-safe consecutivos; executa não-safe individualmente."""
+        batch = []
+        for op in ops:
+            if op.batch_safe:
+                batch.append(op)
+            else:
+                if batch:
+                    self._flush_batch(batch)
+                    batch = []
+                self._exec_one(op)
+        if batch:
+            self._flush_batch(batch)
+
+    def _flush_batch(self, batch: list) -> None:
+        """Executa várias ops em UMA transação."""
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            for op in batch:
+                try:
+                    result = op.fn(*op.args, **op.kwargs)
+                    op.future.set_result(result)
+                except Exception as e:
+                    op.future.set_exception(e)
+                    raise  # aborta batch inteiro
+            self.conn.execute("COMMIT")
+        except Exception as e:
+            try:
+                self.conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            # Fallback: re-executa individualmente as que não foram resolvidas
+            for op in batch:
+                if not op.future.done():
+                    self._exec_one(op)
+
+    def _exec_one(self, op: _WriteOp) -> None:
+        try:
+            result = op.fn(*op.args, **op.kwargs)
+            op.future.set_result(result)
+        except Exception as e:
+            op.future.set_exception(e)
 
     # ============================================================
     # SCHEMA
@@ -189,14 +301,16 @@ class ChainDB:
                 pass
 
     # ============================================================
-    # BACKFILL AUTOMÁTICO
+    # BACKFILL (síncrono no init)
     # ============================================================
     def _migrate_raw_txs(self):
         if os.environ.get("BRN_SKIP_RAW_BACKFILL", "0") == "1":
             return
         try:
             with self.lock:
-                n_null = self.conn.execute("SELECT COUNT(*) AS c FROM transactions WHERE raw IS NULL").fetchone()["c"]
+                n_null = self.conn.execute(
+                    "SELECT COUNT(*) AS c FROM transactions WHERE raw IS NULL"
+                ).fetchone()["c"]
         except Exception:
             return
         if not n_null:
@@ -204,7 +318,9 @@ class ChainDB:
         print(f"[db] backfill: {n_null} tx antigas sem raw — migrando...")
         try:
             with self.lock:
-                rows = self.conn.execute("SELECT DISTINCT block_height FROM transactions WHERE raw IS NULL ORDER BY block_height").fetchall()
+                rows = self.conn.execute(
+                    "SELECT DISTINCT block_height FROM transactions WHERE raw IS NULL ORDER BY block_height"
+                ).fetchall()
                 heights = [r["block_height"] for r in rows]
         except Exception:
             return
@@ -212,7 +328,6 @@ class ChainDB:
             return
         total = len(heights)
         done = 0
-        t0 = time.time()
         for h in heights:
             try:
                 blk = self.get_block(h)
@@ -223,7 +338,10 @@ class ChainDB:
                     try:
                         for tx in blk["transactions"]:
                             blob = zlib.compress(orjson.dumps(tx), level=6)
-                            self.conn.execute("UPDATE transactions SET raw=? WHERE txid=? AND raw IS NULL", (blob, tx["txid"]))
+                            self.conn.execute(
+                                "UPDATE transactions SET raw=? WHERE txid=? AND raw IS NULL",
+                                (blob, tx["txid"]),
+                            )
                         self.conn.execute("COMMIT")
                     except Exception:
                         self.conn.execute("ROLLBACK")
@@ -231,40 +349,42 @@ class ChainDB:
             except Exception:
                 continue
             done += 1
-            if done % 500 == 0 or done == total:
-                dt = time.time() - t0
-                rate = done / dt if dt > 0 else 0.0
-                print(f"[db] backfill: {done}/{total} blocos ({rate:.0f} blocos/s)")
         print(f"[db] backfill concluído: {done}/{total} blocos")
 
     # ============================================================
-    # BLOCOS
+    # BLOCOS (escrita via fila; leitura síncrona)
     # ============================================================
     def add_block(self, block):
-        """Insere bloco + suas txs numa única transação."""
+        """Insere bloco + suas txs numa única transação. Não-batch-safe."""
+        return self._enqueue(self._add_block_impl, block, batch_safe=False)
+
+    def _add_block_impl(self, block):
         with self.lock:
             self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
             try:
                 blob = zlib.compress(orjson.dumps(block), level=6)
                 self.conn.execute(
-                    "INSERT INTO blocks(height,hash,prev_hash,timestamp,nonce,merkle,difficulty,raw) VALUES (?,?,?,?,?,?,?,?)",
-                    (block["height"], block["hash"], block["prev_hash"], block["timestamp"], block["nonce"], block["merkle"], block["difficulty"], blob))
+                    "INSERT INTO blocks(height,hash,prev_hash,timestamp,nonce,merkle,difficulty,raw) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (block["height"], block["hash"], block["prev_hash"],
+                     block["timestamp"], block["nonce"], block["merkle"],
+                     block["difficulty"], blob),
+                )
                 for tx in block["transactions"]:
                     tx_blob = zlib.compress(orjson.dumps(tx), level=6)
-                    self.conn.execute("INSERT OR REPLACE INTO transactions(txid,block_height,raw) VALUES (?,?,?)", (tx["txid"], block["height"], tx_blob))
+                    self.conn.execute(
+                        "INSERT OR REPLACE INTO transactions(txid,block_height,raw) VALUES (?,?,?)",
+                        (tx["txid"], block["height"], tx_blob),
+                    )
                 self.conn.execute("COMMIT")
             except Exception:
                 self.conn.execute("ROLLBACK")
                 raise
 
     def delete_blocks_above(self, height):
-        """
-        Remove blocos, txs e utxos acima de `height`.
+        return self._enqueue(self._delete_blocks_above_impl, height, batch_safe=True)
 
-        [FIX v6.8] Agora limpa transactions.raw também (a query anterior
-        já apagava por block_height; mantido o comportamento, mas agora
-        a operação é explícita e simétrica com blocks).
-        """
+    def _delete_blocks_above_impl(self, height):
         with self.lock:
             n = self.conn.execute("DELETE FROM blocks WHERE height > ?", (height,)).rowcount
             self.conn.execute("DELETE FROM transactions WHERE block_height > ?", (height,))
@@ -272,7 +392,6 @@ class ChainDB:
             return n
 
     def get_block(self, height):
-        """[v6.7] Protegido contra raw NULL e zlib corrompido."""
         row = self.conn.execute("SELECT raw FROM blocks WHERE height=?", (height,)).fetchone()
         if not row or row["raw"] is None:
             return None
@@ -282,7 +401,6 @@ class ChainDB:
             return None
 
     def get_block_by_hash(self, h):
-        """[v6.7] Protegido contra raw NULL e zlib corrompido."""
         row = self.conn.execute("SELECT raw FROM blocks WHERE hash=?", (h,)).fetchone()
         if not row or row["raw"] is None:
             return None
@@ -292,8 +410,10 @@ class ChainDB:
             return None
 
     def get_blocks_range(self, start, end):
-        """[v6.7] Protegido contra raw NULL e zlib corrompido."""
-        rows = self.conn.execute("SELECT raw FROM blocks WHERE height >= ? AND height < ? ORDER BY height", (start, end)).fetchall()
+        rows = self.conn.execute(
+            "SELECT raw FROM blocks WHERE height >= ? AND height < ? ORDER BY height",
+            (start, end),
+        ).fetchall()
         result = []
         for r in rows:
             if r["raw"] is not None:
@@ -316,21 +436,28 @@ class ChainDB:
         return t["hash"] if t else "0" * 64
 
     def headers(self, start, limit=2000):
-        rows = self.conn.execute("SELECT height,hash,prev_hash,timestamp,nonce,merkle,difficulty FROM blocks WHERE height>=? ORDER BY height LIMIT ?", (start, limit)).fetchall()
+        rows = self.conn.execute(
+            "SELECT height,hash,prev_hash,timestamp,nonce,merkle,difficulty "
+            "FROM blocks WHERE height>=? ORDER BY height LIMIT ?",
+            (start, limit),
+        ).fetchall()
         return [dict(r) for r in rows]
 
     def latest_blocks(self, n=10):
         top = self.height()
-        if top < 0: return []
+        if top < 0:
+            return []
         return [b for b in (self.get_block(h) for h in range(max(0, top - n + 1), top + 1)) if b]
 
     # ============================================================
     # TX LOOKUP
     # ============================================================
     def get_tx_by_txid(self, txid: str):
-        """[v6.7] Protegido contra raw NULL e zlib corrompido."""
         try:
-            row = self.conn.execute("SELECT raw, block_height FROM transactions WHERE txid = ? LIMIT 1", (txid,)).fetchone()
+            row = self.conn.execute(
+                "SELECT raw, block_height FROM transactions WHERE txid = ? LIMIT 1",
+                (txid,),
+            ).fetchone()
             if not row or row["raw"] is None:
                 return None, None
             return orjson.loads(zlib.decompress(row["raw"])), row["block_height"]
@@ -339,34 +466,41 @@ class ChainDB:
 
     def get_tx_block_height(self, txid: str) -> int:
         try:
-            row = self.conn.execute("SELECT block_height FROM transactions WHERE txid = ? LIMIT 1", (txid,)).fetchone()
+            row = self.conn.execute(
+                "SELECT block_height FROM transactions WHERE txid = ? LIMIT 1", (txid,),
+            ).fetchone()
             return int(row["block_height"]) if row else -1
         except Exception:
             return -1
 
-    # ============================================================
-    # HISTÓRICO POR ENDEREÇO
-    # ============================================================
     def get_txs_for_address(self, address: str, limit: int = 200) -> list:
         result = []
         seen_txids = set()
 
         with self.lock:
             try:
-                rows = self.conn.execute("SELECT DISTINCT txid FROM utxos WHERE address = ? LIMIT ?", (address, limit)).fetchall()
+                rows = self.conn.execute(
+                    "SELECT DISTINCT txid FROM utxos WHERE address = ? LIMIT ?",
+                    (address, limit),
+                ).fetchall()
                 received_txids = {r["txid"] for r in rows}
             except Exception:
                 received_txids = set()
 
             try:
-                rows = self.conn.execute("SELECT DISTINCT spent_by FROM utxos WHERE address = ? AND spent_by IS NOT NULL LIMIT ?", (address, limit)).fetchall()
+                rows = self.conn.execute(
+                    "SELECT DISTINCT spent_by FROM utxos WHERE address = ? AND spent_by IS NOT NULL LIMIT ?",
+                    (address, limit),
+                ).fetchall()
                 sent_txids = {r["spent_by"] for r in rows if r["spent_by"]}
             except Exception:
                 sent_txids = set()
 
             for txid_str in (received_txids | sent_txids):
                 try:
-                    row = self.conn.execute("SELECT raw, block_height FROM transactions WHERE txid = ?", (txid_str,)).fetchone()
+                    row = self.conn.execute(
+                        "SELECT raw, block_height FROM transactions WHERE txid = ?", (txid_str,),
+                    ).fetchone()
                 except Exception:
                     continue
                 if not row or row["raw"] is None:
@@ -385,9 +519,10 @@ class ChainDB:
 
             for r in mp_rows:
                 txid_str = r["txid"]
-                if txid_str in seen_txids: continue
-                if r["raw"] is None: continue
-
+                if txid_str in seen_txids:
+                    continue
+                if r["raw"] is None:
+                    continue
                 try:
                     tx = orjson.loads(zlib.decompress(r["raw"]))
                 except Exception:
@@ -398,18 +533,20 @@ class ChainDB:
                     if o.get("address") == address:
                         touches = True
                         break
-
                 if not touches:
                     for inp in tx.get("inputs", []):
-                        if inp.get("txid") == "0" * 64: continue
+                        if inp.get("txid") == "0" * 64:
+                            continue
                         try:
-                            row_u = self.conn.execute("SELECT address FROM utxos WHERE txid = ? AND vout = ?", (inp.get("txid"), inp.get("vout"))).fetchone()
+                            row_u = self.conn.execute(
+                                "SELECT address FROM utxos WHERE txid = ? AND vout = ?",
+                                (inp.get("txid"), inp.get("vout")),
+                            ).fetchone()
                         except Exception:
                             continue
                         if row_u and row_u["address"] == address:
                             touches = True
                             break
-
                 if touches:
                     result.append({"tx": tx, "block_height": None, "is_mempool": True})
 
@@ -420,40 +557,62 @@ class ChainDB:
     # UTXO
     # ============================================================
     def balance(self, address):
-        row = self.conn.execute("SELECT COALESCE(SUM(amount),0) AS s FROM utxos WHERE address=? AND spent=0", (address,)).fetchone()
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(amount),0) AS s FROM utxos WHERE address=? AND spent=0",
+            (address,),
+        ).fetchone()
         return int(row["s"])
 
     def utxos_for(self, address):
-        rows = self.conn.execute("SELECT txid,vout,amount,pubkey FROM utxos WHERE address=? AND spent=0 ORDER BY amount DESC", (address,)).fetchall()
+        rows = self.conn.execute(
+            "SELECT txid,vout,amount,pubkey FROM utxos WHERE address=? AND spent=0 ORDER BY amount DESC",
+            (address,),
+        ).fetchall()
         return [dict(r) for r in rows]
 
     def get_utxos(self, address):
         return self.utxos_for(address)
 
     def get_utxo(self, txid, vout):
-        row = self.conn.execute("SELECT * FROM utxos WHERE txid=? AND vout=? AND spent=0", (txid, vout)).fetchone()
+        row = self.conn.execute(
+            "SELECT * FROM utxos WHERE txid=? AND vout=? AND spent=0", (txid, vout),
+        ).fetchone()
         return dict(row) if row else None
 
     def apply_tx(self, tx, height, coinbase=False):
-        """Aplica uma tx: marca inputs como gastos, cria outputs como UTXOs."""
+        """Aplica uma tx. Não-batch-safe (atômico)."""
+        return self._enqueue(self._apply_tx_impl, tx, height, coinbase, batch_safe=False)
+
+    def _apply_tx_impl(self, tx, height, coinbase=False):
         with self.lock:
             self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
             try:
                 if not coinbase:
                     for inp in tx["inputs"]:
-                        self.conn.execute("UPDATE utxos SET spent=1, spent_by=? WHERE txid=? AND vout=? AND spent=0", (tx["txid"], inp["txid"], inp["vout"]))
+                        self.conn.execute(
+                            "UPDATE utxos SET spent=1, spent_by=? WHERE txid=? AND vout=? AND spent=0",
+                            (tx["txid"], inp["txid"], inp["vout"]),
+                        )
                 for i, out in enumerate(tx["outputs"]):
-                    self.conn.execute("INSERT OR REPLACE INTO utxos(txid,vout,address,amount,pubkey,block_height,spent) VALUES (?,?,?,?,?,?,0)", (tx["txid"], i, out["address"], out["amount"], out.get("pubkey", ""), height))
+                    self.conn.execute(
+                        "INSERT OR REPLACE INTO utxos(txid,vout,address,amount,pubkey,block_height,spent) "
+                        "VALUES (?,?,?,?,?,?,0)",
+                        (tx["txid"], i, out["address"], out["amount"], out.get("pubkey", ""), height),
+                    )
                 self.conn.execute("COMMIT")
             except Exception:
                 self.conn.execute("ROLLBACK")
                 raise
 
     def rollback_block(self, height):
-        """Reverte um bloco: remove UTXOs criados e reativa inputs gastos."""
+        """Reverte um bloco. Não-batch-safe."""
+        return self._enqueue(self._rollback_block_impl, height, batch_safe=False)
+
+    def _rollback_block_impl(self, height):
         with self.lock:
             block = self.get_block(height)
-            if not block: return
+            if not block:
+                return
             self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
             try:
                 for tx in reversed(block["transactions"]):
@@ -461,8 +620,12 @@ class ChainDB:
                         self.conn.execute("DELETE FROM utxos WHERE txid=? AND vout=?", (tx["txid"], i))
                     if height > 0:
                         for inp in tx.get("inputs", []):
-                            if inp["txid"] == "0" * 64: continue
-                            self.conn.execute("UPDATE utxos SET spent=0, spent_by=NULL WHERE txid=? AND vout=?", (inp["txid"], inp["vout"]))
+                            if inp["txid"] == "0" * 64:
+                                continue
+                            self.conn.execute(
+                                "UPDATE utxos SET spent=0, spent_by=NULL WHERE txid=? AND vout=?",
+                                (inp["txid"], inp["vout"]),
+                            )
                     self.conn.execute("DELETE FROM transactions WHERE txid=?", (tx["txid"],))
                 self.conn.execute("DELETE FROM blocks WHERE height=?", (height,))
                 self.conn.execute("COMMIT")
@@ -474,36 +637,48 @@ class ChainDB:
     # NONCE
     # ============================================================
     def get_next_nonce(self, address: str) -> int:
-        row = self.conn.execute("SELECT COUNT(*) AS c FROM utxos WHERE address=? AND spent=1", (address,)).fetchone()
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM utxos WHERE address=? AND spent=1", (address,),
+        ).fetchone()
         return int(row["c"])
 
     def get_nonce_for_pubkey(self, pubkey: str) -> int:
-        row = self.conn.execute("SELECT COUNT(*) AS c FROM utxos WHERE pubkey=? AND spent=1", (pubkey,)).fetchone()
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM utxos WHERE pubkey=? AND spent=1", (pubkey,),
+        ).fetchone()
         return int(row["c"])
 
     # ============================================================
     # MEMPOOL
     # ============================================================
     def add_mempool(self, tx, fee):
-        with self.lock:
-            try:
-                self.conn.execute("INSERT INTO mempool(txid,raw,fee,received_at) VALUES (?,?,?,?)", (tx["txid"], zlib.compress(orjson.dumps(tx)), fee, time.time()))
-            except sqlite3.IntegrityError:
-                return False
-            self._prune_mempool()
-            return True
+        return self._enqueue(self._add_mempool_impl, tx, fee, batch_safe=True)
+
+    def _add_mempool_impl(self, tx, fee):
+        try:
+            self.conn.execute(
+                "INSERT INTO mempool(txid,raw,fee,received_at) VALUES (?,?,?,?)",
+                (tx["txid"], zlib.compress(orjson.dumps(tx)), fee, time.time()),
+            )
+        except sqlite3.IntegrityError:
+            return False
+        self._prune_mempool()
+        return True
 
     def _prune_mempool(self, max_size=1000, ttl=86400):
         self.conn.execute("DELETE FROM mempool WHERE received_at < ?", (time.time() - ttl,))
         n = self.conn.execute("SELECT COUNT(*) AS c FROM mempool").fetchone()["c"]
         if n > max_size:
-            self.conn.execute("DELETE FROM mempool WHERE txid IN (SELECT txid FROM mempool ORDER BY fee ASC, received_at ASC LIMIT ?)", (n - max_size,))
+            self.conn.execute(
+                "DELETE FROM mempool WHERE txid IN "
+                "(SELECT txid FROM mempool ORDER BY fee ASC, received_at ASC LIMIT ?)",
+                (n - max_size,),
+            )
 
     def has_mempool(self, txid):
         return self.conn.execute("SELECT 1 FROM mempool WHERE txid=?", (txid,)).fetchone() is not None
 
     def get_mempool_tx(self, txid):
-        """[v6.7] Protegido contra raw NULL e zlib corrompido."""
         row = self.conn.execute("SELECT raw FROM mempool WHERE txid=?", (txid,)).fetchone()
         if not row or row["raw"] is None:
             return None
@@ -513,9 +688,10 @@ class ChainDB:
             return None
 
     def all_mempool(self, limit=1000):
-        """[v6.6] lock na leitura. [v6.7] Protegido contra raw NULL."""
         with self.lock:
-            rows = self.conn.execute("SELECT raw FROM mempool ORDER BY fee DESC LIMIT ?", (limit,)).fetchall()
+            rows = self.conn.execute(
+                "SELECT raw FROM mempool ORDER BY fee DESC LIMIT ?", (limit,),
+            ).fetchall()
             result = []
             for r in rows:
                 if r["raw"] is not None:
@@ -526,25 +702,29 @@ class ChainDB:
             return result
 
     def remove_mempool(self, txid):
-        with self.lock:
-            self.conn.execute("DELETE FROM mempool WHERE txid=?", (txid,))
+        return self._enqueue(self._remove_mempool_impl, txid, batch_safe=True)
+
+    def _remove_mempool_impl(self, txid):
+        self.conn.execute("DELETE FROM mempool WHERE txid=?", (txid,))
 
     def mempool_count(self):
         return self.conn.execute("SELECT COUNT(*) AS c FROM mempool").fetchone()["c"]
 
     def mempool_stats(self):
-        row = self.conn.execute("SELECT COUNT(*) AS c, COALESCE(SUM(fee),0) AS sf FROM mempool").fetchone()
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS c, COALESCE(SUM(fee),0) AS sf FROM mempool"
+        ).fetchone()
         fees = self.conn.execute("SELECT fee FROM mempool ORDER BY fee DESC LIMIT 100").fetchall()
         return {"count": row["c"], "sum_fee": row["sf"], "fees": [f["fee"] for f in fees]}
 
     def utxos_gastos_na_mempool(self) -> set:
-        """[v6.6] lock na checagem de double-spend."""
         gastos = set()
         with self.lock:
             try:
                 rows = self.conn.execute("SELECT raw FROM mempool").fetchall()
                 for r in rows:
-                    if r["raw"] is None: continue
+                    if r["raw"] is None:
+                        continue
                     try:
                         tx = orjson.loads(zlib.decompress(r["raw"]))
                         for inp in tx.get("inputs", []):
@@ -561,68 +741,107 @@ class ChainDB:
     # L2
     # ============================================================
     def save_l2_escrow(self, escrow_dict):
-        with self.lock:
-            self.conn.execute("""
-                INSERT OR REPLACE INTO l2_escrows
-                (escrow_id, creator, buyer, brn_amount, btc_expected_sats,
-                 btc_address, btc_txid, status, created_at, expires_at,
-                 l2_hash, raw_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                escrow_dict['escrow_id'], escrow_dict['creator'],
-                escrow_dict['buyer'], escrow_dict['brn_amount'],
-                escrow_dict['btc_expected_sats'], escrow_dict['btc_address'],
-                escrow_dict.get('btc_txid'), escrow_dict['status'],
-                escrow_dict['created_at'], escrow_dict['expires_at'],
-                escrow_dict['l2_hash'], json.dumps(escrow_dict)))
+        return self._enqueue(self._save_l2_escrow_impl, escrow_dict, batch_safe=True)
+
+    def _save_l2_escrow_impl(self, escrow_dict):
+        self.conn.execute("""
+            INSERT OR REPLACE INTO l2_escrows
+            (escrow_id, creator, buyer, brn_amount, btc_expected_sats,
+             btc_address, btc_txid, status, created_at, expires_at,
+             l2_hash, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            escrow_dict['escrow_id'], escrow_dict['creator'],
+            escrow_dict['buyer'], escrow_dict['brn_amount'],
+            escrow_dict['btc_expected_sats'], escrow_dict['btc_address'],
+            escrow_dict.get('btc_txid'), escrow_dict['status'],
+            escrow_dict['created_at'], escrow_dict['expires_at'],
+            escrow_dict['l2_hash'], json.dumps(escrow_dict)))
 
     def get_l2_escrows(self, status=None):
         if status:
-            rows = self.conn.execute("SELECT raw_json FROM l2_escrows WHERE status=? ORDER BY created_at DESC", (status,)).fetchall()
+            rows = self.conn.execute(
+                "SELECT raw_json FROM l2_escrows WHERE status=? ORDER BY created_at DESC", (status,),
+            ).fetchall()
         else:
             rows = self.conn.execute("SELECT raw_json FROM l2_escrows ORDER BY created_at DESC").fetchall()
         result = []
         for r in rows:
-            try: result.append(json.loads(r["raw_json"]))
-            except Exception: pass
+            try:
+                result.append(json.loads(r["raw_json"]))
+            except Exception:
+                pass
         return result
 
     def get_l2_escrow_by_id(self, escrow_id):
-        row = self.conn.execute("SELECT raw_json FROM l2_escrows WHERE escrow_id=?", (escrow_id,)).fetchone()
+        row = self.conn.execute(
+            "SELECT raw_json FROM l2_escrows WHERE escrow_id=?", (escrow_id,),
+        ).fetchone()
         if row:
-            try: return json.loads(row["raw_json"])
-            except Exception: return None
+            try:
+                return json.loads(row["raw_json"])
+            except Exception:
+                return None
         return None
 
     def update_l2_escrow_status(self, escrow_id, status, btc_txid=None):
-        with self.lock:
-            escrow = self.get_l2_escrow_by_id(escrow_id)
-            if not escrow: return
-            escrow['status'] = status
-            if btc_txid: escrow['btc_txid'] = btc_txid
-            self.conn.execute("UPDATE l2_escrows SET status=?, btc_txid=?, raw_json=? WHERE escrow_id=?", (status, escrow.get('btc_txid'), json.dumps(escrow), escrow_id))
+        return self._enqueue(
+            self._update_l2_escrow_status_impl, escrow_id, status, btc_txid, batch_safe=True,
+        )
+
+    def _update_l2_escrow_status_impl(self, escrow_id, status, btc_txid=None):
+        escrow = self.get_l2_escrow_by_id(escrow_id)
+        if not escrow:
+            return
+        escrow['status'] = status
+        if btc_txid:
+            escrow['btc_txid'] = btc_txid
+        self.conn.execute(
+            "UPDATE l2_escrows SET status=?, btc_txid=?, raw_json=? WHERE escrow_id=?",
+            (status, escrow.get('btc_txid'), json.dumps(escrow), escrow_id),
+        )
 
     def is_btc_txid_used(self, btc_txid):
         row = self.conn.execute("SELECT 1 FROM btc_used WHERE btc_txid=?", (btc_txid,)).fetchone()
         return row is not None
 
     def mark_btc_txid_used(self, btc_txid, escrow_id):
-        with self.lock:
-            self.conn.execute("INSERT OR REPLACE INTO btc_used (btc_txid, escrow_id, used_at) VALUES (?, ?, ?)", (btc_txid, escrow_id, int(time.time())))
+        return self._enqueue(
+            self._mark_btc_txid_used_impl, btc_txid, escrow_id, batch_safe=True,
+        )
+
+    def _mark_btc_txid_used_impl(self, btc_txid, escrow_id):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO btc_used (btc_txid, escrow_id, used_at) VALUES (?, ?, ?)",
+            (btc_txid, escrow_id, int(time.time())),
+        )
 
     def save_l2_block(self, l2_block):
-        with self.lock:
-            self.conn.execute("INSERT OR REPLACE INTO l2_blocks (merkle_root, timestamp, count, raw_json) VALUES (?, ?, ?, ?)", (l2_block['merkle_root'], l2_block['timestamp'], l2_block.get('count', 1), json.dumps(l2_block)))
+        return self._enqueue(self._save_l2_block_impl, l2_block, batch_safe=True)
+
+    def _save_l2_block_impl(self, l2_block):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO l2_blocks (merkle_root, timestamp, count, raw_json) VALUES (?, ?, ?, ?)",
+            (l2_block['merkle_root'], l2_block['timestamp'],
+             l2_block.get('count', 1), json.dumps(l2_block)),
+        )
 
     def save_l2_tx(self, l2_tx):
+        return self._enqueue(self._save_l2_tx_impl, l2_tx, batch_safe=True)
+
+    def _save_l2_tx_impl(self, l2_tx):
         import hashlib
-        with self.lock:
-            txid = hashlib.sha256(json.dumps(l2_tx).encode()).hexdigest()[:16]
-            self.conn.execute("INSERT OR REPLACE INTO l2_txs (txid, type, escrow_id, raw_json, timestamp) VALUES (?, ?, ?, ?, ?)", (txid, l2_tx['type'], l2_tx.get('escrow_id'), json.dumps(l2_tx), int(time.time())))
-            return txid
+        txid = hashlib.sha256(json.dumps(l2_tx).encode()).hexdigest()[:16]
+        self.conn.execute(
+            "INSERT OR REPLACE INTO l2_txs (txid, type, escrow_id, raw_json, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (txid, l2_tx['type'], l2_tx.get('escrow_id'), json.dumps(l2_tx), int(time.time())),
+        )
+        return txid
 
     def get_l2_txs(self, limit=50):
-        rows = self.conn.execute("SELECT raw_json FROM l2_txs ORDER BY timestamp DESC LIMIT ?", (limit,)).fetchall()
+        rows = self.conn.execute(
+            "SELECT raw_json FROM l2_txs ORDER BY timestamp DESC LIMIT ?", (limit,),
+        ).fetchall()
         return [json.loads(r["raw_json"]) for r in rows]
 
     # ============================================================
@@ -630,30 +849,42 @@ class ChainDB:
     # ============================================================
     def get_stats(self):
         return {
-            "height": self.height(), "tip_hash": self.tip_hash(), "utxos": self.count_utxos(),
-            "mempool": self.mempool_count(), "blocks": self.height() + 1, "contracts": self.contract_count(),
+            "height": self.height(),
+            "tip_hash": self.tip_hash(),
+            "utxos": self.count_utxos(),
+            "mempool": self.mempool_count(),
+            "blocks": self.height() + 1,
+            "contracts": self.contract_count(),
             "l2_escrows": self.conn.execute("SELECT COUNT(*) as c FROM l2_escrows").fetchone()["c"],
             "l2_txs": self.conn.execute("SELECT COUNT(*) as c FROM l2_txs").fetchone()["c"],
         }
 
     def prune_spent_utxos(self, keep_height=1000):
+        return self._enqueue(self._prune_spent_utxos_impl, keep_height, batch_safe=True)
+
+    def _prune_spent_utxos_impl(self, keep_height=1000):
         cutoff = max(0, self.height() - keep_height)
-        with self.lock:
-            return self.conn.execute("DELETE FROM utxos WHERE spent=1 AND block_height < ?", (cutoff,)).rowcount
+        return self.conn.execute(
+            "DELETE FROM utxos WHERE spent=1 AND block_height < ?", (cutoff,),
+        ).rowcount
 
     def count_utxos(self):
         return self.conn.execute("SELECT COUNT(*) AS c FROM utxos WHERE spent=0").fetchone()["c"]
 
     def vacuum(self):
-        with self.lock:
-            self.conn.execute("VACUUM")
+        return self._enqueue(self._vacuum_impl, batch_safe=False)
+
+    def _vacuum_impl(self):
+        self.conn.execute("VACUUM")
 
     # ============================================================
     # META
     # ============================================================
     def set_meta(self, key, value):
-        with self.lock:
-            self.conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)", (key, value))
+        return self._enqueue(self._set_meta_impl, key, value, batch_safe=True)
+
+    def _set_meta_impl(self, key, value):
+        self.conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)", (key, value))
 
     def get_meta(self, key):
         row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
@@ -662,42 +893,61 @@ class ChainDB:
     # ============================================================
     # PEERS
     # ============================================================
-    def upsert_peer(self, node_id, address, genesis_hash, version="?", height=0, is_miner=False, public_key="", metadata=None):
-        with self.lock:
-            agora = int(time.time())
-            existente = self.conn.execute("SELECT node_id FROM peers WHERE address=?", (address,)).fetchone()
-            novo = existente is None
-            self.conn.execute("""
-                INSERT INTO peers (address, node_id, genesis_hash, version, height,
-                                   is_miner, public_key, metadata, first_seen, last_seen, score)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-                ON CONFLICT(address) DO UPDATE SET
-                    node_id=excluded.node_id, genesis_hash=excluded.genesis_hash,
-                    version=excluded.version, height=excluded.height,
-                    is_miner=excluded.is_miner, public_key=excluded.public_key,
-                    metadata=excluded.metadata, last_seen=excluded.last_seen
-            """, (address, node_id, genesis_hash, version, height, 1 if is_miner else 0, public_key, orjson.dumps(metadata or {}).decode(), agora, agora))
-            if novo:
-                self._log_event("peer_joined", address, f"node_id={node_id[:12]}")
-            return novo
+    def upsert_peer(self, node_id, address, genesis_hash, version="?", height=0,
+                    is_miner=False, public_key="", metadata=None):
+        return self._enqueue(
+            self._upsert_peer_impl, node_id, address, genesis_hash, version,
+            height, is_miner, public_key, metadata, batch_safe=True,
+        )
+
+    def _upsert_peer_impl(self, node_id, address, genesis_hash, version="?", height=0,
+                          is_miner=False, public_key="", metadata=None):
+        agora = int(time.time())
+        existente = self.conn.execute(
+            "SELECT node_id FROM peers WHERE address=?", (address,),
+        ).fetchone()
+        novo = existente is None
+        self.conn.execute("""
+            INSERT INTO peers (address, node_id, genesis_hash, version, height,
+                               is_miner, public_key, metadata, first_seen, last_seen, score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            ON CONFLICT(address) DO UPDATE SET
+                node_id=excluded.node_id, genesis_hash=excluded.genesis_hash,
+                version=excluded.version, height=excluded.height,
+                is_miner=excluded.is_miner, public_key=excluded.public_key,
+                metadata=excluded.metadata, last_seen=excluded.last_seen
+        """, (address, node_id, genesis_hash, version, height,
+              1 if is_miner else 0, public_key,
+              orjson.dumps(metadata or {}).decode(), agora, agora))
+        if novo:
+            self._log_event_impl("peer_joined", address, f"node_id={node_id[:12]}")
+        return novo
 
     def get_peer_score(self, address):
         row = self.conn.execute("SELECT score FROM peers WHERE address=?", (address,)).fetchone()
         return int(row["score"]) if row else 0
 
     def set_peer_score(self, address, score):
-        with self.lock:
-            self.conn.execute("UPDATE peers SET score=? WHERE address=?", (score, address))
+        return self._enqueue(self._set_peer_score_impl, address, score, batch_safe=True)
+
+    def _set_peer_score_impl(self, address, score):
+        self.conn.execute("UPDATE peers SET score=? WHERE address=?", (score, address))
 
     def add_peer_score(self, address, delta):
-        with self.lock:
-            self.conn.execute("UPDATE peers SET score = COALESCE(score, 0) + ? WHERE address=?", (delta, address))
-            return self.get_peer_score(address)
+        return self._enqueue(self._add_peer_score_impl, address, delta, batch_safe=True)
+
+    def _add_peer_score_impl(self, address, delta):
+        self.conn.execute(
+            "UPDATE peers SET score = COALESCE(score, 0) + ? WHERE address=?", (delta, address),
+        )
+        return self.get_peer_score(address)
 
     def listar_peers(self, apenas_ativos=True, janela=300):
         if apenas_ativos:
             cutoff = int(time.time()) - janela
-            rows = self.conn.execute("SELECT * FROM peers WHERE last_seen >= ? ORDER BY last_seen DESC", (cutoff,)).fetchall()
+            rows = self.conn.execute(
+                "SELECT * FROM peers WHERE last_seen >= ? ORDER BY last_seen DESC", (cutoff,),
+            ).fetchall()
         else:
             rows = self.conn.execute("SELECT * FROM peers ORDER BY last_seen DESC").fetchall()
         return [dict(r) for r in rows]
@@ -709,50 +959,81 @@ class ChainDB:
     def contar_peers(self, apenas_ativos=True, janela=300):
         if apenas_ativos:
             cutoff = int(time.time()) - janela
-            row = self.conn.execute("SELECT COUNT(*) AS n FROM peers WHERE last_seen >= ?", (cutoff,)).fetchone()
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM peers WHERE last_seen >= ?", (cutoff,),
+            ).fetchone()
         else:
             row = self.conn.execute("SELECT COUNT(*) AS n FROM peers").fetchone()
         return int(row["n"])
 
     def remover_peer(self, node_id):
-        with self.lock:
-            self.conn.execute("DELETE FROM peers WHERE node_id=?", (node_id,))
+        return self._enqueue(self._remover_peer_impl, node_id, batch_safe=True)
+
+    def _remover_peer_impl(self, node_id):
+        self.conn.execute("DELETE FROM peers WHERE node_id=?", (node_id,))
 
     def remover_peer_por_endereco(self, address):
-        with self.lock:
-            self.conn.execute("DELETE FROM peers WHERE address=?", (address,))
+        return self._enqueue(self._remover_peer_por_endereco_impl, address, batch_safe=True)
+
+    def _remover_peer_por_endereco_impl(self, address):
+        self.conn.execute("DELETE FROM peers WHERE address=?", (address,))
 
     def remover_peer_por_pubkey(self, pubkey: str) -> None:
-        if not pubkey: return
-        with self.lock:
-            self.conn.execute("DELETE FROM peers WHERE public_key = ?", (pubkey,))
+        if not pubkey:
+            return
+        return self._enqueue(self._remover_peer_por_pubkey_impl, pubkey, batch_safe=True)
+
+    def _remover_peer_por_pubkey_impl(self, pubkey):
+        self.conn.execute("DELETE FROM peers WHERE public_key = ?", (pubkey,))
 
     def limpar_peers_inativos(self, janela=1800):
-        with self.lock:
-            self.conn.execute("DELETE FROM peers WHERE last_seen < ?", (int(time.time()) - janela,))
+        return self._enqueue(self._limpar_peers_inativos_impl, janela, batch_safe=True)
+
+    def _limpar_peers_inativos_impl(self, janela=1800):
+        self.conn.execute("DELETE FROM peers WHERE last_seen < ?", (int(time.time()) - janela,))
 
     # ============================================================
     # EVENTOS
     # ============================================================
     def _log_event(self, tipo, peer="", details=""):
-        with self.lock:
-            self.conn.execute("INSERT INTO network_events (timestamp, event_type, peer_address, details) VALUES (?,?,?,?)", (int(time.time()), tipo, peer, details))
+        return self._enqueue(self._log_event_impl, tipo, peer, details, batch_safe=True)
+
+    def _log_event_impl(self, tipo, peer="", details=""):
+        self.conn.execute(
+            "INSERT INTO network_events (timestamp, event_type, peer_address, details) VALUES (?,?,?,?)",
+            (int(time.time()), tipo, peer, details),
+        )
 
     def ultimos_eventos(self, n=50):
-        rows = self.conn.execute("SELECT * FROM network_events ORDER BY id DESC LIMIT ?", (n,)).fetchall()
+        rows = self.conn.execute(
+            "SELECT * FROM network_events ORDER BY id DESC LIMIT ?", (n,),
+        ).fetchall()
         return [dict(r) for r in rows]
 
     # ============================================================
     # CONTRATOS
     # ============================================================
     def contract_insert(self, contract_id, owner, code, metadata=None):
-        with self.lock:
-            self.conn.execute("INSERT OR REPLACE INTO contracts(contract_id, owner, code, metadata, created_at) VALUES (?,?,?,?,?)", (contract_id, owner, orjson.dumps(code).decode(), orjson.dumps(metadata or {}).decode(), int(time.time())))
-            self.conn.execute("INSERT OR REPLACE INTO contract_state(contract_id, state, updated_at) VALUES (?,?,?)", (contract_id, "{}", int(time.time())))
+        return self._enqueue(
+            self._contract_insert_impl, contract_id, owner, code, metadata, batch_safe=True,
+        )
+
+    def _contract_insert_impl(self, contract_id, owner, code, metadata=None):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO contracts(contract_id, owner, code, metadata, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (contract_id, owner, orjson.dumps(code).decode(),
+             orjson.dumps(metadata or {}).decode(), int(time.time())),
+        )
+        self.conn.execute(
+            "INSERT OR REPLACE INTO contract_state(contract_id, state, updated_at) VALUES (?,?,?)",
+            (contract_id, "{}", int(time.time())),
+        )
 
     def contract_get(self, contract_id):
         row = self.conn.execute("SELECT * FROM contracts WHERE contract_id=?", (contract_id,)).fetchone()
-        if not row: return None
+        if not row:
+            return None
         d = dict(row)
         d["code"] = orjson.loads(d["code"])
         d["metadata"] = orjson.loads(d["metadata"] or "{}")
@@ -760,9 +1041,14 @@ class ChainDB:
 
     def contract_list(self, owner=None, limit=100):
         if owner:
-            rows = self.conn.execute("SELECT * FROM contracts WHERE owner=? ORDER BY created_at DESC LIMIT ?", (owner, limit)).fetchall()
+            rows = self.conn.execute(
+                "SELECT * FROM contracts WHERE owner=? ORDER BY created_at DESC LIMIT ?",
+                (owner, limit),
+            ).fetchall()
         else:
-            rows = self.conn.execute("SELECT * FROM contracts ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+            rows = self.conn.execute(
+                "SELECT * FROM contracts ORDER BY created_at DESC LIMIT ?", (limit,),
+            ).fetchall()
         out = []
         for r in rows:
             d = dict(r)
@@ -775,79 +1061,114 @@ class ChainDB:
         return self.conn.execute("SELECT COUNT(*) AS c FROM contracts").fetchone()["c"]
 
     def contract_delete(self, contract_id):
-        with self.lock:
-            self.conn.execute("DELETE FROM contracts WHERE contract_id=?", (contract_id,))
-            self.conn.execute("DELETE FROM contract_state WHERE contract_id=?", (contract_id,))
-            self.conn.execute("DELETE FROM contract_events WHERE contract_id=?", (contract_id,))
+        return self._enqueue(self._contract_delete_impl, contract_id, batch_safe=True)
+
+    def _contract_delete_impl(self, contract_id):
+        self.conn.execute("DELETE FROM contracts WHERE contract_id=?", (contract_id,))
+        self.conn.execute("DELETE FROM contract_state WHERE contract_id=?", (contract_id,))
+        self.conn.execute("DELETE FROM contract_events WHERE contract_id=?", (contract_id,))
 
     def contract_get_state(self, contract_id):
-        row = self.conn.execute("SELECT state FROM contract_state WHERE contract_id=?", (contract_id,)).fetchone()
+        row = self.conn.execute(
+            "SELECT state FROM contract_state WHERE contract_id=?", (contract_id,),
+        ).fetchone()
         return orjson.loads(row["state"]) if row else {}
 
     def contract_set_state(self, contract_id, state):
-        with self.lock:
-            self.conn.execute("INSERT OR REPLACE INTO contract_state(contract_id, state, updated_at) VALUES (?,?,?)", (contract_id, orjson.dumps(state).decode(), int(time.time())))
+        return self._enqueue(self._contract_set_state_impl, contract_id, state, batch_safe=True)
+
+    def _contract_set_state_impl(self, contract_id, state):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO contract_state(contract_id, state, updated_at) VALUES (?,?,?)",
+            (contract_id, orjson.dumps(state).decode(), int(time.time())),
+        )
 
     def contract_log_event(self, contract_id, event, data):
-        with self.lock:
-            self.conn.execute("INSERT INTO contract_events(contract_id, event, data, timestamp) VALUES (?,?,?,?)", (contract_id, event, orjson.dumps(data).decode() if data is not None else "null", int(time.time())))
+        return self._enqueue(
+            self._contract_log_event_impl, contract_id, event, data, batch_safe=True,
+        )
+
+    def _contract_log_event_impl(self, contract_id, event, data):
+        self.conn.execute(
+            "INSERT INTO contract_events(contract_id, event, data, timestamp) VALUES (?,?,?,?)",
+            (contract_id, event,
+             orjson.dumps(data).decode() if data is not None else "null",
+             int(time.time())),
+        )
 
     def contract_get_events(self, contract_id, limit=50):
-        rows = self.conn.execute("SELECT * FROM contract_events WHERE contract_id=? ORDER BY id DESC LIMIT ?", (contract_id, limit)).fetchall()
+        rows = self.conn.execute(
+            "SELECT * FROM contract_events WHERE contract_id=? ORDER BY id DESC LIMIT ?",
+            (contract_id, limit),
+        ).fetchall()
         return [dict(r) for r in rows]
 
     def contract_all_events(self, limit=200):
-        rows = self.conn.execute("SELECT * FROM contract_events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        rows = self.conn.execute(
+            "SELECT * FROM contract_events ORDER BY id DESC LIMIT ?", (limit,),
+        ).fetchall()
         return [dict(r) for r in rows]
 
     # ============================================================
-    # CONTRACT_SPEND — [FIX v6.8] FAIL-CLOSED POR DEFAULT
-    # ------------------------------------------------------------
-    # ATENÇÃO: esta função NÃO cria tx assinada. Ela escreve UTXOs
-    # diretamente no banco, bypassando validate_tx, apply_tx, auth
-    # tag e mempool. O estado resultante NÃO é auditável pelo
-    # chain_validator (saldo no banco sem tx correspondente).
-    #
-    # Uso pretendido: testes locais.
-    # Requer BRN_ALLOW_CONTRACT_SPEND=1.
+    # CONTRACT_SPEND (fail-closed)
     # ============================================================
     def contract_spend(self, from_addr: str, to_addr: str, amount: int):
         if not _ALLOW_CONTRACT_SPEND:
             raise RuntimeError(
-                "contract_spend() bypassa o consenso (não cria tx assinada). "
-                "Use Blockchain.submit_tx() com uma transação válida e assinada. "
-                "Para habilitar em testes locais, defina BRN_ALLOW_CONTRACT_SPEND=1."
+                "contract_spend() bypassa o consenso. Use Blockchain.submit_tx(). "
+                "Para testes locais: BRN_ALLOW_CONTRACT_SPEND=1."
             )
-        # Log de auditoria quando habilitado
+        return self._enqueue(
+            self._contract_spend_impl, from_addr, to_addr, amount, batch_safe=False,
+        )
+
+    def _contract_spend_impl(self, from_addr: str, to_addr: str, amount: int):
+        import hashlib
         print(
-            f"[db] AVISO: contract_spend habilitado via BRN_ALLOW_CONTRACT_SPEND "
+            f"[db] AVISO: contract_spend habilitado "
             f"({from_addr[:12]}... -> {to_addr[:12]}..., {amount} sat)"
         )
-        import hashlib
         with self.lock:
             self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
             try:
-                rows = self.conn.execute("SELECT txid, vout, amount FROM utxos WHERE address=? AND spent=0 ORDER BY amount DESC", (from_addr,)).fetchall()
+                rows = self.conn.execute(
+                    "SELECT txid, vout, amount FROM utxos WHERE address=? AND spent=0 "
+                    "ORDER BY amount DESC",
+                    (from_addr,),
+                ).fetchall()
                 total = 0
                 sacados = []
                 for r in rows:
                     total += r["amount"]
                     sacados.append((r["txid"], r["vout"], r["amount"]))
-                    if total >= amount: break
-                if total < amount: raise ValueError(f"saldo insuficiente: {total} < {amount}")
+                    if total >= amount:
+                        break
+                if total < amount:
+                    raise ValueError(f"saldo insuficiente: {total} < {amount}")
 
-                seed = (f"{from_addr}|{to_addr}|{amount}|{total}|{time.time_ns()}|{os.urandom(8).hex()}").encode()
+                seed = (
+                    f"{from_addr}|{to_addr}|{amount}|{total}|{time.time_ns()}|{os.urandom(8).hex()}"
+                ).encode()
                 txid_base = hashlib.sha256(seed).hexdigest()
 
                 for txid, vout, _amt in sacados:
-                    self.conn.execute("UPDATE utxos SET spent=1, spent_by=? WHERE txid=? AND vout=?", (txid_base, txid, vout))
+                    self.conn.execute(
+                        "UPDATE utxos SET spent=1, spent_by=? WHERE txid=? AND vout=?",
+                        (txid_base, txid, vout),
+                    )
 
-                self.conn.execute("INSERT INTO utxos(txid, vout, address, amount, pubkey, block_height, spent) VALUES (?,?,?,?,?,?,0)", (txid_base, 0, to_addr, amount, "", self.height()))
-
+                self.conn.execute(
+                    "INSERT INTO utxos(txid, vout, address, amount, pubkey, block_height, spent) "
+                    "VALUES (?,?,?,?,?,?,0)",
+                    (txid_base, 0, to_addr, amount, "", self.height()),
+                )
                 troco = total - amount
                 if troco > 0:
-                    self.conn.execute("INSERT INTO utxos(txid, vout, address, amount, pubkey, block_height, spent) VALUES (?,?,?,?,?,?,0)", (txid_base, 1, from_addr, troco, "", self.height()))
-
+                    self.conn.execute(
+                        "INSERT INTO utxos(txid, vout, address, amount, pubkey, block_height, spent) "
+                        "VALUES (?,?,?,?,?,?,0)",
+                        (txid_base, 1, from_addr, troco, "", self.height()),
+                    )
                 self.conn.execute("COMMIT")
             except Exception:
                 self.conn.execute("ROLLBACK")
@@ -857,6 +1178,14 @@ class ChainDB:
     # CLOSE
     # ============================================================
     def close(self):
+        try:
+            self._write_queue.put(None, timeout=5.0)
+        except Exception:
+            pass
+        try:
+            self._writer_thread.join(timeout=5.0)
+        except Exception:
+            pass
         try:
             self.conn.close()
         except Exception:
