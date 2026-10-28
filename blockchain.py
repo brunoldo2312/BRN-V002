@@ -1,13 +1,10 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.4.4 | Data: 28/10/2026
+Versão: 9.4.5 | Data: 28/10/2026
 ================================================================
-v9.4.4 (2026-10-28):
-  [SECURITY] Removida a Whitelist Hardcoded (AUTHORIZED_VALIDATORS).
-             O consenso agora confia 100% no trust_network.json
-             (que é protegido por assinatura Ed25519).
-             Se o cliente alterar o JSON, a assinatura falha,
-             o trust_net fica vazio e o bloco é rejeitado.
-  [FIX] Correção do signing_hash_block (sha256 para ECDSA/Schnorr).
+v9.4.5 (2026-10-28):
+  [FIX] O bloco Genesis (altura 0) não exige assinatura multi-sig.
+        Isso evita que o cliente rejeite o bloco 0 na sincronização
+        inicial.
 ================================================================
 """
 from __future__ import annotations
@@ -25,7 +22,6 @@ import orjson
 
 from crypto import double_sha256, sha256
 from db import ChainDB
-
 
 log = logging.getLogger("blockchain")
 
@@ -151,13 +147,9 @@ def _maybe_sign_checkpoint(block) -> None:
         pass
 
 
-# ============================================================
-# Assinatura de blocos (multi-sig)
-# ============================================================
 def signing_hash_block(block: dict) -> bytes:
-    """Mensagem assinada pelos validadores: domínio || hash do bloco."""
     raw_msg = BLOCK_SIG_DOMAIN + block["hash"].encode()
-    return sha256(raw_msg)  # <--- FIX CRÍTICO: Transforma em 32 bytes para o ECDSA/Schnorr
+    return sha256(raw_msg)
 
 
 def sign_block_as_validator(block: dict, priv) -> dict:
@@ -190,9 +182,6 @@ def verify_block_signature(pubkey_hex: str, block: dict, sig_hex: str) -> bool:
         return False
 
 
-# ============================================================
-# AUTH TAG
-# ============================================================
 def compute_auth_tag(height: int, block_hash_hex: str, secret: str = None) -> str:
     sec = secret if secret is not None else NETWORK_SECRET
     if not sec:
@@ -208,9 +197,6 @@ def verify_auth_tag(height: int, block_hash_hex: str, tag: str, secret: str = No
     return hmac.compare_digest(expected, tag)
 
 
-# ============================================================
-# PoW / helpers
-# ============================================================
 def block_hash(prev_hash, merkle, timestamp, nonce, difficulty) -> str:
     header = f"{prev_hash}{merkle}{timestamp}{nonce}{difficulty}"
     return double_sha256(header.encode()).hex()
@@ -265,9 +251,6 @@ def signing_hash(tx: dict) -> bytes:
     return double_sha256(SIGNING_DOMAIN + _serialize_core(tx))
 
 
-# ============================================================
-# PoW search
-# ============================================================
 def _pow_search_py(prev_hash, merkle, ts, diff, nonce_start=0, should_continue=None, progress_cb=None):
     prefix = f"{prev_hash}{merkle}{ts}".encode()
     diff_bytes = str(diff).encode()
@@ -325,9 +308,6 @@ def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0, should_continue=None
     return _pow_search_py(prev_hash, merkle, ts, diff, nonce_start, should_continue, progress_cb)
 
 
-# ============================================================
-# Coinbase
-# ============================================================
 def make_coinbase(address: str, pubkey_hex: str, height: int, reward: int, fila_mineracao: dict = None) -> dict:
     if not pubkey_hex:
         raise ValueError("make_coinbase: pubkey_hex é obrigatória")
@@ -369,15 +349,7 @@ def build_genesis() -> dict:
 GENESIS_BLOCK = build_genesis()
 
 
-# ============================================================
-# Blockchain
-# ============================================================
 class Blockchain:
-    # ============================================================
-    # 🛡️ [SECURITY] A Whitelist Hardcoded foi removida!
-    # O consenso agora confia no trust_network.json assinado.
-    # ============================================================
-
     def __init__(self, db_path="brn_v2_chain.db", genesis_address=None, genesis_pubkey=None, auto_genesis=True, network_secret=None, require_auth_tag=None):
         self.db = ChainDB(db_path)
         self.genesis_expected_hash = None
@@ -386,7 +358,6 @@ class Blockchain:
         self.on_block_mined = None
         self._fork_signal = None
 
-        # Injetados pelo main.py
         self.trust_net = None
         self.p2p = None
         self._sign_collector = None
@@ -408,7 +379,6 @@ class Blockchain:
             self.db.apply_tx(g["transactions"][0], 0, coinbase=True)
             self.db.set_meta("genesis_hash", g["hash"])
 
-    # ---- setters (main.py injeta) ----
     def set_trust_net(self, trust):
         self.trust_net = trust
         log.info(f"[Blockchain] trust_net injetado ({len(getattr(trust, 'nodes', {}))} nós)")
@@ -689,10 +659,8 @@ class Blockchain:
         return True, "ok"
 
     def submit_tx(self, tx: dict) -> tuple:
-        # [SECURITY] Proteção contra Mempool Flooding
         if self.db.mempool_count() >= MAX_MEMPOOL_SIZE:
             return False, "Mempool cheia. Tente novamente mais tarde."
-            
         if self.db.has_mempool(tx["txid"]):
             return False, "ja na mempool"
         ok, msg = self.validate_tx(tx)
@@ -720,11 +688,6 @@ class Blockchain:
         return timestamps[len(timestamps) // 2]
 
     def _get_active_validators(self) -> list:
-        """
-        [SECURITY v9.4.4] Removida a Whitelist Hardcoded.
-        Agora a fonte da verdade é EXCLUSIVAMENTE o trust_network.json
-        (que é protegido pela assinatura Ed25519).
-        """
         trust = self.trust_net
         if trust is None:
             return []
@@ -732,8 +695,6 @@ class Blockchain:
             top = trust.get_top_validators(count=MAX_VALIDATORS)
             if not top:
                 return []
-                
-            # Retorna todos os validadores que o trust_network aprovou
             return sorted({p for p in top if p})
         except Exception as e:
             log.warning(f"[VALIDATORS] get_top_validators falhou: {e}")
@@ -748,9 +709,7 @@ class Blockchain:
         need = max(1, math.ceil(n * VALIDATOR_QUORUM))
         return min(need, n)
 
-    def _validate_validators_sig(
-        self, block: dict, validators: Optional[list] = None
-    ) -> tuple:
+    def _validate_validators_sig(self, block: dict, validators: Optional[list] = None) -> tuple:
         if validators is None:
             validators = self._get_active_validators()
         if not validators:
@@ -793,9 +752,7 @@ class Blockchain:
             )
         return True, ""
 
-    def validate_block(
-        self, block: dict, prev_block=None, validators: Optional[list] = None
-    ) -> tuple:
+    def validate_block(self, block: dict, prev_block=None, validators: Optional[list] = None) -> tuple:
         if block["height"] == 0 and prev_block is None:
             if (self.genesis_expected_hash and block["hash"] != self.genesis_expected_hash):
                 return False, f"genesis nao corresponde ao esperado"
@@ -827,9 +784,11 @@ class Blockchain:
         if not ok_cp:
             return False, msg_cp
 
-        ok_sig, msg_sig = self._validate_validators_sig(block, validators=validators)
-        if not ok_sig:
-            return False, msg_sig
+        # [FIX v9.4.5] A validação de assinatura só ocorre em blocos > 0 (Genesis não tem sig)
+        if block["height"] > 0:
+            ok_sig, msg_sig = self._validate_validators_sig(block, validators=validators)
+            if not ok_sig:
+                return False, msg_sig
 
         if block["height"] > 0 and self.require_auth_tag:
             if not self.network_secret:
@@ -872,9 +831,7 @@ class Blockchain:
             return False, "coinbase acima do permitido"
         return True, "ok"
 
-    def accept_block(
-        self, block: dict, validators: Optional[list] = None
-    ) -> tuple:
+    def accept_block(self, block: dict, validators: Optional[list] = None) -> tuple:
         prev = self.db.get_block_by_hash(block["prev_hash"])
         ok, msg = self.validate_block(block, prev, validators=validators)
         if not ok:
@@ -922,9 +879,7 @@ class Blockchain:
         except Exception as e:
             print(f"[on_block_mined] callback falhou: {e}")
 
-    def _collect_signatures(
-        self, block: dict, validators: Optional[list] = None
-    ) -> list:
+    def _collect_signatures(self, block: dict, validators: Optional[list] = None) -> list:
         if validators is None:
             validators = self._get_active_validators()
         if not validators:
@@ -988,10 +943,7 @@ class Blockchain:
             raise ValueError("mine_block: miner_pubkey é obrigatória")
         return self.mine_block_interruptible(miner_address, miner_pubkey, None)
 
-    def mine_block_interruptible(
-        self, miner_address: str, miner_pubkey: str,
-        should_continue=None, progress_cb=None
-    ) -> dict:
+    def mine_block_interruptible(self, miner_address: str, miner_pubkey: str, should_continue=None, progress_cb=None) -> dict:
         if not miner_pubkey:
             raise ValueError("mine_block_interruptible: miner_pubkey é obrigatória")
 
@@ -1077,8 +1029,6 @@ class Blockchain:
             "validator_quorum": VALIDATOR_QUORUM,
         }
 
-
-# ---- reorg / chain_validator (como antes) ----
 try:
     from reorg import reorg_to as _reorg_to, find_fork_point as _find_fork
     def _reorg_to_method(self, new_blocks, max_depth=MAX_REORG_DEPTH, allow_genesis_reorg=False):
