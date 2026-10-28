@@ -1,36 +1,10 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.4.1 | Data: 26/10/2026
+Versão: 9.4.3 | Data: 28/10/2026
 ================================================================
-v9.4.1 (2026-10-27):
-  [FIX] _get_active_validators() NÃO usa mais fila_mineracao como
-        fallback. A fila é bootstrap de mineração, não conjunto de
-        consenso. Sem trust_net → modo bootstrap (sem multi-sig).
-  [NEW] REQUIRE_ALL_SIGS configurável via BRN_REQUIRE_ALL_SIGS.
-        Quando 0, exige quórum BRN_VALIDATOR_QUORUM (default 0.67).
-  [NEW] SIG_COLLECT_TIMEOUT (BRN_SIG_COLLECT_TIMEOUT, default 10s)
-        para o _sign_collector via ThreadPoolExecutor.
-  [FIX] _collect_signatures() verifica cada assinatura antes de
-        incluir na lista (descarta lixo do coletor externo).
-  [FIX] Snapshot ÚNICO de validadores em mine_block_interruptible:
-        coleta, validação e accept_block usam o MESMO conjunto,
-        evitando divergência se trust_net mudar durante o PoW.
-  [FIX] set_local_validator_sk() valida entrada (Wallet | hex | None)
-        e nunca engole erro silenciosamente.
-  [NEW] state_snapshot() expõe require_all_sigs e validator_quorum.
-v9.4.0 (2026-10-26):
-  [NEW] REGRA MULTI-SIG DOS TOP VALIDADORES:
-        - Bloco precisa ter assinatura de TODOS os validadores ativos.
-        - 1 validador  → 1 assinatura
-        - 2 validadores → 2 assinaturas
-        - N validadores → N assinaturas
-        - Se faltar QUALQUER assinatura, o bloco é REJEITADO.
-  [FIX] Removido trust_system (não existia). Agora usa trust_network.
-  [NEW] chain.trust_net deve ser injetado pelo main.py (já é).
-  [NEW] chain.p2p deve ser injetado pelo main.py para coleta P2P.
-  [NEW] chain._sign_collector: callback opcional para coletar assinaturas.
-v9.3.4:
-  [FIX] median_time_past com try/except.
-  [FIX] accept_block verifica se bloco já existe antes de gravar.
+v9.4.3 (2026-10-28):
+  [FIX] Correção do signing_hash_block (sha256 para ECDSA).
+  [SECURITY] Whitelist PoA (AUTHORIZED_VALIDATORS) ativada.
+  [SECURITY] Proteção contra Spam de Mempool (MAX_MEMPOOL_SIZE).
 ================================================================
 """
 from __future__ import annotations
@@ -75,20 +49,12 @@ CHECKPOINT_INTERVAL   = 1000
 MTP_WINDOW            = 50
 FILA_MAX_MINERADORES  = 20
 
-# ============================================================
-# Multi-sig dos validadores
-# ------------------------------------------------------------
-# BRN_REQUIRE_ALL_SIGS=1 (default): exige assinatura de TODOS os validadores
-# BRN_REQUIRE_ALL_SIGS=0           : exige quórum BRN_VALIDATOR_QUORUM
-# BRN_VALIDATOR_QUORUM (default 0.67 = 2/3)
-# BRN_SIG_COLLECT_TIMEOUT (default 10s)
-# ============================================================
 MAX_VALIDATORS       = int(os.environ.get("BRN_MAX_VALIDATORS", "5"))
 REQUIRE_ALL_SIGS     = os.environ.get("BRN_REQUIRE_ALL_SIGS", "1") == "1"
 VALIDATOR_QUORUM     = float(os.environ.get("BRN_VALIDATOR_QUORUM", "0.67"))
 SIG_COLLECT_TIMEOUT  = float(os.environ.get("BRN_SIG_COLLECT_TIMEOUT", "10"))
+MAX_MEMPOOL_SIZE     = int(os.environ.get("BRN_MAX_MEMPOOL_SIZE", "5000"))
 
-# Validação defensiva
 if not (0.0 < VALIDATOR_QUORUM <= 1.0):
     VALIDATOR_QUORUM = 0.67
 if SIG_COLLECT_TIMEOUT <= 0:
@@ -188,14 +154,10 @@ def _maybe_sign_checkpoint(block) -> None:
 def signing_hash_block(block: dict) -> bytes:
     """Mensagem assinada pelos validadores: domínio || hash do bloco."""
     raw_msg = BLOCK_SIG_DOMAIN + block["hash"].encode()
-    return sha256(raw_msg)  # <--- FIX: Transforma em 32 bytes para o ECDSA
+    return sha256(raw_msg)  # <--- FIX CRÍTICO: Transforma em 32 bytes para o ECDSA
 
 
 def sign_block_as_validator(block: dict, priv) -> dict:
-    """
-    Assina o hash do bloco com a chave privada Ed25519 do validador.
-    Retorna {pubkey_hex, signature_hex} ou {} se falhar.
-    """
     if priv is None:
         return {}
     try:
@@ -217,7 +179,6 @@ def sign_block_as_validator(block: dict, priv) -> dict:
 
 
 def verify_block_signature(pubkey_hex: str, block: dict, sig_hex: str) -> bool:
-    """Verifica a assinatura Ed25519 do hash do bloco."""
     try:
         from wallet import Wallet
         h = signing_hash_block(block)
@@ -409,6 +370,14 @@ GENESIS_BLOCK = build_genesis()
 # Blockchain
 # ============================================================
 class Blockchain:
+    # ============================================================
+    # 🛡️ WHITELIST PoA - APENAS ESTAS CHAVES PODEM VALIDAR BLOCOS
+    # ============================================================
+    AUTHORIZED_VALIDATORS = [
+        "03379c0b2ceabcaf6003e2492824909738a99fbbff09fafb9faff31299a3e2d21c", # Ubuntu (Sua chave pública correta)
+        # Adicione as chaves públicas dos Windows aqui depois
+    ]
+
     def __init__(self, db_path="brn_v2_chain.db", genesis_address=None, genesis_pubkey=None, auto_genesis=True, network_secret=None, require_auth_tag=None):
         self.db = ChainDB(db_path)
         self.genesis_expected_hash = None
@@ -447,12 +416,7 @@ class Blockchain:
     def set_p2p(self, p2p):
         self.p2p = p2p
 
-    # [FIX v9.4.1] set_local_validator_sk valida entrada
     def set_local_validator_sk(self, sk) -> None:
-        """
-        sk: Wallet() | hex string (64 chars) | None.
-        Nunca engole erro silencioso: em caso de problema, loga e zera.
-        """
         if sk is None:
             self._local_validator_sk = None
             return
@@ -471,20 +435,15 @@ class Blockchain:
                 self._local_validator_sk = Wallet(private_key_hex=h)
                 log.info("[SIG] chave local de validador configurada (hex)")
                 return
-            log.warning(
-                f"[SIG] set_local_validator_sk: tipo não suportado "
-                f"({type(sk).__name__}); ignorando"
-            )
+            log.warning(f"[SIG] set_local_validator_sk: tipo não suportado ({type(sk).__name__}); ignorando")
             self._local_validator_sk = None
         except Exception as e:
             log.warning(f"[SIG] set_local_validator_sk falhou: {e}")
             self._local_validator_sk = None
 
     def set_sign_collector(self, cb):
-        """cb(block) -> list[{pubkey, signature}]"""
         self._sign_collector = cb
 
-    # ---- fila de mineradores (bootstrap) ----
     def adicionar_na_fila(self, address: str, pubkey: str) -> None:
         if self.rede_descentralizada:
             return
@@ -523,7 +482,6 @@ class Blockchain:
             if self.require_auth_tag is False:
                 self.require_auth_tag = bool(self.network_secret)
 
-    # ---- consenso ----
     def current_reward(self, height: int) -> int:
         halvings = height // HALVING_INTERVAL
         if halvings >= 64:
@@ -604,7 +562,6 @@ class Blockchain:
                 in_sum += u["amount"]
         return in_sum - sum(o["amount"] for o in tx["outputs"])
 
-    # ---- contratos ----
     def _validate_contract_tx(self, tx: dict) -> tuple:
         tx_data = tx.get("data") or {}
         t = tx_data.get("type")
@@ -664,7 +621,6 @@ class Blockchain:
             return r
         raise ValueError(f"tipo de contrato desconhecido: {t}")
 
-    # ---- validação de transação ----
     def validate_tx(self, tx: dict, from_mempool: bool = False) -> tuple:
         from wallet import Wallet
         if not tx.get("inputs") or not tx.get("outputs"):
@@ -733,6 +689,10 @@ class Blockchain:
         return True, "ok"
 
     def submit_tx(self, tx: dict) -> tuple:
+        # [SECURITY] Proteção contra Mempool Flooding
+        if self.db.mempool_count() >= MAX_MEMPOOL_SIZE:
+            return False, "Mempool cheia. Tente novamente mais tarde."
+            
         if self.db.has_mempool(tx["txid"]):
             return False, "ja na mempool"
         ok, msg = self.validate_tx(tx)
@@ -759,20 +719,7 @@ class Blockchain:
         timestamps.sort()
         return timestamps[len(timestamps) // 2]
 
-    # ============================================================
-    # [FIX v9.4.1] VALIDAÇÃO MULTI-SIG DOS TOP VALIDADORES
-    # ============================================================
     def _get_active_validators(self) -> list:
-        """
-        Retorna pubkeys dos validadores ativos, ordenadas.
-
-        Fonte ÚNICA de verdade: trust_net.get_top_validators().
-        NÃO usa fila_mineracao como fallback — a fila é bootstrap de
-        mineração, não conjunto de consenso.
-
-        Se trust_net estiver vazio/indisponível → retorna [] →
-        modo bootstrap (consenso multi-sig NÃO é aplicado).
-        """
         trust = self.trust_net
         if trust is None:
             return []
@@ -780,14 +727,19 @@ class Blockchain:
             top = trust.get_top_validators(count=MAX_VALIDATORS)
             if not top:
                 return []
-            # Ordenar + dedupe → determinismo entre peers
+                
+            # [🛡️ WHITELIST PoA APLICADA AQUI]
+            if self.AUTHORIZED_VALIDATORS:
+                top = [p for p in top if p in self.AUTHORIZED_VALIDATORS]
+                if not top:
+                    log.warning("[VALIDATORS] Nenhum validador autorizado da Whitelist está online!")
+                    
             return sorted({p for p in top if p})
         except Exception as e:
             log.warning(f"[VALIDATORS] get_top_validators falhou: {e}")
             return []
 
     def _required_signatures(self, validators: list) -> int:
-        """Quantas assinaturas o bloco precisa para ser aceito."""
         n = len(validators)
         if n == 0:
             return 0
@@ -799,16 +751,10 @@ class Blockchain:
     def _validate_validators_sig(
         self, block: dict, validators: Optional[list] = None
     ) -> tuple:
-        """
-        Verifica a regra multi-sig dos validadores.
-
-        `validators` pode ser passado explicitamente (snapshot do minerador)
-        para evitar divergência entre coleta e validação.
-        """
         if validators is None:
             validators = self._get_active_validators()
         if not validators:
-            return True, ""  # bootstrap
+            return True, ""
 
         required = self._required_signatures(validators)
 
@@ -881,12 +827,10 @@ class Blockchain:
         if not ok_cp:
             return False, msg_cp
 
-        # ---- Multi-sig dos validadores ----
         ok_sig, msg_sig = self._validate_validators_sig(block, validators=validators)
         if not ok_sig:
             return False, msg_sig
 
-        # ---- Auth tag ----
         if block["height"] > 0 and self.require_auth_tag:
             if not self.network_secret:
                 return False, "no exige auth_tag mas sem BRN_NETWORK_SECRET"
@@ -902,7 +846,6 @@ class Blockchain:
                     if not verify_auth_tag(block["height"], block["hash"], tag, self.network_secret):
                         return False, "auth_tag invalido em bloco legado"
 
-        # ---- Coinbase e txs ----
         cb = block["transactions"][0]
         if cb["inputs"][0]["txid"] != "0" * 64:
             return False, "primeira tx nao e coinbase"
@@ -979,19 +922,9 @@ class Blockchain:
         except Exception as e:
             print(f"[on_block_mined] callback falhou: {e}")
 
-    # ============================================================
-    # [FIX v9.4.1] COLETA DE ASSINATURAS COM VERIFICAÇÃO E TIMEOUT
-    # ============================================================
     def _collect_signatures(
         self, block: dict, validators: Optional[list] = None
     ) -> list:
-        """
-        Coleta assinaturas dos validadores ativos para o bloco.
-
-        - Assina localmente se este nó é validador.
-        - Consulta _sign_collector com timeout (BRN_SIG_COLLECT_TIMEOUT).
-        - Verifica cada assinatura antes de incluir.
-        """
         if validators is None:
             validators = self._get_active_validators()
         if not validators:
@@ -1001,7 +934,6 @@ class Blockchain:
         sigs: list = []
         seen: set = set()
 
-        # ---- 1) Assinatura local (se este nó é validador) ----
         local_sk = self._local_validator_sk
         if local_sk is not None:
             entry = sign_block_as_validator(block, local_sk)
@@ -1016,29 +948,18 @@ class Blockchain:
                     else:
                         log.warning(f"[SIG] assinatura local inválida ({pk[:16]})")
                 elif pk:
-                    log.info(
-                        f"[SIG] pubkey local {pk[:16]} não é validador ativo — "
-                        f"assinatura descartada"
-                    )
+                    log.info(f"[SIG] pubkey local {pk[:16]} não é validador ativo — assinatura descartada")
 
-        # ---- 2) Coletor externo, com timeout ----
         if self._sign_collector is not None:
             extra: list = []
             try:
-                from concurrent.futures import (
-                    ThreadPoolExecutor, TimeoutError as FutTimeout,
-                )
-                with ThreadPoolExecutor(
-                    max_workers=1, thread_name_prefix="sig-collect"
-                ) as pool:
+                from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
+                with ThreadPoolExecutor(max_workers=1, thread_name_prefix="sig-collect") as pool:
                     fut = pool.submit(self._sign_collector, block)
                     try:
                         extra = fut.result(timeout=SIG_COLLECT_TIMEOUT) or []
                     except FutTimeout:
-                        log.warning(
-                            f"[SIG] _sign_collector timeout após "
-                            f"{SIG_COLLECT_TIMEOUT:.1f}s"
-                        )
+                        log.warning(f"[SIG] _sign_collector timeout após {SIG_COLLECT_TIMEOUT:.1f}s")
             except Exception as e:
                 log.warning(f"[SIG] _sign_collector falhou: {e}")
 
@@ -1074,9 +995,6 @@ class Blockchain:
         if not miner_pubkey:
             raise ValueError("mine_block_interruptible: miner_pubkey é obrigatória")
 
-        # [FIX v9.4.1] Snapshot ÚNICO de validadores.
-        # Garante que coleta, validação e accept_block usem o MESMO conjunto,
-        # mesmo que trust_net seja atualizado por outra thread no meio.
         validators = self._get_active_validators()
 
         height = self.db.height() + 1
@@ -1125,17 +1043,14 @@ class Blockchain:
         }
         self._attach_auth_tag(block)
 
-        # ---- Coleta de assinaturas dos validadores (snapshot) ----
         sigs = self._collect_signatures(block, validators=validators)
         block["validators_sig"] = sigs
 
-        # ---- Valida multi-sig antes de aceitar (mesmo snapshot) ----
         ok_sig, msg_sig = self._validate_validators_sig(block, validators=validators)
         if not ok_sig:
             log.warning(f"[MINER] bloco #{height} REJEITADO (multi-sig): {msg_sig}")
             return None
 
-        # accept_block usa o mesmo snapshot → sem revalidação contraditória
         ok, msg = self.accept_block(block, validators=validators)
         if ok:
             self._fire_block_mined(block)
