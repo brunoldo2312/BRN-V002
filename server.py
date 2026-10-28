@@ -1,27 +1,12 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.17)
+server.py — Backend HTTP do nó BRN (v9.9.18)
 ================================================================
-v9.9.17 (2026-10-26):
-  [FIX CRÍTICO] Removidas duplicatas de sync_info / sync_status /
-                miner_status (causavam AssertionError no Flask).
-  [FIX CRÍTICO] _register_miner_in_trust agora prefere register_node
-                (trust_network) antes de ensure_peer_entry (trust_system).
-                Não chama mais update_score inexistente.
-  [FIX] Restaurados todos os endpoints removidos por engano na v9.9.16:
-                /api/mine, /api/faucet, /api/verificar-recebimento,
-                /api/miner/stop, /api/pool/disconnect, /api/mempool,
-                /api/latest, /api/work, /api/nonce, /api/fee-estimate,
-                /api/peers/score, /api/peers, /api/hd/*, /api/contract/*,
-                /api/l2/*, /api/block/<height>.
-  [NEW] /api/consensus/validators — Top 5 validadores (multi-sig)
-  [NEW] /api/block/<height>/signatures — Assinaturas de um bloco
-  [NEW] /api/status retorna validators_active
-  [NEW] /api/miner/status retorna signatures_required/collected
-v9.9.16 (2026-10-25):
-  [FIX] /api/minhas-txs restaurado.
-  [FIX] proxy pool para clientes.
-v9.9.15 (2026-10-24):
-  [NEW] Integração com trust_system.py.
+v9.9.18 (2026-10-28):
+  [NEW] Suporte ao auto-registro P2P de validadores:
+        - /api/consensus/validators lê os validadores que
+          se anunciaram via P2P (register_validator).
+        - Registra a pubkey do validador automaticamente no
+          trust_net se ela ainda não estiver lá.
 ================================================================
 """
 from __future__ import annotations
@@ -148,7 +133,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
                 headers={"Content-Type": "application/json",
-                         "User-Agent": "brn-server/9.9.17"},
+                         "User-Agent": "brn-server/9.9.18"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -255,7 +240,7 @@ def _get_trust_network():
 
 
 # ============================================================
-# [FIX v9.9.17] _register_miner_in_trust
+# _register_miner_in_trust
 # ============================================================
 def _register_miner_in_trust(pubkey: str, address: str) -> None:
     """Registra o minerador no Trust Network (prefere trust_network.register_node)."""
@@ -263,13 +248,11 @@ def _register_miner_in_trust(pubkey: str, address: str) -> None:
     if trust is None:
         return
     try:
-        # trust_network.py (mais comum)
         if hasattr(trust, "register_node"):
             trust.register_node(node_id=pubkey, address=address, public_key=pubkey)
             if hasattr(trust, "mark_connected"):
                 trust.mark_connected(pubkey)
             return
-        # trust_system.py (fallback)
         if hasattr(trust, "ensure_peer_entry"):
             trust.ensure_peer_entry(pubkey, address=address)
     except Exception as e:
@@ -1041,7 +1024,6 @@ def miner_status():
         m = get_miner(chain)
         st = m.status()
 
-        # Top 5 validadores (multi-sig)
         validators_active = 0
         trust = _get_trust_network()
         if trust is not None:
@@ -1380,7 +1362,6 @@ def status():
             except Exception:
                 pass
 
-        # [NEW] validators_active para multi-sig
         validators_active = 0
         trust = _get_trust_network()
         if trust is not None:
@@ -1531,7 +1512,6 @@ def trust_stats():
     if trust is None:
         return jsonify({"ok": False, "msg": "TrustNetwork indisponivel"}), 503
     try:
-        # trust_system.py (novo)
         if hasattr(trust, "peers"):
             peers = trust.peers
             total = len(peers)
@@ -1544,7 +1524,6 @@ def trust_stats():
                 "banned_nodes": banned,
                 "avg_trust": 100.0,
             })
-        # trust_network.py (antigo)
         stats = trust.get_network_stats()
         return jsonify({"ok": True, **stats})
     except Exception as e:
@@ -1560,7 +1539,6 @@ def trust_nodes():
     try:
         limit = int(request.args.get("limit", 100))
 
-        # trust_system.py (novo)
         if hasattr(trust, "peers"):
             nodes = []
             for pubkey, data in trust.peers.items():
@@ -1574,7 +1552,6 @@ def trust_nodes():
             nodes.sort(key=lambda x: x["trust_score"], reverse=True)
             return jsonify({"ok": True, "count": len(nodes), "nodes": nodes[:limit]})
 
-        # trust_network.py (antigo)
         from dataclasses import asdict
         nodes_raw = list(trust.nodes.values()) if hasattr(trust, "nodes") else []
         nodes = [asdict(n) for n in nodes_raw]
@@ -2056,7 +2033,7 @@ def l2_cancel(escrow_id):
 
 
 # ============================================================
-# [NEW v9.9.17] CONSENSUS / MULTI-SIG
+# CONSENSUS / MULTI-SIG
 # ============================================================
 @app.route("/api/consensus/validators", methods=["GET"])
 @require_rate_limit("status")
@@ -2073,7 +2050,6 @@ def consensus_validators():
             except Exception as e:
                 log.warning(f"get_top_validators falhou: {e}")
 
-        # Encontra os NodeRecords que correspondem
         nodes = list(trust.nodes.values()) if hasattr(trust, "nodes") else []
         validators = []
         for n in nodes:
@@ -2140,7 +2116,7 @@ def health():
         return jsonify({
             "ok": True,
             "height": _get_chain().db.height(),
-            "version": "9.9.17",
+            "version": "9.9.18",
             "chain_injected": _CHAIN is not None,
             "p2p_injected": _P2P_MANAGER is not None,
             "pool_injected": _POOL_MANAGER is not None,
@@ -2157,7 +2133,7 @@ def health():
 def index():
     return jsonify({
         "name": "BRN Node API",
-        "version": "9.9.17",
+        "version": "9.9.18",
         "mode": "modo2_aberto",
         "l2_enabled": L2_ENABLED,
         "pool_enabled": _POOL_MANAGER is not None,
@@ -2182,7 +2158,7 @@ def _shutdown():
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.17 (Proxy + Trust + Multi-Sig + History)")
+    print(f"BRN Server v9.9.18 (Proxy + Trust + Multi-Sig + History)")
     print(f"  → http://{WEB_HOST}:{port}")
     print(f"  L2: {'ATIVO' if L2_ENABLED else 'DESABILITADO'}")
     print(f"  Admin token: {'SIM' if ADMIN_TOKEN else 'NÃO'}")
