@@ -1,18 +1,11 @@
 """
-p2p_unified.py — BRN P2P Network v6.7.0
+p2p_unified.py — BRN P2P Network v6.8.0
 ================================================================
-v6.7.0 (2026-10-26):
-  [NEW] Suporte a multi-sig dos Top 5 validadores:
-        - P2PServer._handle_sign_block() — assina blocos se o nó for validador
-        - P2PClient.request_block_signature() — pede assinatura a um peer
-        - P2PManager.request_block_signature() — wrapper
-        - _process_message() trata "sign_block"
-        - Valida hash do bloco antes de assinar (evita assinar lixo)
-        - Checa se o nó local está entre os Top 5 validadores
-  [INFO] Se o bloco for inválido ou o nó não for validador, retorna
-         {pubkey: "", signature: ""} (graceful degradation).
-v6.6.5:
-  [FIX] P2PClient.send_message e variantes aceitam timeout.
+v6.8.0 (2026-10-28):
+  [NEW] Auto-registro automático de validadores via P2P.
+        Quando um nó carrega a Validator SK, ele avisa a rede
+        (register_validator) para que os outros nós o adicionem
+        ao trust_network.json sem intervenção manual.
 ================================================================
 """
 from __future__ import annotations
@@ -446,18 +439,7 @@ class P2PServer(threading.Thread):
             except Exception:
                 pass
 
-    # ============================================================
-    # [NEW v6.7.0] Handler de assinatura de bloco
-    # ============================================================
     def _handle_sign_block(self, msg: dict, addr, peer_id) -> dict:
-        """
-        Assina o hash de um bloco com a chave privada do validador local.
-        Só assina se:
-          1. O nó tem SK (wallet aberta)
-          2. O nó está entre os Top 5 validadores
-          3. O hash do bloco é válido
-        Retorna {pubkey, signature} ou {pubkey: "", signature: ""}.
-        """
         block = msg.get("block")
         if not block or not isinstance(block, dict):
             return {"type": "sign_block_response", "pubkey": "", "signature": ""}
@@ -466,7 +448,6 @@ class P2PServer(threading.Thread):
         local_sk = getattr(self.bc, "_local_validator_sk", None)
 
         if trust is None or local_sk is None:
-            log.debug(f"[SIGN] {addr}: nó não é validador (trust/SK ausente)")
             return {"type": "sign_block_response", "pubkey": "", "signature": ""}
 
         try:
@@ -477,13 +458,10 @@ class P2PServer(threading.Thread):
                 local_sk = Wallet(private_key_hex=str(local_sk))
             my_pub = local_sk.pub_hex
 
-            # 1) Nó é validador?
             validators = trust.get_top_validators(count=5)
             if my_pub not in validators:
-                log.debug(f"[SIGN] {addr}: {my_pub[:8]}… não está no Top 5")
                 return {"type": "sign_block_response", "pubkey": "", "signature": ""}
 
-            # 2) Valida hash do bloco
             try:
                 h_calc = _bh(
                     block["prev_hash"], block["merkle"],
@@ -494,32 +472,40 @@ class P2PServer(threading.Thread):
                     self.metrics.inc("block_sigs_invalid")
                     return {"type": "sign_block_response", "pubkey": "", "signature": ""}
             except KeyError as e:
-                log.warning(f"[SIGN] {addr}: bloco com campo ausente: {e}")
                 return {"type": "sign_block_response", "pubkey": "", "signature": ""}
 
-            # 3) Assina
             entry = sign_block_as_validator(block, local_sk)
             if not entry:
                 return {"type": "sign_block_response", "pubkey": "", "signature": ""}
 
             self.metrics.inc("block_sigs_provided")
-            log.info(
-                f"[SIGN] {addr}: assinado bloco #{block.get('height')} "
-                f"({entry['pubkey'][:8]}…)"
-            )
+            log.info(f"[SIGN] {addr}: assinado bloco #{block.get('height')} ({entry['pubkey'][:8]}…)")
             return {
                 "type": "sign_block_response",
                 "pubkey": entry["pubkey"],
                 "signature": entry["signature"],
             }
         except Exception as e:
-            log.warning(f"[SIGN] {addr}: erro assinando bloco: {e}")
             return {"type": "sign_block_response", "pubkey": "", "signature": ""}
 
     def _process_message(self, msg: dict, addr, peer_id: Optional[str]) -> Optional[dict]:
         mtype = msg.get("type")
         peer_ip = addr[0]
         try:
+            # [NOVO v6.8.0] Auto-registro de Validador via P2P
+            if mtype == "register_validator":
+                pubkey = msg.get("pubkey", "").strip()
+                address = msg.get("address", "").strip()
+                if pubkey and address:
+                    trust = getattr(self.bc, "trust_net", None)
+                    if trust is not None:
+                        try:
+                            trust.register_node(node_id=pubkey, address=address, public_key=pubkey)
+                            log.info(f"[P2P] Validador auto-registrado na rede: {pubkey[:16]}...")
+                        except Exception as e:
+                            log.warning(f"[P2P] Erro ao auto-registrar validador: {e}")
+                return {"type": "ack", "ok": True}
+
             if mtype == "ping":
                 return {
                     "type": "pong", "version": PROTOCOL_VERSION,
@@ -599,7 +585,6 @@ class P2PServer(threading.Thread):
                         pass
                 return {"type": "peers", "peers": peers[:MAX_PEERS_PER_PEX]}
 
-            # [NEW v6.7.0] Assinatura de bloco
             if mtype == "sign_block":
                 self.metrics.inc("block_sigs_requested")
                 return self._handle_sign_block(msg, addr, peer_id)
@@ -743,27 +728,13 @@ class P2PClient:
     def get_peers(ip, port, timeout=None):
         return P2PClient.send_message(ip, port, {"type": "get_peers"}, timeout=timeout)
 
-    # [NEW v6.7.0] Pede assinatura de um bloco para o peer
     @staticmethod
-    def request_block_signature(ip: str, port: int, block: dict,
-                                 timeout: Optional[float] = None) -> Optional[dict]:
-        """
-        Pede ao peer para assinar o hash do bloco.
-
-        Retorna {pubkey, signature} ou None se o peer não respondeu
-        ou não é validador.
-        """
+    def request_block_signature(ip: str, port: int, block: dict, timeout: Optional[float] = None) -> Optional[dict]:
         if timeout is None:
             timeout = BLOCK_SIG_TIMEOUT_S
-
-        resp, _ = P2PClient.send_message(
-            ip, port,
-            {"type": "sign_block", "block": block},
-            timeout=timeout,
-        )
+        resp, _ = P2PClient.send_message(ip, port, {"type": "sign_block", "block": block}, timeout=timeout)
         if not resp:
             return None
-        # Response tem type="sign_block_response"
         if resp.get("type") != "sign_block_response":
             return None
         pubkey = (resp.get("pubkey") or "").strip()
@@ -1207,14 +1178,22 @@ class P2PManager:
     def is_read_only(self) -> bool:
         return self.read_only
 
-    # [NEW v6.7.0] Pede assinatura de um bloco a um peer específico
-    def request_block_signature(self, ip: str, port: int, block: dict,
-                                 timeout: Optional[float] = None) -> Optional[dict]:
-        """
-        Pede ao peer (ip, port) para assinar o bloco.
-        Retorna {pubkey, signature} ou None.
-        """
+    def request_block_signature(self, ip: str, port: int, block: dict, timeout: Optional[float] = None) -> Optional[dict]:
         return P2PClient.request_block_signature(ip, port, block, timeout=timeout)
+
+    # [NOVO v6.8.0] Envia auto-registro de validador para a rede
+    def broadcast_validator_registration(self, pubkey: str, address: str) -> None:
+        """Avisa toda a rede P2P que este nó é um validador"""
+        msg = {"type": "register_validator", "pubkey": pubkey, "address": address}
+        log.info(f"[P2P] Enviando auto-registro de validador para a rede...")
+        for peer in self.discovery.listar_peers():
+            try:
+                ip, port = peer.split(":")
+                self._broadcast_pool.submit(
+                    P2PClient.send_message, ip, int(port), msg
+                )
+            except Exception:
+                pass
 
     def _setup_upnp(self) -> None:
         try:
