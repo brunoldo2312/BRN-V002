@@ -1,5 +1,15 @@
-"""miner_pool_client.py — Cliente do pool de mineração BRN (v5)
+"""miner_pool_client.py — Cliente do pool de mineração BRN (v5.1)
 ================================================================
+v5.1 (2026-10-28):
+  [FIX] _loop_heartbeat detecta "miner desconhecido" e re-registra
+        automaticamente (após restart do pool ou timeout >60s).
+        Antes, o cliente continuava minerando para sempre sem
+        nenhuma share ser aceita — precisava reiniciar o Windows
+        manualmente.
+  [FIX] run() trata "miner desconhecido" no submit com re-register.
+  [FIX] run() limpa self._job = None ao detectar "job expirado" —
+        evita minerar bloco morto enquanto o fetch falha.
+  [NEW] Método _reregister() encapsula a lógica de re-registro.
 v5 (2026-10-28):
   [SECURITY] Envia o job_id para o pool (proteção anti-replay).
   [FIX] Se o job expirar no servidor, o cliente puxa um novo trabalho
@@ -60,7 +70,7 @@ def _http_post(base_url: str, path: str, body: dict, timeout: float = HTTP_TIMEO
         req = urllib.request.Request(
             url, data=data,
             headers={"Content-Type": "application/json",
-                     "User-Agent": "brn-pool-client/5"},
+                     "User-Agent": "brn-pool-client/5.1"},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -219,15 +229,45 @@ class PoolClient(threading.Thread):
     def is_running(self) -> bool:
         return self._running
 
+    # [NEW v5.1] Re-registra o miner no pool (pool restart, timeout >60s).
+    def _reregister(self) -> None:
+        """Refaz o /api/pool/register e busca work novo.
+        Idempotente: se já estiver registrado, o pool devolve o mesmo
+        miner_id e nenhuma ação destrutiva ocorre."""
+        try:
+            r = _http_post(self.pool_url, "/api/pool/register", {
+                "miner_id": self.miner_id,
+                "address":  self.address,
+                "pubkey":   self.pubkey,
+            })
+            if r.get("ok"):
+                self.miner_id = r.get("miner_id", self.miner_id)
+                log.info("pool client: re-registrado (miner_id=%s)", self.miner_id)
+                try:
+                    self._fetch_work()
+                except Exception:
+                    pass
+            else:
+                log.warning("pool client: re-register falhou: %s", r.get("msg"))
+        except Exception as e:
+            log.warning("pool client: re-register exception: %s", e)
+
     def _loop_heartbeat(self):
         while not self._stop.wait(HEARTBEAT_S):
             try:
                 h = self.hashrate_meter.rate()
-                _http_post(self.pool_url, "/api/pool/heartbeat", {
+                r = _http_post(self.pool_url, "/api/pool/heartbeat", {
                     "miner_id":     self.miner_id,
                     "hashrate":     h,
                     "hashes_total": self.hashes_total,
                 }, timeout=5.0)
+                # [FIX v5.1] Se o pool esqueceu este miner (restart,
+                # timeout >60s, etc.), re-registra automaticamente.
+                if not r.get("ok"):
+                    msg = (r.get("msg") or "").lower()
+                    if "desconhecido" in msg:
+                        log.warning("pool client: pool esqueceu miner, re-registrando...")
+                        self._reregister()
             except Exception as e:
                 log.debug("heartbeat: %s", e)
 
@@ -358,14 +398,24 @@ class PoolClient(threading.Thread):
                 self.shares_rejected += 1
                 self.last_error = r.get("msg", "rejeitado")
                 log.debug("share rejeitado: %s", self.last_error)
-                
-                # [FIX] Se o job expirou (outro minerador achou o bloco), puxa um novo
-                if "job expirado" in self.last_error.lower() or "job_id" in self.last_error.lower():
+                err_low = self.last_error.lower()
+
+                # [FIX v5.1] Job expirado: descarta o job local ANTES de
+                # refazer o fetch. Se o fetch falhar (pool offline),
+                # o minerador dorme em vez de queimar CPU em job morto.
+                if "job expirado" in err_low or "job_id" in err_low:
                     log.info("pool client: job expirou, buscando novo trabalho...")
+                    with self._job_lock:
+                        self._job = None
                     try:
                         self._fetch_work()
                     except Exception:
                         pass
+
+                # [FIX v5.1] Miner desconhecido no pool: re-registra.
+                elif "desconhecido" in err_low:
+                    log.warning("pool client: miner desconhecido pelo pool, re-registrando...")
+                    self._reregister()
 
     def status(self) -> dict:
         with self._lock:
