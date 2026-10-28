@@ -1,10 +1,13 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.4.3 | Data: 28/10/2026
+Versão: 9.4.4 | Data: 28/10/2026
 ================================================================
-v9.4.3 (2026-10-28):
-  [FIX] Correção do signing_hash_block (sha256 para ECDSA).
-  [SECURITY] Whitelist PoA (AUTHORIZED_VALIDATORS) ativada.
-  [SECURITY] Proteção contra Spam de Mempool (MAX_MEMPOOL_SIZE).
+v9.4.4 (2026-10-28):
+  [SECURITY] Removida a Whitelist Hardcoded (AUTHORIZED_VALIDATORS).
+             O consenso agora confia 100% no trust_network.json
+             (que é protegido por assinatura Ed25519).
+             Se o cliente alterar o JSON, a assinatura falha,
+             o trust_net fica vazio e o bloco é rejeitado.
+  [FIX] Correção do signing_hash_block (sha256 para ECDSA/Schnorr).
 ================================================================
 """
 from __future__ import annotations
@@ -154,7 +157,7 @@ def _maybe_sign_checkpoint(block) -> None:
 def signing_hash_block(block: dict) -> bytes:
     """Mensagem assinada pelos validadores: domínio || hash do bloco."""
     raw_msg = BLOCK_SIG_DOMAIN + block["hash"].encode()
-    return sha256(raw_msg)  # <--- FIX CRÍTICO: Transforma em 32 bytes para o ECDSA
+    return sha256(raw_msg)  # <--- FIX CRÍTICO: Transforma em 32 bytes para o ECDSA/Schnorr
 
 
 def sign_block_as_validator(block: dict, priv) -> dict:
@@ -371,12 +374,9 @@ GENESIS_BLOCK = build_genesis()
 # ============================================================
 class Blockchain:
     # ============================================================
-    # 🛡️ WHITELIST PoA - APENAS ESTAS CHAVES PODEM VALIDAR BLOCOS
+    # 🛡️ [SECURITY] A Whitelist Hardcoded foi removida!
+    # O consenso agora confia no trust_network.json assinado.
     # ============================================================
-    AUTHORIZED_VALIDATORS = [
-        "03379c0b2ceabcaf6003e2492824909738a99fbbff09fafb9faff31299a3e2d21c", # Ubuntu (Sua chave pública correta)
-        # Adicione as chaves públicas dos Windows aqui depois
-    ]
 
     def __init__(self, db_path="brn_v2_chain.db", genesis_address=None, genesis_pubkey=None, auto_genesis=True, network_secret=None, require_auth_tag=None):
         self.db = ChainDB(db_path)
@@ -720,6 +720,11 @@ class Blockchain:
         return timestamps[len(timestamps) // 2]
 
     def _get_active_validators(self) -> list:
+        """
+        [SECURITY v9.4.4] Removida a Whitelist Hardcoded.
+        Agora a fonte da verdade é EXCLUSIVAMENTE o trust_network.json
+        (que é protegido pela assinatura Ed25519).
+        """
         trust = self.trust_net
         if trust is None:
             return []
@@ -728,12 +733,7 @@ class Blockchain:
             if not top:
                 return []
                 
-            # [🛡️ WHITELIST PoA APLICADA AQUI]
-            if self.AUTHORIZED_VALIDATORS:
-                top = [p for p in top if p in self.AUTHORIZED_VALIDATORS]
-                if not top:
-                    log.warning("[VALIDATORS] Nenhum validador autorizado da Whitelist está online!")
-                    
+            # Retorna todos os validadores que o trust_network aprovou
             return sorted({p for p in top if p})
         except Exception as e:
             log.warning(f"[VALIDATORS] get_top_validators falhou: {e}")
