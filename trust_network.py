@@ -1,32 +1,16 @@
-"""trust_network.py — Rede de confiança e reputação do BRN (v3.0)
+"""trust_network.py — Rede de confiança e reputação do BRN (v3.1)
 ================================================================
-v3.0 (2026-10-27):
-  [NEW] get_top_validators(count) — retorna PUBKEYS HEX Ed25519
-        dos top validadores por trust_score. É a fonte lida por
-        blockchain._get_active_validators() para a regra multi-sig
-        dos Top N (v9.4.1).
-        - Filtra banned e public_key vazia.
-        - Ordena por (-trust_score, public_key) para determinismo
-          entre peers (evita divergência de ordem → fork por regra
-          de assinatura).
-        - Loga warning quando retorna menos que `count`.
-  [KEEP] get_validator_list() — API antiga (retorna dicts com
-        address, para uso informativo no /api/trust/validators).
-        NÃO é usada pelo consenso.
-v2 (2026-10-19):
-  [FIX] RLock em todas as operações (thread-safe com P2P + miner + HTTP).
-  [FIX] get_validator_list() não dá KeyError com validators órfãos.
-  [FIX] record_share_submitted() rastreia valid_shares e invalid_shares.
-  [FIX] list_all_nodes() com precedência de operadores correta.
-  [FIX] Saves em disco BATCHED — flag dirty + flush() a cada 30s.
-  [NEW] flush() público e shutdown() para save no Ctrl+C.
-  [NEW] marcar_nó_online() / marcar_nó_offline() com nomes PT-BR.
-  [NEW] Compatível com PoW: NÃO interfere no consenso (reputação só).
+v3.1 (2026-10-28):
+  [SECURITY] Assinatura digital Ed25519 do trust_network.json.
+             O nó Origem assina o arquivo. Nós Clientes verificam
+             a assinatura. Se um cliente alterar o arquivo JSON
+             (ex: para se dar 9999 pontos), a assinatura quebra
+             e o arquivo é rejeitado.
 ================================================================
 """
 from __future__ import annotations
 
-__version__ = "3.0"
+__version__ = "3.1"
 
 import json
 import logging
@@ -35,6 +19,8 @@ import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Any
+
+from crypto import Ed25519PrivateKey, Ed25519PublicKey
 
 log = logging.getLogger("trust_network")
 
@@ -65,7 +51,6 @@ MAX_VALIDATORS = 21
 VALIDATOR_ROTATION_BLOCKS = 100
 DEFAULT_DATA_FILE = "trust_network.json"
 
-# Intervalo de flush em disco (segundos)
 FLUSH_INTERVAL_S = 30.0
 
 
@@ -145,8 +130,11 @@ class NodeRecord:
 class TrustNetwork:
     """Reputação de nós. NÃO interfere no consenso (PoW continua)."""
 
-    def __init__(self, data_file: str = DEFAULT_DATA_FILE):
+    def __init__(self, data_file: str = DEFAULT_DATA_FILE, is_origin: bool = False, node_sk=None):
         self.data_file = Path(data_file)
+        self.is_origin = is_origin
+        self.node_sk = node_sk # Chave privada Ed25519 do nó (para assinar)
+        
         self.nodes: Dict[str, NodeRecord] = {}
         self.active_validators: Set[str] = set()
         self.last_decay_time: float = time.time()
@@ -162,7 +150,7 @@ class TrustNetwork:
                  len(self.nodes), len(self.active_validators))
 
     # ========================================================
-    # PERSISTÊNCIA (BATCHED)
+    # PERSISTÊNCIA (BATCHED + ASSINADA)
     # ========================================================
     def _mark_dirty(self) -> None:
         self._dirty = True
@@ -171,7 +159,7 @@ class TrustNetwork:
             self.flush()
 
     def flush(self) -> None:
-        """Força save em disco agora (chamado a cada 30s)."""
+        """Assina (se Origem) e salva o arquivo em disco."""
         with self._lock:
             if not self._dirty:
                 return
@@ -181,8 +169,18 @@ class TrustNetwork:
                     "last_decay_time": self.last_decay_time,
                     "active_validators": list(self.active_validators),
                     "last_rotation_height": self._last_rotation_height,
-                    "saved_at": time.time(),
                 }
+                
+                # [SECURITY v3.1] Se for o nó Origem, assina os dados
+                if self.is_origin and self.node_sk is not None:
+                    # Serialização determinística (sort_keys=True é crucial)
+                    payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                    sig = self.node_sk.sign(payload)
+                    data["signature"] = sig.hex()
+                    data["origin_pubkey"] = self.node_sk.public_key().public_bytes_raw().hex()
+                
+                data["saved_at"] = time.time()
+                
                 with open(self.data_file, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
                 self._dirty = False
@@ -192,7 +190,6 @@ class TrustNetwork:
                 log.error("[TrustNetwork] flush falhou: %s", e)
 
     def shutdown(self) -> None:
-        """Chamado no Ctrl+C — força save final."""
         self.flush()
 
     def _load(self) -> None:
@@ -202,6 +199,30 @@ class TrustNetwork:
         try:
             with open(self.data_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            
+            # [SECURITY v3.1] Verificação de Assinatura
+            sig_hex = data.pop("signature", None)
+            origin_pub_hex = data.pop("origin_pubkey", None)
+            
+            if sig_hex and origin_pub_hex:
+                payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                try:
+                    pub_bytes = bytes.fromhex(origin_pub_hex)
+                    pk = Ed25519PublicKey.from_public_bytes(pub_bytes)
+                    pk.verify(bytes.fromhex(sig_hex), payload)
+                    log.info("[TrustNetwork] Assinatura do Origem VALIDADA.")
+                except Exception as e:
+                    log.error("[TrustNetwork] ASSINATURA INVÁLIDA! O arquivo foi alterado.")
+                    if not self.is_origin:
+                        log.error("[TrustNetwork] Cliente rejeitou o arquivo. Iniciando vazio por segurança.")
+                        return
+                    else:
+                        log.warning("[TrustNetwork] Origem ignorando falha de assinatura (migração?).")
+            else:
+                if not self.is_origin:
+                    log.warning("[TrustNetwork] Arquivo sem assinatura. Cliente não confia. Iniciando vazio.")
+                    return
+            
             with self._lock:
                 self.nodes = {
                     nid: NodeRecord.from_dict(nd)
@@ -226,7 +247,6 @@ class TrustNetwork:
                 n.last_seen = time.time()
                 if peer_addr:
                     n.peer_addr = peer_addr
-                # [FIX v3] Atualiza public_key se antes estava vazia
                 if not n.public_key and public_key:
                     n.public_key = public_key
                     self._mark_dirty()
@@ -283,7 +303,7 @@ class TrustNetwork:
             self._apply_decay()
 
     # ========================================================
-    # EVENTOS (chamados pelo P2P / miner)
+    # EVENTOS
     # ========================================================
     def record_block_validated(self, node_id: str, block_height: int) -> None:
         with self._lock:
@@ -412,23 +432,8 @@ class TrustNetwork:
 
     # ========================================================
     # VALIDADORES
-    # --------------------------------------------------------
-    # ATENÇÃO — DOIS MÉTODOS COM SEMÂNTICAS DIFERENTES:
-    #
-    #   get_top_validators(count)  → PUBKEYS HEX (usado pelo consenso
-    #                                 em blockchain._get_active_validators)
-    #   get_validator_list()       → DICTS informativos para API HTTP
-    #
-    # Não confundir. O consenso precisa de pubkey (para verificar
-    # assinatura Ed25519). A API precisa de address/score (para UI).
     # ========================================================
     def select_validators(self, current_block_height: int) -> List[str]:
-        """
-        Retorna node_ids dos candidatos a validador por rotação.
-        NOTA: no BRN atual (PoW), isto é apenas INFORMATIVO.
-        Não bloqueia mineração nem consenso. O consenso usa
-        get_top_validators() para obter as PUBKEYS.
-        """
         with self._lock:
             if (current_block_height - self._last_rotation_height
                     < VALIDATOR_ROTATION_BLOCKS):
@@ -460,22 +465,6 @@ class TrustNetwork:
             return node_id in self.active_validators
 
     def get_top_validators(self, count: int = 5) -> List[str]:
-        """
-        [NEW v3.0] Retorna PUBKEYS HEX Ed25519 dos top `count`
-        validadores por trust_score.
-
-        Usado por blockchain._get_active_validators() para a regra
-        multi-sig dos Top N (blockchain v9.4.1).
-
-        Regras:
-          - Filtra nós banned.
-          - Filtra nós sem public_key (não podem assinar).
-          - Ordena por (-trust_score, public_key) — determinístico
-            entre peers (pubkey é identidade estável; score pode
-            oscilar ligeiramente por timing de heartbeat).
-          - Deduplica pubkeys (dois node_id com mesma pubkey = 1).
-          - Retorna [] se ninguém qualifica (modo bootstrap).
-        """
         try:
             n_target = max(1, int(count))
         except (TypeError, ValueError):
@@ -486,7 +475,6 @@ class TrustNetwork:
                 n for n in self.nodes.values()
                 if not n.banned and n.public_key
             ]
-            # Sort determinístico: score desc, pubkey asc (tiebreak)
             cands.sort(key=lambda n: (-n.trust_score, n.public_key))
 
             out: List[str] = []
@@ -521,10 +509,6 @@ class TrustNetwork:
             return out
 
     def get_validator_list(self) -> List[Dict]:
-        """
-        API informativa — retorna dicts com address/score para UI.
-        NÃO é usada pelo consenso (o consenso usa get_top_validators).
-        """
         with self._lock:
             ids = [nid for nid in self.active_validators if nid in self.nodes]
             return [
