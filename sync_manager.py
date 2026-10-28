@@ -1,23 +1,17 @@
-"""sync_manager.py — Sincronizador automático de blockchain (v2.1)
+"""sync_manager.py — Sincronizador automático de blockchain (v2.2)
 ================================================================
 Versão HTTP — funciona de QUALQUER lugar (LAN, Tailscale, internet).
+
+v2.2 (2026-10-28):
+  [NEW] Sincronização do Trust Network (trust_network.json) via HTTP.
+        A cada ciclo, o cliente baixa o arquivo assinado do Origem.
+        Se a assinatura for válida, ele atualiza a memória. Isso
+        permite que o cliente descubra que virou validador ao
+        acumular pontos no pool.
 
 Substitui a versão P2P anterior que dependia de multicast/UDP.
 O P2P continua para transações, mas o sync da blockchain é feito
 via HTTP (porta 5000), que é universal e à prova de firewall.
-
-Como funciona:
-  1. Lê peers de bootstrap_peers.json + BRN_BOOTSTRAP_PEERS
-  2. GET /api/chain-info em cada peer para ver a altura
-  3. Se peer tem mais blocos: GET /api/blocks?start=N&limit=100
-  4. Valida cada bloco com chain.accept_block() (PoW, merkle, auth)
-  5. Repete a cada SYNC_INTERVAL segundos
-
-Compatível com fork_guard.py (PeerStatus tem .addr e .height).
-v2.1 (2026-10-27):
-  [FIX] Impede que o sync tente importar blocos fora de ordem
-        (o que causava o erro "bloco #0 rejeitado: prev_hash incorreto"
-        quando o banco local oscilava rapidamente).
 ================================================================
 """
 from __future__ import annotations
@@ -100,7 +94,7 @@ class ChainSyncManager:
         if not _HAS_REQUESTS:
             log.error("requests nao instalado - sync HTTP indisponivel")
 
-        log.info("ChainSyncManager v2.1 (HTTP) inicializado")
+        log.info("ChainSyncManager v2.2 (HTTP + Trust) inicializado")
 
     # ============================================================
     # CICLO DE VIDA
@@ -152,6 +146,9 @@ class ChainSyncManager:
 
         self._refresh_peer_list()
 
+        # [NEW v2.2] Sincroniza o Trust Network antes de checar os blocos
+        self._sync_trust_network()
+
         best = self._probe_peers()
         if best is None:
             return
@@ -174,6 +171,65 @@ class ChainSyncManager:
         finally:
             with self._state_lock:
                 self._syncing = False
+
+    # ============================================================
+    # TRUST NETWORK SYNC (NOVO)
+    # ============================================================
+    def _sync_trust_network(self) -> None:
+        """
+        [NEW v2.2] Baixa o trust_network.json do peer Origem e recarrega a memória.
+        Isso permite que o nó Windows veja quando sua pontuação subiu.
+        """
+        with self.peer_lock:
+            addrs = list(self.peers.keys())
+
+        for addr in addrs:
+            if ":" not in addr:
+                continue
+            ip = addr.rpartition(":")[0]
+            
+            try:
+                # Tenta baixar o arquivo do peer
+                url = f"http://{ip}:{HTTP_PORT}/api/trust/download"
+                r = requests.get(url, timeout=5, proxies={"http": None, "https": None})
+                
+                if r.status_code != 200:
+                    continue
+
+                # Salva o arquivo temporariamente para não corromper se a conexão cair
+                temp_path = BASE_DIR / "trust_network.json.tmp"
+                temp_path.write_bytes(r.content)
+                
+                # Valida a assinatura usando uma instância temporária
+                from trust_network import TrustNetwork
+                temp_tn = TrustNetwork(str(temp_path), is_origin=False, node_sk=None)
+                
+                if len(temp_tn.nodes) > 0:
+                    # Se carregou nós, a assinatura era válida.
+                    os.replace(temp_path, BASE_DIR / "trust_network.json")
+                    
+                    # Recarrega a instância oficial na memória
+                    trust_net = getattr(self.chain, "trust_net", None)
+                    if trust_net is not None:
+                        trust_net._load()
+                        
+                        # Verifica se a nossa pubkey virou validadora
+                        try:
+                            from secure_store import load_current_wallet
+                            senha = os.environ.get("BRN_WALLET_SESSION_PASS", "") or os.environ.get("BRN_NODE_PASSWORD", "")
+                            if senha:
+                                w = load_current_wallet(senha)
+                                if w and w.get("ok"):
+                                    my_pub = w.get("public_key", "")
+                                    if trust_net.is_validator(my_pub):
+                                        log.info("🎉 SUA CHAVE FOI PROMOVIDA A VALIDADOR PELA REDE!")
+                        except Exception:
+                            pass
+                if temp_path.exists():
+                    temp_path.unlink()
+                break # Se conseguiu baixar de um peer, não precisa tentar os outros
+            except Exception as e:
+                log.debug(f"Falha ao baixar trust_network de {ip}: {e}")
 
     # ============================================================
     # PEERS
@@ -239,7 +295,7 @@ class ChainSyncManager:
                     f"http://{ip}:{HTTP_PORT}/api/chain-info",
                     timeout=PEER_HTTP_TIMEOUT,
                     proxies={"http": None, "https": None},
-                    headers={"User-Agent": "brn-sync/2.1"},
+                    headers={"User-Agent": "brn-sync/2.2"},
                 )
                 if r.status_code != 200:
                     with self.peer_lock:
@@ -278,7 +334,7 @@ class ChainSyncManager:
         return best
 
     # ============================================================
-    # SINCRONIZAÇÃO
+    # SINCRONIZAÇÃO DE BLOCOS
     # ============================================================
     def _sync_from_peer(self, peer: PeerStatus) -> None:
         ip = peer.addr.rpartition(":")[0]
@@ -305,7 +361,7 @@ class ChainSyncManager:
                         f"?start={cursor}&limit={SYNC_BATCH}",
                         timeout=30,
                         proxies={"http": None, "https": None},
-                        headers={"User-Agent": "brn-sync/2.1"},
+                        headers={"User-Agent": "brn-sync/2.2"},
                     )
                     if r.status_code == 200:
                         blocks = r.json().get("blocks", [])
@@ -327,7 +383,7 @@ class ChainSyncManager:
                 if self._stop.is_set():
                     return
                 
-                # [FIX] Valida se o bloco veio fora de ordem
+                # Valida se o bloco veio fora de ordem
                 if blk.get("height") != cursor:
                     log.warning("sync: bloco fora de ordem (esperado #%d, recebido #%d)", cursor, blk.get("height"))
                     return  # Aborta esse sync. Na próxima rodada ele tenta de novo.
