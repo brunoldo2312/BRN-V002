@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================
-REM   iniciar_cliente.bat - BRN Node Auto-Setup (v4.1 - FastAPI)
+REM   iniciar_cliente.bat - BRN Node Auto-Setup (v4.2 - FastAPI)
 REM   Fluxo: Deps -> Tailscale -> Sync -> GUI (Carteira)
 REM ============================================================
 setlocal EnableDelayedExpansion
@@ -27,7 +27,7 @@ goto parse_args
 
 echo.
 echo ============================================================
-echo   BRN Node - AUTO SETUP E INICIALIZACAO (v4.1)
+echo   BRN Node - AUTO SETUP E INICIALIZACAO (v4.2)
 echo ============================================================
 echo   Pasta: %CD%
 echo   Data:  %DATE% %TIME%
@@ -37,6 +37,22 @@ if "%FORCE_HEADLESS%"=="1" (
     echo   Modo:  GUI ^(Carteira Grafica^)
 )
 echo ============================================================
+echo.
+
+REM ============================================================
+REM 0. VERIFICAR ARQUIVO DE CONFIGURACAO (.env)
+REM ============================================================
+if not exist "brn_network.env" (
+    echo [AVISO] O arquivo brn_network.env NAO ENCONTRADO!
+    echo         Copiando brn_network.env.example para brn_network.env...
+    if exist "brn_network.env.example" (
+        copy "brn_network.env.example" "brn_network.env" >nul
+        echo         [IMPORTANTE] Edite o brn_network.env e preencha BRN_WEB_PASS e BRN_WALLET_SESSION_PASS antes de continuar!
+    ) else (
+        echo [ERRO] brn_network.env.example tambem nao existe. Crie o .env manualmente.
+    )
+    pause
+)
 echo.
 
 REM ============================================================
@@ -55,13 +71,13 @@ echo [ok] Python encontrado.
 echo.
 
 REM ============================================================
-REM 2. INSTALAR DEPENDENCIAS (Incluindo FastAPI/Uvicorn)
+REM 2. INSTALAR DEPENDENCIAS (Incluindo FastAPI/Uvicorn/Bitcoinlib)
 REM ============================================================
 if "%SKIP_DEPS%"=="1" goto deps_skip
 
-echo [2/5] Verificando e instalando dependencias...
-REM Lista de pacotes essenciais atualizada
-set "PKGS=flask flask-cors fastapi uvicorn requests orjson waitress cryptography argon2-cffi mnemonic pymongo pywebview pythonnet"
+echo [2/5] Verificando e instalando dependencias (isso pode demorar)...
+REM Adicionado 'bitcoinlib' para a ponte Offramp e 'pythonnet' para pywebview
+set "PKGS=flask flask-cors fastapi uvicorn requests orjson waitress cryptography argon2-cffi mnemonic pymongo pywebview pythonnet bitcoinlib"
 
 for %%P in (!PKGS!) do (
     python -c "import %%P" >nul 2>&1
