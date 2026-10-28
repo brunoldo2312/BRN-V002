@@ -1,20 +1,13 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.7.4)
+"""main.py — Entrypoint unificado do nó BRN (v13.7.5)
 ================================================================
-v13.7.4 (2026-10-28):
-  [FIX] broadcast_validator_registration agora é safe-call. Antes,
-        a chamada direta a p2p.broadcast_validator_registration(...)
-        caía em AttributeError silenciosamente (método não existia
-        no p2p_unified.py v6.7.1). Agora tenta chamar o método se
-        existir; se não existir, loga um INFO informativo.
-  [NEW] BRN_FORCE_HEADLESS=1 força headless mesmo se config.json
-        ou --gui estiverem setados. Útil para CI e automação.
-  [NEW] BRN_UVICORN_WORKERS controla o número de processos Uvicorn
-        (default 1). Com >1, usa a string de import (exigência do
-        Uvicorn para multiprocessing).
+v13.7.5 (2026-10-28):
+  [NEW] Inicialização do OfframpManager (BRN -> BTC) e BTCSender.
+        Se BRN_BTC_WIF estiver definida no .env, o motor de saque
+        é ligado automaticamente e injetado no server.py.
+  [KEEP] broadcast_validator_registration safe-call (v13.7.4).
+  [KEEP] BRN_FORCE_HEADLESS e BRN_UVICORN_WORKERS (v13.7.4).
   [KEEP] Migração Flask→FastAPI via WSGIMiddleware.
   [KEEP] ForkGuard, SyncManager, PoolManager, PoolClient, TrustNet.
-  [KEEP] Compatível com crypto.py v3.0 (Schnorr BIP-340) sem mudanças
-        no main.py — a troca é transparente via wallet.py.
 ================================================================
 """
 from __future__ import annotations
@@ -172,20 +165,25 @@ def _check_required_modules() -> list:
 
 
 # ============================================================
-# L2
+# L2 (ONRAMP + OFFRAMP)
 # ============================================================
 L2_ENABLED = False
 btc_config = None
 BTCWatcher = None
 L2Manager = None
+OfframpManager = None
+BTCSender = None
+
 try:
     import btc_config
     from btc_watcher import BTCWatcher
     from l2_manager import L2Manager
+    from offramp_manager import OfframpManager
+    from btc_sender import BTCSender
     L2_ENABLED = True
-    print("[L2] Módulos BTC carregados OK")
+    print("[L2] Módulos BTC (Onramp + Offramp) carregados OK")
 except Exception as _e:
-    print("[AVISO] btc_watcher/l2_manager indisponível: " + str(_e))
+    print("[AVISO] Módulos L2 indisponíveis: " + str(_e))
 
 
 def _l2_disponivel() -> bool:
@@ -194,6 +192,8 @@ def _l2_disponivel() -> bool:
         and btc_config is not None
         and BTCWatcher is not None
         and L2Manager is not None
+        and OfframpManager is not None
+        and BTCSender is not None
     )
 
 
@@ -549,10 +549,11 @@ def _verify_chain(chain) -> str:
 # ============================================================
 def _inject_into_server(what: str, obj, log) -> bool:
     setter_name = {
-        "p2p":  "set_p2p_manager",
-        "sync": "set_sync_manager",
-        "pool": "set_pool_manager",
-        "trust": "set_trust_network",
+        "p2p":     "set_p2p_manager",
+        "sync":    "set_sync_manager",
+        "pool":    "set_pool_manager",
+        "trust":   "set_trust_network",
+        "offramp": "set_offramp_manager",
     }.get(what)
     if setter_name is None:
         log.warning(f"[inject] tipo desconhecido: {what}")
@@ -614,7 +615,6 @@ def run_http(app_instance):
         import uvicorn
 
         if workers > 1:
-            # Multiprocessing exige string de import (não o objeto)
             log.info(f"HTTP Uvicorn (FastAPI, {workers} workers) - "
                      f"http://{WEB_HOST}:{port}")
             uvicorn.run(
@@ -913,7 +913,6 @@ def main():
     if args.log_file:
         cfg.data["log_file"] = args.log_file
 
-    # [NEW v13.7.4] Força headless via env var (útil para automação/CI)
     if os.environ.get("BRN_FORCE_HEADLESS", "0") == "1":
         cfg.data["headless"] = True
 
@@ -1069,9 +1068,6 @@ def main():
             chain.set_local_validator_sk(validator_sk)
             log.info(f"Validator SK carregada: {validator_sk.pub_hex[:16]}...")
 
-            # [FIX v13.7.4] safe-call: só chama se o método existir.
-            # Antes a chamada direta caía em AttributeError silencioso
-            # (o método não existe no p2p_unified.py v6.7.1).
             if p2p is not None:
                 try:
                     if hasattr(p2p, "broadcast_validator_registration"):
@@ -1160,6 +1156,33 @@ def main():
     elif args.no_pool:
         log.info("Pool: desativado por --no-pool")
 
+    # ---- Offramp (BRN -> BTC) ----
+    offramp = None
+    if L2_ENABLED and btc_config is not None and getattr(btc_config, "BTC_WIF", "").strip():
+        try:
+            log.info("Iniciando OfframpManager (BRN -> BTC)...")
+            btc_sender = BTCSender(btc_config.BTC_WIF, network=btc_config.BTC_NETWORK)
+            offramp = OfframpManager(
+                db=chain.db,
+                blockchain=chain,
+                btc_sender=btc_sender,
+                rate_brn_per_btc=btc_config.BRN_PER_BTC,
+                fee_pct=btc_config.FEE_PERCENT,
+                min_brn_sats=btc_config.MIN_OFFRAMP_BRN_SATS,
+                max_brn_sats=btc_config.MAX_OFFRAMP_BRN_SATS,
+                min_btc_sats=btc_config.MIN_OFFRAMP_BTC_SATS,
+                ttl_s=btc_config.OFFRAMP_TTL_S,
+                treasury_brn=btc_config.BRN_TREASURY_ADDRESS,
+            )
+            offramp.start()
+            _register_service("offramp", offramp)
+            log.info("OfframpManager ativado. Cofre BTC: %s", btc_sender.get_address())
+        except Exception as e:
+            log.error(f"Falha ao iniciar OfframpManager: {e}")
+            offramp = None
+    else:
+        log.info("OfframpManager: desativado (BRN_BTC_WIF ausente ou L2 indisponível).")
+
     # ---- HTTP ----
     http_app = _init_http_server(chain, log)
     if http_app is not None:
@@ -1190,6 +1213,11 @@ def main():
         _inject_into_server("trust", trust_net, log)
     else:
         log.info("Sem TrustNetwork — rotas /api/trust/* indisponiveis")
+
+    if offramp is not None:
+        _inject_into_server("offramp", offramp, log)
+    else:
+        log.info("Sem OfframpManager — rotas /api/l2/offramp/* indisponiveis")
 
     # ---- PoolClient ----
     disabled_pool_client = args.no_pool_client
@@ -1282,6 +1310,7 @@ def main():
         "trust":       bool(trust_net),
         "validator_sk": bool(validator_sk),
         "fork_guard":  bool(fork_guard_started),
+        "offramp":     bool(offramp),
     })
 
     log.info("Nó pronto. Ctrl+C para encerrar.")
