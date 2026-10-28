@@ -1,13 +1,13 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.7.5)
+"""main.py — Entrypoint unificado do nó BRN (v13.7.6)
 ================================================================
-v13.7.5 (2026-10-28):
-  [NEW] Inicialização do OfframpManager (BRN -> BTC) e BTCSender.
-        Se BRN_BTC_WIF estiver definida no .env, o motor de saque
-        é ligado automaticamente e injetado no server.py.
+v13.7.6 (2026-10-28):
+  [SECURITY] Inicialização do TrustNetwork com assinatura digital.
+        O nó Origem (Ubuntu) agora assina o trust_network.json com
+        sua chave Ed25519, garantindo que clientes não possam
+        alterar a pontuação ou a whitelist localmente.
+  [KEEP] OfframpManager (BRN -> BTC) e BTCSender (v13.7.5).
   [KEEP] broadcast_validator_registration safe-call (v13.7.4).
-  [KEEP] BRN_FORCE_HEADLESS e BRN_UVICORN_WORKERS (v13.7.4).
   [KEEP] Migração Flask→FastAPI via WSGIMiddleware.
-  [KEEP] ForkGuard, SyncManager, PoolManager, PoolClient, TrustNet.
 ================================================================
 """
 from __future__ import annotations
@@ -1010,7 +1010,13 @@ def main():
     trust_net = None
     if _HAS_TRUST:
         try:
-            trust_net = TrustNetwork(str(BASE_DIR / "trust_network.json"))
+            # [SECURITY v13.7.6] Passa is_origin e a chave privada (node_sk)
+            # para que o nó Origem possa assinar o arquivo JSON.
+            trust_net = TrustNetwork(
+                str(BASE_DIR / "trust_network.json"),
+                is_origin=is_origin,
+                node_sk=node_sk
+            )
             try:
                 chain.set_trust_net(trust_net)
             except AttributeError:
