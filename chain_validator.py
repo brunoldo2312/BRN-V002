@@ -1,8 +1,15 @@
-"""chain_validator.py — Auditoria completa da cadeia BRN (v2.3)
+"""chain_validator.py — Auditoria completa da cadeia BRN (v2.4)
 ================================================================
-v2.3 (2026-10-28):
-  [FIX CRÍTICO] Corrige o erro "validators_sig nao e lista" em blocos
-                antigos. Se o bloco for None, converte para lista vazia.
+v2.4 (2026-10-28):
+  [FIX CRÍTICO] _verify_tx_signature agora usa Wallet.verify (que
+                aceita Schnorr BIP-340 E ECDSA como fallback). Antes
+                chamava verify_ecdsa diretamente — rejeitava blocos
+                novos assinados com Schnorr.
+  [FIX] Remove import direto de verify_ecdsa (só usado via Wallet).
+v2.3:
+  [FIX] validators_sig None → [] em blocos antigos.
+v2.2:
+  [NEW] Verificação de validators_sig.
 ================================================================
 """
 from __future__ import annotations
@@ -11,11 +18,11 @@ import hashlib
 import logging
 import time
 
-from crypto import verify_ecdsa, sha256, double_sha256
+from crypto import sha256, double_sha256
 
 log = logging.getLogger("chain_validator")
 
-__version__ = "2.3"
+__version__ = "2.4"
 
 
 # ============================================================
@@ -166,7 +173,7 @@ def _verify_coinbase(cb: dict, height: int, chain) -> tuple:
 
 
 # ============================================================
-# Assinatura de tx
+# Assinatura de tx (v2.4 — usa Wallet.verify: Schnorr ou ECDSA)
 # ============================================================
 def _verify_tx_signature(tx: dict, chain=None) -> bool:
     if _is_coinbase(tx):
@@ -182,14 +189,34 @@ def _verify_tx_signature(tx: dict, chain=None) -> bool:
     except Exception:
         return False
 
+    # Import tardio para evitar circular import (wallet importa blockchain)
+    try:
+        from wallet import Wallet
+    except Exception:
+        # Fallback: usa ECDSA direto (compatibilidade com ambientes
+        # onde wallet.py ainda não foi migrado para Schnorr)
+        try:
+            from crypto import verify_ecdsa
+            for inp in inputs:
+                sig_hex = inp.get("signature", "")
+                pub_hex = inp.get("pubkey", "")
+                if not sig_hex or not pub_hex:
+                    return False
+                if not verify_ecdsa(bytes.fromhex(pub_hex),
+                                    bytes.fromhex(sig_hex), h):
+                    return False
+            return True
+        except Exception:
+            return False
+
     for inp in inputs:
         sig_hex = inp.get("signature", "")
         pub_hex = inp.get("pubkey", "")
         if not sig_hex or not pub_hex:
             return False
         try:
-            if not verify_ecdsa(bytes.fromhex(pub_hex),
-                                bytes.fromhex(sig_hex), h):
+            # Wallet.verify (v2+) aceita Schnorr BIP-340 e ECDSA
+            if not Wallet.verify(h, sig_hex, pub_hex):
                 return False
         except Exception:
             return False
@@ -272,11 +299,11 @@ def _verify_validator_sigs(
     block: dict, chain, strict: bool = False
 ) -> tuple:
     sigs = block.get("validators_sig")
-    
-    # [FIX CRÍTICO v2.3] Corrige o erro "validators_sig nao e lista" em blocos antigos
+
+    # [FIX v2.3] Corrige o erro "validators_sig nao e lista" em blocos antigos
     if sigs is None:
         sigs = []
-        
+
     if not isinstance(sigs, list):
         return False, "validators_sig nao e lista", 0
 
