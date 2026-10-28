@@ -1,5 +1,13 @@
-"""trust_network.py — Rede de confiança e reputação do BRN (v3.1)
+"""trust_network.py — Rede de confiança e reputação do BRN (v3.2)
 ================================================================
+v3.2 (2026-10-28):
+  [TUNING] Acelerada a progressão de reputação para viabilizar
+           validadores via pool de mineração.
+           - TRUST_THRESHOLD_VALIDATOR: 600 -> 150
+           - GAIN_SHARE_SUBMITTED: 0.05 -> 0.5
+           - GAIN_BLOCK_VALIDATED: 2.0 -> 20.0
+           - GAIN_ONLINE_HOUR: 0.1 -> 0.5
+           - FLUSH_INTERVAL_S: 30.0 -> 10.0 (salva o JSON mais rápido)
 v3.1 (2026-10-28):
   [SECURITY] Assinatura digital Ed25519 do trust_network.json.
              O nó Origem assina o arquivo. Nós Clientes verificam
@@ -10,7 +18,7 @@ v3.1 (2026-10-28):
 """
 from __future__ import annotations
 
-__version__ = "3.1"
+__version__ = "3.2"
 
 import json
 import logging
@@ -30,12 +38,12 @@ log = logging.getLogger("trust_network")
 INITIAL_TRUST_SCORE = 100.0
 MAX_TRUST_SCORE = 1000.0
 MIN_TRUST_SCORE = 0.0
-TRUST_THRESHOLD_VALIDATOR = 600.0
-TRUST_THRESHOLD_ACTIVE = 200.0
+TRUST_THRESHOLD_VALIDATOR = 150.0 # <--- ALTERADO (era 600)
+TRUST_THRESHOLD_ACTIVE = 120.0    # <--- ALTERADO (era 200)
 
-GAIN_BLOCK_VALIDATED = 2.0
-GAIN_ONLINE_HOUR = 0.1
-GAIN_SHARE_SUBMITTED = 0.05
+GAIN_BLOCK_VALIDATED = 20.0  # <--- ALTERADO (era 2.0)
+GAIN_ONLINE_HOUR = 0.5       # <--- ALTERADO (era 0.1)
+GAIN_SHARE_SUBMITTED = 0.5   # <--- ALTERADO (era 0.05)
 GAIN_REWARD_DISTRIBUTED = 5.0
 
 PENALTY_INVALID_BLOCK = -50.0
@@ -51,7 +59,7 @@ MAX_VALIDATORS = 21
 VALIDATOR_ROTATION_BLOCKS = 100
 DEFAULT_DATA_FILE = "trust_network.json"
 
-FLUSH_INTERVAL_S = 30.0
+FLUSH_INTERVAL_S = 10.0 # <--- ALTERADO (era 30) - Salva mais rápido
 
 
 # ============================================================
@@ -98,7 +106,7 @@ class NodeRecord:
             self.is_validator = False
         elif self.trust_score >= TRUST_THRESHOLD_VALIDATOR:
             self.trust_level = "validator"
-        elif self.trust_score >= 400:
+        elif self.trust_score >= 400: # Este continua alto para "trusted"
             self.trust_level = "trusted"
         elif self.trust_score >= TRUST_THRESHOLD_ACTIVE:
             self.trust_level = "active"
