@@ -1,14 +1,13 @@
-"""miner_pool_client.py — Cliente do pool de mineração BRN (v4)
+"""miner_pool_client.py — Cliente do pool de mineração BRN (v5)
 ================================================================
+v5 (2026-10-28):
+  [SECURITY] Envia o job_id para o pool (proteção anti-replay).
+  [FIX] Se o job expirar no servidor, o cliente puxa um novo trabalho
+        imediatamente em vez de continuar minerando no bloco velho.
 v4:
-  [NEW] Suporte a Vardiff: o cliente agora detecta mudanças de
-        share_difficulty mesmo quando o job_id é o mesmo, permitindo
-        que o servidor ajuste a dificuldade por minerador sem
-        invalidar o job atual.
+  [NEW] Suporte a Vardiff (dificuldade variável).
 v3:
-  [FIX] Corrigido o bug onde _http_post ignorava o self.pool_url
-        e tentava ligar sempre a 127.0.0.1 (localhost).
-  [FIX] _mine_batch agora usa share_difficulty no pow_search.
+  [FIX] Correção do bug de conexão localhost.
 ================================================================
 """
 from __future__ import annotations
@@ -52,7 +51,7 @@ except Exception as e:
 
 
 # ============================================================
-# HTTP (RECEBE A BASE_URL)
+# HTTP
 # ============================================================
 def _http_post(base_url: str, path: str, body: dict, timeout: float = HTTP_TIMEOUT_S) -> dict:
     url = base_url.rstrip("/") + path
@@ -61,7 +60,7 @@ def _http_post(base_url: str, path: str, body: dict, timeout: float = HTTP_TIMEO
         req = urllib.request.Request(
             url, data=data,
             headers={"Content-Type": "application/json",
-                     "User-Agent": "brn-pool-client/4"},
+                     "User-Agent": "brn-pool-client/5"},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -120,7 +119,6 @@ def _mine_batch(prev_hash: str, merkle: str, ts: int, diff: int, share_difficult
         prefix = prev_hash + merkle + str(ts)
         diff_str = str(int(diff))
         try:
-            # Usa share_difficulty (não diff) no pow_search
             result = _brn_miner_c.pow_search(
                 prefix, diff_str, int(share_difficulty),
                 nonce_start=nonce_start,
@@ -247,7 +245,6 @@ class PoolClient(threading.Thread):
             return
         job = r.get("job") or {}
         with self._job_lock:
-            # [VARDIFF] Atualiza também quando só a share_difficulty muda
             if self._job is None:
                 should_update = True
             else:
@@ -294,7 +291,6 @@ class PoolClient(threading.Thread):
                 time.sleep(1.0)
                 continue
 
-            # Só reseta o nonce quando o job muda de verdade.
             if job.get("job_id") != last_job_id:
                 last_job_id = job.get("job_id")
                 nonce = 0
@@ -335,8 +331,10 @@ class PoolClient(threading.Thread):
             log.info("pool client: share nonce=%s hash=%s", found_nonce, found_hash[:20])
 
             try:
+                # [SECURITY] Envia o job_id para validação anti-replay
                 r = _http_post(self.pool_url, "/api/pool/submit", {
                     "miner_id": self.miner_id,
+                    "job_id":   job.get("job_id"),
                     "nonce":    int(found_nonce),
                     "hash":     found_hash,
                 })
@@ -360,6 +358,14 @@ class PoolClient(threading.Thread):
                 self.shares_rejected += 1
                 self.last_error = r.get("msg", "rejeitado")
                 log.debug("share rejeitado: %s", self.last_error)
+                
+                # [FIX] Se o job expirou (outro minerador achou o bloco), puxa um novo
+                if "job expirado" in self.last_error.lower() or "job_id" in self.last_error.lower():
+                    log.info("pool client: job expirou, buscando novo trabalho...")
+                    try:
+                        self._fetch_work()
+                    except Exception:
+                        pass
 
     def status(self) -> dict:
         with self._lock:
