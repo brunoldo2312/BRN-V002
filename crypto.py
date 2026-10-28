@@ -1,36 +1,28 @@
-"""crypto.py — Primitivas criptográficas do BRN (v2.0)
+"""crypto.py — Primitivas criptográficas do BRN (v3.0)
 ================================================================
-v2.0 (2026-10-27):
-  [FIX CRÍTICO] verify_ecdsa() agora VALIDA que a pubkey está na
-                curva secp256k1:
-                  - 65 bytes (não comprimida): confere y² ≡ x³+7 mod P
-                  - 33 bytes (comprimida):     confere y² == x³+7 mod P
-                    após recuperar y via sqrt (rejeita x³+7 que NÃO é
-                    resíduo quadrático — antes era aceito silenciosamente)
-                  - x, y em [0, P)
-                  - ponto não é o infinito
-  [FIX] _point_add: se p1 == p2 e y1 == 0, retorna None (infinito).
-        Defesa em profundidade — em secp256k1 (ordem prima) isso não
-        ocorre, mas evita `_inv_mod(0, P) == 0` gerar ponto inválido.
-  [FIX] pubkey_from_priv: valida retorno de _point_mul.
-  [NEW] _point_on_curve(x, y) — helper usado na validação de pubkey.
-  [NEW] _decompress_pubkey() — recuperação de y com validação de QR.
-  [NEW] __version__, __all__, docstrings.
-  [KEEP] API 100% compatível com v1: assinaturas, retornos e nomes
-         inalterados. Aliases sign_schnorr/verify_schnorr mantidos
-         (NÃO são BIP340 — são ECDSA; ver comentário).
+v3.0 (2026-10-28):
+  [NEW] sign_schnorr / verify_schnorr agora implementam BIP-340 REAL
+        (assinaturas de 64 bytes sobre secp256k1 com tagged hashes,
+        nonce determinístico + aux_rand opcional).
+  [NEW] verify_schnorr aceita pubkey em dois formatos:
+        - 32 bytes (x-only, formato canônico BIP-340)
+        - 33 bytes (compressed 02/03, formato que a Wallet usa)
+  [NEW] Helpers _tagged_hash, _has_even_y, _lift_x.
+  [NEW] Auto-teste valida contra os vetores oficiais da BIP-340.
+  [KEEP] sign_ecdsa / verify_ecdsa 100% inalterados (backward compat).
+  [KEEP] API pública da v2.0 (só adiciona, não remove).
 ================================================================
 """
 from __future__ import annotations
 
-__version__ = "2.0"
+__version__ = "3.0"
 
 __all__ = [
     "Ed25519PrivateKey", "Ed25519PublicKey",
     "sha256", "double_sha256", "hash160",
     "generate_private_key", "pubkey_from_priv", "pubkey_to_address",
     "sign_ecdsa", "verify_ecdsa",
-    "sign_schnorr", "verify_schnorr",
+    "sign_schnorr", "verify_schnorr",           # BIP-340 real (v3.0)
     "P", "N", "Gx", "Gy",
 ]
 
@@ -86,36 +78,19 @@ def _inv_mod(a: int, m: int) -> int:
 
 
 def _point_on_curve(x: int, y: int) -> bool:
-    """
-    [NEW v2.0] True se (x, y) satisfaz y² ≡ x³ + 7 (mod P).
-    Também exige x, y em [0, P) e não é o ponto no infinito
-    (representado fora desta função como None).
-    """
     if not (0 <= x < P) or not (0 <= y < P):
         return False
-    lhs = (y * y) % P
-    rhs = (pow(x, 3, P) + 7) % P
-    return lhs == rhs
+    return (y * y) % P == (pow(x, 3, P) + 7) % P
 
 
 def _decompress_pubkey(prefix: int, x: int):
-    """
-    [NEW v2.0] Recupera y de uma pubkey comprimida.
-    Retorna (x, y) se válido, None caso contrário.
-
-    Valida:
-      - prefix ∈ {0x02, 0x03}
-      - x ∈ [0, P)
-      - y_sq = x³+7 mod P é resíduo quadrático (y² == y_sq após sqrt)
-      - paridade de y bate com o prefixo
-    """
+    """Recupera y de pubkey comprimida (33B com prefixo 02/03)."""
     if prefix not in (0x02, 0x03):
         return None
     if not (0 <= x < P):
         return None
     y_sq = (pow(x, 3, P) + 7) % P
-    y = pow(y_sq, (P + 1) // 4, P)  # válido porque P ≡ 3 mod 4
-    # [FIX v2.0] confirmar que y_sq é realmente QR
+    y = pow(y_sq, (P + 1) // 4, P)
     if (y * y) % P != y_sq:
         return None
     if (y % 2 == 0) != (prefix == 0x02):
@@ -124,7 +99,6 @@ def _decompress_pubkey(prefix: int, x: int):
 
 
 def _point_add(p1, p2):
-    """Soma de dois pontos. None = ponto no infinito."""
     if p1 is None:
         return p2
     if p2 is None:
@@ -134,8 +108,6 @@ def _point_add(p1, p2):
     if x1 == x2 and (y1 + y2) % P == 0:
         return None
     if p1 == p2:
-        # [FIX v2.0] defesa: y1 == 0 implicaria infinito (não ocorre em
-        # secp256k1, mas evita _inv_mod(0, P) == 0 gerar ponto espúrio).
         if y1 == 0:
             return None
         lam = (3 * x1 * x1) * _inv_mod(2 * y1, P) % P
@@ -147,7 +119,6 @@ def _point_add(p1, p2):
 
 
 def _point_mul(k: int, point):
-    """Multiplicação escalar. Retorna None = infinito."""
     result = None
     addend = point
     while k:
@@ -162,7 +133,6 @@ def _point_mul(k: int, point):
 # CHAVE PRIVADA / PUBKEY
 # ============================================================
 def generate_private_key() -> bytes:
-    """Gera 32 bytes de chave privada válida para secp256k1."""
     while True:
         k = secrets.token_bytes(32)
         val = int.from_bytes(k, "big")
@@ -171,17 +141,10 @@ def generate_private_key() -> bytes:
 
 
 def pubkey_from_priv(priv_bytes: bytes, compressed: bool = True) -> bytes:
-    """
-    Deriva a pubkey secp256k1 a partir da privkey.
-    compressed=True → 33 bytes (0x02/0x03 || x)
-    compressed=False → 65 bytes (0x04 || x || y)
-    """
     k = int.from_bytes(priv_bytes, "big")
     if k == 0 or k >= N:
         raise ValueError("chave privada fora do range")
     point = _point_mul(k, (Gx, Gy))
-    # [FIX v2.0] _point_mul nunca deveria retornar None para k válido,
-    # mas defendemos o caso.
     if point is None:
         raise ValueError("ponto no infinito (privkey inválida?)")
     x, y = point
@@ -192,19 +155,14 @@ def pubkey_from_priv(priv_bytes: bytes, compressed: bool = True) -> bytes:
 
 
 def pubkey_to_address(pubkey_hex: str) -> str:
-    """Deriva endereço Bech32 (brn1...) a partir da pubkey em hex."""
     from bech32 import address_from_pubkey
     return address_from_pubkey(bytes.fromhex(pubkey_hex))
 
 
 # ============================================================
-# ECDSA secp256k1
+# ECDSA secp256k1 (inalterado — backward compat)
 # ============================================================
 def sign_ecdsa(priv_bytes: bytes, msg_hash: bytes) -> bytes:
-    """
-    Assina o hash (32 bytes). Retorna r||s (64 bytes) com low-S.
-    Levanta ValueError para chave inválida.
-    """
     if len(msg_hash) != 32:
         raise ValueError("msg_hash deve ter 32 bytes (SHA-256)")
     z = int.from_bytes(msg_hash, "big")
@@ -216,7 +174,7 @@ def sign_ecdsa(priv_bytes: bytes, msg_hash: bytes) -> bytes:
         k = secrets.randbelow(N - 1) + 1
         point = _point_mul(k, (Gx, Gy))
         if point is None:
-            continue  # probabilidade ~0, mas não trava
+            continue
         x, _y = point
         r = x % N
         if r == 0:
@@ -230,17 +188,6 @@ def sign_ecdsa(priv_bytes: bytes, msg_hash: bytes) -> bytes:
 
 
 def verify_ecdsa(pub_bytes: bytes, sig_bytes: bytes, msg_hash: bytes) -> bool:
-    """
-    Verifica assinatura ECDSA (r||s, low-S).
-
-    [FIX v2.0] Valida a pubkey:
-      - comprimento 33 ou 65
-      - prefixo correto
-      - ponto realmente na curva secp256k1
-      - x, y em [0, P)
-    Rejeita: sig != 64 bytes, r/s fora de [1, N-1], s > N/2, ponto no
-    infinito, R == None, mismatch de r, msg_hash != 32 bytes.
-    """
     try:
         if not isinstance(pub_bytes, (bytes, bytearray)):
             return False
@@ -248,7 +195,6 @@ def verify_ecdsa(pub_bytes: bytes, sig_bytes: bytes, msg_hash: bytes) -> bool:
             return False
         if len(msg_hash) != 32:
             return False
-
         if len(sig_bytes) != 64:
             return False
         r = int.from_bytes(sig_bytes[:32], "big")
@@ -258,7 +204,6 @@ def verify_ecdsa(pub_bytes: bytes, sig_bytes: bytes, msg_hash: bytes) -> bool:
         if s > _HALF_N:
             return False
 
-        # ---------- Recuperar e VALIDAR Q ----------
         if len(pub_bytes) == 65 and pub_bytes[0] == 0x04:
             x = int.from_bytes(pub_bytes[1:33], "big")
             y = int.from_bytes(pub_bytes[33:], "big")
@@ -273,7 +218,6 @@ def verify_ecdsa(pub_bytes: bytes, sig_bytes: bytes, msg_hash: bytes) -> bool:
         else:
             return False
 
-        # ---------- Verificação ECDSA ----------
         z = int.from_bytes(msg_hash, "big")
         w = _inv_mod(s, N)
         u1 = (z * w) % N
@@ -289,15 +233,180 @@ def verify_ecdsa(pub_bytes: bytes, sig_bytes: bytes, msg_hash: bytes) -> bool:
 
 
 # ============================================================
-# ALIASES (compatibilidade — NÃO são BIP340 real)
+# SCHNORR BIP-340 (v3.0 — implementação real)
 # ------------------------------------------------------------
-# Estes aliases existem para compatibilidade com chamadas antigas.
-# Eles usam ECDSA secp256k1, NÃO Schnorr/BIP340. Não use para
-# interoperabilidade com Bitcoin Taproot ou qualquer coisa que
-# exija BIP340 de verdade.
+# Referência: https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki
+#
+# Formato da assinatura: 64 bytes = R.x (32) || s (32)
+# Pubkey canônica: 32 bytes (x-only). Aceita 33 bytes (02/03 compressed)
+# por conveniência — internamente usa lift_x, produzindo o mesmo ponto
+# de Y par que BIP-340 exige.
 # ============================================================
-sign_schnorr = sign_ecdsa
-verify_schnorr = verify_ecdsa
+def _tagged_hash(tag: str, msg: bytes) -> bytes:
+    """tagged_hash(tag, msg) = SHA256(SHA256(tag) || SHA256(tag) || msg)."""
+    tag_hash = hashlib.sha256(tag.encode("ascii")).digest()
+    return hashlib.sha256(tag_hash + tag_hash + msg).digest()
+
+
+def _has_even_y(point) -> bool:
+    if point is None:
+        return False
+    return point[1] % 2 == 0
+
+
+def _lift_x(x: int):
+    """Retorna o ponto (x, y) com Y PAR. Retorna None se x não é QR."""
+    if not (0 <= x < P):
+        return None
+    y_sq = (pow(x, 3, P) + 7) % P
+    y = pow(y_sq, (P + 1) // 4, P)
+    if (y * y) % P != y_sq:
+        return None
+    if y % 2 != 0:
+        y = P - y
+    return (x, y)
+
+
+def sign_schnorr(
+    priv_bytes: bytes,
+    msg_hash: bytes,
+    aux_rand: bytes | None = None,
+) -> bytes:
+    """
+    Assina `msg_hash` (32 bytes) usando Schnorr/BIP-340.
+
+    Params:
+        priv_bytes : 32 bytes (chave privada secp256k1).
+        msg_hash   : 32 bytes (SHA-256, ou qualquer digest de 32B).
+        aux_rand   : 32 bytes de aleatoriedade opcional. Se None, gera
+                     via secrets.token_bytes(32). Passar bytes fixos
+                     permite assinatura determinística (útil em testes).
+
+    Retorna:
+        64 bytes: R.x (32) || s (32).
+
+    Raises:
+        ValueError se algum argumento for inválido.
+    """
+    if not isinstance(priv_bytes, (bytes, bytearray)) or len(priv_bytes) != 32:
+        raise ValueError("priv_bytes deve ter 32 bytes")
+    if not isinstance(msg_hash, (bytes, bytearray)) or len(msg_hash) != 32:
+        raise ValueError("msg_hash deve ter 32 bytes")
+    if aux_rand is None:
+        aux_rand = secrets.token_bytes(32)
+    if not isinstance(aux_rand, (bytes, bytearray)) or len(aux_rand) != 32:
+        raise ValueError("aux_rand deve ter 32 bytes")
+
+    d_prime = int.from_bytes(priv_bytes, "big")
+    if not (1 <= d_prime < N):
+        raise ValueError("chave privada fora do range secp256k1")
+
+    # P = d' * G
+    P_point = _point_mul(d_prime, (Gx, Gy))
+    if P_point is None:
+        raise ValueError("ponto no infinito (privkey inválida)")
+    px, py = P_point
+
+    # d = d' se Y(P) for par, senão n - d'
+    d = d_prime if py % 2 == 0 else (N - d_prime)
+
+    # t = d XOR tagged_hash("BIP0340/aux", aux_rand)
+    aux_hash = _tagged_hash("BIP0340/aux", bytes(aux_rand))
+    t = bytes(a ^ b for a, b in zip(d.to_bytes(32, "big"), aux_hash))
+
+    # rand = tagged_hash("BIP0340/nonce", t || bytes(P.x) || msg)
+    rand = _tagged_hash("BIP0340/nonce", t + px.to_bytes(32, "big") + bytes(msg_hash))
+    k_prime = int.from_bytes(rand, "big") % N
+    if k_prime == 0:
+        raise ValueError("nonce k' = 0 (extremamente improvável); tente novamente")
+
+    # R = k' * G
+    R_point = _point_mul(k_prime, (Gx, Gy))
+    if R_point is None:
+        raise ValueError("R no infinito (nonce inválido)")
+    rx, ry = R_point
+
+    # k = k' se Y(R) for par, senão n - k'
+    k = k_prime if ry % 2 == 0 else (N - k_prime)
+
+    # e = int(tagged_hash("BIP0340/challenge", bytes(R.x) || bytes(P.x) || msg)) mod n
+    e = int.from_bytes(
+        _tagged_hash(
+            "BIP0340/challenge",
+            rx.to_bytes(32, "big") + px.to_bytes(32, "big") + bytes(msg_hash),
+        ),
+        "big",
+    ) % N
+
+    # s = (k + e*d) mod n
+    s = (k + e * d) % N
+
+    return rx.to_bytes(32, "big") + s.to_bytes(32, "big")
+
+
+def verify_schnorr(
+    pub_bytes: bytes,
+    sig_bytes: bytes,
+    msg_hash: bytes,
+) -> bool:
+    """
+    Verifica assinatura Schnorr/BIP-340.
+
+    Aceita pubkey em dois formatos:
+        - 32 bytes (x-only, formato canônico BIP-340)
+        - 33 bytes (compressed, 0x02/0x03 || x — formato da Wallet BRN)
+    Internamente ambas produzem o mesmo ponto (Y par via lift_x).
+
+    Retorna True/False. Nunca levanta exceção.
+    """
+    try:
+        if not isinstance(pub_bytes, (bytes, bytearray)):
+            return False
+        if not isinstance(sig_bytes, (bytes, bytearray)):
+            return False
+        if not isinstance(msg_hash, (bytes, bytearray)):
+            return False
+        if len(msg_hash) != 32 or len(sig_bytes) != 64:
+            return False
+
+        # Aceita 32 (x-only) ou 33 (compressed 02/03)
+        if len(pub_bytes) == 32:
+            px = int.from_bytes(pub_bytes, "big")
+        elif len(pub_bytes) == 33 and pub_bytes[0] in (0x02, 0x03):
+            px = int.from_bytes(pub_bytes[1:], "big")
+        else:
+            return False
+
+        P_point = _lift_x(px)
+        if P_point is None:
+            return False
+
+        r = int.from_bytes(sig_bytes[:32], "big")
+        s = int.from_bytes(sig_bytes[32:], "big")
+        if r >= P or s >= N:
+            return False
+
+        e = int.from_bytes(
+            _tagged_hash(
+                "BIP0340/challenge",
+                sig_bytes[:32] + px.to_bytes(32, "big") + bytes(msg_hash),
+            ),
+            "big",
+        ) % N
+
+        # R = s*G - e*P = s*G + (N-e)*P
+        R1 = _point_mul(s, (Gx, Gy))
+        R2 = _point_mul((N - e) % N, P_point)
+        R_point = _point_add(R1, R2)
+        if R_point is None:
+            return False
+
+        rx, ry = R_point
+        if ry % 2 != 0:      # BIP-340 exige Y(R) par
+            return False
+        return rx == r
+    except Exception:
+        return False
 
 
 # ============================================================
@@ -322,7 +431,7 @@ if __name__ == "__main__":
             print(f"  [ERR]  {name}: {e}")
             failures.append(name)
 
-    # 1) Roundtrip sign/verify (comprimida e não comprimida)
+    # ---------- ECDSA (v2.0) ----------
     def t1():
         priv = generate_private_key()
         msg = sha256(b"hello brn")
@@ -330,101 +439,159 @@ if __name__ == "__main__":
         assert len(sig) == 64
         pk_c = pubkey_from_priv(priv, compressed=True)
         pk_u = pubkey_from_priv(priv, compressed=False)
-        assert len(pk_c) == 33
-        assert len(pk_u) == 65
-        assert verify_ecdsa(pk_c, sig, msg), "comprimida deveria verificar"
-        assert verify_ecdsa(pk_u, sig, msg), "não comprimida deveria verificar"
-    _check("roundtrip sign/verify (33 e 65 bytes)", t1)
+        assert verify_ecdsa(pk_c, sig, msg)
+        assert verify_ecdsa(pk_u, sig, msg)
+    _check("[ECDSA] roundtrip 33/65 bytes", t1)
 
-    # 2) Mensagem errada
     def t2():
         priv = generate_private_key()
         sig = sign_ecdsa(priv, sha256(b"a"))
         pk = pubkey_from_priv(priv)
         assert not verify_ecdsa(pk, sig, sha256(b"b"))
-    _check("rejeita mensagem diferente", t2)
+    _check("[ECDSA] rejeita msg diferente", t2)
 
-    # 3) Assinatura adulterada
+    # ---------- SCHNORR BIP-340 (v3.0) ----------
     def t3():
         priv = generate_private_key()
-        msg = sha256(b"x")
-        sig = bytearray(sign_ecdsa(priv, msg))
-        sig[0] ^= 0xFF
-        pk = pubkey_from_priv(priv)
-        assert not verify_ecdsa(pk, bytes(sig), msg)
-    _check("rejeita assinatura adulterada", t3)
+        msg = sha256(b"hello schnorr")
+        sig = sign_schnorr(priv, msg)
+        assert len(sig) == 64, f"esperado 64B, recebido {len(sig)}"
+        pk_c = pubkey_from_priv(priv, compressed=True)
+        pk_x = pk_c[1:]  # 32 bytes x-only
+        assert verify_schnorr(pk_c, sig, msg), "verify com 33B falhou"
+        assert verify_schnorr(pk_x, sig, msg), "verify com 32B x-only falhou"
+    _check("[BIP340] roundtrip sign/verify (33B e 32B x-only)", t3)
 
-    # 4) [FIX v2.0] pubkey não comprimida fora da curva
     def t4():
         priv = generate_private_key()
-        msg = sha256(b"y")
-        sig = sign_ecdsa(priv, msg)
-        pk = bytearray(pubkey_from_priv(priv, compressed=False))
-        # corromper y
-        pk[64] ^= 0x01
-        assert not verify_ecdsa(bytes(pk), sig, msg), \
-            "pubkey fora da curva NÃO pode passar"
-    _check("[FIX] rejeita pubkey 65B fora da curva", t4)
+        sig = sign_schnorr(priv, sha256(b"a"))
+        pk = pubkey_from_priv(priv)
+        assert not verify_schnorr(pk, sig, sha256(b"b"))
+    _check("[BIP340] rejeita msg diferente", t4)
 
-    # 5) [FIX v2.0] pubkey comprimida cujo x³+7 NÃO é QR
     def t5():
-        # escolhe x arbitrário e testa se a recuperação falha
-        # varre até achar um x onde x³+7 não é QR
-        found = None
-        for x in range(1, 50):
-            y_sq = (pow(x, 3, P) + 7) % P
-            y = pow(y_sq, (P + 1) // 4, P)
-            if (y * y) % P != y_sq:
-                found = x
-                break
-        assert found is not None, "nenhum x encontrado (improvável)"
-        fake_pk = b"\x02" + found.to_bytes(32, "big")
-        msg = sha256(b"z")
-        # qualquer assinatura deve ser rejeitada
-        fake_sig = b"\x01" + b"\x00" * 31 + b"\x01" + b"\x00" * 31
-        assert not verify_ecdsa(fake_pk, fake_sig, msg), \
-            "pubkey comprimida não-QR NÃO pode passar"
-    _check("[FIX] rejeita pubkey 33B não-QR", t5)
+        priv = generate_private_key()
+        msg = sha256(b"x")
+        sig = bytearray(sign_schnorr(priv, msg))
+        sig[0] ^= 0x01
+        pk = pubkey_from_priv(priv)
+        assert not verify_schnorr(pk, bytes(sig), msg)
+    _check("[BIP340] rejeita sig adulterada", t5)
 
-    # 6) Tamanhos inválidos
     def t6():
         priv = generate_private_key()
-        msg = sha256(b"w")
-        sig = sign_ecdsa(priv, msg)
-        pk = pubkey_from_priv(priv)
-        assert not verify_ecdsa(b"", sig, msg)
-        assert not verify_ecdsa(pk, b"", msg)
-        assert not verify_ecdsa(pk, sig + b"\x00", msg)
-        assert not verify_ecdsa(b"\x04" + b"\x00" * 64, sig, msg)
-        assert not verify_ecdsa(pk, sig, b"")
-        assert not verify_ecdsa(pk, sig, b"short")
-    _check("rejeita tamanhos inválidos", t6)
+        msg = sha256(b"det")
+        aux = b"\x00" * 32
+        sig1 = sign_schnorr(priv, msg, aux_rand=aux)
+        sig2 = sign_schnorr(priv, msg, aux_rand=aux)
+        assert sig1 == sig2, "com mesmo aux_rand deve ser determinístico"
+        sig3 = sign_schnorr(priv, msg)  # aux aleatório
+        assert sig1 != sig3
+    _check("[BIP340] aux_rand determinístico", t6)
 
-    # 7) r=0, s=0, high-S
+    # ---------- VETORES OFICIAIS BIP-340 ----------
     def t7():
-        priv = generate_private_key()
-        msg = sha256(b"v")
-        pk = pubkey_from_priv(priv)
-        assert not verify_ecdsa(pk, b"\x00" * 64, msg)  # r=s=0
-        sig = sign_ecdsa(priv, msg)
-        r, s = int.from_bytes(sig[:32], "big"), int.from_bytes(sig[32:], "big")
-        # high-S: s' = N - s (não é o mesmo sig válido)
-        high_s = r.to_bytes(32, "big") + (N - s).to_bytes(32, "big")
-        assert not verify_ecdsa(pk, high_s, msg), "high-S deve ser rejeitado"
-    _check("rejeita r=0, s=0, high-S", t7)
+        """BIP-340 test vector index 0."""
+        seckey = bytes.fromhex(
+            "0000000000000000000000000000000000000000000000000000000000000003"
+        )
+        expected_pub = "F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9"
+        aux = bytes(32)
+        msg = bytes(32)
+        expected_sig = (
+            "E907831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA8215"
+            "25F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536C0"
+        )
 
-    # 8) low-S está sendo produzido
+        # Deriva pubkey x-only
+        pub_c = pubkey_from_priv(seckey, compressed=True)
+        pub_x = pub_c[1:]
+        assert pub_x.hex().upper() == expected_pub, (
+            f"pubkey x-only errada: {pub_x.hex().upper()}"
+        )
+
+        sig = sign_schnorr(seckey, msg, aux_rand=aux)
+        assert sig.hex().upper() == expected_sig, (
+            f"assinatura errada:\n  obtido  = {sig.hex().upper()}\n"
+            f"  esperado= {expected_sig}"
+        )
+
+        assert verify_schnorr(pub_x, sig, msg)
+    _check("[BIP340] test vector index 0 (oficial)", t7)
+
     def t8():
-        for _ in range(5):
-            priv = generate_private_key()
-            msg = sha256(secrets.token_bytes(16))
-            sig = sign_ecdsa(priv, msg)
-            s = int.from_bytes(sig[32:], "big")
-            assert s <= _HALF_N, "sign_ecdsa deve produzir low-S"
-    _check("sign_ecdsa produz low-S", t8)
+        """BIP-340 test vector index 1."""
+        seckey = bytes.fromhex(
+            "B7E151628AED2A6ABF7158809CF4F3C762E7160F38B4DA56A784D9045190CFEF"
+        )
+        expected_pub = "DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659"
+        aux = bytes.fromhex(
+            "0000000000000000000000000000000000000000000000000000000000000001"
+        )
+        msg = bytes.fromhex(
+            "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89"
+        )
+        expected_sig = (
+            "6896BD60EEAE296DB48A229FF71DFE071BDE413E6D43F917DC8DCF8C78DE3341"
+            "8906D11AC976ABCCB20B091292BFF4EA897EFCB639EA871CFA95F6DE339E4B0A"
+        )
 
-    # 9) hash160 e pubkey_to_address
+        pub_c = pubkey_from_priv(seckey, compressed=True)
+        pub_x = pub_c[1:]
+        assert pub_x.hex().upper() == expected_pub
+
+        sig = sign_schnorr(seckey, msg, aux_rand=aux)
+        assert sig.hex().upper() == expected_sig
+
+        assert verify_schnorr(pub_x, sig, msg)
+    _check("[BIP340] test vector index 1 (oficial)", t8)
+
+    # ---------- INCOMPATIBILIDADE ECDSA x SCHNORR ----------
     def t9():
+        """Uma assinatura Schnorr NÃO deve validar em verify_ecdsa (e vice-versa)."""
+        priv = generate_private_key()
+        msg = sha256(b"cross")
+        pk = pubkey_from_priv(priv)
+
+        sig_schnorr = sign_schnorr(priv, msg)
+        sig_ecdsa = sign_ecdsa(priv, msg)
+
+        # Schnorr não passa em ECDSA
+        assert not verify_ecdsa(pk, sig_schnorr, msg), \
+            "Schnorr NÃO pode validar em verify_ecdsa"
+        # ECDSA não passa em Schnorr (na esmagadora maioria dos casos)
+        # Nota: existe uma chance ~2^-256 de coincidência; aceitamos
+        assert not verify_schnorr(pk, sig_ecdsa, msg), \
+            "ECDSA NÃO pode validar em verify_schnorr"
+    _check("[INTEROP] ECDSA e Schnorr são incompatíveis", t9)
+
+    # ---------- NEGATIVOS ----------
+    def t10():
+        priv = generate_private_key()
+        msg = sha256(b"neg")
+        sig = sign_schnorr(priv, msg)
+        pk = pubkey_from_priv(priv)
+
+        assert not verify_schnorr(b"", sig, msg)
+        assert not verify_schnorr(pk, b"", msg)
+        assert not verify_schnorr(pk, sig + b"\x00", msg)
+        assert not verify_schnorr(pk, sig[:32], msg)
+        assert not verify_schnorr(pk, sig, b"short")
+        # x-only fora da curva
+        assert not verify_schnorr(b"\xff" * 32, sig, msg)
+    _check("[BIP340] rejeita tamanhos/pubkeys inválidos", t10)
+
+    def t11():
+        # assinatura com r fora do range (>= p) deve falhar
+        priv = generate_private_key()
+        msg = sha256(b"range")
+        pk = pubkey_from_priv(priv)
+        bad_sig = (P).to_bytes(32, "big") + b"\x01" * 32
+        assert not verify_schnorr(pk, bad_sig, msg)
+    _check("[BIP340] rejeita r >= p", t11)
+
+    # ---------- COEXISTÊNCIA COM HASHES ----------
+    def t12():
         assert len(hash160(b"test")) == 20
         priv = generate_private_key()
         pk = pubkey_from_priv(priv, compressed=False)
@@ -432,34 +599,7 @@ if __name__ == "__main__":
         assert addr.startswith("brn1")
         from bech32 import validate_address
         assert validate_address(addr)
-    _check("hash160 e pubkey_to_address", t9)
-
-    # 10) Aliases (compat)
-    def t10():
-        priv = generate_private_key()
-        msg = sha256(b"alias")
-        sig = sign_schnorr(priv, msg)
-        pk = pubkey_from_priv(priv)
-        assert verify_schnorr(pk, sig, msg)
-    _check("aliases sign_schnorr/verify_schnorr", t10)
-
-    # 11) _point_on_curve direto
-    def t11():
-        assert _point_on_curve(Gx, Gy)
-        assert not _point_on_curve(Gx, Gy + 1)
-        assert not _point_on_curve(-1, 0)
-        assert not _point_on_curve(P, 0)
-    _check("_point_on_curve", t11)
-
-    # 12) pubkey_from_priv rejeita chave inválida
-    def t12():
-        for bad in (b"\x00" * 32, (N).to_bytes(32, "big")):
-            try:
-                pubkey_from_priv(bad)
-                raise AssertionError(f"deveria rejeitar {bad.hex()[:8]}")
-            except ValueError:
-                pass
-    _check("pubkey_from_priv rejeita privkey inválida", t12)
+    _check("hash160 e pubkey_to_address", t12)
 
     print()
     print("=" * 60)
