@@ -1,9 +1,20 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.18)
+server.py — Backend HTTP do nó BRN (v9.9.19)
 ================================================================
+v9.9.19 (2026-10-28):
+  [NEW] OFFRAMP (BRN → BTC): 6 endpoints + OfframpManager.
+        - GET  /api/l2/offramp/quote?brn_sats=N
+        - POST /api/l2/offramp/create      (valida SK, move BRN p/ cofre)
+        - GET  /api/l2/offramp/status/<id>
+        - GET  /api/l2/offramp/list?buyer=&status=
+        - POST /api/l2/offramp/cancel/<id>
+        - GET  /api/l2/offramp/stats
+  [NEW] set_offramp_manager / _get_offramp
+  [NEW] helper _send_brn_to_treasury (assina tx BRN buyer → cofre)
+  [NEW] /health reporta offramp_injected
 v9.9.18 (2026-10-28):
-  [FIX] /api/pool/submit agora repassa o job_id (anti-replay).
-  [FIX] /api/mine agora roda em background (evita timeout na GUI).
+  [FIX] /api/pool/submit repassa job_id (anti-replay).
+  [FIX] /api/mine roda em background (evita timeout na GUI).
   [FIX] _register_miner_in_trust prefere register_node.
 ================================================================
 """
@@ -131,7 +142,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
                 headers={"Content-Type": "application/json",
-                         "User-Agent": "brn-server/9.9.18"},
+                         "User-Agent": "brn-server/9.9.19"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -237,6 +248,24 @@ def _get_trust_network():
     return _TRUST_NETWORK
 
 
+# ============================================================
+# [NEW v9.9.19] OFFRAMP MANAGER
+# ============================================================
+_OFFRAMP = None
+_OFFRAMP_LOCK = threading.Lock()
+
+
+def set_offramp_manager(off) -> None:
+    global _OFFRAMP
+    with _OFFRAMP_LOCK:
+        _OFFRAMP = off
+    log.info(f"server: OfframpManager {'injetado' if off else 'removido'}")
+
+
+def _get_offramp():
+    return _OFFRAMP
+
+
 def _register_miner_in_trust(pubkey: str, address: str) -> None:
     trust = _get_trust_network()
     if trust is None:
@@ -254,7 +283,7 @@ def _register_miner_in_trust(pubkey: str, address: str) -> None:
 
 
 # ============================================================
-# L2 MANAGER
+# L2 MANAGER (ONRAMP)
 # ============================================================
 try:
     from l2_manager import L2Manager, L2Error
@@ -465,7 +494,7 @@ def _pubkey_from_db_or_payload(addr: str, payload_pubkey: str = "",
     try:
         for u in _get_chain().db.get_utxos(addr):
             pk = (u.get("pubkey") or "").strip()
-            if pk:
+            if pk and set(pk) != {"0"}:
                 return pk
     except Exception:
         pass
@@ -864,8 +893,9 @@ def transfer():
                 "timestamp": int(time.time()), "locktime": 0, "nonce": nonce,
             }
             h = signing_hash(tx)
+            sig = w.sign(h)
             for inp in tx["inputs"]:
-                inp["signature"] = w.sign(h)
+                inp["signature"] = sig
             tx["txid"] = calc_txid(tx)
             ok, msg = chain.submit_tx(tx)
 
@@ -892,7 +922,7 @@ def transfer():
 
 
 # ============================================================
-# MINE (1 bloco) — AGORA COM THREAD!
+# MINE (1 bloco) — background
 # ============================================================
 @app.route("/api/mine", methods=["POST"])
 @require_rate_limit("mine")
@@ -914,8 +944,7 @@ def mine():
             return jsonify({"ok": False, "msg": "Pubkey desconhecida."}), 400
 
         chain = _get_chain()
-        
-        # [FIX] Roda em background para não travar a GUI (evita timeout)
+
         def _bg_mine():
             try:
                 with CHAIN_LOCK:
@@ -931,7 +960,7 @@ def mine():
                 log.error(f"[API] Erro na mineração local: {e}")
 
         threading.Thread(target=_bg_mine, daemon=True, name="MinerLocal").start()
-        
+
         return jsonify({
             "ok": True,
             "msg": "Mineracao iniciada em background. Acompanhe o progresso no log.",
@@ -1201,8 +1230,7 @@ def pool_submit():
     pool = _get_pool_manager()
     if pool is None:
         return _proxy_pool_request("/api/pool/submit", "POST")
-    
-    # [FIX v9.9.18] Recebe o job_id e repassa para o Pool (anti-replay)
+
     try:
         data = request.get_json(force=True) or {}
         miner_id = (data.get("miner_id") or "").strip()
@@ -1757,7 +1785,7 @@ def contracts_list():
 
 
 # ============================================================
-# L2
+# L2 — ONRAMP (BTC → BRN) — pre-existente
 # ============================================================
 @app.route("/api/l2/quote", methods=["GET"])
 def l2_quote():
@@ -2028,6 +2056,212 @@ def l2_cancel(escrow_id):
 
 
 # ============================================================
+# [NEW v9.9.19] L2 — OFFRAMP (BRN → BTC)
+# ============================================================
+def _send_brn_to_treasury(wallet, buyer: str, brn_sats: int,
+                          treasury: str) -> dict:
+    """
+    Assina e submete uma tx BRN de `buyer` para `treasury` (cofre BRN).
+    Retorna {"ok": bool, "txid": str, "msg": str}.
+    Reutiliza a mesma lógica de `transfer()`, mas sem passar por HTTP.
+    """
+    if not treasury or not WalletManager.validate_address(treasury):
+        return {"ok": False, "msg": "BRN_TREASURY_ADDRESS invalido"}
+    if brn_sats <= 0:
+        return {"ok": False, "msg": "brn_sats <= 0"}
+
+    FEE = int(MIN_RELAY_FEE)
+    chain = _get_chain()
+
+    with CHAIN_LOCK:
+        utxos = chain.db.get_utxos(buyer)
+        utxos.sort(key=lambda u: u["amount"], reverse=True)
+        total, escolhidos = 0, []
+        for u in utxos:
+            escolhidos.append(u)
+            total += u["amount"]
+            if total >= brn_sats + FEE:
+                break
+
+        if total < brn_sats + FEE:
+            return {"ok": False,
+                    "msg": f"saldo BRN insuficiente: {total} < {brn_sats + FEE}"}
+
+        troco = total - brn_sats - FEE
+        outputs = [{"address": treasury, "amount": brn_sats, "pubkey": ""}]
+        if troco > 0:
+            outputs.append({"address": buyer, "amount": troco, "pubkey": ""})
+
+        inputs = [{
+            "txid": u["txid"], "vout": u["vout"],
+            "pubkey": wallet.pub_hex, "signature": "",
+        } for u in escolhidos]
+
+        nonce = chain.db.get_nonce_for_pubkey(wallet.pub_hex)
+        tx = {
+            "txid": "", "inputs": inputs, "outputs": outputs,
+            "timestamp": int(time.time()), "locktime": 0, "nonce": nonce,
+        }
+        h = signing_hash(tx)
+        sig = wallet.sign(h)
+        for inp in tx["inputs"]:
+            inp["signature"] = sig
+        tx["txid"] = calc_txid(tx)
+        ok, msg = chain.submit_tx(tx)
+
+    if not ok:
+        return {"ok": False, "msg": msg}
+
+    p2p = _get_p2p_manager()
+    if p2p:
+        try:
+            p2p.broadcast_tx(tx)
+        except Exception:
+            pass
+
+    _saldo_cache_invalidate(buyer)
+    _saldo_cache_invalidate(treasury)
+    return {"ok": True, "txid": tx["txid"], "msg": "ok"}
+
+
+@app.route("/api/l2/offramp/quote", methods=["GET"])
+def offramp_quote():
+    off = _get_offramp()
+    if off is None:
+        return jsonify({"error": "offramp indisponivel"}), 503
+    try:
+        sats = int(request.args.get("brn_sats", 0))
+        return jsonify(off.quote(sats))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/l2/offramp/create", methods=["POST"])
+@require_rate_limit("transfer")
+def offramp_create():
+    off = _get_offramp()
+    if off is None:
+        return jsonify({"error": "offramp indisponivel"}), 503
+
+    try:
+        data = request.get_json(force=True) or {}
+        buyer_brn = (data.get("buyer_brn") or "").strip()
+        btc_dest  = (data.get("btc_dest") or "").strip()
+        brn_amount_raw = data.get("brn_amount", 0)
+        sk = (request.headers.get("X-BRN-Sk", "")
+              or data.get("private_key", ""))
+
+        try:
+            brn_amount = float(brn_amount_raw)
+        except (TypeError, ValueError):
+            return jsonify({"error": "brn_amount invalido"}), 400
+
+        if brn_amount <= 0:
+            return jsonify({"error": "brn_amount invalido"}), 400
+        if not WalletManager.validate_address(buyer_brn):
+            return jsonify({"error": "buyer_brn invalido"}), 400
+        if not btc_dest:
+            return jsonify({"error": "btc_dest vazio"}), 400
+        if not sk:
+            return jsonify({"error": "X-BRN-Sk obrigatorio"}), 400
+
+        try:
+            w = Wallet(private_key_hex=sk)
+            if w.address != buyer_brn:
+                raise ValueError()
+        except Exception:
+            return jsonify({"error": "private_key nao corresponde ao buyer_brn"}), 400
+
+        brn_sats = int(brn_amount * 1e8)
+
+        r = off.create_escrow(buyer_brn, brn_sats, btc_dest)
+        if not r.get("ok"):
+            return jsonify({"error": r.get("msg")}), 400
+
+        escrow = r["escrow"]
+        escrow_id = escrow["escrow_id"]
+
+        # Envia BRN do usuário para o cofre
+        r2 = _send_brn_to_treasury(
+            wallet=w,
+            buyer=buyer_brn,
+            brn_sats=brn_sats,
+            treasury=off.treasury_brn,
+        )
+        if not r2.get("ok"):
+            # Cancela escrow se a tx BRN falhou
+            off.cancel(escrow_id)
+            return jsonify({"error": f"tx BRN falhou: {r2.get('msg')}"}), 500
+
+        r3 = off.mark_brn_locked(escrow_id, r2["txid"])
+        if not r3.get("ok"):
+            return jsonify({"error": r3.get("msg")}), 500
+
+        return jsonify({
+            "ok": True,
+            "escrow_id": escrow_id,
+            "brn_txid": r2["txid"],
+            "brn_locked": brn_sats / 1e8,
+            "btc_dest": escrow["btc_dest"],
+            "btc_expected_sats": escrow["btc_expected_sats"],
+            "status": "BRN_LOCKED",
+            "msg": "BRN bloqueado, envio de BTC em andamento",
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/l2/offramp/status/<escrow_id>", methods=["GET"])
+def offramp_status(escrow_id):
+    off = _get_offramp()
+    if off is None:
+        return jsonify({"error": "offramp indisponivel"}), 503
+    try:
+        e = _get_chain().db.get_l2_escrow_by_id(escrow_id)
+        if not e or e.get("direction") != "BRN_TO_BTC":
+            return jsonify({"error": "escrow nao encontrado"}), 404
+        return jsonify(e)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/l2/offramp/list", methods=["GET"])
+def offramp_list():
+    off = _get_offramp()
+    if off is None:
+        return jsonify({"error": "offramp indisponivel"}), 503
+    try:
+        buyer = request.args.get("buyer")
+        status = request.args.get("status")
+        return jsonify(off.list_orders(buyer=buyer, status=status))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/l2/offramp/cancel/<escrow_id>", methods=["POST"])
+def offramp_cancel(escrow_id):
+    off = _get_offramp()
+    if off is None:
+        return jsonify({"error": "offramp indisponivel"}), 503
+    try:
+        r = off.cancel(escrow_id)
+        return jsonify(r), (200 if r.get("ok") else 400)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/l2/offramp/stats", methods=["GET"])
+def offramp_stats():
+    off = _get_offramp()
+    if off is None:
+        return jsonify({"error": "offramp indisponivel"}), 503
+    try:
+        return jsonify(off.stats())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ============================================================
 # CONSENSUS / MULTI-SIG
 # ============================================================
 @app.route("/api/consensus/validators", methods=["GET"])
@@ -2111,12 +2345,13 @@ def health():
         return jsonify({
             "ok": True,
             "height": _get_chain().db.height(),
-            "version": "9.9.18",
+            "version": "9.9.19",
             "chain_injected": _CHAIN is not None,
             "p2p_injected": _P2P_MANAGER is not None,
             "pool_injected": _POOL_MANAGER is not None,
             "sync_injected": _SYNC_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
+            "offramp_injected": _OFFRAMP is not None,
             "l2_enabled": L2_ENABLED,
             "hd_wallet": _HAS_HD,
         })
@@ -2128,10 +2363,11 @@ def health():
 def index():
     return jsonify({
         "name": "BRN Node API",
-        "version": "9.9.18",
+        "version": "9.9.19",
         "mode": "modo2_aberto",
         "l2_enabled": L2_ENABLED,
         "pool_enabled": _POOL_MANAGER is not None,
+        "offramp_enabled": _OFFRAMP is not None,
         "admin_protected": bool(ADMIN_TOKEN),
     })
 
@@ -2153,7 +2389,7 @@ def _shutdown():
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.18 (Proxy + Trust + Multi-Sig + History)")
+    print(f"BRN Server v9.9.19 (Proxy + Trust + Multi-Sig + History + Offramp)")
     print(f"  → http://{WEB_HOST}:{port}")
     print(f"  L2: {'ATIVO' if L2_ENABLED else 'DESABILITADO'}")
     print(f"  Admin token: {'SIM' if ADMIN_TOKEN else 'NÃO'}")
