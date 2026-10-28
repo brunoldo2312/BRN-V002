@@ -1,9 +1,16 @@
 """
-p2p_unified.py — BRN P2P Network v6.7.1
+p2p_unified.py — BRN P2P Network v6.7.2
 ================================================================
-v6.7.1 (2026-10-28):
-  [SECURITY] Proteção contra DDoS (Exaustão de Conexões TCP).
-             Adicionado limite de 5 conexões simultâneas por IP.
+v6.7.2 (2026-10-28):
+  [NEW] broadcast_validator_registration() em P2PManager.
+        Chamado pelo main.py v13.7.4 no boot para auto-registro
+        rápido de validadores (peer-to-peer announce).
+  [NEW] Handler "announce_validator" em P2PServer._process_message().
+        Registra a pubkey do validador no trust_network local
+        quando um peer se anuncia.
+  [KEEP] Proteção anti-DDoS por IP (v6.7.1).
+  [KEEP] Multi-sig sign_block (v6.7.0).
+  [KEEP] Toda a lógica de sync, discovery, PEX, rate-limit.
 ================================================================
 """
 from __future__ import annotations
@@ -312,7 +319,7 @@ class P2PServer(threading.Thread):
         self.sock = None
         self._rate_counters = {}
         self._rate_lock = threading.Lock()
-        
+
         # [SECURITY] Contador de conexões ativas por IP
         self._active_conns_by_ip = defaultdict(int)
 
@@ -385,7 +392,7 @@ class P2PServer(threading.Thread):
     def _handle_conn(self, conn: socket.socket, addr) -> None:
         peer_ip = addr[0]
         peer_id = None
-        
+
         # [SECURITY] Limite de conexões por IP (DDoS Protection)
         with self._rate_lock:
             self._active_conns_by_ip[peer_ip] += 1
@@ -562,6 +569,25 @@ class P2PServer(threading.Thread):
                 self.metrics.inc("block_sigs_requested")
                 return self._handle_sign_block(msg, addr, peer_id)
 
+            # [NEW v6.7.2] Auto-registro de validador via P2P.
+            # Um peer anuncia que É validador (pubkey + address).
+            # Registramos no trust_network local para que ele apareça
+            # imediatamente em get_top_validators().
+            if mtype == "announce_validator":
+                pub = (msg.get("pubkey") or "").strip()
+                addr_v = (msg.get("address") or "").strip()
+                if pub and addr_v:
+                    try:
+                        trust = getattr(self.bc, "trust_net", None)
+                        if trust is not None and hasattr(trust, "register_node"):
+                            trust.register_node(pub, addr_v, pub)
+                            log.info(f"[P2P] validator anunciado: {pub[:16]}… ({addr_v[:16]}…)")
+                        else:
+                            log.debug("[P2P] announce_validator: trust_net ausente")
+                    except Exception as e:
+                        log.debug(f"[P2P] announce_validator falhou: {e}")
+                return {"type": "ack", "ok": True}
+
             if mtype == "relay_capabilities":
                 if self.on_relay_caps and peer_id:
                     try: self.on_relay_caps(peer_ip, peer_id, msg)
@@ -670,6 +696,14 @@ class P2PClient:
     def get_mempool(ip, port, timeout=None): return P2PClient.send_message(ip, port, {"type": "get_mempool"}, timeout=timeout)
     @staticmethod
     def get_peers(ip, port, timeout=None): return P2PClient.send_message(ip, port, {"type": "get_peers"}, timeout=timeout)
+
+    @staticmethod
+    def announce_validator(ip, port, pubkey, address, timeout=None):
+        return P2PClient.send_message(
+            ip, port,
+            {"type": "announce_validator", "pubkey": pubkey, "address": address},
+            timeout=timeout,
+        )
 
     @staticmethod
     def request_block_signature(ip: str, port: int, block: dict, timeout: Optional[float] = None) -> Optional[dict]:
@@ -1015,6 +1049,42 @@ class P2PManager:
 
     def request_block_signature(self, ip: str, port: int, block: dict, timeout: Optional[float] = None) -> Optional[dict]:
         return P2PClient.request_block_signature(ip, port, block, timeout=timeout)
+
+    # [NEW v6.7.2] Auto-registro de validador via P2P.
+    # Chamado pelo main.py v13.7.4 no boot para anunciar que este
+    # nó é validador. Cada peer que receber o "announce_validator"
+    # registra nossa pubkey no trust_network local → aparecemos
+    # rapidamente em get_top_validators() deles.
+    def broadcast_validator_registration(self, pubkey: str, address: str) -> None:
+        if self.read_only:
+            return
+        if not pubkey or not address:
+            log.debug("[P2P] broadcast_validator_registration: pubkey/address vazios")
+            return
+        payload = {
+            "type": "announce_validator",
+            "pubkey": pubkey,
+            "address": address,
+        }
+        enviados = 0
+        falhas = 0
+        for peer in self.discovery.listar_peers():
+            try:
+                ip, port_s = peer.rsplit(":", 1)
+                port = int(port_s)
+            except Exception:
+                continue
+            try:
+                self._broadcast_pool.submit(
+                    P2PClient.send_message, ip, port, payload
+                )
+                enviados += 1
+            except Exception:
+                falhas += 1
+        log.info(
+            f"[P2P] announce_validator enviado para "
+            f"{enviados} peer(s) (falhas={falhas})"
+        )
 
     def _setup_upnp(self) -> None:
         try:
