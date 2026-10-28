@@ -1,3 +1,47 @@
+🚀 BRN (BrunoCoin): A Nova Era da Mineração Descentralizada e Segura
+ 
+É com enorme satisfação que anunciamos a maior atualização da rede BRN até hoje! Depois de dias de testes intensivos, correções profundas no consenso e reestruturação do ecossistema, a BRN acaba de entrar em sua fase de maturidade operacional.
+ 
+A rede evoluiu de um único servidor para uma malha descentralizada com múltiplos validadores, capaz de sincronizar e minerar de forma coordenada, segura e à prova de falhas.
+ 
+🛡️ O que mudou nesta nova evolução?
+ 
+1. Segurança de Nível Institucional (Multi-Sig)
+ 
+O consenso da rede não aceita mais blocos "vazios". A blockchain agora exige a assinatura criptográfica (Ed25519) dos validadores da rede (Top Validators). Se um bloco for forjado ou não tiver o quórum de assinaturas, ele é sumariamente rejeitado. Isso torna a rede imune a ataques de falsificação.
+ 
+2. Sincronização à Prova de Falhas (HTTP Sync v2.1)
+ 
+Abandonamos o sincronizador antigo baseado em P2P/Multicast (que falhava atrás de firewalls e do Tailscale). O novo sync_manager.py baixa a blockchain via HTTP (Port 5000). Agora, qualquer computador no mundo, conectado via VPN ou Tailscale, consegue baixar os mais de 5.000 blocos da rede em segundos, sem travar.
+ 
+3. Pool de Mineração Otimizado (Vardiff)
+ 
+O servidor de Pool (rodando no Ubuntu) foi reescrito para coordenar múltiplos mineradores (Windows, Linux, Mac) sem gargalos no banco de dados. Implementamos Vardiff (dificuldade variável), onde mineradores mais lentos recebem desafios mais fáceis, garantindo que todos recebam sua recompensa de forma justa.
+ 
+4. Automação e Facilidade (Zero Config)
+ 
+Esqueça comandos complexos no terminal. A rede agora conta com scripts de inicialização automatizados que preparam o ambiente, instalam as dependências, configuram o Tailscale e conectam seu nó ao Pool instantaneamente. 
+ 
+💻 Como iniciar o seu Cliente BRN e começar a minerar agora
+ 
+A rede está aberta. Se você deseja participar, minerar e garantir sua parte das recompensas, o processo foi reduzido a um clique.
+ 
+O que você precisa:
+• Ter o Python instalado.
+• Estar conectado à rede (via Tailscale ou LAN).
+• Ter a pasta do projeto BRN. 
+O Passo a Passo para o Futuro:
+1. Baixe e extraia o código-fonte atualizado da BRN.
+2. Localize o arquivo iniciar_cliente.bat na pasta principal.
+3. Dê um duplo clique no arquivo iniciar_cliente.bat.
+4. O script fará tudo sozinho: baixará as dependências, verificará a sincronização com o servidor Origem, configurará o pool e abrirá a sua Carteira Gráfica.
+5. Assim que a carteira abrir, clique no botão azul "Minerar Pool". 
+Não digite comandos. Não configure arquivos. Apenas clique em iniciar_cliente.bat e faça parte da nova economia.
+ 
+A BRN está pronta para escalar. O código está validado. A rede está no ar. Junte-se a nós! 
+
+
+
 Para instalar o BRN no seu computador com Windows, comece baixando e instalando o Python pelo site oficial em python.org, e durante a instalação não se esqueça de marcar a opção "Adicionar Python ao PATH". Depois, baixe o projeto BRN-V002 do GitHub, seja clonando com git clone https://github.com/brunoldo2312/BRN-V002.git ou baixando o arquivo ZIP diretamente da página do repositório e extraindo os arquivos. Em seguida, abra o Prompt de Comando dentro da pasta do projeto que você acabou de baixar e execute o comando pip install flask flask-cors cryptography argon2-cffi orjson requests mnemonic pywebview para instalar todas as bibliotecas necessárias. Quando terminar a instalação, basta digitar python main.py ou simplesmente dar dois cliques no arquivo iniciar_cliente.bat e o BRN vai abrir pronto para você usar como minerador e carteira. Se em algum momento aparecer uma mensagem dizendo que o Python não foi encontrado, provavelmente é porque você não marcou a opção de adicionar ao PATH — basta reinstalar o Python marcando essa caixinha que resolve! 😊
 [ Interface / pywebview ]
                   │
