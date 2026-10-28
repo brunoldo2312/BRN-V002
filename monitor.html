@@ -5,244 +5,97 @@
 <title>BRN — Monitor de Rede</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
+  /* [MANTENHA O CSS ORIGINAL AQUI, ELE ESTÁ PERFEITO] */
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background: #0d1117; color: #e6edf3; padding: 20px;
-    font-size: 14px; line-height: 1.5;
-  }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0d1117; color: #e6edf3; padding: 20px; font-size: 14px; line-height: 1.5; }
   .container { max-width: 1400px; margin: 0 auto; }
-  header {
-    display: flex; justify-content: space-between; align-items: center;
-    padding-bottom: 16px; border-bottom: 1px solid #30363d; margin-bottom: 20px;
-    flex-wrap: wrap; gap: 10px;
-  }
-  h1 { font-size: 1.4rem; }
-  h1 span { color: #58a6ff; }
-  .controls {
-    display: flex; align-items: center; gap: 10px;
-    flex-wrap: wrap;
-  }
-  .btn {
-    background: #21262d; border: 1px solid #30363d; color: #e6edf3;
-    padding: 6px 14px; border-radius: 6px; cursor: pointer;
-    font-size: 0.85rem; font-family: inherit;
-    transition: all 0.15s;
-  }
+  header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 16px; border-bottom: 1px solid #30363d; margin-bottom: 20px; flex-wrap: wrap; gap: 10px; }
+  h1 { font-size: 1.4rem; } h1 span { color: #58a6ff; }
+  .controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .btn { background: #21262d; border: 1px solid #30363d; color: #e6edf3; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 0.85rem; font-family: inherit; transition: all 0.15s; }
   .btn:hover { background: #30363d; }
-  .btn.primary { background: #238636; border-color: #2ea043; }
-  .btn.primary:hover { background: #2ea043; }
-  .btn.danger { background: #da3633; border-color: #f85149; }
-  .btn.danger:hover { background: #f85149; }
-  .btn.discover { background: #1f3a5f; border-color: #2f6faa; }
-  .btn.discover:hover { background: #2f6faa; }
-
-  .status-banner {
-    padding: 16px 20px; border-radius: 10px; margin-bottom: 20px;
-    display: flex; align-items: center; gap: 14px;
-    border: 2px solid;
-  }
-  .status-banner.ok      { background: rgba(63,185,80,0.1);
-                            border-color: #3fb950; color: #3fb950; }
-  .status-banner.warn    { background: rgba(210,153,34,0.1);
-                            border-color: #d29922; color: #d29922; }
-  .status-banner.err     { background: rgba(248,81,73,0.1);
-                            border-color: #f85149; color: #f85149; }
-  .status-banner.info    { background: rgba(88,166,255,0.1);
-                            border-color: #58a6ff; color: #58a6ff; }
-  .status-banner .icon   { font-size: 2rem; }
-  .status-banner .main   { flex: 1; }
-  .status-banner .title  { font-size: 1.1rem; font-weight: 700; }
-  .status-banner .detail { font-size: 0.85rem; opacity: 0.9; margin-top: 2px; }
-
-  .nodes-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-    gap: 14px; margin-bottom: 20px;
-  }
-  .node-card {
-    background: #161b22; border: 1px solid #30363d;
-    border-radius: 10px; padding: 16px 18px;
-    transition: border-color 0.3s;
-  }
-  .node-card.online    { border-left: 4px solid #3fb950; }
-  .node-card.offline   { border-left: 4px solid #f85149; opacity: 0.6; }
-  .node-card.fork      { border-left: 4px solid #f85149;
-                         background: rgba(248,81,73,0.05); }
-  .node-card.behind    { border-left: 4px solid #d29922; }
-
-  .node-header {
-    display: flex; justify-content: space-between; align-items: center;
-    margin-bottom: 12px; flex-wrap: wrap; gap: 8px;
-  }
-  .node-name { font-size: 1rem; font-weight: 700; }
-  .node-host { font-size: 0.75rem; color: #8b949e; }
-
+  .btn.primary { background: #238636; border-color: #2ea043; } .btn.primary:hover { background: #2ea043; }
+  .btn.danger { background: #da3633; border-color: #f85149; } .btn.danger:hover { background: #f85149; }
+  .btn.discover { background: #1f3a5f; border-color: #2f6faa; } .btn.discover:hover { background: #2f6faa; }
+  .status-banner { padding: 16px 20px; border-radius: 10px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px; border: 2px solid; }
+  .status-banner.ok      { background: rgba(63,185,80,0.1); border-color: #3fb950; color: #3fb950; }
+  .status-banner.warn    { background: rgba(210,153,34,0.1); border-color: #d29922; color: #d29922; }
+  .status-banner.err     { background: rgba(248,81,73,0.1); border-color: #f85149; color: #f85149; }
+  .status-banner.info    { background: rgba(88,166,255,0.1); border-color: #58a6ff; color: #58a6ff; }
+  .status-banner .icon   { font-size: 2rem; } .status-banner .main   { flex: 1; }
+  .status-banner .title  { font-size: 1.1rem; font-weight: 700; } .status-banner .detail { font-size: 0.85rem; opacity: 0.9; margin-top: 2px; }
+  .nodes-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; margin-bottom: 20px; }
+  .node-card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 16px 18px; transition: border-color 0.3s; }
+  .node-card.online    { border-left: 4px solid #3fb950; } .node-card.offline   { border-left: 4px solid #f85149; opacity: 0.6; }
+  .node-card.fork      { border-left: 4px solid #f85149; background: rgba(248,81,73,0.05); } .node-card.behind    { border-left: 4px solid #d29922; }
+  .node-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 8px; }
+  .node-name { font-size: 1rem; font-weight: 700; } .node-host { font-size: 0.75rem; color: #8b949e; }
   .badges { display: flex; gap: 6px; flex-wrap: wrap; }
-  .badge {
-    padding: 3px 8px; border-radius: 4px; font-size: 0.7rem;
-    font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px;
-  }
-  .badge.ok     { background: rgba(63,185,80,0.15); color: #3fb950; }
-  .badge.warn   { background: rgba(210,153,34,0.15); color: #d29922; }
-  .badge.err    { background: rgba(248,81,73,0.15); color: #f85149; }
-  .badge.info   { background: rgba(88,166,255,0.15); color: #58a6ff; }
-  .badge.gray   { background: rgba(139,148,158,0.15); color: #8b949e; }
-  .badge.auto   { background: rgba(163,113,247,0.15); color: #a371f7; }
-  .badge.manual { background: rgba(88,166,255,0.12); color: #58a6ff; }
-  .badge.mining { background: rgba(88,166,255,0.2); color: #58a6ff;
-                  animation: pulse 2s infinite; }
+  .badge { padding: 3px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px; }
+  .badge.ok     { background: rgba(63,185,80,0.15); color: #3fb950; } .badge.warn   { background: rgba(210,153,34,0.15); color: #d29922; }
+  .badge.err    { background: rgba(248,81,73,0.15); color: #f85149; } .badge.info   { background: rgba(88,166,255,0.15); color: #58a6ff; }
+  .badge.gray   { background: rgba(139,148,158,0.15); color: #8b949e; } .badge.auto   { background: rgba(163,113,247,0.15); color: #a371f7; }
+  .badge.manual { background: rgba(88,166,255,0.12); color: #58a6ff; } .badge.mining { background: rgba(88,166,255,0.2); color: #58a6ff; animation: pulse 2s infinite; }
   @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.5 } }
-
-  .node-stats {
-    display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
-    margin-bottom: 10px;
-  }
-  .stat .k { font-size: 0.7rem; color: #8b949e;
-             text-transform: uppercase; letter-spacing: 0.4px; }
-  .stat .v { font-size: 1.05rem; font-weight: 600; color: #58a6ff;
-             font-variant-numeric: tabular-nums;
-             word-break: break-all; }
-  .stat .v.sm { font-size: 0.85rem; }
-  .stat .v.green { color: #3fb950; }
-  .stat .v.red   { color: #f85149; }
-  .stat .v.yellow { color: #d29922; }
-
-  .node-details {
-    border-top: 1px solid #21262d; padding-top: 10px;
-    font-size: 0.8rem;
-  }
-  .node-details .line {
-    display: flex; justify-content: space-between; margin-bottom: 4px;
-    gap: 8px;
-  }
-  .node-details .line .k { color: #8b949e; }
-  .node-details .line .v { color: #e6edf3; font-variant-numeric: tabular-nums;
-                            text-align: right; word-break: break-all; }
-  .node-details .line .v.mono {
-    font-family: ui-monospace, Menlo, monospace; font-size: 0.75rem;
-  }
-  .node-details .line .v.alert { color: #f85149; font-weight: 700; }
-
-  .node-actions {
-    margin-top: 10px; display: flex; gap: 6px; flex-wrap: wrap;
-  }
-
-  .section {
-    background: #161b22; border: 1px solid #30363d;
-    border-radius: 10px; padding: 16px 20px; margin-bottom: 16px;
-  }
+  .node-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
+  .stat .k { font-size: 0.7rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.4px; }
+  .stat .v { font-size: 1.05rem; font-weight: 600; color: #58a6ff; font-variant-numeric: tabular-nums; word-break: break-all; }
+  .stat .v.sm { font-size: 0.85rem; } .stat .v.green { color: #3fb950; } .stat .v.red   { color: #f85149; } .stat .v.yellow { color: #d29922; }
+  .node-details { border-top: 1px solid #21262d; padding-top: 10px; font-size: 0.8rem; }
+  .node-details .line { display: flex; justify-content: space-between; margin-bottom: 4px; gap: 8px; }
+  .node-details .line .k { color: #8b949e; } .node-details .line .v { color: #e6edf3; font-variant-numeric: tabular-nums; text-align: right; word-break: break-all; }
+  .node-details .line .v.mono { font-family: ui-monospace, Menlo, monospace; font-size: 0.75rem; } .node-details .line .v.alert { color: #f85149; font-weight: 700; }
+  .node-actions { margin-top: 10px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .section { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 16px 20px; margin-bottom: 16px; }
   .section h2 { font-size: 1rem; margin-bottom: 12px; }
   table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
-  th, td {
-    padding: 8px 10px; text-align: left;
-    border-bottom: 1px solid #21262d;
-    font-variant-numeric: tabular-nums;
-  }
-  th {
-    color: #8b949e; font-weight: 500; font-size: 0.72rem;
-    text-transform: uppercase; letter-spacing: 0.5px;
-  }
+  th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #21262d; font-variant-numeric: tabular-nums; }
+  th { color: #8b949e; font-weight: 500; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.5px; }
   tr:hover { background: #1c2128; }
-  td.mono { font-family: ui-monospace, Menlo, monospace;
-             font-size: 0.78rem; color: #79c0ff; }
-  td.green { color: #3fb950; }
-  td.red   { color: #f85149; font-weight: 700; }
-  td.yellow { color: #d29922; }
-
+  td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 0.78rem; color: #79c0ff; }
+  td.green { color: #3fb950; } td.red   { color: #f85149; font-weight: 700; } td.yellow { color: #d29922; }
   .alerts { margin-bottom: 16px; }
-  .alert {
-    padding: 10px 14px; border-radius: 6px; margin-bottom: 8px;
-    font-size: 0.85rem; display: flex; align-items: flex-start; gap: 10px;
-  }
-  .alert.err  { background: rgba(248,81,73,0.1);
-                border: 1px solid rgba(248,81,73,0.4); color: #f85149; }
-  .alert.warn { background: rgba(210,153,34,0.1);
-                border: 1px solid rgba(210,153,34,0.4); color: #d29922; }
-  .alert.info { background: rgba(88,166,255,0.1);
-                border: 1px solid rgba(88,166,255,0.4); color: #58a6ff; }
+  .alert { padding: 10px 14px; border-radius: 6px; margin-bottom: 8px; font-size: 0.85rem; display: flex; align-items: flex-start; gap: 10px; }
+  .alert.err  { background: rgba(248,81,73,0.1); border: 1px solid rgba(248,81,73,0.4); color: #f85149; }
+  .alert.warn { background: rgba(210,153,34,0.1); border: 1px solid rgba(210,153,34,0.4); color: #d29922; }
+  .alert.info { background: rgba(88,166,255,0.1); border: 1px solid rgba(88,166,255,0.4); color: #58a6ff; }
   .alert .icon { flex-shrink: 0; }
-
-  .modal-overlay {
-    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-    background: rgba(0,0,0,0.7); display: none;
-    align-items: center; justify-content: center; z-index: 1000;
-  }
+  .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); display: none; align-items: center; justify-content: center; z-index: 1000; }
   .modal-overlay.show { display: flex; }
-  .modal {
-    background: #161b22; border: 1px solid #30363d;
-    border-radius: 10px; padding: 24px; max-width: 460px; width: 90%;
-  }
+  .modal { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 24px; max-width: 460px; width: 90%; }
   .modal h3 { margin-bottom: 14px; font-size: 1.05rem; }
-  .modal label { display: block; font-size: 0.8rem;
-                 color: #8b949e; margin-bottom: 4px; margin-top: 12px; }
-  .modal input {
-    width: 100%; padding: 8px 10px; background: #0d1117;
-    border: 1px solid #30363d; border-radius: 6px;
-    color: #e6edf3; font-family: inherit; font-size: 0.9rem;
-  }
+  .modal label { display: block; font-size: 0.8rem; color: #8b949e; margin-bottom: 4px; margin-top: 12px; }
+  .modal input { width: 100%; padding: 8px 10px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-family: inherit; font-size: 0.9rem; }
   .modal input:focus { outline: none; border-color: #58a6ff; }
-  .modal-actions {
-    margin-top: 20px; display: flex; gap: 8px; justify-content: flex-end;
-  }
-
-  .footer {
-    text-align: center; margin-top: 32px; padding-top: 16px;
-    border-top: 1px solid #30363d; color: #8b949e; font-size: 0.8rem;
-  }
+  .modal-actions { margin-top: 20px; display: flex; gap: 8px; justify-content: flex-end; }
+  .footer { text-align: center; margin-top: 32px; padding-top: 16px; border-top: 1px solid #30363d; color: #8b949e; font-size: 0.8rem; }
   .footer a { color: #58a6ff; text-decoration: none; }
-
-  @media (max-width: 600px) {
-    .node-stats { grid-template-columns: 1fr; }
-    h1 { font-size: 1.1rem; }
-  }
+  @media (max-width: 600px) { .node-stats { grid-template-columns: 1fr; } h1 { font-size: 1.1rem; } }
 </style>
 </head>
 <body>
 <div class="container">
-
   <header>
     <h1>🔍 <span>BRN</span> — Monitor de Rede</h1>
     <div class="controls">
       <button class="btn discover" onclick="forceDiscovery()">🛰️ Descobrir Peers</button>
       <button class="btn" onclick="openAddNode()">+ Adicionar Nó</button>
       <button class="btn" onclick="loadAll()">🔄 Atualizar</button>
-      <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:0.85rem;">
-        <input type="checkbox" id="autoRefresh" checked> Auto (5s)
-      </label>
+      <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:0.85rem;"><input type="checkbox" id="autoRefresh" checked> Auto (5s)</label>
     </div>
   </header>
 
   <div id="statusBanner" class="status-banner info" style="display:none;">
     <div class="icon" id="bannerIcon">ℹ</div>
-    <div class="main">
-      <div class="title" id="bannerTitle">Carregando...</div>
-      <div class="detail" id="bannerDetail"></div>
-    </div>
+    <div class="main"><div class="title" id="bannerTitle">Carregando...</div><div class="detail" id="bannerDetail"></div></div>
   </div>
 
   <div class="alerts" id="alerts"></div>
-
   <div class="nodes-grid" id="nodesGrid"></div>
 
   <div class="section" id="comparisonSection" style="display:none;">
     <h2>📊 Comparação</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>Nó</th>
-          <th>Host</th>
-          <th>Altura</th>
-          <th>Tip (hash)</th>
-          <th>Dific.</th>
-          <th>Peers</th>
-          <th>Mineração</th>
-          <th>Sync</th>
-          <th>Latência</th>
-        </tr>
-      </thead>
-      <tbody id="comparisonBody"></tbody>
-    </table>
+    <table><thead><tr><th>Nó</th><th>Host</th><th>Altura</th><th>Tip (hash)</th><th>Dific.</th><th>Peers</th><th>Mineração</th><th>Sync</th><th>Latência</th></tr></thead><tbody id="comparisonBody"></tbody></table>
   </div>
 
   <div class="section">
@@ -253,52 +106,33 @@
       <button class="btn" onclick="clearAutoNodes()">🧹 Limpar auto-descobertos</button>
       <button class="btn danger" onclick="resetNodes()">🗑 Restaurar nós padrão</button>
     </div>
-    <p style="font-size:0.75rem;color:#8b949e;margin-top:8px;">
-      Peers descobertos automaticamente via P2P aparecem com a badge
-      <span class="badge auto">auto</span>.
-      Nós adicionados manualmente têm a badge
-      <span class="badge manual">manual</span>.
-    </p>
   </div>
 
-  <div class="footer">
-    BRN Monitor v1.3 · <a href="http://127.0.0.1:8080/panel">Painel local</a> ·
-    <a href="http://127.0.0.1:8080/">Explorer</a>
-  </div>
+  <div class="footer">BRN Monitor v1.3 · <a href="http://127.0.0.1:8080/">Explorer</a></div>
 </div>
 
 <div class="modal-overlay" id="addModal">
   <div class="modal">
     <h3>Adicionar nó à monitoração</h3>
-    <label for="nodeName">Nome</label>
-    <input type="text" id="nodeName" placeholder="Ex: Ubuntu, Notebook, VPS..." autocomplete="off">
-    <label for="nodeHost">IP (Tailscale ou LAN)</label>
-    <input type="text" id="nodeHost" placeholder="Ex: 100.111.253.8" autocomplete="off">
-    <label for="nodeRole">Papel</label>
-    <input type="text" id="nodeRole" placeholder="origin / client" autocomplete="off">
-    <div class="modal-actions">
-      <button class="btn" onclick="closeAddNode()">Cancelar</button>
-      <button class="btn primary" onclick="addNode()">Adicionar</button>
-    </div>
+    <label for="nodeName">Nome</label><input type="text" id="nodeName" placeholder="Ex: Ubuntu, Notebook, VPS..." autocomplete="off">
+    <label for="nodeHost">IP (Tailscale ou LAN)</label><input type="text" id="nodeHost" placeholder="Ex: 100.111.253.8" autocomplete="off">
+    <label for="nodeRole">Papel</label><input type="text" id="nodeRole" placeholder="origin / client" autocomplete="off">
+    <div class="modal-actions"><button class="btn" onclick="closeAddNode()">Cancelar</button><button class="btn primary" onclick="addNode()">Adicionar</button></div>
   </div>
 </div>
 
 <script>
 "use strict";
-
-// ============================================================
-// CONFIGURAÇÃO — LISTA FIXA COM TODOS OS IPs DO TAILSCALE + LAN
-// ============================================================
 const STORAGE_KEY = "brn_monitor_nodes_v4";
 
+// ⚠️ IPs DO SEU CLUSTER AQUI
 const DEFAULT_NODES = [
-  { name: "Origem (Mayra)",   host: "100.84.11.48",  port: 5000, role: "origin" },
-  { name: "Linux (Cliente)",  host: "100.111.253.8", port: 5000, role: "client" },
-  { name: "Filipe (Cliente)", host: "100.64.151.67", port: 5000, role: "client" },
+  { name: "Ubuntu (Origem)",  host: "100.111.253.8", port: 5000, role: "origin" },
+  { name: "Windows (Mayra)",  host: "100.84.11.48",  port: 5000, role: "client" },
   { name: "Desktop 61ltr",    host: "100.70.107.15", port: 5000, role: "client" },
+  { name: "Filipe (Cliente)", host: "100.64.151.67", port: 5000, role: "client" },
   { name: "Ubuntu Local",     host: "192.168.0.19",  port: 5000, role: "client" }
 ];
-
 const DISCOVERY_INTERVAL_MS = 30000;
 
 let nodes = [];
@@ -307,647 +141,175 @@ let autoTimer = null;
 let lastDiscoveryTs = 0;
 let discoveryInFlight = false;
 
-// ============================================================
-// PERSISTÊNCIA
-// ============================================================
 function loadNodes() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        return parsed;
-      }
-    }
-  } catch (e) {}
+  try { const raw = localStorage.getItem(STORAGE_KEY); if (raw) { const parsed = JSON.parse(raw); if (Array.isArray(parsed) && parsed.length > 0) return parsed; } } catch (e) {}
   return DEFAULT_NODES.map(n => ({ ...n }));
 }
+function saveNodes() { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(nodes)); } catch (e) {} }
+function resetNodes() { if (!confirm("Restaurar a lista padrão de nós?")) return; nodes = DEFAULT_NODES.map(n => ({ ...n })); saveNodes(); render(); loadAll(); }
+function clearAutoNodes() { const autos = nodes.filter(n => n.auto); if (autos.length === 0) return alert("Nenhum nó auto."); if (!confirm(`Remover ${autos.length} nó(s) auto?`)) return; nodes = nodes.filter(n => !n.auto); saveNodes(); render(); }
 
-function saveNodes() {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(nodes));
-  } catch (e) {}
-}
-
-function resetNodes() {
-  if (!confirm("Restaurar a lista padrão de nós?\n\n" +
-               DEFAULT_NODES.map(n => `${n.name} (${n.host})`).join("\n"))) return;
-  nodes = DEFAULT_NODES.map(n => ({ ...n }));
-  saveNodes();
-  render();
-  loadAll();
-}
-
-function clearAutoNodes() {
-  const autos = nodes.filter(n => n.auto);
-  if (autos.length === 0) {
-    alert("Nenhum nó auto-descoberto para remover.");
-    return;
-  }
-  if (!confirm(`Remover ${autos.length} nó(s) auto-descoberto(s)?`)) return;
-  nodes = nodes.filter(n => !n.auto);
-  saveNodes();
-  render();
-}
-
-// ============================================================
-// AUTO-DESCOBERTA DE PEERS (Ajustada para bater na API real)
-// ============================================================
 async function fetchDiscoveredPeers() {
   if (nodes.length === 0) return [];
-  
-  // Tenta buscar a lista de peers do primeiro nó da lista
   const firstNode = nodes[0];
   const url = `http://${firstNode.host}:${firstNode.port}/api/peers/discovered`;
-  
   try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 8000);
+    const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 8000);
     const r = await fetch(url, { signal: ctrl.signal });
     clearTimeout(t);
     if (!r.ok) return [];
     const data = await r.json();
     if (!data || !data.ok || !Array.isArray(data.peers)) return [];
     return data.peers;
-  } catch (e) {
-    console.warn("Falha na descoberta:", e);
-    return [];
-  }
+  } catch (e) { return []; }
 }
 
 function mergeDiscoveredPeers(discovered) {
-  let added = 0;
-  let updated = 0;
-  const existingIps = new Set(nodes.map(n => n.host));
-
+  let added = 0; let updated = 0; const existingIps = new Set(nodes.map(n => n.host));
   for (const p of discovered) {
-    const ip = (p.ip || "").trim();
-    if (!ip) continue;
-    if (ip.startsWith("127.") || ip === "0.0.0.0" || ip === "::1") continue;
-
-    if (existingIps.has(ip)) {
-      const existingNode = nodes.find(n => n.host === ip);
-      if (existingNode && !existingNode.manual) {
-        existingNode.role = "auto";
-        existingNode.auto = true;
-        existingNode.node_id = p.node_id || existingNode.node_id || "";
-        updated++;
-      }
-      continue;
-    }
-
-    nodes.push({
-      name:       (p.node_id ? "peer-" + p.node_id.slice(0, 8) : ip),
-      host:       ip,
-      port:       5000, // API HTTP
-      role:       "auto",
-      auto:       true,
-      manual:     false,
-      node_id:    p.node_id || "",
-    });
-    existingIps.add(ip);
-    added++;
+    const ip = (p.ip || "").trim(); if (!ip || ip.startsWith("127.") || ip === "0.0.0.0" || ip === "::1") continue;
+    if (existingIps.has(ip)) { const existingNode = nodes.find(n => n.host === ip); if (existingNode && !existingNode.manual) { existingNode.role = "auto"; existingNode.auto = true; existingNode.node_id = p.node_id || existingNode.node_id || ""; updated++; } continue; }
+    nodes.push({ name: (p.node_id ? "peer-" + p.node_id.slice(0, 8) : ip), host: ip, port: 5000, role: "auto", auto: true, manual: false, node_id: p.node_id || "", });
+    existingIps.add(ip); added++;
   }
-
-  if (added > 0 || updated > 0) {
-    saveNodes();
-  }
+  if (added > 0 || updated > 0) saveNodes();
   return added;
 }
 
 async function forceDiscovery() {
-  if (discoveryInFlight) {
-    alert("Descoberta já em andamento...");
-    return;
-  }
+  if (discoveryInFlight) return alert("Descoberta já em andamento...");
   discoveryInFlight = true;
   try {
     const discovered = await fetchDiscoveredPeers();
-    if (discovered.length === 0) {
-      alert("Nenhum peer descoberto.\nVerifique se o nó está rodando e se o CORS está liberado (BRN_CORS_ORIGIN=*).");
-    } else {
-      const added = mergeDiscoveredPeers(discovered);
-      alert(`Descoberta concluída.\n\n${discovered.length} peer(s) encontrado(s).\n${added} novo(s) adicionado(s).`);
-      render();
-      loadAll();
-    }
+    if (discovered.length === 0) alert("Nenhum peer descoberto. Verifique se o CORS está liberado.");
+    else { const added = mergeDiscoveredPeers(discovered); alert(`Descoberta concluída.\n\n${discovered.length} peer(s) encontrado(s).\n${added} novo(s).`); render(); loadAll(); }
     lastDiscoveryTs = Date.now();
-  } finally {
-    discoveryInFlight = false;
-  }
+  } finally { discoveryInFlight = false; }
 }
 
-// ============================================================
-// MODAL
-// ============================================================
-function openAddNode() {
-  document.getElementById("nodeName").value = "";
-  document.getElementById("nodeHost").value = "";
-  document.getElementById("nodeRole").value = "";
-  document.getElementById("addModal").classList.add("show");
-  document.getElementById("nodeName").focus();
-}
-
-function closeAddNode() {
-  document.getElementById("addModal").classList.remove("show");
-}
-
+function openAddNode() { document.getElementById("nodeName").value = ""; document.getElementById("nodeHost").value = ""; document.getElementById("nodeRole").value = ""; document.getElementById("addModal").classList.add("show"); document.getElementById("nodeName").focus(); }
+function closeAddNode() { document.getElementById("addModal").classList.remove("show"); }
 function addNode() {
-  const name = document.getElementById("nodeName").value.trim();
-  const host = document.getElementById("nodeHost").value.trim();
-  const role = document.getElementById("nodeRole").value.trim() || "client";
-
-  if (!name || !host) {
-    alert("Preencha nome e IP");
-    return;
-  }
-  if (nodes.some(n => n.host === host)) {
-    alert("Esse IP já está na lista");
-    return;
-  }
-  nodes.push({ name, host, port: 5000, role, manual: true });
-  saveNodes();
-  closeAddNode();
-  render();
-  loadAll();
+  const name = document.getElementById("nodeName").value.trim(); const host = document.getElementById("nodeHost").value.trim(); const role = document.getElementById("nodeRole").value.trim() || "client";
+  if (!name || !host) return alert("Preencha nome e IP");
+  if (nodes.some(n => n.host === host)) return alert("Esse IP já está na lista");
+  nodes.push({ name, host, port: 5000, role, manual: true }); saveNodes(); closeAddNode(); render(); loadAll();
 }
+function removeNode(host) { const n = nodes.find(x => x.host === host); if (!n) return; if (!confirm(`Remover o nó "${n.name}" (${host})?`)) return; nodes = nodes.filter(x => x.host !== host); delete nodeStates[host]; saveNodes(); render(); }
 
-function removeNode(host) {
-  const n = nodes.find(x => x.host === host);
-  if (!n) return;
-  if (!confirm(`Remover o nó "${n.name}" (${host})?`)) return;
-  nodes = nodes.filter(x => x.host !== host);
-  delete nodeStates[host];
-  saveNodes();
-  render();
-}
-
-// ============================================================
-// FETCH COM TIMEOUT
-// ============================================================
 async function fetchFromNode(host, port, path, timeoutMs = 5000) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-  const t0 = performance.now();
+  const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), timeoutMs); const t0 = performance.now();
   try {
-    const url = `http://${host}:${port}${path}`;
-    const r = await fetch(url, { signal: ctrl.signal });
-    clearTimeout(t);
-    const lat = Math.round(performance.now() - t0);
+    const url = `http://${host}:${port}${path}`; const r = await fetch(url, { signal: ctrl.signal });
+    clearTimeout(t); const lat = Math.round(performance.now() - t0);
     if (!r.ok) throw new Error("HTTP " + r.status);
     return { ok: true, data: await r.json(), latency: lat };
-  } catch (e) {
-    clearTimeout(t);
-    return { ok: false, error: e.message, latency: -1 };
-  }
+  } catch (e) { clearTimeout(t); return { ok: false, error: e.message, latency: -1 }; }
 }
 
-// ============================================================
-// QUERY DE UM NÓ (Rotas Corretas da API HTTP)
-// ============================================================
 async function queryNode(node) {
   const { host, port } = node;
-  
   const [status, chain, sync, miner] = await Promise.all([
     fetchFromNode(host, port, "/api/status"),
     fetchFromNode(host, port, "/api/chain-info"),
     fetchFromNode(host, port, "/api/sync/status"), 
     fetchFromNode(host, port, "/api/miner/status"),
   ]);
-
   const anyOk = status.ok || chain.ok || sync.ok || miner.ok;
-
   return {
-    name: node.name,
-    host,
-    port,
-    role: node.role,
-    auto: !!node.auto,
-    online: anyOk,
-    status: status.ok ? status.data : null,
-    chain: chain.ok ? chain.data : null,
-    sync: sync.ok ? sync.data : null,
-    miner: miner.ok ? miner.data : null,
-    latency: Math.max(
-      status.latency || 0,
-      chain.latency || 0,
-      sync.latency || 0,
-      miner.latency || 0
-    ),
-    error: !anyOk ? (status.error || "offline") : null,
-    ts: Date.now(),
+    name: node.name, host, port, role: node.role, auto: !!node.auto, online: anyOk,
+    status: status.ok ? status.data : null, chain: chain.ok ? chain.data : null,
+    sync: sync.ok ? sync.data : null, miner: miner.ok ? miner.data : null,
+    latency: Math.max(status.latency || 0, chain.latency || 0, sync.latency || 0, miner.latency || 0),
+    error: !anyOk ? (status.error || "offline") : null, ts: Date.now(),
   };
 }
 
-// ============================================================
-// ANÁLISE DE CONSENSO
-// ============================================================
 function analyzeNetwork(states) {
   const online = states.filter(s => s.online && s.chain);
   const alerts = [];
-
-  if (online.length === 0) {
-    return {
-      level: "err",
-      title: "Nenhum nó respondendo",
-      detail: "Verifique se os nós estão rodando e se o CORS está liberado.",
-      alerts: [{ type: "err", msg: "Todos os nós offline." }],
-    };
-  }
-
-  const heights = online.map(s => s.chain.height);
-  const maxH = Math.max(...heights);
-  const minH = Math.min(...heights);
-  const diffH = maxH - minH;
-
+  if (online.length === 0) return { level: "err", title: "Nenhum nó respondendo", detail: "Verifique se os nós estão rodando e o CORS liberado.", alerts: [{ type: "err", msg: "Todos os nós offline." }] };
+  const heights = online.map(s => s.chain.height); const maxH = Math.max(...heights); const minH = Math.min(...heights); const diffH = maxH - minH;
   const tipMap = {};
-  for (const s of online) {
-    const h = s.chain.height;
-    if (!tipMap[h]) tipMap[h] = new Set();
-    tipMap[h].add(s.chain.tip_hash);
-  }
-
+  for (const s of online) { const h = s.chain.height; if (!tipMap[h]) tipMap[h] = new Set(); tipMap[h].add(s.chain.tip_hash); }
   let forkAtHeight = null;
-  for (const [h, hashes] of Object.entries(tipMap)) {
-    if (hashes.size > 1) {
-      forkAtHeight = parseInt(h);
-      break;
-    }
-  }
-
+  for (const [h, hashes] of Object.entries(tipMap)) { if (hashes.size > 1) { forkAtHeight = parseInt(h); break; } }
   const minersRunning = online.filter(s => s.miner && s.miner.running);
-
-  let level = "ok";
-  let title = "Rede OK — todos sincronizados";
-  let detail = `${online.length} nó(s) online · altura ${maxH}`;
-
-  if (forkAtHeight !== null) {
-    level = "err";
-    title = `🔴 FORK DETECTADO no bloco #${forkAtHeight}`;
-    detail = "Nós têm hashes diferentes na mesma altura.";
-    alerts.push({
-      type: "err",
-      msg: `FORK em #${forkAtHeight}: blocos divergentes.`,
-    });
-  } else if (diffH > 0) {
-    if (diffH <= 2) {
-      level = "warn";
-      title = "Sincronizando — diferença pequena";
-      detail = `Diferença de ${diffH} bloco(s) — normal.`;
-    } else if (diffH <= 10) {
-      level = "warn";
-      title = `Atenção — ${diffH} blocos de diferença`;
-      detail = "Alguns nós estão atrás.";
-    } else {
-      level = "err";
-      title = `Problema — ${diffH} blocos de diferença`;
-      detail = "Nós muito dessincronizados. Verifique o P2P.";
-    }
-  }
-
-  if (minersRunning.length === 0) {
-    if (level === "ok") level = "warn";
-    alerts.push({
-      type: "warn",
-      msg: "⚠ Nenhum nó está minerando.",
-    });
-  } else if (minersRunning.length > 1) {
-    if (level === "ok") level = "warn";
-    alerts.push({
-      type: "warn",
-      msg: `⚠ ${minersRunning.length} nós minerando simultaneamente. Cuidado com forks.`,
-    });
-  }
-
+  let level = "ok"; let title = "Rede OK — todos sincronizados"; let detail = `${online.length} nó(s) online · altura ${maxH}`;
+  if (forkAtHeight !== null) { level = "err"; title = `🔴 FORK DETECTADO no bloco #${forkAtHeight}`; detail = "Nós têm hashes diferentes na mesma altura."; alerts.push({ type: "err", msg: `FORK em #${forkAtHeight}: blocos divergentes.` }); }
+  else if (diffH > 0) { if (diffH <= 2) { level = "warn"; title = "Sincronizando — diferença pequena"; detail = `Diferença de ${diffH} bloco(s) — normal.`; } else if (diffH <= 10) { level = "warn"; title = `Atenção — ${diffH} blocos de diferença`; detail = "Alguns nós estão atrás."; } else { level = "err"; title = `Problema — ${diffH} blocos de diferença`; detail = "Nós muito dessincronizados."; } }
+  if (minersRunning.length === 0) { if (level === "ok") level = "warn"; alerts.push({ type: "warn", msg: "⚠ Nenhum nó está minerando." }); }
+  else if (minersRunning.length > 1) { if (level === "ok") level = "warn"; alerts.push({ type: "warn", msg: `⚠ ${minersRunning.length} nós minerando simultaneamente.` }); }
   return { level, title, detail, alerts };
 }
 
-// ============================================================
-// RENDER
-// ============================================================
 function render() {
   const grid = document.getElementById("nodesGrid");
-  if (nodes.length === 0) {
-    grid.innerHTML = `
-      <div class="node-card">
-        <p style="color:#8b949e;text-align:center">
-          Nenhum nó configurado. Clique em "+ Adicionar Nó".
-        </p>
-      </div>`;
-    return;
-  }
-
+  if (nodes.length === 0) return grid.innerHTML = `<div class="node-card"><p style="color:#8b949e;text-align:center">Nenhum nó configurado.</p></div>`;
   grid.innerHTML = "";
   for (const n of nodes) {
     const st = nodeStates[n.host];
-    const card = document.createElement("div");
-    card.className = "node-card";
-
-    if (!st) {
-      card.classList.add("offline");
-      const b0 = [];
-      if (n.auto) b0.push('<span class="badge auto">auto</span>');
-      else if (n.manual) b0.push('<span class="badge manual">manual</span>');
-      b0.push('<span class="badge gray">carregando</span>');
-
-      card.innerHTML = `
-        <div class="node-header">
-          <div>
-            <div class="node-name">${escapeHtml(n.name)}</div>
-            <div class="node-host">${escapeHtml(n.host)}:${n.port}</div>
-          </div>
-          <div class="badges">${b0.join("")}</div>
-        </div>`;
-      grid.appendChild(card);
-      continue;
-    }
-
-    if (!st.online) {
-      card.classList.add("offline");
-      const badges = [];
-      if (n.auto) badges.push('<span class="badge auto">auto</span>');
-      else if (n.manual) badges.push('<span class="badge manual">manual</span>');
-      badges.push('<span class="badge err">offline</span>');
-
-      card.innerHTML = `
-        <div class="node-header">
-          <div>
-            <div class="node-name">${escapeHtml(n.name)}</div>
-            <div class="node-host">${escapeHtml(n.host)}:${n.port}</div>
-          </div>
-          <div class="badges">${badges.join("")}</div>
-        </div>
-        <div class="node-stats">
-          <div class="stat">
-            <div class="k">Erro</div>
-            <div class="v sm red">${escapeHtml(st.error || "?")}</div>
-          </div>
-        </div>
-        <div class="node-actions">
-          <button class="btn" onclick="removeNode('${escapeAttr(n.host)}')">Remover</button>
-        </div>`;
-      grid.appendChild(card);
-      continue;
-    }
-
-    const c = st.chain || {};
-    const s = st.status || {};
-    const sy = st.sync || {};
-    const m = st.miner || {};
-
-    const height = c.height ?? s.height ?? "?";
-    const tip = c.tip_hash || "?";
-    const diff = c.difficulty ?? s.difficulty ?? "?";
-    const peers = s.peers ?? "?";
-
-    const badges = [];
-    if (n.auto) badges.push('<span class="badge auto">auto</span>');
-    else if (n.manual) badges.push('<span class="badge manual">manual</span>');
-
-    if (m.running) badges.push('<span class="badge mining">⛏ minerando</span>');
-    else badges.push('<span class="badge gray">○ parado</span>');
-
-    if (sy.synced) badges.push('<span class="badge ok">✓ sync</span>');
-    else if (sy.syncing) badges.push('<span class="badge warn">↻ sync</span>');
+    const card = document.createElement("div"); card.className = "node-card";
+    if (!st) { card.classList.add("offline"); const b0 = []; if (n.auto) b0.push('<span class="badge auto">auto</span>'); else if (n.manual) b0.push('<span class="badge manual">manual</span>'); b0.push('<span class="badge gray">carregando</span>'); card.innerHTML = `<div class="node-header"><div><div class="node-name">${escapeHtml(n.name)}</div><div class="node-host">${escapeHtml(n.host)}:${n.port}</div></div><div class="badges">${b0.join("")}</div></div>`; grid.appendChild(card); continue; }
+    if (!st.online) { card.classList.add("offline"); const badges = []; if (n.auto) badges.push('<span class="badge auto">auto</span>'); else if (n.manual) badges.push('<span class="badge manual">manual</span>'); badges.push('<span class="badge err">offline</span>'); card.innerHTML = `<div class="node-header"><div><div class="node-name">${escapeHtml(n.name)}</div><div class="node-host">${escapeHtml(n.host)}:${n.port}</div></div><div class="badges">${badges.join("")}</div></div><div class="node-stats"><div class="stat"><div class="k">Erro</div><div class="v sm red">${escapeHtml(st.error || "?")}</div></div></div><div class="node-actions"><button class="btn" onclick="removeNode('${escapeAttr(n.host)}')">Remover</button></div>`; grid.appendChild(card); continue; }
+    const c = st.chain || {}; const s = st.status || {}; const sy = st.sync || {}; const m = st.miner || {};
+    const height = c.height ?? s.height ?? "?"; const tip = c.tip_hash || "?"; const diff = c.difficulty ?? s.difficulty ?? "?"; const peers = s.peers ?? "?";
+    const badges = []; if (n.auto) badges.push('<span class="badge auto">auto</span>'); else if (n.manual) badges.push('<span class="badge manual">manual</span>');
+    if (m.running) badges.push('<span class="badge mining">⛏ minerando</span>'); else badges.push('<span class="badge gray">○ parado</span>');
+    if (sy.synced) badges.push('<span class="badge ok">✓ sync</span>'); else if (sy.syncing) badges.push('<span class="badge warn">↻ sync</span>');
     if (sy.forking) badges.push('<span class="badge err">⚠ fork</span>');
-
-    const allOnline = Object.values(nodeStates).filter(x => x && x.online);
-    const maxHeight = Math.max(...allOnline.map(x => x.chain?.height || 0));
-    const isBehind = (c.height || 0) < maxHeight;
-    const behindBy = maxHeight - (c.height || 0);
-
-    if (isBehind && behindBy > 0) {
-      card.classList.add("behind");
-      badges.push(`<span class="badge warn">↓ -${behindBy}</span>`);
-    } else {
-      card.classList.add("online");
-    }
-
-    card.innerHTML = `
-      <div class="node-header">
-        <div>
-          <div class="node-name">${escapeHtml(n.name)}</div>
-          <div class="node-host">${escapeHtml(n.host)}:${n.port}
-            · <span style="color:#8b949e">${escapeHtml(n.role || "?")}</span>
-          </div>
-        </div>
-        <div class="badges">${badges.join("")}</div>
-      </div>
-
-      <div class="node-stats">
-        <div class="stat">
-          <div class="k">Altura</div>
-          <div class="v">${formatNum(height)}</div>
-        </div>
-        <div class="stat">
-          <div class="k">Dificuldade</div>
-          <div class="v">${diff}</div>
-        </div>
-        <div class="stat">
-          <div class="k">Peers</div>
-          <div class="v">${peers}</div>
-        </div>
-        <div class="stat">
-          <div class="k">Latência</div>
-          <div class="v ${st.latency > 2000 ? 'yellow' : 'green'}">${st.latency}ms</div>
-        </div>
-      </div>
-
-      <div class="node-details">
-        <div class="line">
-          <span class="k">Tip hash</span>
-          <span class="v mono">${shortHash(tip)}</span>
-        </div>
-        <div class="line">
-          <span class="k">Sync</span>
-          <span class="v ${sy.synced ? 'green' : 'yellow'}">
-            ${sy.local_height ?? "?"} → ${sy.target_height ?? "?"}
-            (${(sy.progress ?? 0).toFixed(1)}%)
-          </span>
-        </div>
-        <div class="line">
-          <span class="k">Minerador</span>
-          <span class="v">${m.running
-            ? `rodando · ${m.blocks_mined ?? 0} blocos`
-            : "parado"}</span>
-        </div>
-        ${m.last_error ? `<div class="line">
-          <span class="k">Último erro</span>
-          <span class="v alert">${escapeHtml(m.last_error)}</span>
-        </div>` : ""}
-      </div>
-
-      <div class="node-actions">
-        <button class="btn" onclick="removeNode('${escapeAttr(n.host)}')">Remover</button>
-      </div>
-    `;
+    const allOnline = Object.values(nodeStates).filter(x => x && x.online); const maxHeight = Math.max(...allOnline.map(x => x.chain?.height || 0)); const isBehind = (c.height || 0) < maxHeight; const behindBy = maxHeight - (c.height || 0);
+    if (isBehind && behindBy > 0) { card.classList.add("behind"); badges.push(`<span class="badge warn">↓ -${behindBy}</span>`); } else { card.classList.add("online"); }
+    card.innerHTML = `<div class="node-header"><div><div class="node-name">${escapeHtml(n.name)}</div><div class="node-host">${escapeHtml(n.host)}:${n.port} · <span style="color:#8b949e">${escapeHtml(n.role || "?")}</span></div></div><div class="badges">${badges.join("")}</div></div><div class="node-stats"><div class="stat"><div class="k">Altura</div><div class="v">${formatNum(height)}</div></div><div class="stat"><div class="k">Dificuldade</div><div class="v">${diff}</div></div><div class="stat"><div class="k">Peers</div><div class="v">${peers}</div></div><div class="stat"><div class="k">Latência</div><div class="v ${st.latency > 2000 ? 'yellow' : 'green'}">${st.latency}ms</div></div></div><div class="node-details"><div class="line"><span class="k">Tip hash</span><span class="v mono">${shortHash(tip)}</span></div><div class="line"><span class="k">Sync</span><span class="v ${sy.synced ? 'green' : 'yellow'}">${sy.local_height ?? "?"} → ${sy.target_height ?? "?"} (${(sy.progress ?? 0).toFixed(1)}%)</span></div><div class="line"><span class="k">Minerador</span><span class="v">${m.running ? `rodando · ${m.blocks_mined ?? 0} blocos` : "parado"}</span></div>${m.last_error ? `<div class="line"><span class="k">Último erro</span><span class="v alert">${escapeHtml(m.last_error)}</span></div>` : ""}</div><div class="node-actions"><button class="btn" onclick="removeNode('${escapeAttr(n.host)}')">Remover</button></div>`;
     grid.appendChild(card);
   }
-
   renderComparison();
 }
 
 function renderComparison() {
-  const section = document.getElementById("comparisonSection");
-  const tbody = document.getElementById("comparisonBody");
-  const online = Object.values(nodeStates).filter(s => s.online && s.chain);
-
-  if (online.length === 0) {
-    section.style.display = "none";
-    return;
-  }
+  const section = document.getElementById("comparisonSection"); const tbody = document.getElementById("comparisonBody"); const online = Object.values(nodeStates).filter(s => s.online && s.chain);
+  if (online.length === 0) return section.style.display = "none";
   section.style.display = "block";
-
   const tipMap = {};
-  for (const s of online) {
-    const h = s.chain.height;
-    if (!tipMap[h]) tipMap[h] = new Set();
-    tipMap[h].add(s.chain.tip_hash);
-  }
-  let forkAtHeight = null;
-  for (const [h, hashes] of Object.entries(tipMap)) {
-    if (hashes.size > 1) { forkAtHeight = parseInt(h); break; }
-  }
-
+  for (const s of online) { const h = s.chain.height; if (!tipMap[h]) tipMap[h] = new Set(); tipMap[h].add(s.chain.tip_hash); }
+  let forkAtHeight = null; for (const [h, hashes] of Object.entries(tipMap)) { if (hashes.size > 1) { forkAtHeight = parseInt(h); break; } }
   tbody.innerHTML = "";
   for (const s of online) {
-    const tr = document.createElement("tr");
-    const h = s.chain.height;
-    const tip = s.chain.tip_hash;
-    const isForkHere = forkAtHeight === h;
-    const maxH = Math.max(...online.map(x => x.chain.height));
-
-    tr.innerHTML = `
-      <td><strong>${escapeHtml(s.name)}</strong></td>
-      <td class="mono">${escapeHtml(s.host)}</td>
-      <td class="${h < maxH ? 'yellow' : 'green'}">${formatNum(h)}</td>
-      <td class="mono ${isForkHere ? 'red' : ''}">${shortHash(tip)}</td>
-      <td>${s.chain.difficulty ?? "?"}</td>
-      <td>${s.status?.peers ?? "?"}</td>
-      <td class="${s.miner?.running ? 'green' : ''}">
-        ${s.miner?.running ? "⛏ " + (s.miner.blocks_mined ?? 0) : "—"}
-      </td>
-      <td class="${s.sync?.synced ? 'green' : 'yellow'}">
-        ${s.sync?.synced ? "✓" : "↻"} ${(s.sync?.progress ?? 0).toFixed(1)}%
-      </td>
-      <td>${s.latency}ms</td>
-    `;
+    const tr = document.createElement("tr"); const h = s.chain.height; const tip = s.chain.tip_hash; const isForkHere = forkAtHeight === h; const maxH = Math.max(...online.map(x => x.chain.height));
+    tr.innerHTML = `<td><strong>${escapeHtml(s.name)}</strong></td><td class="mono">${escapeHtml(s.host)}</td><td class="${h < maxH ? 'yellow' : 'green'}">${formatNum(h)}</td><td class="mono ${isForkHere ? 'red' : ''}">${shortHash(tip)}</td><td>${s.chain.difficulty ?? "?"}</td><td>${s.status?.peers ?? "?"}</td><td class="${s.miner?.running ? 'green' : ''}">${s.miner?.running ? "⛏ " + (s.miner.blocks_mined ?? 0) : "—"}</td><td class="${s.sync?.synced ? 'green' : 'yellow'}">${s.sync?.synced ? "✓" : "↻"} ${(s.sync?.progress ?? 0).toFixed(1)}%</td><td>${s.latency}ms</td>`;
     tbody.appendChild(tr);
   }
 }
 
-// ============================================================
-// LOAD ALL
-// ============================================================
 async function loadAll() {
   const now = Date.now();
   if (now - lastDiscoveryTs > DISCOVERY_INTERVAL_MS && !discoveryInFlight) {
     discoveryInFlight = true;
-    try {
-      const discovered = await fetchDiscoveredPeers();
-      if (discovered.length > 0) {
-        mergeDiscoveredPeers(discovered);
-      }
-      lastDiscoveryTs = now;
-    } catch (e) {
-      // silencioso
-    } finally {
-      discoveryInFlight = false;
-    }
+    try { const discovered = await fetchDiscoveredPeers(); if (discovered.length > 0) mergeDiscoveredPeers(discovered); lastDiscoveryTs = now; } catch (e) {} finally { discoveryInFlight = false; }
   }
-
   const results = await Promise.all(nodes.map(n => queryNode(n)));
-
-  for (const r of results) {
-    nodeStates[r.host] = r;
-  }
-
-  const allStates = Object.values(nodeStates).filter(
-    s => s && nodes.some(n => n.host === s.host)
-  );
+  for (const r of results) nodeStates[r.host] = r;
+  const allStates = Object.values(nodeStates).filter(s => s && nodes.some(n => n.host === s.host));
   const analysis = analyzeNetwork(allStates);
-
-  const banner = document.getElementById("statusBanner");
-  banner.style.display = "flex";
-  banner.className = `status-banner ${analysis.level}`;
-  document.getElementById("bannerIcon").textContent =
-    analysis.level === "ok" ? "✓" : analysis.level === "warn" ? "⚠" : "✗";
-  document.getElementById("bannerTitle").textContent = analysis.title;
-  document.getElementById("bannerDetail").textContent = analysis.detail;
-
+  const banner = document.getElementById("statusBanner"); banner.style.display = "flex"; banner.className = `status-banner ${analysis.level}`;
+  document.getElementById("bannerIcon").textContent = analysis.level === "ok" ? "✓" : analysis.level === "warn" ? "⚠" : "✗";
+  document.getElementById("bannerTitle").textContent = analysis.title; document.getElementById("bannerDetail").textContent = analysis.detail;
   const alertEl = document.getElementById("alerts");
-  if (analysis.alerts.length === 0) {
-    alertEl.innerHTML = "";
-  } else {
-    alertEl.innerHTML = analysis.alerts.map(a => `
-      <div class="alert ${a.type}">
-        <span class="icon">${a.type === "err" ? "✗" : "⚠"}</span>
-        <span>${escapeHtml(a.msg)}</span>
-      </div>
-    `).join("");
-  }
-
+  if (analysis.alerts.length === 0) alertEl.innerHTML = ""; else alertEl.innerHTML = analysis.alerts.map(a => `<div class="alert ${a.type}"><span class="icon">${a.type === "err" ? "✗" : "⚠"}</span><span>${escapeHtml(a.msg)}</span></div>`).join("");
   render();
 }
 
-// ============================================================
-// AUTO REFRESH
-// ============================================================
-function startAuto() {
-  if (autoTimer) clearInterval(autoTimer);
-  autoTimer = setInterval(loadAll, 5000);
-}
+function startAuto() { if (autoTimer) clearInterval(autoTimer); autoTimer = setInterval(loadAll, 5000); }
+function stopAuto() { if (autoTimer) clearInterval(autoTimer); autoTimer = null; }
+function shortHash(h) { if (!h || h.length < 20) return h || "?"; return h.slice(0, 16) + "…" + h.slice(-6); }
+function formatNum(n) { if (n == null) return "?"; return Number(n).toLocaleString("pt-BR"); }
+function escapeHtml(s) { if (s == null) return ""; return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+function escapeAttr(s) { return escapeHtml(s); }
 
-function stopAuto() {
-  if (autoTimer) clearInterval(autoTimer);
-  autoTimer = null;
-}
-
-// ============================================================
-// HELPERS
-// ============================================================
-function shortHash(h) {
-  if (!h || h.length < 20) return h || "?";
-  return h.slice(0, 16) + "…" + h.slice(-6);
-}
-
-function formatNum(n) {
-  if (n == null) return "?";
-  return Number(n).toLocaleString("pt-BR");
-}
-
-function escapeHtml(s) {
-  if (s == null) return "";
-  return String(s).replace(/[&<>"']/g, c => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;",
-    '"': "&quot;", "'": "&#39;"
-  }[c]));
-}
-
-function escapeAttr(s) {
-  return escapeHtml(s);
-}
-
-// ============================================================
-// INIT
-// ============================================================
-nodes = loadNodes();
-render();
-loadAll();
-startAuto();
-
-document.getElementById("autoRefresh").addEventListener("change", e => {
-  if (e.target.checked) startAuto();
-  else stopAuto();
-});
-
-document.getElementById("addModal").addEventListener("click", e => {
-  if (e.target.id === "addModal") closeAddNode();
-});
-
-document.addEventListener("keydown", e => {
-  if (e.key === "Escape") closeAddNode();
-});
+nodes = loadNodes(); render(); loadAll(); startAuto();
+document.getElementById("autoRefresh").addEventListener("change", e => { if (e.target.checked) startAuto(); else stopAuto(); });
+document.getElementById("addModal").addEventListener("click", e => { if (e.target.id === "addModal") closeAddNode(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeAddNode(); });
 </script>
 </body>
 </html>
