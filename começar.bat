@@ -1,230 +1,157 @@
 @echo off
 REM ============================================================
-REM   instalar_e_rodar.bat - BRN Node setup completo (v2.0)
-REM   Detecta, instala, sincroniza e roda - em sequencia segura
+REM   iniciar_cliente.bat - BRN Node Auto-Setup (v4.1 - FastAPI)
+REM   Fluxo: Deps -> Tailscale -> Sync -> GUI (Carteira)
 REM ============================================================
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
-set "SKIP_SYNC=0"
+REM Configura encoding UTF-8 no console
+chcp 65001 >nul 2>&1
+set "PYTHONIOENCODING=utf-8"
+set "PYTHONUTF8=1"
+set "PYTHONUNBUFFERED=1"
+
 set "SKIP_DEPS=0"
-set "FORCE_HEADLESS=1"
+set "SKIP_SYNC=0"
+set "FORCE_HEADLESS=0"
 
 :parse_args
 if "%~1"=="" goto args_done
-if /i "%~1"=="--skip-sync"     set "SKIP_SYNC=1"
-if /i "%~1"=="--skip-deps"     set "SKIP_DEPS=1"
-if /i "%~1"=="--gui"           set "FORCE_HEADLESS=0"
+if /i "%~1"=="--skip-deps" set "SKIP_DEPS=1"
+if /i "%~1"=="--skip-sync" set "SKIP_SYNC=1"
+if /i "%~1"=="--headless"  set "FORCE_HEADLESS=1"
 shift
 goto parse_args
 :args_done
 
 echo.
 echo ============================================================
-echo   BRN Node - SETUP COMPLETO (v2.0)
+echo   BRN Node - AUTO SETUP E INICIALIZACAO (v4.1)
 echo ============================================================
 echo   Pasta: %CD%
 echo   Data:  %DATE% %TIME%
+if "%FORCE_HEADLESS%"=="1" (
+    echo   Modo:  HEADLESS ^(API^)
+) else (
+    echo   Modo:  GUI ^(Carteira Grafica^)
+)
 echo ============================================================
 echo.
 
 REM ============================================================
-REM 1. DETECTAR PYTHON
+REM 1. VERIFICAR PYTHON
 REM ============================================================
-echo [1/6] Detectando Python...
-set "PY="
-where python >nul 2>&1 && set "PY=python"
-if not defined PY where py >nul 2>&1 && set "PY=py -3"
-if not defined PY (
+echo [1/5] Verificando Python...
+where python >nul 2>&1
+if errorlevel 1 (
     echo [ERRO] Python nao encontrado no PATH.
-    echo        Instale: https://www.python.org/downloads/
-    echo        Marque "Add Python to PATH" na instalacao.
+    echo        Instale em: https://www.python.org/downloads/
     pause
     exit /b 1
 )
-%PY% --version
-set "PYTHONUNBUFFERED=1"
-echo [ok] Python: %PY%
+python --version
+echo [ok] Python encontrado.
 echo.
 
 REM ============================================================
-REM 2. INSTALAR DEPENDENCIAS
+REM 2. INSTALAR DEPENDENCIAS (Incluindo FastAPI/Uvicorn)
 REM ============================================================
 if "%SKIP_DEPS%"=="1" goto deps_skip
 
-echo [2/6] Instalando dependencias Python...
-echo        (isso pode levar 2-3 min na primeira vez)
-echo.
+echo [2/5] Verificando e instalando dependencias...
+REM Lista de pacotes essenciais atualizada
+set "PKGS=flask flask-cors fastapi uvicorn requests orjson waitress cryptography argon2-cffi mnemonic pymongo pywebview pythonnet"
 
-%PY% -m pip install --quiet --upgrade pip 2>nul
-if errorlevel 1 echo [!] pip upgrade falhou (continuando)
-
-set "PKGS=flask flask-cors requests orjson waitress cryptography argon2-cffi mnemonic pymongo"
-for %%P in (%PKGS%) do (
-    echo        - %%P
-    %PY% -m pip install --quiet %%P
+for %%P in (!PKGS!) do (
+    python -c "import %%P" >nul 2>&1
     if errorlevel 1 (
-        echo        [X] falhou ao instalar %%P
-        echo        Tentando com --user...
-        %PY% -m pip install --quiet --user %%P
+        echo        Instalando %%P...
+        python -m pip install --quiet %%P
         if errorlevel 1 (
-            echo        [X] %%P NAO instalado. Abortando.
-            pause
-            exit /b 2
+            echo        [AVISO] Falha ao instalar %%P. Tentando com --user...
+            python -m pip install --quiet --user %%P
         )
+    ) else (
+        echo        [ok] %%P ja instalado.
     )
 )
-
-echo [ok] Dependencias instaladas
+echo [ok] Dependencias verificadas.
 echo.
 :deps_skip
 
 REM ============================================================
-REM 3. CRIAR .ENV (SE NAO EXISTIR)
+REM 3. VERIFICAR TAILSCALE
 REM ============================================================
-echo [3/6] Configurando brn_network.env...
+echo [3/5] Verificando Tailscale...
+set "TS_PATH=C:\Program Files\Tailscale\tailscale.exe"
+if not exist "%TS_PATH%" set "TS_PATH=tailscale"
 
-if exist "brn_network.env" (
-    echo [ok] brn_network.env ja existe - mantendo
-    goto env_done
+"%TS_PATH%" status >nul 2>&1
+if errorlevel 1 (
+    echo        Tailscale nao esta rodando ou desconectado.
+    echo        Tentando iniciar o Tailscale...
+    start "" "C:\Program Files\Tailscale\tailscale.exe"
+    timeout /t 3 >nul
+    "%TS_PATH%" up
+) else (
+    echo [ok] Tailscale esta rodando.
 )
-
-(
-echo # ============================================================
-echo # brn_network.env - BRN Node Config
-echo # ============================================================
-echo.
-echo # SEGREDOS - DEVEM SER IGUAIS AO UBUNTU
-echo BRN_NETWORK_SECRET=9226edea8ba62bc1c6ae36883c0536c95b4c85642195465d6c4d9456abef20f9
-echo BRN_NODE_PASSWORD=senha-no-temp-123
-echo BRN_WALLET_SESSION_PASS=senha-forte-da-carteira-2026
-echo BRN_WEB_PASS=senha-temp-123
-echo.
-echo # PEERS: Ubuntu primeiro ^(mais atualizado^), 61ltr37 segundo
-echo BRN_BOOTSTRAP_PEERS=100.111.253.8:6001,192.168.0.12:6002
-echo BRN_POOL_URL=http://100.111.253.8:5000
-echo.
-echo # MODO
-echo BRN_IS_ORIGIN=0
-echo BRN_POOL_ENABLED=1
-echo BRN_AUTO_MINE=0
-echo.
-echo # P2P
-echo BRN_P2P_PORT=6002
-echo BRN_P2P_AUTH=optional
-echo BRN_UPNP=0
-echo.
-echo # HTTP
-echo BRN_WEB_HOST=0.0.0.0
-echo BRN_WEB_PORT=5000
-echo BRN_CORS_ORIGIN=*
-echo.
-echo # LOG
-echo BRN_LOG_LEVEL=INFO
-echo BRN_AUDIT_ENABLED=1
-echo BRN_SKIP_VERIFY=0
-) > brn_network.env
-
-echo [ok] brn_network.env criado
-:env_done
-
-REM Verificar BOM (PowerShell cmd) - avisa se o arquivo esta estranho
-%PY% -c "from pathlib import Path; d=Path('brn_network.env').read_bytes(); print('[ok] .env sem BOM' if d[:3]!=b'\xef\xbb\xbf' else '[!] .env TEM BOM - considere reescrever')"
 echo.
 
 REM ============================================================
-REM 4. VERIFICAR ARQUIVOS ESSENCIAIS
-REM ============================================================
-echo [4/6] Verificando arquivos do BRN...
-set "FALTANDO="
-for %%F in (main.py server.py blockchain.py db.py crypto.py wallet.py sync_manager.py chain_validator.py checkpoints.py p2p_unified.py discovery_v2.py secure_store.py) do (
-    if not exist "%%F" set "FALTANDO=!FALTANDO! %%F"
-)
-if not "!FALTANDO!"=="" (
-    echo [ERRO] Arquivos faltando:!FALTANDO!
-    echo        Copie a pasta BRN-V002-main completa do outro PC.
-    pause
-    exit /b 3
-)
-echo [ok] Todos os arquivos essenciais presentes
-echo.
-
-REM ============================================================
-REM 5. SINCRONIZAR BLOCKCHAIN (SE NECESSARIO)
+REM 4. SINCRONIZAR BLOCKCHAIN
 REM ============================================================
 if "%SKIP_SYNC%"=="1" goto sync_skip
 
-echo [5/6] Verificando blockchain local...
-
-REM Verifica altura do DB atual
+echo [4/5] Verificando blockchain...
 set "DB_HEIGHT=-1"
-for /f "delims=" %%H in ('%PY% -c "from db import ChainDB; d=ChainDB('brn_v2_chain.db'); print(d.height()); d.close()" 2^>nul') do set "DB_HEIGHT=%%H"
+for /f "delims=" %%H in ('python -c "from db import ChainDB; d=ChainDB('brn_v2_chain.db'); print(d.height()); d.close()" 2^>nul') do set "DB_HEIGHT=%%H"
 
 echo        Altura local: !DB_HEIGHT!
-
 if not "!DB_HEIGHT!"=="-1" (
-    echo [ok] Blockchain ja sincronizada ^(altura !DB_HEIGHT!^) - pulando sync
+    echo [ok] Blockchain ja sincronizada.
     goto sync_done
 )
 
-echo        DB vazio - precisa sincronizar do Ubuntu
-echo.
-
-if not exist "sync_direct.py" (
-    echo [ERRO] sync_direct.py nao encontrado.
-    echo        Crie manualmente com o codigo fornecido, OU
-    echo        copie do PC anterior ^(laban^).
-    echo.
-    echo        Depois rode:
-    echo          python sync_direct.py http://100.111.253.8:5000
-    echo.
-    echo        Ou execute este .bat com --skip-sync para tentar
-    echo        sync via P2P ^(mais lento, menos confiavel^).
-    pause
-    exit /b 4
+echo        DB vazio - tentando sincronizar via HTTP...
+if exist "sync_direct.py" (
+    python sync_direct.py http://100.111.253.8:5000
+    if errorlevel 1 (
+        echo [AVISO] sync_direct falhou. O main.py tentara sync automatico.
+    )
+) else (
+    echo [INFO] sync_direct.py nao encontrado. Sync automatico no main.py.
 )
-
-echo        Rodando sync_direct.py do Ubuntu ^(100.111.253.8^)...
-echo.
-%PY% sync_direct.py http://100.111.253.8:5000
-if errorlevel 1 (
-    echo.
-    echo [X] Sync falhou. Verifique:
-    echo     - Ubuntu acessivel? ^(Test-NetConnection 100.111.253.8 -Port 5000^)
-    echo     - Tailscale UP? ^(tailscale status^)
-    pause
-    exit /b 5
-)
-
-echo.
-echo [ok] Sync concluido
 :sync_done
 echo.
-
 :sync_skip
 
 REM ============================================================
-REM 6. RODAR main.py
+REM 5. INICIAR CARTEIRA GRAFICA
 REM ============================================================
-echo [6/6] Iniciando BRN Node...
+echo [5/5] Iniciando BRN Node...
 echo.
+
+REM Cria a carteira se nao existir
+if not exist "current_wallet.enc" (
+    echo        Criando carteira nova...
+    python -c "from wallet import Wallet, WalletManager; import os; w = Wallet.create(); pw = os.environ.get('BRN_WALLET_SESSION_PASS', 'senha-forte-da-carteira-2026'); WalletManager.save_current(w.address, w.priv_hex, w.pub_hex, pw)"
+)
 
 set "HEADLESS_FLAG=--headless"
 if "%FORCE_HEADLESS%"=="0" set "HEADLESS_FLAG="
 
 echo ============================================================
-echo   INICIANDO: %PY% main.py %HEADLESS_FLAG% --no-tailscale --skip-verify
+echo   INICIANDO O NO...
+echo   python main.py %HEADLESS_FLAG% --skip-verify
 echo ============================================================
 echo.
 
-%PY% main.py %HEADLESS_FLAG% --no-tailscale --skip-verify
-set "RC=%ERRORLEVEL%"
+REM Roda o main.py (que agora usa FastAPI/Uvicorn internamente)
+python main.py %HEADLESS_FLAG% --skip-verify
 
-echo.
-if not "%RC%"=="0" (
-    echo [X] main.py saiu com codigo %RC%
-) else (
-    echo [ok] main.py encerrado normalmente
+if errorlevel 1 (
+    echo [X] O programa saiu com erro.
 )
 pause
-exit /b %RC%
