@@ -1,4 +1,4 @@
-"""sync_manager.py — Sincronizador automático de blockchain (v2.0)
+"""sync_manager.py — Sincronizador automático de blockchain (v2.1)
 ================================================================
 Versão HTTP — funciona de QUALQUER lugar (LAN, Tailscale, internet).
 
@@ -14,6 +14,10 @@ Como funciona:
   5. Repete a cada SYNC_INTERVAL segundos
 
 Compatível com fork_guard.py (PeerStatus tem .addr e .height).
+v2.1 (2026-10-27):
+  [FIX] Impede que o sync tente importar blocos fora de ordem
+        (o que causava o erro "bloco #0 rejeitado: prev_hash incorreto"
+        quando o banco local oscilava rapidamente).
 ================================================================
 """
 from __future__ import annotations
@@ -96,7 +100,7 @@ class ChainSyncManager:
         if not _HAS_REQUESTS:
             log.error("requests nao instalado - sync HTTP indisponivel")
 
-        log.info("ChainSyncManager v2.0 (HTTP) inicializado")
+        log.info("ChainSyncManager v2.1 (HTTP) inicializado")
 
     # ============================================================
     # CICLO DE VIDA
@@ -235,7 +239,7 @@ class ChainSyncManager:
                     f"http://{ip}:{HTTP_PORT}/api/chain-info",
                     timeout=PEER_HTTP_TIMEOUT,
                     proxies={"http": None, "https": None},
-                    headers={"User-Agent": "brn-sync/2.0"},
+                    headers={"User-Agent": "brn-sync/2.1"},
                 )
                 if r.status_code != 200:
                     with self.peer_lock:
@@ -301,7 +305,7 @@ class ChainSyncManager:
                         f"?start={cursor}&limit={SYNC_BATCH}",
                         timeout=30,
                         proxies={"http": None, "https": None},
-                        headers={"User-Agent": "brn-sync/2.0"},
+                        headers={"User-Agent": "brn-sync/2.1"},
                     )
                     if r.status_code == 200:
                         blocks = r.json().get("blocks", [])
@@ -322,19 +326,23 @@ class ChainSyncManager:
             for blk in blocks:
                 if self._stop.is_set():
                     return
+                
+                # [FIX] Valida se o bloco veio fora de ordem
+                if blk.get("height") != cursor:
+                    log.warning("sync: bloco fora de ordem (esperado #%d, recebido #%d)", cursor, blk.get("height"))
+                    return  # Aborta esse sync. Na próxima rodada ele tenta de novo.
+                
                 try:
                     ok, msg = self.chain.accept_block(blk)
                 except Exception as e:
                     ok, msg = False, str(e)
                 if not ok:
-                    log.warning("bloco #%s rejeitado: %s",
-                                blk.get("height"), msg)
+                    log.warning("bloco #%s rejeitado: %s", blk.get("height"), msg)
                     with self._state_lock:
                         self._last_error = f"#{blk.get('height')}: {msg}"
                     return
                 imported += 1
-
-            cursor = end
+                cursor += 1
 
             # Log de progresso
             elapsed = time.time() - t0
