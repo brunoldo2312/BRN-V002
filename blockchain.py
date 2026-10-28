@@ -187,7 +187,8 @@ def _maybe_sign_checkpoint(block) -> None:
 # ============================================================
 def signing_hash_block(block: dict) -> bytes:
     """Mensagem assinada pelos validadores: domínio || hash do bloco."""
-    return BLOCK_SIG_DOMAIN + block["hash"].encode()
+    raw_msg = BLOCK_SIG_DOMAIN + block["hash"].encode()
+    return sha256(raw_msg)  # <--- FIX: Transforma em 32 bytes para o ECDSA
 
 
 def sign_block_as_validator(block: dict, priv) -> dict:
@@ -812,6 +813,8 @@ class Blockchain:
         required = self._required_signatures(validators)
 
         sigs = block.get("validators_sig", [])
+        if sigs is None:
+            sigs = []
         if not isinstance(sigs, list):
             return False, "validators_sig inválido"
 
