@@ -1,24 +1,14 @@
-"""trust_network.py — Rede de confiança e reputação do BRN (v3.2)
+"""trust_network.py — Rede de confiança e reputação do BRN (v3.3)
 ================================================================
-v3.2 (2026-10-28):
-  [TUNING] Acelerada a progressão de reputação para viabilizar
-           validadores via pool de mineração.
-           - TRUST_THRESHOLD_VALIDATOR: 600 -> 150
-           - GAIN_SHARE_SUBMITTED: 0.05 -> 0.5
-           - GAIN_BLOCK_VALIDATED: 2.0 -> 20.0
-           - GAIN_ONLINE_HOUR: 0.1 -> 0.5
-           - FLUSH_INTERVAL_S: 30.0 -> 10.0 (salva o JSON mais rápido)
-v3.1 (2026-10-28):
-  [SECURITY] Assinatura digital Ed25519 do trust_network.json.
-             O nó Origem assina o arquivo. Nós Clientes verificam
-             a assinatura. Se um cliente alterar o arquivo JSON
-             (ex: para se dar 9999 pontos), a assinatura quebra
-             e o arquivo é rejeitado.
+v3.3 (2026-10-28):
+  [FIX] Removido 'saved_at' do payload de verificação da assinatura.
+        Isso garante que a assinatura do JSON não quebre quando
+        o cliente baixa o arquivo do servidor.
 ================================================================
 """
 from __future__ import annotations
 
-__version__ = "3.2"
+__version__ = "3.3"
 
 import json
 import logging
@@ -32,18 +22,15 @@ from crypto import Ed25519PrivateKey, Ed25519PublicKey
 
 log = logging.getLogger("trust_network")
 
-# ============================================================
-# CONSTANTES DO SISTEMA
-# ============================================================
 INITIAL_TRUST_SCORE = 100.0
 MAX_TRUST_SCORE = 1000.0
 MIN_TRUST_SCORE = 0.0
-TRUST_THRESHOLD_VALIDATOR = 150.0 # <--- ALTERADO (era 600)
-TRUST_THRESHOLD_ACTIVE = 120.0    # <--- ALTERADO (era 200)
+TRUST_THRESHOLD_VALIDATOR = 150.0
+TRUST_THRESHOLD_ACTIVE = 120.0
 
-GAIN_BLOCK_VALIDATED = 20.0  # <--- ALTERADO (era 2.0)
-GAIN_ONLINE_HOUR = 0.5       # <--- ALTERADO (era 0.1)
-GAIN_SHARE_SUBMITTED = 0.5   # <--- ALTERADO (era 0.05)
+GAIN_BLOCK_VALIDATED = 20.0
+GAIN_ONLINE_HOUR = 0.5
+GAIN_SHARE_SUBMITTED = 0.5
 GAIN_REWARD_DISTRIBUTED = 5.0
 
 PENALTY_INVALID_BLOCK = -50.0
@@ -58,13 +45,8 @@ DECAY_INTERVAL_SECONDS = 86400
 MAX_VALIDATORS = 21
 VALIDATOR_ROTATION_BLOCKS = 100
 DEFAULT_DATA_FILE = "trust_network.json"
+FLUSH_INTERVAL_S = 10.0
 
-FLUSH_INTERVAL_S = 10.0 # <--- ALTERADO (era 30) - Salva mais rápido
-
-
-# ============================================================
-# ESTRUTURA DE DADOS DO NÓ
-# ============================================================
 @dataclass
 class NodeRecord:
     node_id: str
@@ -106,7 +88,7 @@ class NodeRecord:
             self.is_validator = False
         elif self.trust_score >= TRUST_THRESHOLD_VALIDATOR:
             self.trust_level = "validator"
-        elif self.trust_score >= 400: # Este continua alto para "trusted"
+        elif self.trust_score >= 400:
             self.trust_level = "trusted"
         elif self.trust_score >= TRUST_THRESHOLD_ACTIVE:
             self.trust_level = "active"
@@ -132,23 +114,17 @@ class NodeRecord:
         return cls(**{k: v for k, v in data.items() if k in campos})
 
 
-# ============================================================
-# TRUST NETWORK (thread-safe)
-# ============================================================
 class TrustNetwork:
-    """Reputação de nós. NÃO interfere no consenso (PoW continua)."""
-
     def __init__(self, data_file: str = DEFAULT_DATA_FILE, is_origin: bool = False, node_sk=None):
         self.data_file = Path(data_file)
         self.is_origin = is_origin
-        self.node_sk = node_sk # Chave privada Ed25519 do nó (para assinar)
+        self.node_sk = node_sk
         
         self.nodes: Dict[str, NodeRecord] = {}
         self.active_validators: Set[str] = set()
         self.last_decay_time: float = time.time()
         self._last_rotation_height: int = 0
 
-        # Thread safety
         self._lock = threading.RLock()
         self._dirty = False
         self._last_flush = 0.0
@@ -157,9 +133,6 @@ class TrustNetwork:
         log.info("[TrustNetwork] Inicializada — %d nós, %d validadores",
                  len(self.nodes), len(self.active_validators))
 
-    # ========================================================
-    # PERSISTÊNCIA (BATCHED + ASSINADA)
-    # ========================================================
     def _mark_dirty(self) -> None:
         self._dirty = True
         agora = time.time()
@@ -167,7 +140,6 @@ class TrustNetwork:
             self.flush()
 
     def flush(self) -> None:
-        """Assina (se Origem) e salva o arquivo em disco."""
         with self._lock:
             if not self._dirty:
                 return
@@ -179,9 +151,7 @@ class TrustNetwork:
                     "last_rotation_height": self._last_rotation_height,
                 }
                 
-                # [SECURITY v3.1] Se for o nó Origem, assina os dados
                 if self.is_origin and self.node_sk is not None:
-                    # Serialização determinística (sort_keys=True é crucial)
                     payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
                     sig = self.node_sk.sign(payload)
                     data["signature"] = sig.hex()
@@ -193,7 +163,6 @@ class TrustNetwork:
                     json.dump(data, f, indent=2, ensure_ascii=False)
                 self._dirty = False
                 self._last_flush = time.time()
-                log.debug("[TrustNetwork] flush OK (%d nós)", len(self.nodes))
             except Exception as e:
                 log.error("[TrustNetwork] flush falhou: %s", e)
 
@@ -202,15 +171,14 @@ class TrustNetwork:
 
     def _load(self) -> None:
         if not self.data_file.exists():
-            log.info("[TrustNetwork] Arquivo não existe — iniciando vazio")
             return
         try:
             with open(self.data_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             
-            # [SECURITY v3.1] Verificação de Assinatura
             sig_hex = data.pop("signature", None)
             origin_pub_hex = data.pop("origin_pubkey", None)
+            data.pop("saved_at", None) # <--- O FIX ESTÁ AQUI
             
             if sig_hex and origin_pub_hex:
                 payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -222,13 +190,13 @@ class TrustNetwork:
                 except Exception as e:
                     log.error("[TrustNetwork] ASSINATURA INVÁLIDA! O arquivo foi alterado.")
                     if not self.is_origin:
-                        log.error("[TrustNetwork] Cliente rejeitou o arquivo. Iniciando vazio por segurança.")
+                        log.error("[TrustNetwork] Cliente rejeitou o arquivo. Iniciando vazio.")
                         return
                     else:
-                        log.warning("[TrustNetwork] Origem ignorando falha de assinatura (migração?).")
+                        log.warning("[TrustNetwork] Origem ignorando falha de assinatura.")
             else:
                 if not self.is_origin:
-                    log.warning("[TrustNetwork] Arquivo sem assinatura. Cliente não confia. Iniciando vazio.")
+                    log.warning("[TrustNetwork] Arquivo sem assinatura. Iniciando vazio.")
                     return
             
             with self._lock:
@@ -239,14 +207,9 @@ class TrustNetwork:
                 self.last_decay_time = data.get("last_decay_time", time.time())
                 self.active_validators = set(data.get("active_validators", []))
                 self._last_rotation_height = int(data.get("last_rotation_height", 0))
-            log.info("[TrustNetwork] Carregada — %d nós, %d validadores",
-                     len(self.nodes), len(self.active_validators))
         except Exception as e:
             log.error("[TrustNetwork] Load falhou: %s — iniciando vazio", e)
 
-    # ========================================================
-    # REGISTRO E CONEXÃO
-    # ========================================================
     def register_node(self, node_id: str, address: str, public_key: str,
                       peer_addr: str = "") -> NodeRecord:
         with self._lock:
@@ -268,8 +231,6 @@ class TrustNetwork:
             )
             self.nodes[node_id] = n
             self._mark_dirty()
-            log.info("[TrustNetwork] ✅ Novo nó: %s (%s)",
-                     node_id[:12] + "…", address[:12] + "…")
             return n
 
     def mark_connected(self, node_id: str) -> None:
@@ -310,20 +271,15 @@ class TrustNetwork:
                 self._adjust_score(node_id, GAIN_ONLINE_HOUR / 10, "heartbeat")
             self._apply_decay()
 
-    # ========================================================
-    # EVENTOS
-    # ========================================================
     def record_block_validated(self, node_id: str, block_height: int) -> None:
         with self._lock:
             n = self.nodes.get(node_id)
             if not n:
                 return
             n.blocks_validated += 1
-            self._adjust_score(node_id, GAIN_BLOCK_VALIDATED,
-                               f"validou #{block_height}")
+            self._adjust_score(node_id, GAIN_BLOCK_VALIDATED, f"validou #{block_height}")
 
-    def record_block_rejected(self, node_id: str, block_height: int,
-                              reason: str = "") -> None:
+    def record_block_rejected(self, node_id: str, block_height: int, reason: str = "") -> None:
         with self._lock:
             n = self.nodes.get(node_id)
             if not n:
@@ -335,8 +291,7 @@ class TrustNetwork:
                 "severity": "high",
                 "amount": PENALTY_INVALID_BLOCK,
             })
-            self._adjust_score(node_id, PENALTY_INVALID_BLOCK,
-                               f"bloco inválido #{block_height}")
+            self._adjust_score(node_id, PENALTY_INVALID_BLOCK, f"bloco inválido #{block_height}")
             if n.trust_score < MIN_TRUST_SCORE:
                 self.ban_node(node_id, "pontuação mínima atingida")
 
@@ -353,28 +308,16 @@ class TrustNetwork:
                 n.invalid_shares += 1
                 self._adjust_score(node_id, PENALTY_SUSPICIOUS_RATE, "share inválida")
             if n.shares_submitted > 0:
-                n.success_rate = round(
-                    (n.valid_shares / n.shares_submitted) * 100.0, 1
-                )
+                n.success_rate = round((n.valid_shares / n.shares_submitted) * 100.0, 1)
 
-    def penalize(self, node_id: str, reason: str,
-                 severity: str = "medium",
-                 auto_ban_threshold: Optional[float] = None) -> float:
-        penalties = {
-            "low": -5.0, "medium": -50.0,
-            "high": -200.0, "critical": -1000.0,
-        }
+    def penalize(self, node_id: str, reason: str, severity: str = "medium", auto_ban_threshold: Optional[float] = None) -> float:
+        penalties = {"low": -5.0, "medium": -50.0, "high": -200.0, "critical": -1000.0}
         amount = penalties.get(severity, -50.0)
         with self._lock:
             n = self.nodes.get(node_id)
             if not n:
                 return 0.0
-            n.penalties.append({
-                "time": time.time(),
-                "reason": reason,
-                "severity": severity,
-                "amount": amount,
-            })
+            n.penalties.append({"time": time.time(), "reason": reason, "severity": severity, "amount": amount})
             n.total_penalties += 1
             new_score = self._adjust_score(node_id, amount, reason)
             if auto_ban_threshold and new_score < auto_ban_threshold:
@@ -390,14 +333,9 @@ class TrustNetwork:
             n.ban_reason = reason
             n.is_validator = False
             self.active_validators.discard(node_id)
-            log.warning("[TrustNetwork] 🚫 %s banido: %s",
-                        node_id[:12] + "…", reason)
             self._mark_dirty()
             return True
 
-    # ========================================================
-    # SCORE INTERNO
-    # ========================================================
     def _adjust_score(self, node_id: str, delta: float, reason: str = "") -> float:
         n = self.nodes.get(node_id)
         if not n or n.banned:
@@ -406,8 +344,6 @@ class TrustNetwork:
         n.trust_score = max(MIN_TRUST_SCORE, min(MAX_TRUST_SCORE, old + delta))
         n.update_trust_level()
         if abs(delta) > 0.1:
-            log.debug("[TrustNetwork] %s %.1f→%.1f (%+0.1f) %s",
-                      node_id[:12] + "…", old, n.trust_score, delta, reason)
             self._mark_dirty()
         return n.trust_score
 
@@ -415,11 +351,7 @@ class TrustNetwork:
         n = self.nodes.get(node_id)
         if not n:
             return
-        recent = [
-            p for p in n.penalties
-            if "drop" in p.get("reason", "")
-            and time.time() - p.get("time", 0) < 86400 * 7
-        ]
+        recent = [p for p in n.penalties if "drop" in p.get("reason", "") and time.time() - p.get("time", 0) < 86400 * 7]
         n.uptime_score = max(0.0, 100.0 - len(recent) * 5.0)
 
     def _apply_decay(self) -> None:
@@ -435,22 +367,14 @@ class TrustNetwork:
                 fator = 1.0 - (TRUST_DECAY_DAILY / 100.0)
                 n.trust_score = max(MIN_TRUST_SCORE, n.trust_score * fator)
                 n.update_trust_level()
-        log.info("[TrustNetwork] decaimento aplicado")
         self._mark_dirty()
 
-    # ========================================================
-    # VALIDADORES
-    # ========================================================
     def select_validators(self, current_block_height: int) -> List[str]:
         with self._lock:
-            if (current_block_height - self._last_rotation_height
-                    < VALIDATOR_ROTATION_BLOCKS):
+            if (current_block_height - self._last_rotation_height < VALIDATOR_ROTATION_BLOCKS):
                 return list(self.active_validators)
             self._last_rotation_height = current_block_height
-            candidates = [
-                n for n in self.nodes.values()
-                if not n.banned and n.trust_score >= TRUST_THRESHOLD_VALIDATOR
-            ]
+            candidates = [n for n in self.nodes.values() if not n.banned and n.trust_score >= TRUST_THRESHOLD_VALIDATOR]
             if not candidates:
                 self.active_validators.clear()
                 self._mark_dirty()
@@ -463,8 +387,6 @@ class TrustNetwork:
                 n.is_validator = (n.node_id in ids)
                 if n.is_validator and not n.validator_since:
                     n.validator_since = time.time()
-            log.info("[TrustNetwork] validadores: %d/%d",
-                     len(ids), len(candidates))
             self._mark_dirty()
             return ids
 
@@ -479,10 +401,7 @@ class TrustNetwork:
             n_target = 5
 
         with self._lock:
-            cands = [
-                n for n in self.nodes.values()
-                if not n.banned and n.public_key
-            ]
+            cands = [n for n in self.nodes.values() if not n.banned and n.public_key]
             cands.sort(key=lambda n: (-n.trust_score, n.public_key))
 
             out: List[str] = []
@@ -495,24 +414,6 @@ class TrustNetwork:
                 out.append(pk)
                 if len(out) >= n_target:
                     break
-
-            n_found = len(out)
-            if n_found == 0:
-                log.warning(
-                    "[TrustNetwork] get_top_validators: NENHUM validador "
-                    "qualificado (nodes=%d, com pubkey=%d). "
-                    "Consenso multi-sig ficará em modo bootstrap.",
-                    len(self.nodes),
-                    sum(1 for x in self.nodes.values() if x.public_key),
-                )
-            elif n_found < n_target:
-                log.info(
-                    "[TrustNetwork] get_top_validators: %d/%d (só há %d "
-                    "nós com pubkey não-banidos)",
-                    n_found, n_target,
-                    sum(1 for x in self.nodes.values()
-                        if x.public_key and not x.banned),
-                )
 
             return out
 
@@ -529,13 +430,9 @@ class TrustNetwork:
                     "uptime_score": round(self.nodes[nid].uptime_score, 1),
                     "blocks_validated": self.nodes[nid].blocks_validated,
                 }
-                for nid in sorted(ids,
-                                  key=lambda x: -self.nodes[x].trust_score)
+                for nid in sorted(ids, key=lambda x: -self.nodes[x].trust_score)
             ]
 
-    # ========================================================
-    # CONSULTAS / API
-    # ========================================================
     def get_node_info(self, node_id: str) -> Optional[Dict]:
         with self._lock:
             n = self.nodes.get(node_id)
@@ -557,8 +454,7 @@ class TrustNetwork:
                 min_idx = levels.index(min_level)
             out = []
             for n in sorted(self.nodes.values(), key=lambda x: -x.trust_score):
-                if (not n.banned or min_level == "banned") and \
-                   levels.index(n.trust_level) >= min_idx:
+                if (not n.banned or min_level == "banned") and levels.index(n.trust_level) >= min_idx:
                     out.append({
                         "node_id": n.node_id,
                         "address": n.address,
@@ -576,8 +472,7 @@ class TrustNetwork:
         n = self.nodes.get(node_id)
         if not n:
             return 0.0
-        scores = sorted(s for s in (x.trust_score for x in self.nodes.values()
-                                    if not x.banned))
+        scores = sorted(s for s in (x.trust_score for x in self.nodes.values() if not x.banned))
         if not scores:
             return 0.0
         pos = sum(1 for s in scores if s <= n.trust_score)
