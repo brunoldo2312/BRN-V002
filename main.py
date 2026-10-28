@@ -1,12 +1,12 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.7.6)
+"""main.py — Entrypoint unificado do nó BRN (v13.7.7)
 ================================================================
-v13.7.6 (2026-10-28):
-  [SECURITY] Inicialização do TrustNetwork com assinatura digital.
-        O nó Origem (Ubuntu) agora assina o trust_network.json com
-        sua chave Ed25519, garantindo que clientes não possam
-        alterar a pontuação ou a whitelist localmente.
+v13.7.7 (2026-10-28):
+  [SECURITY] Verificação de integridade do código (Code Integrity).
+        O nó calcula o SHA-256 do blockchain.py e trust_network.py.
+        Se um cliente alterar o código para burlar o consenso, o
+        nó detecta a mudança e aborta a inicialização.
+  [KEEP] Assinatura digital do trust_network.json (v13.7.6).
   [KEEP] OfframpManager (BRN -> BTC) e BTCSender (v13.7.5).
-  [KEEP] broadcast_validator_registration safe-call (v13.7.4).
   [KEEP] Migração Flask→FastAPI via WSGIMiddleware.
 ================================================================
 """
@@ -21,6 +21,7 @@ import time
 import json
 import subprocess
 import urllib.request
+import hashlib
 from pathlib import Path
 
 
@@ -89,6 +90,47 @@ _bootstrap_env()
 _applied = _apply_hardcoded_defaults()
 if _applied:
     print(f"[boot] defaults não-sensíveis aplicados: {_applied} variáveis")
+
+
+# ============================================================
+# [SECURITY v13.7.7] VERIFICAÇÃO DE INTEGRIDADE DO CÓDIGO
+# ============================================================
+def _verificar_integridade_codigo() -> None:
+    """
+    Verifica se o blockchain.py e trust_network.py foram alterados.
+    Gere os hashes usando:
+    python -c "import hashlib; print(hashlib.sha256(open('blockchain.py','rb').read()).hexdigest())"
+    """
+    HASHES_OFICIAIS = {
+        "blockchain.py":    "COLE_O_HASH_SHA256_AQUI",
+        "trust_network.py": "COLE_O_HASH_SHA256_AQUI",
+    }
+    
+    for arquivo, hash_esperado in HASHES_OFICIAIS.items():
+        # Se você ainda não gerou o hash, ignora a verificação
+        if hash_esperado == "COLE_O_HASH_SHA256_AQUI":
+            continue
+            
+        caminho = BASE_DIR / arquivo
+        if not caminho.exists():
+            print(f"[ALERTA CRÍTICO] Arquivo crítico {arquivo} não encontrado! Abortando.")
+            sys.exit(1)
+            
+        try:
+            with open(caminho, "rb") as f:
+                hash_real = hashlib.sha256(f.read()).hexdigest()
+            
+            if hash_real != hash_esperado:
+                print("=" * 64)
+                print(f"[ALERTA CRÍTICO] O arquivo {arquivo} foi MODIFICADO!")
+                print(f"Esperado: {hash_esperado}")
+                print(f"Real:     {hash_real}")
+                print("O nó foi abortado por segurança (Code Integrity Failure).")
+                print("=" * 64)
+                sys.exit(1)
+        except Exception as e:
+            print(f"[ERRO] Falha ao verificar integridade de {arquivo}: {e}")
+            sys.exit(1)
 
 
 from brn_config import Config
@@ -899,6 +941,9 @@ def _graceful_shutdown(log, trust_net=None) -> None:
 # MAIN
 # ============================================================
 def main():
+    # [SECURITY v13.7.7] Verifica a integridade do código antes de tudo
+    _verificar_integridade_codigo()
+
     args = parse_args()
     cfg = Config(args.config)
 
@@ -1011,7 +1056,6 @@ def main():
     if _HAS_TRUST:
         try:
             # [SECURITY v13.7.6] Passa is_origin e a chave privada (node_sk)
-            # para que o nó Origem possa assinar o arquivo JSON.
             trust_net = TrustNetwork(
                 str(BASE_DIR / "trust_network.json"),
                 is_origin=is_origin,
