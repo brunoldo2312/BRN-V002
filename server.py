@@ -2,11 +2,9 @@
 server.py — Backend HTTP do nó BRN (v9.9.18)
 ================================================================
 v9.9.18 (2026-10-28):
-  [NEW] Suporte ao auto-registro P2P de validadores:
-        - /api/consensus/validators lê os validadores que
-          se anunciaram via P2P (register_validator).
-        - Registra a pubkey do validador automaticamente no
-          trust_net se ela ainda não estiver lá.
+  [FIX] /api/pool/submit agora repassa o job_id (anti-replay).
+  [FIX] /api/mine agora roda em background (evita timeout na GUI).
+  [FIX] _register_miner_in_trust prefere register_node.
 ================================================================
 """
 from __future__ import annotations
@@ -239,11 +237,7 @@ def _get_trust_network():
     return _TRUST_NETWORK
 
 
-# ============================================================
-# _register_miner_in_trust
-# ============================================================
 def _register_miner_in_trust(pubkey: str, address: str) -> None:
-    """Registra o minerador no Trust Network (prefere trust_network.register_node)."""
     trust = _get_trust_network()
     if trust is None:
         return
@@ -898,7 +892,7 @@ def transfer():
 
 
 # ============================================================
-# MINE (1 bloco)
+# MINE (1 bloco) — AGORA COM THREAD!
 # ============================================================
 @app.route("/api/mine", methods=["POST"])
 @require_rate_limit("mine")
@@ -920,31 +914,27 @@ def mine():
             return jsonify({"ok": False, "msg": "Pubkey desconhecida."}), 400
 
         chain = _get_chain()
-        with CHAIN_LOCK:
-            block = chain.mine_block(miner, miner_pubkey)
-
-        if not block:
-            return jsonify({"ok": False, "msg": "Falha ao minerar."}), 500
-
-        _saldo_cache_invalidate(miner)
-
-        p2p = _get_p2p_manager()
-        if p2p:
+        
+        # [FIX] Roda em background para não travar a GUI (evita timeout)
+        def _bg_mine():
             try:
-                p2p.broadcast_block(block)
-            except Exception:
-                pass
+                with CHAIN_LOCK:
+                    block = chain.mine_block(miner, miner_pubkey)
+                if block:
+                    _saldo_cache_invalidate(miner)
+                    p2p = _get_p2p_manager()
+                    if p2p:
+                        try: p2p.broadcast_block(block)
+                        except Exception: pass
+                    log.info(f"[API] Bloco #{block['height']} minerado via API local.")
+            except Exception as e:
+                log.error(f"[API] Erro na mineração local: {e}")
 
+        threading.Thread(target=_bg_mine, daemon=True, name="MinerLocal").start()
+        
         return jsonify({
             "ok": True,
-            "msg": f"Bloco #{block['height']} minerado!",
-            "block": {
-                "height": block["height"],
-                "hash": block["hash"],
-                "txs": len(block["transactions"]),
-                "difficulty": block["difficulty"],
-                "nonce": block["nonce"],
-            },
+            "msg": "Mineracao iniciada em background. Acompanhe o progresso no log.",
         })
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
@@ -1211,14 +1201,19 @@ def pool_submit():
     pool = _get_pool_manager()
     if pool is None:
         return _proxy_pool_request("/api/pool/submit", "POST")
+    
+    # [FIX v9.9.18] Recebe o job_id e repassa para o Pool (anti-replay)
     try:
         data = request.get_json(force=True) or {}
         miner_id = (data.get("miner_id") or "").strip()
+        job_id = (data.get("job_id") or "").strip()
         nonce = data.get("nonce")
         hash_hex = (data.get("hash") or "").strip()
 
         if not miner_id:
             return jsonify({"ok": False, "msg": "miner_id obrigatorio"}), 400
+        if not job_id:
+            return jsonify({"ok": False, "msg": "job_id obrigatorio"}), 400
         if nonce is None:
             return jsonify({"ok": False, "msg": "nonce obrigatorio"}), 400
         try:
@@ -1226,7 +1221,7 @@ def pool_submit():
         except Exception:
             return jsonify({"ok": False, "msg": "nonce invalido"}), 400
 
-        r = pool.submit_share(miner_id, nonce, hash_hex)
+        r = pool.submit_share(miner_id, job_id, nonce, hash_hex)
         return jsonify(r), (200 if r.get("ok") else 400)
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
