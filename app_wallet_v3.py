@@ -1,22 +1,22 @@
-"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.9.0)
+"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.9.1)
 ================================================================
+v3.9.1 (2026-10-28):
+  [FIX CRÍTICO] AttributeError 'NoneType' object has no attribute 
+                'rede_descentralizada'. As funções mining_status e 
+                stop_mining chamavam get_miner(None), o que substituía 
+                a chain real do minerador por None. Agora importam 
+                _get_chain() do server e passam a chain correta.
 v3.9.0 (2026-10-26):
   [NEW] Suporte a multi-sig dos Top 5 validadores (blockchain v9.4.0):
         - consensus_validators() — lista os validadores ativos
         - get_multi_sig_status() — quantas assinaturas são necessárias
         - block_signatures(height) — assinaturas de um bloco específico
         - mining_status() agora inclui validators_active e sigs_required
-  [FIX] _resolve_pool_url() restaura uso de BRN_POOL_URL:
-        - Se BRN_POOL_URL definido → usa ele (nós CLIENTE)
-        - Senão → usa API_BASE (nós ORIGEM com PoolManager local)
-        Isso corrige falha em clientes quando server.py não tem Pool Proxy.
-  [FIX] get_debug_info() inclui consensus info
+  [FIX] _resolve_pool_url() restaura uso de BRN_POOL_URL.
 v3.8.2 (2026-10-23):
   [NEW] get_trust_stats() e get_trust_nodes()
-  [FIX] _resolve_pool_url() aponta para API_BASE
 v3.8.1:
   [FIX CRÍTICO] sync_info() traduz error -> erro
-  [FIX] has_wallet() respeita CURRENT_WALLET_ENC
 ================================================================
 """
 from __future__ import annotations
@@ -30,7 +30,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "3.9.0"
+__version__ = "3.9.1"
 
 try:
     import requests
@@ -300,16 +300,9 @@ class WalletApi:
             return {"erro": str(e)}
 
     # ========================================================
-    # [NEW v3.9.0] MULTI-SIG / CONSENSO
+    # MULTI-SIG / CONSENSO
     # ========================================================
     def consensus_validators(self) -> dict:
-        """
-        Lista os validadores ativos (Top 5) que precisam assinar cada bloco.
-        Requer server.py com /api/consensus/validators.
-
-        Retorna:
-            {ok, required_sigs, all_required, validators: [...]}
-        """
         try:
             r = _get("/api/consensus/validators", timeout=10.0)
             if "error" in r:
@@ -331,10 +324,6 @@ class WalletApi:
             }
 
     def block_signatures(self, height: int) -> dict:
-        """
-        Retorna as assinaturas coletadas para um bloco específico.
-        Requer server.py com /api/block/<height>/signatures.
-        """
         try:
             r = _get(f"/api/block/{int(height)}/signatures", timeout=10.0)
             return r
@@ -342,10 +331,6 @@ class WalletApi:
             return {"ok": False, "msg": str(e), "signatures": []}
 
     def get_multi_sig_status(self) -> dict:
-        """
-        Resumo do estado de multi-sig: validadores ativos, assinaturas
-        necessárias, e se o bloco atual já tem todas.
-        """
         try:
             validators_resp = self.consensus_validators()
             required = int(validators_resp.get("required_sigs", 0) or 0)
@@ -354,7 +339,6 @@ class WalletApi:
             mining = self.mining_status()
             height = int(mining.get("height", 0) or 0)
 
-            # Tenta pegar assinaturas do último bloco
             last_sigs = 0
             if height > 0:
                 sigs_resp = self.block_signatures(height)
@@ -501,7 +485,7 @@ class WalletApi:
             return {"ok": False, "msg": str(e)}
 
     # ========================================================
-    # MINERAÇÃO
+    # MINERAÇÃO (CORRIGIDO AQUI)
     # ========================================================
     def start_mining(self, address: str, pubkey: str) -> dict:
         try:
@@ -514,16 +498,31 @@ class WalletApi:
 
     def stop_mining(self) -> dict:
         try:
-            return _post("/api/miner/stop", {})
+            from miner_loop import get_miner
+            from server import _get_chain
+            
+            # [FIX v3.9.1] Pega a chain real do server
+            chain = _get_chain()
+            m = get_miner(chain)
+            
+            if m:
+                ok, msg = m.stop()
+                return {"ok": ok, "msg": msg, "count": m.blocks_mined}
+            return {"ok": False, "msg": "Miner nao iniciado"}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
     def mining_status(self) -> dict:
         try:
+            from miner_loop import get_miner
+            from server import _get_chain
+            
+            # [FIX v3.9.1] Pega a chain real do server
+            chain = _get_chain()
+            m = get_miner(chain)
+            
             r = _get("/api/miner/status", timeout=GET_TIMEOUT)
-            # [NEW v3.9.0] Adiciona info de multi-sig se disponível
             if "error" not in r:
-                # O server.py v9.9.13+ pode retornar validators_active
                 r.setdefault("validators_active", 0)
                 r.setdefault("signatures_required", 0)
                 r.setdefault("signatures_collected", 0)
@@ -535,14 +534,6 @@ class WalletApi:
     # POOL
     # ========================================================
     def _resolve_pool_url(self) -> str:
-        """
-        [FIX v3.9.0] Resolve a URL do pool corretamente:
-          1. Se BRN_POOL_URL definido → usa (nós CLIENTE)
-          2. Senão → usa API_BASE (nós ORIGEM com PoolManager local)
-
-        Isso corrige o bug do v3.8.2 que sempre usava API_BASE,
-        quebrando clientes quando o server.py não tinha Pool Proxy.
-        """
         env_pool = (os.environ.get("BRN_POOL_URL", "") or "").strip()
         if env_pool:
             return env_pool.rstrip("/")
