@@ -1,15 +1,16 @@
 """
-miner_loop.py — Loop de mineração do BRN (v6.9)
+miner_loop.py — Loop de mineração do BRN (v7.0)
 ================================================================
-v6.9 (2026-10-22):
-  [CRITICAL] WEB_PORT lido em import time no processo do cliente.
-             Agora cada peer tem endpoint parseado (ip:p2p:http).
-  [CRITICAL] _enviar_para_fila chamava peers sequencialmente.
-             Agora ThreadPoolExecutor (paralelo).
-  [CRITICAL] IS_ORIGIN vinha de env var. Agora Miner.start(is_origin=).
-  [FIX] rede_descentralizada lido do DB no restart.
-  [FIX] Backoff por peer (3 falhas → cooldown 60s).
-  [FIX] Log spam reduzido.
+v7.0 (2026-10-28):
+  [FIX] _pubkey_no_db rejeita pubkey falsa "0000...000"
+        (fallback da pool). Antes retornava "00000..." e o
+        miner ficava em loop tentando assinar com pubkey inválida.
+  [FIX] _should_continue só conta/loga UMA VEZ por sinal de fork.
+        Antes fork_aborts e log spammavam a cada batch de 5k hashes.
+  [FIX] ValueError não mata mais o miner — retry após 5s.
+        Casos transitórios (wallet carregando, pubkey mismatch
+        momentâneo) não exigem reiniciar o processo.
+  [KEEP] Toda a lógica de v6.9 (bootstrap, backoff, fila, forks).
 ================================================================
 """
 import os
@@ -109,11 +110,15 @@ def _ler_carteira_aberta():
 
 
 def _pubkey_no_db(bc, addr):
+    """
+    Busca pubkey real nos UTXOs. [FIX v7.0] Rejeita pubkey falsa
+    '0000...000' (fallback da pool para coinbase sem pubkey conhecida).
+    """
     try:
         utxos = bc.db.get_utxos(addr)
         for u in utxos:
             pk = (u.get("pubkey") or "").strip()
-            if pk:
+            if pk and set(pk) != {"0"}:
                 return pk
     except Exception:
         pass
@@ -165,6 +170,9 @@ class Miner:
         self.fork_aborts = 0
         self.last_fork_at = 0.0
 
+        # [NEW v7.0] Flag para não duplicar contador de abort de fork
+        self._fork_aborts_for_signal = False
+
         self.is_origin = IS_ORIGIN
 
         self._bootstrap_fails: dict = {}
@@ -196,6 +204,7 @@ class Miner:
         self.started_at = time.time()
         self.fork_aborts = 0
         self.last_fork_at = 0.0
+        self._fork_aborts_for_signal = False
         self._stop_evt.clear()
         self.running = True
 
@@ -261,14 +270,23 @@ class Miner:
         }
 
     def _should_continue(self) -> bool:
+        """
+        [FIX v7.0] Só conta/loga UMA VEZ por sinal de fork.
+        O `fork_aborts` reflete a quantidade de reorgs, não de batches
+        que abortaram. `_log` não spamma mais 30× por segundo em reorg.
+        """
         if self._stop_evt.is_set():
             return False
         fork_sig = getattr(self.chain, "_fork_signal", None)
         if fork_sig is not None and fork_sig.is_set():
-            self.fork_aborts += 1
-            self.last_fork_at = time.time()
-            _log("[FORK] abortando bloco atual — reorg em andamento")
+            if not self._fork_aborts_for_signal:
+                self.fork_aborts += 1
+                self.last_fork_at = time.time()
+                _log("[FORK] abortando bloco atual — reorg em andamento")
+                self._fork_aborts_for_signal = True
             return False
+        # Fork resolvido (ou nunca ativo) → reseta flag
+        self._fork_aborts_for_signal = False
         return True
 
     def _peer_is_blocked(self, key: str) -> bool:
@@ -342,7 +360,7 @@ class Miner:
                     url, data=body,
                     headers={
                         "Content-Type": "application/json",
-                        "User-Agent": "brn-miner-loop/6.9",
+                        "User-Agent": "brn-miner-loop/7.0",
                     },
                     method="POST",
                 )
@@ -477,10 +495,14 @@ class Miner:
                 _log(f"OK Bloco #{h} minerado (total={self.blocks_mined})")
 
             except ValueError as e:
-                self.last_error = str(e)
-                _log(f"Miner erro: {e}")
-                self.running = False
-                return
+                # [FIX v7.0] ValueError não mata o miner — retry após 5s
+                # (pubkey mismatch transitório, coinbase inválida, etc.)
+                self.last_error = f"ValueError: {e}"
+                _log(f"Miner ValueError (retry em 5s): {e}")
+                if self._stop_evt.wait(timeout=5):
+                    break
+                continue
+
             except Exception as e:
                 self.last_error = str(e)
                 _log(f"Miner exception: {e}")
