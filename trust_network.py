@@ -2,18 +2,9 @@
 ================================================================
 v3.4 (2026-10-29):
   [FIX] Deduplicação por public_key no register_node().
-        Antes, cada reinício do Windows gerava um novo miner_id
-        (UUID aleatório) e criava uma nova entrada duplicada no
-        trust_network.json. Agora, se a public_key já existir,
-        a entrada é atualizada em vez de duplicada.
-        A segurança criptográfica (assinaturas, multi-sig) NÃO
-        foi alterada.
-v3.3 (2026-10-28):
-  [FIX] Removido 'saved_at' do payload de verificação da assinatura.
-v3.2 (2026-10-28):
-  [TUNING] Acelerada a progressão de reputação.
-v3.1 (2026-10-28):
-  [SECURITY] Assinatura digital Ed25519 do trust_network.json.
+        Cada reinício do Windows gerava um novo miner_id (UUID)
+        e criava duplicatas. Agora, a public_key é a chave de
+        verificação para evitar fantasmas.
 ================================================================
 """
 from __future__ import annotations
@@ -32,9 +23,6 @@ from crypto import Ed25519PrivateKey, Ed25519PublicKey
 
 log = logging.getLogger("trust_network")
 
-# ============================================================
-# CONSTANTES DO SISTEMA
-# ============================================================
 INITIAL_TRUST_SCORE = 100.0
 MAX_TRUST_SCORE = 1000.0
 MIN_TRUST_SCORE = 0.0
@@ -58,13 +46,9 @@ DECAY_INTERVAL_SECONDS = 86400
 MAX_VALIDATORS = 21
 VALIDATOR_ROTATION_BLOCKS = 100
 DEFAULT_DATA_FILE = "trust_network.json"
-
 FLUSH_INTERVAL_S = 10.0
 
 
-# ============================================================
-# ESTRUTURA DE DADOS DO NÓ
-# ============================================================
 @dataclass
 class NodeRecord:
     node_id: str
@@ -132,12 +116,7 @@ class NodeRecord:
         return cls(**{k: v for k, v in data.items() if k in campos})
 
 
-# ============================================================
-# TRUST NETWORK (thread-safe)
-# ============================================================
 class TrustNetwork:
-    """Reputação de nós. NÃO interfere no consenso (PoW continua)."""
-
     def __init__(self, data_file: str = DEFAULT_DATA_FILE, is_origin: bool = False, node_sk=None):
         self.data_file = Path(data_file)
         self.is_origin = is_origin
@@ -194,7 +173,6 @@ class TrustNetwork:
 
     def _load(self) -> None:
         if not self.data_file.exists():
-            log.info("[TrustNetwork] Arquivo não existe — iniciando vazio")
             return
         try:
             with open(self.data_file, "r", encoding="utf-8") as f:
@@ -214,13 +192,12 @@ class TrustNetwork:
                 except Exception as e:
                     log.error("[TrustNetwork] ASSINATURA INVÁLIDA! O arquivo foi alterado.")
                     if not self.is_origin:
-                        log.error("[TrustNetwork] Cliente rejeitou o arquivo. Iniciando vazio por segurança.")
                         return
                     else:
-                        log.warning("[TrustNetwork] Origem ignorando falha de assinatura (migração?).")
+                        log.warning("[TrustNetwork] Origem ignorando falha de assinatura.")
             else:
                 if not self.is_origin:
-                    log.warning("[TrustNetwork] Arquivo sem assinatura. Cliente não confia. Iniciando vazio.")
+                    log.warning("[TrustNetwork] Arquivo sem assinatura. Iniciando vazio.")
                     return
             
             with self._lock:
@@ -236,22 +213,16 @@ class TrustNetwork:
         except Exception as e:
             log.error("[TrustNetwork] Load falhou: %s — iniciando vazio", e)
 
-    # ========================================================
-    # REGISTRO E CONEXÃO (COM DEDUPLICAÇÃO POR PUBKEY)
-    # ========================================================
     def register_node(self, node_id: str, address: str, public_key: str,
                       peer_addr: str = "") -> NodeRecord:
         with self._lock:
-            # [FIX v3.4] Deduplicação por public_key.
-            # Se a chave já existir (mesmo que o node_id/UUID tenha mudado),
-            # atualizamos a entrada existente e evitamos criar fantasmas.
+            # [FIX v3.4] Deduplicação por public_key
             if public_key:
                 for existing_id, existing_node in list(self.nodes.items()):
                     if existing_node.public_key == public_key:
                         existing_node.last_seen = time.time()
                         if peer_addr:
                             existing_node.peer_addr = peer_addr
-                        # Atualiza o node_id para o mais recente (sessão atual)
                         if existing_id != node_id:
                             self.nodes.pop(existing_id)
                             existing_node.node_id = node_id
@@ -259,7 +230,6 @@ class TrustNetwork:
                         self._mark_dirty()
                         return existing_node
 
-            # Se a public_key não existe, checa se o node_id já existe
             if node_id in self.nodes:
                 n = self.nodes[node_id]
                 n.last_seen = time.time()
@@ -270,7 +240,6 @@ class TrustNetwork:
                     self._mark_dirty()
                 return n
 
-            # Se nem a pubkey nem o node_id existem, cria uma nova entrada
             n = NodeRecord(
                 node_id=node_id,
                 address=address,
@@ -279,8 +248,6 @@ class TrustNetwork:
             )
             self.nodes[node_id] = n
             self._mark_dirty()
-            log.info("[TrustNetwork] ✅ Novo nó: %s (%s)",
-                     node_id[:12] + "…", address[:12] + "…")
             return n
 
     def mark_connected(self, node_id: str) -> None:
