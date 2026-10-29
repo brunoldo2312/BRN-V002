@@ -1,11 +1,12 @@
-"""mining_pool.py — Pool de mineração BRN (v6.3)
+"""mining_pool.py — Pool de mineração BRN (v6.5)
 ================================================================
-v6.3 (2026-10-28):
-  [SECURITY] Proteção contra spam de shares. Mineradores que enviam
-             shares inválidas repetidamente são banidos.
-  [SECURITY] Proteção contra replay de shares (valida job_id).
-  [KEEP] Multi-sig integrado no Pool (v6.2).
-  [KEEP] Vardiff.
+v6.5 (2026-10-29):
+  [FIX CRÍTICO] O pool tentava creditar pontos no TrustNetwork
+        usando a pubkey (m.pubkey) em vez do miner_id (m.miner_id).
+        Como o TrustNetwork indexa os nós pelo miner_id (UUID),
+        os pontos não eram contabilizados. Agora usa m.miner_id.
+  [KEEP] Multi-sig integrado no Pool.
+  [KEEP] Vardiff e Anti-Spam.
 ================================================================
 """
 from __future__ import annotations
@@ -26,7 +27,6 @@ JOB_REFRESH_S       = 20
 MAX_MINERS          = 50
 MAX_RECENT_JOBS     = 5
 
-# [SECURITY] Limite de shares inválidas antes de banir
 MAX_INVALID_SHARES  = 50
 
 # ============================================================
@@ -154,17 +154,11 @@ class PoolManager:
         if _trust is not None:
             log.info("PoolManager: usando chain.trust_net (unificado com consenso)")
         else:
-            try:
-                from trust_system import trust_system as _legacy  # noqa: F401
-                log.warning("PoolManager: chain.trust_net ausente — usando "
-                            "trust_system LEGADO")
-            except Exception:
-                log.warning("PoolManager: sem trust network — reputação de "
-                            "mineradores desabilitada neste pool")
+            log.warning("PoolManager: chain.trust_net ausente — reputação desabilitada")
 
         self._stop = threading.Event()
         threading.Thread(target=self._maintenance_loop, daemon=True, name="Pool-Maint").start()
-        log.info("PoolManager iniciado (v6.3) — Anti-Spam e Multi-Sig ativos")
+        log.info("PoolManager iniciado (v6.5) — Anti-Spam, Multi-Sig e Trust ativos")
 
     # ============================================================
     # Helpers de integração com o trust network
@@ -178,11 +172,6 @@ class PoolManager:
             except Exception as e:
                 log.warning("[Pool] register_node falhou em trust_net: %s", e)
                 return
-        try:
-            from trust_system import trust_system as _legacy
-            _legacy.ensure_peer_entry(pubkey)
-        except Exception:
-            pass
 
     def _credit_miner_in_trust(self, cb: dict, height: int) -> None:
         output_pubkeys = {o.get("pubkey") for o in cb.get("outputs", []) if o.get("pubkey")}
@@ -194,24 +183,14 @@ class PoolManager:
             for mid, m in self.miners.items():
                 if m.pubkey in output_pubkeys:
                     try:
-                        trust.record_block_validated(mid, height)
-                        log.info("[Trust] %s creditado por bloco #%d", m.pubkey[:8], height)
+                        # [FIX v6.5] Usa m.miner_id
+                        trust.record_block_validated(m.miner_id, height)
+                        if hasattr(trust, "_adjust_score"):
+                            trust._adjust_score(m.miner_id, 100.0, f"Block Winner #{height}")
+                        log.info("[Trust] %s creditado por bloco #%d (+bônus de 100)", m.pubkey[:8], height)
                     except Exception as e:
-                        log.warning("[Trust] record_block_validated falhou "
-                                    "para %s: %s", mid, e)
+                        log.warning("[Trust] record_block_validated falhou para %s: %s", mid, e)
                     return
-            return
-
-        try:
-            from trust_system import trust_system as _legacy
-            for mid, m in self.miners.items():
-                if m.pubkey in output_pubkeys:
-                    _legacy.update_score(m.pubkey, "valid_block")
-                    log.info("[Trust-legacy] %s creditado por bloco #%d",
-                             m.pubkey[:8], height)
-                    return
-        except Exception:
-            pass
 
     # ============================================================
     # Registro de mineradores
@@ -388,10 +367,8 @@ class PoolManager:
                 return {"ok": False, "msg": "miner desconhecido"}
             m.last_seen = time.time()
             
-            # [SECURITY] Verifica se a share pertence ao job correto
             job = self.current_job
             if job is None or job.job_id != job_id:
-                # Tenta achar nos recentes
                 job = self.recent_jobs.get(job_id)
                 if job is None:
                     return {"ok": False, "msg": "job expirado ou invalido"}
@@ -412,7 +389,6 @@ class PoolManager:
                 self.rejected_shares += 1
                 m.invalid_shares += 1
                 
-                # [SECURITY] Anti-Spam
                 if m.invalid_shares >= MAX_INVALID_SHARES:
                     log.warning(f"[SECURITY] Minerador {miner_id} banido por spam de shares invalidas ({m.invalid_shares} erros).")
                     self.disconnect(miner_id)
@@ -429,7 +405,15 @@ class PoolManager:
             m.shares_period += 1
             m.shares_total += 1
             self.accepted_shares += 1
-            m.invalid_shares = 0 # Reseta o contador se a share for válida
+            m.invalid_shares = 0
+            
+            # [FIX v6.5] Atualiza o Trust Score passando o miner_id
+            try:
+                trust = getattr(self.chain, "trust_net", None)
+                if trust:
+                    trust.record_share_submitted(m.miner_id, valid=True)
+            except Exception as e:
+                log.debug("Falha ao atualizar trust por share: %s", e)
 
             m.share_times.append(time.time())
             if len(m.share_times) > VARDIFF_MAX_SAMPLES:
@@ -504,9 +488,6 @@ class PoolManager:
         except Exception:
             pass
 
-        # ============================================================
-        # COLETA DE ASSINATURAS MULTI-SIG (TOP VALIDADORES)
-        # ============================================================
         validators = []
         try:
             if hasattr(self.chain, "_get_active_validators"):
@@ -523,7 +504,6 @@ class PoolManager:
         except Exception as e:
             log.error(f"[POOL] Erro coletando assinaturas: {e}")
 
-        # Passa o snapshot de validadores para não mudar no meio do caminho
         ok, msg = self.chain.accept_block(block, validators=validators)
         if not ok:
             log.warning("pool: accept_block: %s", msg)
