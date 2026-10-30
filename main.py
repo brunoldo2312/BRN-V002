@@ -1,15 +1,14 @@
 """main.py — Entrypoint unificado do nó BRN (v13.7.8)
 ================================================================
 v13.7.8 (2026-10-29):
-  [CHANGE] PoolClient NÃO inicia mais automaticamente.
-        Por padrão, o nó carrega a carteira e abre a GUI, mas
-        NÃO entra no pool. Para minerar:
-          - Passe --pool-client, OU
-          - Defina BRN_AUTO_POOL_CLIENT=1 no .env
-        Isso evita que o nó minerar sem o usuário saber.
+  [SECURITY/UX] PoolClient NÃO inicia automaticamente.
+        Padrão: nó abre, GUI carrega carteira, mas NÃO registra na fila.
+        Só minera se --pool-client for passado OU BRN_POOL_CLIENT=1
+        no .env OU o usuário clicar em "Minerar Pool" na GUI.
+        Isso evita endereços fantasmas na fila de bootstrap.
   [KEEP] Verificação de integridade do código (v13.7.7).
   [KEEP] Assinatura digital do trust_network.json (v13.7.6).
-  [KEEP] OfframpManager (BRN -> BTC) e BTCSender (v13.7.5).
+  [KEEP] OfframpManager e BTCSender (v13.7.5).
   [KEEP] Migração Flask→FastAPI via WSGIMiddleware.
 ================================================================
 """
@@ -73,11 +72,11 @@ _HARDCODED_DEFAULTS = {
     "TS_TAILNET":              "",
     "TS_HOSTNAME_PREFIX":      "brn-node",
     "BRN_POOL_ENABLED":        "1",
+    "BRN_POOL_CLIENT":         "0",
     "BRN_POOL_URL_LOCAL":      "http://127.0.0.1:5000",
     "BRN_WEB_PASS":            "",
     "BRN_FORCE_HEADLESS":      "0",
     "BRN_UVICORN_WORKERS":     "1",
-    "BRN_AUTO_POOL_CLIENT":    "0",
 }
 
 
@@ -109,21 +108,20 @@ def _verificar_integridade_codigo() -> None:
         "blockchain.py":    "COLE_O_HASH_SHA256_AQUI",
         "trust_network.py": "COLE_O_HASH_SHA256_AQUI",
     }
-    
+
     for arquivo, hash_esperado in HASHES_OFICIAIS.items():
-        # Se você ainda não gerou o hash, ignora a verificação
         if hash_esperado == "COLE_O_HASH_SHA256_AQUI":
             continue
-            
+
         caminho = BASE_DIR / arquivo
         if not caminho.exists():
             print(f"[ALERTA CRÍTICO] Arquivo crítico {arquivo} não encontrado! Abortando.")
             sys.exit(1)
-            
+
         try:
             with open(caminho, "rb") as f:
                 hash_real = hashlib.sha256(f.read()).hexdigest()
-            
+
             if hash_real != hash_esperado:
                 print("=" * 64)
                 print(f"[ALERTA CRÍTICO] O arquivo {arquivo} foi MODIFICADO!")
@@ -338,8 +336,11 @@ def parse_args():
     p.add_argument("--no-tailscale", action="store_true")
     p.add_argument("--no-sync", action="store_true")
     p.add_argument("--no-pool", action="store_true")
-    p.add_argument("--pool-client", action="store_true")
-    p.add_argument("--no-pool-client", action="store_true")
+    p.add_argument("--pool-client", action="store_true",
+                   help="Inicia o PoolClient automaticamente (registra na fila e minera). "
+                        "SEM esta flag, o nó NÃO minera por padrão.")
+    p.add_argument("--no-pool-client", action="store_true",
+                   help="Força não iniciar o PoolClient (mesmo se BRN_POOL_CLIENT=1).")
     p.add_argument("--pool-stats", action="store_true")
     p.add_argument("--gui", action="store_true")
     p.add_argument("--no-gui", action="store_true")
@@ -595,11 +596,12 @@ def _verify_chain(chain) -> str:
 # ============================================================
 def _inject_into_server(what: str, obj, log) -> bool:
     setter_name = {
-        "p2p":     "set_p2p_manager",
-        "sync":    "set_sync_manager",
-        "pool":    "set_pool_manager",
-        "trust":   "set_trust_network",
-        "offramp": "set_offramp_manager",
+        "p2p":         "set_p2p_manager",
+        "sync":        "set_sync_manager",
+        "pool":        "set_pool_manager",
+        "trust":       "set_trust_network",
+        "offramp":     "set_offramp_manager",
+        "pool_client": "set_pool_client_local",
     }.get(what)
     if setter_name is None:
         log.warning(f"[inject] tipo desconhecido: {what}")
@@ -738,6 +740,8 @@ def run_status_loop(chain, p2p, sync=None, pool=None, pool_client=None,
                         msg += (" PoolClient["
                                 + str(round(pcs.get("hashrate_khs", 0), 1))
                                 + " kH/s]")
+                    else:
+                        msg += " PoolClient[parado]"
                 except Exception:
                     pass
             if trust_net:
@@ -781,7 +785,18 @@ def run_wallet_main_thread():
         if not index_path.exists():
             log.error("index_wallet.html não encontrado: " + str(index_path))
             return False
-        api = WalletApi()
+
+        wallet_pass = os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
+        try:
+            api = WalletApi(wallet_password=wallet_pass) if wallet_pass else WalletApi()
+        except TypeError:
+            api = WalletApi()
+            if wallet_pass and hasattr(api, "unlock_session"):
+                try:
+                    api.unlock_session(wallet_pass)
+                except Exception as e:
+                    log.warning(f"unlock_session falhou: {e}")
+
         webview.create_window(
             "BRN RWA — Carteira Digital",
             url=index_path.resolve().as_uri(),
@@ -798,12 +813,14 @@ def run_wallet_main_thread():
 
 
 # ============================================================
-# POOL CLIENT LOCAL
+# POOL CLIENT LOCAL — NÃO INICIA AUTOMATICAMENTE
 # ============================================================
-def _setup_pool_client_local(chain, pool, log, disabled: bool, is_origin: bool):
-    if disabled:
-        log.info("PoolClient: desativado (mineração sob demanda)")
-        return None
+def _setup_pool_client_local(chain, pool, log, is_origin: bool):
+    """
+    [FIX v13.7.8] Cria o PoolClient mas NÃO chama start_mining().
+    O start só acontece se o usuário pedir explicitamente (via GUI
+    ou chamando /api/pool/start_local no server.py).
+    """
     if PoolClient is None:
         log.info("PoolClient: miner_pool_client indisponível")
         return None
@@ -839,12 +856,8 @@ def _setup_pool_client_local(chain, pool, log, disabled: bool, is_origin: bool):
 
     try:
         pc = PoolClient(addr, pub, pool_url=pool_url)
-        ok, msg = pc.start_mining()
-        if not ok:
-            log.warning("PoolClient: start_mining falhou: " + str(msg))
-            return None
-        log.info("PoolClient iniciado (is_origin=" + str(is_origin)
-                 + " pool=" + pool_url + ")")
+        log.info("PoolClient preparado (NÃO iniciado). Endereço: "
+                 + addr[:16] + "...")
         return pc
     except Exception as e:
         log.warning("PoolClient: exceção: " + str(e))
@@ -945,7 +958,6 @@ def _graceful_shutdown(log, trust_net=None) -> None:
 # MAIN
 # ============================================================
 def main():
-    # [SECURITY v13.7.7] Verifica a integridade do código antes de tudo
     _verificar_integridade_codigo()
 
     args = parse_args()
@@ -985,10 +997,18 @@ def main():
         else ("ON" if _pool_disponivel() else "off")
     )
 
+    # [FIX v13.7.8] PoolClient agora é OPT-IN
+    _env_pool_client = os.environ.get("BRN_POOL_CLIENT", "0") == "1"
+    wants_pool_client = bool(args.pool_client) or _env_pool_client
+    if args.no_pool_client:
+        wants_pool_client = False
+    pool_client_mode = "ON" if wants_pool_client else "off (aguardando GUI)"
+
     log.info(" Config: " + cfg.source
              + " | Modo: " + ("ORIGEM" if is_origin else "CLIENTE")
              + " | L2: " + l2_mode
-             + " | Pool: " + pool_mode)
+             + " | Pool: " + pool_mode
+             + " | PoolClient: " + pool_client_mode)
     log.info(" HTTPS: " + ("ON" if os.environ.get("BRN_HTTPS") == "1" else "off")
              + " | Auto-mine: " + ("ON" if AUTO_MINE else "off"))
     log.info(" GUI: " + ("headless" if cfg["headless"] else "pywebview"))
@@ -1006,6 +1026,7 @@ def main():
         print(" Explorer  : " + EXPLORER_HOST + ":" + str(cfg["explorer_port"]))
         print(" P2P       : " + str(cfg["p2p_port"]))
         print(" Pool      : " + ("SIM" if _pool_disponivel() else "não"))
+        print(" PoolClient: " + pool_client_mode)
         print(" L2        : " + ("SIM" if _l2_disponivel() else "não"))
         print(" Role      : " + ("ORIGEM" if is_origin else "CLIENTE"))
         print("=" * 64)
@@ -1019,7 +1040,7 @@ def main():
         log.error("Módulos obrigatórios faltando: " + ", ".join(missing))
         return 1
 
-    wants_mining = bool(args.mine or AUTO_MINE or (not args.no_pool))
+    wants_mining = bool(args.mine or AUTO_MINE or wants_pool_client)
     if not _validate_required_secrets(log, is_origin, wants_mining):
         return 1
 
@@ -1272,25 +1293,37 @@ def main():
     else:
         log.info("Sem OfframpManager — rotas /api/l2/offramp/* indisponiveis")
 
-    # ---- PoolClient (mineração sob demanda) ----
-    # [CHANGE v13.7.8] Por padrão, NÃO inicia o PoolClient.
-    # Só inicia se --pool-client for passado, OU se
-    # BRN_AUTO_POOL_CLIENT=1 estiver no .env.
-    # Isso permite abrir a carteira sem minerar automaticamente.
-    auto_pool = os.environ.get("BRN_AUTO_POOL_CLIENT", "0") == "1"
-    disabled_pool_client = True
-    if args.pool_client or auto_pool:
-        disabled_pool_client = False
-    if args.no_pool_client:
-        disabled_pool_client = True
-
-    pool_client = _setup_pool_client_local(
-        chain, pool, log,
-        disabled=disabled_pool_client,
-        is_origin=is_origin,
-    )
-    if pool_client is not None:
-        _register_service("pool_client", pool_client)
+    # ---- PoolClient (OPT-IN) ----
+    pool_client = None
+    if wants_pool_client:
+        pool_client = _setup_pool_client_local(
+            chain, pool, log,
+            is_origin=is_origin,
+        )
+        if pool_client is not None:
+            _register_service("pool_client", pool_client)
+            # Ativa a mineração SÓ porque o usuário pediu explicitamente
+            try:
+                ok, msg = pool_client.start_mining()
+                if ok:
+                    log.info("PoolClient iniciado: " + msg)
+                else:
+                    log.warning("PoolClient.start_mining falhou: " + msg)
+            except Exception as e:
+                log.warning("PoolClient.start_mining exceção: " + str(e))
+    else:
+        # Prepara o PoolClient, mas NÃO inicia
+        pool_client = _setup_pool_client_local(
+            chain, pool, log,
+            is_origin=is_origin,
+        )
+        if pool_client is not None:
+            _register_service("pool_client", pool_client)
+            _inject_into_server("pool_client", pool_client, log)
+            log.info("PoolClient preparado (NÃO iniciado). "
+                     "Use --pool-client ou clique em 'Minerar Pool' na GUI.")
+        else:
+            log.info("PoolClient: não preparado (carteira ausente?)")
 
     # ---- Broadcast local → P2P + ForkGuard ----
     _setup_local_miner_broadcast(chain, p2p, log)
@@ -1362,6 +1395,7 @@ def main():
         "mine":        bool(quer_miner_local),
         "pool":        bool(pool),
         "pool_client": bool(pool_client),
+        "pool_client_started": bool(wants_pool_client),
         "https":       os.environ.get("BRN_HTTPS") == "1",
         "height":      chain.db.height(),
         "node_id":     node_pub[:16],
