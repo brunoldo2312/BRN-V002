@@ -1,23 +1,20 @@
-"""trust_network.py — Rede de confiança e reputação do BRN (v3.5)
+"""trust_network.py — Rede de confiança e reputação do BRN (v3.6)
 ================================================================
+v3.6 (2026-10-30):
+  [FIX] get_active_validators() agora SEMPRE inclui o Origin, mesmo
+        que ele esteja fora de ACTIVE_TTL_SECONDS. Isso evita que o
+        Origin seja excluído do consenso por inatividade.
+        Também removido o fallback para "top score" (que retornava
+        fantasmas quando ninguém estava ativo).
 v3.5 (2026-10-30):
-  [NEW] _prune_inactive() — remove nós offline há mais de NODE_TTL_SECONDS.
-        Rodado em flush() a cada 60s. Nunca remove o Origin, nem
-        nós com score >= SCORE_PROTECTED.
-  [NEW] get_active_validators() — como get_top_validators, mas
-        filtra por last_seen < ACTIVE_TTL_SECONDS. Faz fallback
-        para o Origin se ninguém estiver ativo, e para o top
-        score se ainda assim ficar vazio.
-  [NEW] set_origin_pubkey() — registra a pubkey do Origin para
-        que ela nunca seja podada.
-  [NEW] Env vars: BRN_TRUST_NODE_TTL, BRN_TRUST_ACTIVE_TTL,
-        BRN_TRUST_PROTECT_SCORE.
-  [KEEP] Tudo da v3.4 (dedup por pubkey, assinatura Ed25519, etc.).
+  [NEW] _prune_inactive(), get_active_validators(), set_origin_pubkey()
+v3.4 (2026-10-29):
+  [FIX] Deduplicação por public_key
 ================================================================
 """
 from __future__ import annotations
 
-__version__ = "3.5"
+__version__ = "3.6"
 
 import json
 import logging
@@ -57,7 +54,6 @@ VALIDATOR_ROTATION_BLOCKS = 100
 DEFAULT_DATA_FILE = "trust_network.json"
 FLUSH_INTERVAL_S = 10.0
 
-# [NEW v3.5] Configurações de pruning / atividade
 NODE_TTL_SECONDS   = int(os.environ.get("BRN_TRUST_NODE_TTL",   "3600"))
 ACTIVE_TTL_SECONDS = int(os.environ.get("BRN_TRUST_ACTIVE_TTL", "300"))
 SCORE_PROTECTED    = int(os.environ.get("BRN_TRUST_PROTECT_SCORE", "500"))
@@ -142,7 +138,6 @@ class TrustNetwork:
         self.last_decay_time: float = time.time()
         self._last_rotation_height: int = 0
 
-        # [NEW v3.5] Origin pubkey protegida + controle de pruning
         self._origin_pubkey: str = ""
         self._last_prune: float = 0.0
 
@@ -154,21 +149,13 @@ class TrustNetwork:
         log.info("[TrustNetwork] v%s Inicializada — %d nós, %d validadores",
                  __version__, len(self.nodes), len(self.active_validators))
 
-    # ========================================================
-    # [NEW v3.5] ORIGIN + PRUNING
-    # ========================================================
     def set_origin_pubkey(self, pk: str) -> None:
-        """Registra a pubkey do Origin para nunca ser podada."""
         self._origin_pubkey = (pk or "").strip().lower()
         if self._origin_pubkey:
             log.info("[TrustNetwork] origin_pubkey=%s… (protegida)",
                      self._origin_pubkey[:16])
 
     def _prune_inactive(self) -> int:
-        """
-        Remove nós offline há mais de NODE_TTL_SECONDS.
-        Exceto: Origin e nós com score >= SCORE_PROTECTED.
-        """
         now = time.time()
         if now - self._last_prune < PRUNE_INTERVAL_S:
             return 0
@@ -195,9 +182,6 @@ class TrustNetwork:
 
         return len(to_remove)
 
-    # ========================================================
-    # PERSISTÊNCIA
-    # ========================================================
     def _mark_dirty(self) -> None:
         self._dirty = True
         agora = time.time()
@@ -209,7 +193,6 @@ class TrustNetwork:
             if not self._dirty:
                 return
 
-            # [NEW v3.5] Prune antes de salvar
             self._prune_inactive()
 
             try:
@@ -280,9 +263,6 @@ class TrustNetwork:
         except Exception as e:
             log.error("[TrustNetwork] Load falhou: %s — iniciando vazio", e)
 
-    # ========================================================
-    # REGISTRO E CONEXÃO
-    # ========================================================
     def register_node(self, node_id: str, address: str, public_key: str,
                       peer_addr: str = "") -> NodeRecord:
         with self._lock:
@@ -357,9 +337,6 @@ class TrustNetwork:
                 self._adjust_score(node_id, GAIN_ONLINE_HOUR / 10, "heartbeat")
             self._apply_decay()
 
-    # ========================================================
-    # EVENTOS
-    # ========================================================
     def record_block_validated(self, node_id: str, block_height: int) -> None:
         with self._lock:
             n = self.nodes.get(node_id)
@@ -442,9 +419,6 @@ class TrustNetwork:
             self._mark_dirty()
             return True
 
-    # ========================================================
-    # SCORE INTERNO
-    # ========================================================
     def _adjust_score(self, node_id: str, delta: float, reason: str = "") -> float:
         n = self.nodes.get(node_id)
         if not n or n.banned:
@@ -485,9 +459,6 @@ class TrustNetwork:
         log.info("[TrustNetwork] decaimento aplicado")
         self._mark_dirty()
 
-    # ========================================================
-    # VALIDADORES
-    # ========================================================
     def select_validators(self, current_block_height: int) -> List[str]:
         with self._lock:
             if (current_block_height - self._last_rotation_height
@@ -520,7 +491,6 @@ class TrustNetwork:
             return node_id in self.active_validators
 
     def get_top_validators(self, count: int = 5) -> List[str]:
-        """Top N por score (sem filtro de atividade). Mantido para compat."""
         try:
             n_target = max(1, int(count))
         except (TypeError, ValueError):
@@ -545,11 +515,10 @@ class TrustNetwork:
                     break
             return out
 
+    # ============================================================
+    # [FIX v3.6] Sempre inclui o Origin, sem fallback para top score
+    # ============================================================
     def get_active_validators(self, count: int = 5) -> List[str]:
-        """
-        [NEW v3.5] Como get_top_validators, mas filtra por last_seen recente.
-        Se ninguém estiver ativo, cai para o Origin. Se ainda vazio, top score.
-        """
         try:
             n_target = max(1, int(count))
         except (TypeError, ValueError):
@@ -565,16 +534,21 @@ class TrustNetwork:
             active = [n for n in cands
                       if (now - n.last_seen) < ACTIVE_TTL_SECONDS]
 
-            # Fallback 1: só o Origin
-            if not active and self._origin_pubkey:
-                for n in cands:
-                    if (n.public_key or "").strip().lower() == self._origin_pubkey:
-                        active = [n]
-                        break
+            if self._origin_pubkey:
+                origin = next(
+                    (n for n in cands
+                     if (n.public_key or "").strip().lower() == self._origin_pubkey),
+                    None,
+                )
+                if origin is not None and origin not in active:
+                    active.append(origin)
 
-            # Fallback 2: top score
             if not active:
-                active = cands
+                log.warning(
+                    "[TrustNetwork] get_active_validators: nenhum nó ativo "
+                    "e Origin ausente — retornando [] (modo bootstrap)"
+                )
+                return []
 
             active.sort(key=lambda n: (-n.trust_score, n.public_key))
 
@@ -589,8 +563,9 @@ class TrustNetwork:
                 if len(out) >= n_target:
                     break
 
-            log.info("[TrustNetwork] get_active_validators: %d/%d (total=%d)",
-                     len(out), len(active), len(cands))
+            log.info("[TrustNetwork] get_active_validators: %d/%d (total=%d, origin=%s)",
+                     len(out), len(active), len(cands),
+                     "sim" if self._origin_pubkey else "não")
             return out
 
     def get_validator_list(self) -> List[Dict]:
@@ -610,9 +585,6 @@ class TrustNetwork:
                                   key=lambda x: -self.nodes[x].trust_score)
             ]
 
-    # ========================================================
-    # CONSULTAS / API
-    # ========================================================
     def get_node_info(self, node_id: str) -> Optional[Dict]:
         with self._lock:
             n = self.nodes.get(node_id)
