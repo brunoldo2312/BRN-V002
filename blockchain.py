@@ -1,10 +1,14 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.4.5 | Data: 28/10/2026
+Versão: 9.4.6 | Data: 30/10/2026
 ================================================================
-v9.4.5 (2026-10-28):
-  [FIX] O bloco Genesis (altura 0) não exige assinatura multi-sig.
-        Isso evita que o cliente rejeite o bloco 0 na sincronização
-        inicial.
+v9.4.6 (2026-10-30):
+  [FIX] _get_active_validators() agora usa trust.get_active_validators()
+        (filtra por last_seen recente) em vez de get_top_validators()
+        (só por score). Isso resolve o problema dos "fantasmas"
+        que travavam o consenso.
+  [NEW] _required_signatures() loga o quórum em tempo real:
+        [SIG] quorum=0.50 → 1/2 assinaturas
+  [KEEP] Tudo da v9.4.5 (Genesis sem multi-sig, whitelist removida).
 ================================================================
 """
 from __future__ import annotations
@@ -22,6 +26,7 @@ import orjson
 
 from crypto import double_sha256, sha256
 from db import ChainDB
+
 
 log = logging.getLogger("blockchain")
 
@@ -687,27 +692,39 @@ class Blockchain:
         timestamps.sort()
         return timestamps[len(timestamps) // 2]
 
+    # ============================================================
+    # [FIX v9.4.6] Prefere validadores ATIVOS (last_seen recente)
+    # ============================================================
     def _get_active_validators(self) -> list:
         trust = self.trust_net
         if trust is None:
             return []
         try:
-            top = trust.get_top_validators(count=MAX_VALIDATORS)
+            if hasattr(trust, "get_active_validators"):
+                top = trust.get_active_validators(count=MAX_VALIDATORS)
+            else:
+                top = trust.get_top_validators(count=MAX_VALIDATORS)
             if not top:
                 return []
             return sorted({p for p in top if p})
         except Exception as e:
-            log.warning(f"[VALIDATORS] get_top_validators falhou: {e}")
+            log.warning(f"[VALIDATORS] falhou: {e}")
             return []
 
+    # ============================================================
+    # [NEW v9.4.6] Loga o quórum em tempo real
+    # ============================================================
     def _required_signatures(self, validators: list) -> int:
         n = len(validators)
         if n == 0:
             return 0
         if REQUIRE_ALL_SIGS:
+            log.info(f"[SIG] quorum=ALL ({n}/{n})")
             return n
         need = max(1, math.ceil(n * VALIDATOR_QUORUM))
-        return min(need, n)
+        need = min(need, n)
+        log.info(f"[SIG] quorum={VALIDATOR_QUORUM} → {need}/{n} assinaturas")
+        return need
 
     def _validate_validators_sig(self, block: dict, validators: Optional[list] = None) -> tuple:
         if validators is None:
@@ -784,7 +801,6 @@ class Blockchain:
         if not ok_cp:
             return False, msg_cp
 
-        # [FIX v9.4.5] A validação de assinatura só ocorre em blocos > 0 (Genesis não tem sig)
         if block["height"] > 0:
             ok_sig, msg_sig = self._validate_validators_sig(block, validators=validators)
             if not ok_sig:
@@ -1028,6 +1044,7 @@ class Blockchain:
             "require_all_sigs": REQUIRE_ALL_SIGS,
             "validator_quorum": VALIDATOR_QUORUM,
         }
+
 
 try:
     from reorg import reorg_to as _reorg_to, find_fork_point as _find_fork
