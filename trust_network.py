@@ -1,18 +1,27 @@
-"""trust_network.py — Rede de confiança e reputação do BRN (v3.4)
+"""trust_network.py — Rede de confiança e reputação do BRN (v3.5)
 ================================================================
-v3.4 (2026-10-29):
-  [FIX] Deduplicação por public_key no register_node().
-        Cada reinício do Windows gerava um novo miner_id (UUID)
-        e criava duplicatas. Agora, a public_key é a chave de
-        verificação para evitar fantasmas.
+v3.5 (2026-10-30):
+  [NEW] _prune_inactive() — remove nós offline há mais de NODE_TTL_SECONDS.
+        Rodado em flush() a cada 60s. Nunca remove o Origin, nem
+        nós com score >= SCORE_PROTECTED.
+  [NEW] get_active_validators() — como get_top_validators, mas
+        filtra por last_seen < ACTIVE_TTL_SECONDS. Faz fallback
+        para o Origin se ninguém estiver ativo, e para o top
+        score se ainda assim ficar vazio.
+  [NEW] set_origin_pubkey() — registra a pubkey do Origin para
+        que ela nunca seja podada.
+  [NEW] Env vars: BRN_TRUST_NODE_TTL, BRN_TRUST_ACTIVE_TTL,
+        BRN_TRUST_PROTECT_SCORE.
+  [KEEP] Tudo da v3.4 (dedup por pubkey, assinatura Ed25519, etc.).
 ================================================================
 """
 from __future__ import annotations
 
-__version__ = "3.4"
+__version__ = "3.5"
 
 import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field, asdict
@@ -47,6 +56,12 @@ MAX_VALIDATORS = 21
 VALIDATOR_ROTATION_BLOCKS = 100
 DEFAULT_DATA_FILE = "trust_network.json"
 FLUSH_INTERVAL_S = 10.0
+
+# [NEW v3.5] Configurações de pruning / atividade
+NODE_TTL_SECONDS   = int(os.environ.get("BRN_TRUST_NODE_TTL",   "3600"))
+ACTIVE_TTL_SECONDS = int(os.environ.get("BRN_TRUST_ACTIVE_TTL", "300"))
+SCORE_PROTECTED    = int(os.environ.get("BRN_TRUST_PROTECT_SCORE", "500"))
+PRUNE_INTERVAL_S   = 60.0
 
 
 @dataclass
@@ -121,20 +136,68 @@ class TrustNetwork:
         self.data_file = Path(data_file)
         self.is_origin = is_origin
         self.node_sk = node_sk
-        
+
         self.nodes: Dict[str, NodeRecord] = {}
         self.active_validators: Set[str] = set()
         self.last_decay_time: float = time.time()
         self._last_rotation_height: int = 0
+
+        # [NEW v3.5] Origin pubkey protegida + controle de pruning
+        self._origin_pubkey: str = ""
+        self._last_prune: float = 0.0
 
         self._lock = threading.RLock()
         self._dirty = False
         self._last_flush = 0.0
 
         self._load()
-        log.info("[TrustNetwork] Inicializada — %d nós, %d validadores",
-                 len(self.nodes), len(self.active_validators))
+        log.info("[TrustNetwork] v%s Inicializada — %d nós, %d validadores",
+                 __version__, len(self.nodes), len(self.active_validators))
 
+    # ========================================================
+    # [NEW v3.5] ORIGIN + PRUNING
+    # ========================================================
+    def set_origin_pubkey(self, pk: str) -> None:
+        """Registra a pubkey do Origin para nunca ser podada."""
+        self._origin_pubkey = (pk or "").strip().lower()
+        if self._origin_pubkey:
+            log.info("[TrustNetwork] origin_pubkey=%s… (protegida)",
+                     self._origin_pubkey[:16])
+
+    def _prune_inactive(self) -> int:
+        """
+        Remove nós offline há mais de NODE_TTL_SECONDS.
+        Exceto: Origin e nós com score >= SCORE_PROTECTED.
+        """
+        now = time.time()
+        if now - self._last_prune < PRUNE_INTERVAL_S:
+            return 0
+        self._last_prune = now
+
+        to_remove = []
+        with self._lock:
+            for nid, n in list(self.nodes.items()):
+                pk = (n.public_key or "").strip().lower()
+                if pk and pk == self._origin_pubkey:
+                    continue
+                if n.trust_score >= SCORE_PROTECTED:
+                    continue
+                if (now - n.last_seen) > NODE_TTL_SECONDS:
+                    to_remove.append(nid)
+
+            for nid in to_remove:
+                del self.nodes[nid]
+                log.info("[TrustNetwork] pruned %s… (offline >%ds)",
+                         nid[:12], NODE_TTL_SECONDS)
+
+            if to_remove:
+                self._mark_dirty()
+
+        return len(to_remove)
+
+    # ========================================================
+    # PERSISTÊNCIA
+    # ========================================================
     def _mark_dirty(self) -> None:
         self._dirty = True
         agora = time.time()
@@ -145,6 +208,10 @@ class TrustNetwork:
         with self._lock:
             if not self._dirty:
                 return
+
+            # [NEW v3.5] Prune antes de salvar
+            self._prune_inactive()
+
             try:
                 data = {
                     "nodes": {nid: n.to_dict() for nid, n in self.nodes.items()},
@@ -152,15 +219,15 @@ class TrustNetwork:
                     "active_validators": list(self.active_validators),
                     "last_rotation_height": self._last_rotation_height,
                 }
-                
+
                 if self.is_origin and self.node_sk is not None:
                     payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
                     sig = self.node_sk.sign(payload)
                     data["signature"] = sig.hex()
                     data["origin_pubkey"] = self.node_sk.public_key().public_bytes_raw().hex()
-                
+
                 data["saved_at"] = time.time()
-                
+
                 with open(self.data_file, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
                 self._dirty = False
@@ -177,11 +244,11 @@ class TrustNetwork:
         try:
             with open(self.data_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            
+
             sig_hex = data.pop("signature", None)
             origin_pub_hex = data.pop("origin_pubkey", None)
             data.pop("saved_at", None)
-            
+
             if sig_hex and origin_pub_hex:
                 payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
                 try:
@@ -199,7 +266,7 @@ class TrustNetwork:
                 if not self.is_origin:
                     log.warning("[TrustNetwork] Arquivo sem assinatura. Iniciando vazio.")
                     return
-            
+
             with self._lock:
                 self.nodes = {
                     nid: NodeRecord.from_dict(nd)
@@ -213,10 +280,12 @@ class TrustNetwork:
         except Exception as e:
             log.error("[TrustNetwork] Load falhou: %s — iniciando vazio", e)
 
+    # ========================================================
+    # REGISTRO E CONEXÃO
+    # ========================================================
     def register_node(self, node_id: str, address: str, public_key: str,
                       peer_addr: str = "") -> NodeRecord:
         with self._lock:
-            # [FIX v3.4] Deduplicação por public_key
             if public_key:
                 for existing_id, existing_node in list(self.nodes.items()):
                     if existing_node.public_key == public_key:
@@ -288,6 +357,9 @@ class TrustNetwork:
                 self._adjust_score(node_id, GAIN_ONLINE_HOUR / 10, "heartbeat")
             self._apply_decay()
 
+    # ========================================================
+    # EVENTOS
+    # ========================================================
     def record_block_validated(self, node_id: str, block_height: int) -> None:
         with self._lock:
             n = self.nodes.get(node_id)
@@ -365,11 +437,14 @@ class TrustNetwork:
             n.ban_reason = reason
             n.is_validator = False
             self.active_validators.discard(node_id)
-            log.warning("[TrustNetwork] 🚫 %s banido: %s",
+            log.warning("[TrustNetwork] %s banido: %s",
                         node_id[:12] + "…", reason)
             self._mark_dirty()
             return True
 
+    # ========================================================
+    # SCORE INTERNO
+    # ========================================================
     def _adjust_score(self, node_id: str, delta: float, reason: str = "") -> float:
         n = self.nodes.get(node_id)
         if not n or n.banned:
@@ -410,6 +485,9 @@ class TrustNetwork:
         log.info("[TrustNetwork] decaimento aplicado")
         self._mark_dirty()
 
+    # ========================================================
+    # VALIDADORES
+    # ========================================================
     def select_validators(self, current_block_height: int) -> List[str]:
         with self._lock:
             if (current_block_height - self._last_rotation_height
@@ -442,6 +520,7 @@ class TrustNetwork:
             return node_id in self.active_validators
 
     def get_top_validators(self, count: int = 5) -> List[str]:
+        """Top N por score (sem filtro de atividade). Mantido para compat."""
         try:
             n_target = max(1, int(count))
         except (TypeError, ValueError):
@@ -464,25 +543,54 @@ class TrustNetwork:
                 out.append(pk)
                 if len(out) >= n_target:
                     break
+            return out
 
-            n_found = len(out)
-            if n_found == 0:
-                log.warning(
-                    "[TrustNetwork] get_top_validators: NENHUM validador "
-                    "qualificado (nodes=%d, com pubkey=%d). "
-                    "Consenso multi-sig ficará em modo bootstrap.",
-                    len(self.nodes),
-                    sum(1 for x in self.nodes.values() if x.public_key),
-                )
-            elif n_found < n_target:
-                log.info(
-                    "[TrustNetwork] get_top_validators: %d/%d (só há %d "
-                    "nós com pubkey não-banidos)",
-                    n_found, n_target,
-                    sum(1 for x in self.nodes.values()
-                        if x.public_key and not x.banned),
-                )
+    def get_active_validators(self, count: int = 5) -> List[str]:
+        """
+        [NEW v3.5] Como get_top_validators, mas filtra por last_seen recente.
+        Se ninguém estiver ativo, cai para o Origin. Se ainda vazio, top score.
+        """
+        try:
+            n_target = max(1, int(count))
+        except (TypeError, ValueError):
+            n_target = 5
 
+        now = time.time()
+        with self._lock:
+            cands = [
+                n for n in self.nodes.values()
+                if not n.banned and n.public_key
+            ]
+
+            active = [n for n in cands
+                      if (now - n.last_seen) < ACTIVE_TTL_SECONDS]
+
+            # Fallback 1: só o Origin
+            if not active and self._origin_pubkey:
+                for n in cands:
+                    if (n.public_key or "").strip().lower() == self._origin_pubkey:
+                        active = [n]
+                        break
+
+            # Fallback 2: top score
+            if not active:
+                active = cands
+
+            active.sort(key=lambda n: (-n.trust_score, n.public_key))
+
+            out: List[str] = []
+            seen_pk: Set[str] = set()
+            for n in active:
+                pk = (n.public_key or "").strip().lower()
+                if not pk or pk in seen_pk:
+                    continue
+                seen_pk.add(pk)
+                out.append(pk)
+                if len(out) >= n_target:
+                    break
+
+            log.info("[TrustNetwork] get_active_validators: %d/%d (total=%d)",
+                     len(out), len(active), len(cands))
             return out
 
     def get_validator_list(self) -> List[Dict]:
@@ -502,6 +610,9 @@ class TrustNetwork:
                                   key=lambda x: -self.nodes[x].trust_score)
             ]
 
+    # ========================================================
+    # CONSULTAS / API
+    # ========================================================
     def get_node_info(self, node_id: str) -> Optional[Dict]:
         with self._lock:
             n = self.nodes.get(node_id)
