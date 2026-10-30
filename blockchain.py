@@ -2,37 +2,26 @@
 Versão: 9.4.7 | Data: 30/10/2026
 ================================================================
 v9.4.7 (2026-10-30):
-  [FIX CRÍTICO] _validate_validators_sig agora aceita blocos com
-                assinaturas ESTRANGEIRAS (válidas criptograficamente
-                mas fora do set local) em MODO BOOTSTRAP quando:
-                  - o set local tem < 2 validadores, E
-                  - nenhum validador local assinou, E
-                  - há >= 1 assinatura estrangeira válida, E
-                  - o bloco não "salta" altura (block_h <= tip+1).
-                Antes (v9.4.6), QUALQUER sig de pubkey fora do set
-                era descartada silenciosamente, fazendo o cliente
-                rejeitar eternamente os blocos do Origin — a chain
-                local travava em #3 e nunca subia.
-                SEGURANÇA PRESERVADA:
-                  * assinatura inválida (Ed25519/Schnorr falha) →
-                    rejeitado em QUALQUER modo
-                  * set local >= 2 validadores → multi-sig ESTRITO
-                    (comportamento idêntico a v9.4.6)
-                  * anti-fork de genesis: block_h > tip+1 → rejeitado
-                    mesmo em bootstrap (evita reorg a partir de #0)
-                  * toda aceitação em bootstrap emite WARNING explícito
-                    pedindo sync do trust_network.json
-  [NEW] Log de quorum em tempo real mantido (v9.4.6).
-  [KEEP] Tudo da v9.4.6 (trust.get_active_validators, genesis sem
-         multi-sig, whitelist removida).
+  [NEW] MULTISIG_START_HEIGHT (env BRN_MULTISIG_START_HEIGHT):
+        altura a partir da qual multi-sig é obrigatório. Blocos
+        abaixo são "legacy" e são aceitos sem validators_sig.
+        Padrão 0 = auto-detectar (primeiro bloco assinado).
+  [NEW] CHECKPOINT_HEIGHTS (env BRN_CHECKPOINT_HEIGHTS):
+        alturas explícitas para checkpoint, além do intervalo
+        automático de CHECKPOINT_INTERVAL (1000). Ex.: "32" cria
+        checkpoint em #32 e finaliza toda a chain até ali.
+  [FIX] _multisig_activation_height(): lê env, ou DB meta
+        "multisig_active_from" (auto-persistido no 1º bloco
+        assinado aceito).
+  [FIX] _validate_validators_sig(): skip para blocos legacy,
+        evitando que a ativação de multi-sig invalide chains
+        pré-existentes.
+  [FIX] accept_block(): persiste multisig_active_from após o
+        primeiro bloco assinado.
 v9.4.6 (2026-10-30):
-  [FIX] _get_active_validators() agora usa trust.get_active_validators()
-        (filtra por last_seen recente) em vez de get_top_validators()
-        (só por score). Isso resolve o problema dos "fantasmas"
-        que travavam o consenso.
-  [NEW] _required_signatures() loga o quórum em tempo real:
-        [SIG] quorum=0.50 → 1/2 assinaturas
-  [KEEP] Tudo da v9.4.5 (Genesis sem multi-sig, whitelist removida).
+  [FIX] _get_active_validators() usa trust.get_active_validators()
+        (filtra por last_seen recente).
+  [NEW] _required_signatures() loga o quórum.
 ================================================================
 """
 from __future__ import annotations
@@ -87,6 +76,40 @@ if not (0.0 < VALIDATOR_QUORUM <= 1.0):
     VALIDATOR_QUORUM = 0.67
 if SIG_COLLECT_TIMEOUT <= 0:
     SIG_COLLECT_TIMEOUT = 10.0
+
+# ============================================================
+# [v9.4.7] Multi-sig activation height
+# ============================================================
+MULTISIG_START_HEIGHT_ENV = os.environ.get("BRN_MULTISIG_START_HEIGHT", "").strip()
+MULTISIG_START_HEIGHT = 0
+if MULTISIG_START_HEIGHT_ENV:
+    try:
+        MULTISIG_START_HEIGHT = max(0, int(MULTISIG_START_HEIGHT_ENV))
+        log.info("[SIG] MULTISIG_START_HEIGHT=%d (env)", MULTISIG_START_HEIGHT)
+    except (ValueError, TypeError):
+        log.warning("[SIG] BRN_MULTISIG_START_HEIGHT invalido: %r",
+                    MULTISIG_START_HEIGHT_ENV)
+        MULTISIG_START_HEIGHT = 0
+
+# ============================================================
+# [v9.4.7] Explicit checkpoint heights (além de h % CHECKPOINT_INTERVAL)
+# ============================================================
+CHECKPOINT_HEIGHTS_ENV = os.environ.get("BRN_CHECKPOINT_HEIGHTS", "").strip()
+CHECKPOINT_HEIGHTS_SET: set = set()
+if CHECKPOINT_HEIGHTS_ENV:
+    for part in CHECKPOINT_HEIGHTS_ENV.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            h = int(part)
+            if h > 0:
+                CHECKPOINT_HEIGHTS_SET.add(h)
+        except ValueError:
+            log.warning("[SIG] altura de checkpoint invalida: %r", part)
+    if CHECKPOINT_HEIGHTS_SET:
+        log.info("[SIG] CHECKPOINT_HEIGHTS=%s", sorted(CHECKPOINT_HEIGHTS_SET))
+
 
 GENESIS_PREV      = "0" * 64
 GENESIS_TIMESTAMP = 1700000000
@@ -155,11 +178,22 @@ def _verify_checkpoint_for_block(block) -> tuple:
 
 
 def _maybe_sign_checkpoint(block) -> None:
+    """
+    Assina checkpoint se:
+      - priv disponível
+      - altura é 0, ou múltiplo de CHECKPOINT_INTERVAL, ou está em
+        CHECKPOINT_HEIGHTS_SET ([v9.4.7] — permite checkpoints avulsos)
+    """
     if _checkpoint_priv is None:
         return
     try:
         h = int(block["height"])
-        if h == 0 or h % CHECKPOINT_INTERVAL != 0:
+        should_sign = (
+            h == 0
+            or h % CHECKPOINT_INTERVAL == 0
+            or h in CHECKPOINT_HEIGHTS_SET
+        )
+        if not should_sign:
             return
         from checkpoints import sign_checkpoint, save_checkpoints
         from wallet import Wallet
@@ -171,9 +205,10 @@ def _maybe_sign_checkpoint(block) -> None:
             return
         _checkpoints[str(h)] = cp
         save_checkpoints(_checkpoints)
-        print(f"[CHECKPOINT] #{h} assinado e salvo")
-    except Exception:
-        pass
+        log.info("[CHECKPOINT] #%d assinado e salvo (%s)",
+                 h, block["hash"][:16] + "...")
+    except Exception as e:
+        log.warning("[CHECKPOINT] falha em #%s: %s", block.get("height"), e)
 
 
 def signing_hash_block(block: dict) -> bytes:
@@ -716,9 +751,6 @@ class Blockchain:
         timestamps.sort()
         return timestamps[len(timestamps) // 2]
 
-    # ============================================================
-    # [FIX v9.4.6] Prefere validadores ATIVOS (last_seen recente)
-    # ============================================================
     def _get_active_validators(self) -> list:
         trust = self.trust_net
         if trust is None:
@@ -736,8 +768,27 @@ class Blockchain:
             return []
 
     # ============================================================
-    # [NEW v9.4.6] Loga o quórum em tempo real
+    # [v9.4.7] Altura de ativação do multi-sig
     # ============================================================
+    def _multisig_activation_height(self) -> int:
+        """
+        Altura a partir da qual multi-sig é obrigatório.
+
+        Prioridade:
+          1. BRN_MULTISIG_START_HEIGHT (env) — override explícito
+          2. DB meta "multisig_active_from" — auto-detectado/persistido
+          3. 0 — multi-sig desligado (modo bootstrap)
+        """
+        if MULTISIG_START_HEIGHT > 0:
+            return MULTISIG_START_HEIGHT
+        try:
+            stored = self.db.get_meta("multisig_active_from")
+            if stored:
+                return max(0, int(stored))
+        except (ValueError, TypeError):
+            pass
+        return 0
+
     def _required_signatures(self, validators: list) -> int:
         n = len(validators)
         if n == 0:
@@ -750,13 +801,16 @@ class Blockchain:
         log.info(f"[SIG] quorum={VALIDATOR_QUORUM} → {need}/{n} assinaturas")
         return need
 
-    # ============================================================
-    # [FIX v9.4.7] Multi-sig com MODO BOOTSTRAP seguro
-    # ============================================================
     def _validate_validators_sig(self, block: dict, validators: Optional[list] = None) -> tuple:
         if validators is None:
             validators = self._get_active_validators()
         if not validators:
+            return True, ""
+
+        # [v9.4.7] Skip obrigatório para blocos históricos (legacy).
+        # Sem isso, ativar multi-sig invalidaria chains pré-existentes.
+        activation = self._multisig_activation_height()
+        if activation > 0 and int(block.get("height", 0)) < activation:
             return True, ""
 
         required = self._required_signatures(validators)
@@ -768,10 +822,7 @@ class Blockchain:
             return False, "validators_sig inválido"
 
         valid_set = set(validators)
-        # [NEW v9.4.7] Separa assinaturas verificadas em "conhecidas" e
-        # "estrangeiras" (válidas criptograficamente mas fora do set local).
-        verified_pubkeys: set = set()      # Ed25519 OK + está no set local
-        foreign_pubkeys: set = set()       # Ed25519 OK, mas não está no set
+        valid_pubkeys: set = set()
 
         for entry in sigs:
             if not isinstance(entry, dict):
@@ -780,80 +831,24 @@ class Blockchain:
             signature = (entry.get("signature") or "").strip()
             if not pubkey or not signature:
                 continue
-            if pubkey in verified_pubkeys or pubkey in foreign_pubkeys:
+            if pubkey not in valid_set:
+                log.warning(f"[SIG] pubkey fora do set: {pubkey[:16]}")
                 continue
-
-            # [v9.4.7] Verifica a assinatura PRIMEIRO. Se inválida, rejeita
-            # (não conta nem como conhecida nem como estrangeira).
-            if not verify_block_signature(pubkey, block, signature):
-                log.warning(f"[SIG] assinatura inválida de {pubkey[:16]}")
+            if pubkey in valid_pubkeys:
                 continue
-
-            if pubkey in valid_set:
-                verified_pubkeys.add(pubkey)
+            if verify_block_signature(pubkey, block, signature):
+                valid_pubkeys.add(pubkey)
             else:
-                foreign_pubkeys.add(pubkey)
+                log.warning(f"[SIG] assinatura inválida de {pubkey[:16]}")
 
-        got = len(verified_pubkeys)
-        got_foreign = len(foreign_pubkeys)
-
-        # ---------------------------------------------------------
-        # CAMINHO FELIZ — quorum do set local atingido
-        # ---------------------------------------------------------
-        if got >= required:
-            return True, ""
-
-        # ---------------------------------------------------------
-        # MODO BOOTSTRAP [NEW v9.4.7]
-        #
-        # Aceitação controlada de sigs estrangeiras APENAS se:
-        #   1. Temos < 2 validadores no set local (multi-sig real
-        #      não é possível de qualquer forma)
-        #   2. Nenhum dos nossos assinou (got == 0)
-        #   3. Há >= 1 assinatura estrangeira criptograficamente válida
-        #   4. O bloco não "salta" além de tip+1 (proteção contra fork
-        #      de longa distância a partir da genesis)
-        #
-        # Isso permite que um cliente com trust_network.json
-        # desatualizado sincronize blocos do Origin SEM abrir mão da
-        # segurança em redes com multi-sig real (>= 2 validadores).
-        # ---------------------------------------------------------
-        if len(validators) < 2 and got == 0 and got_foreign >= 1:
-            try:
-                block_h = int(block.get("height", -1))
-                my_height = self.db.height()
-            except Exception:
-                block_h = -1
-                my_height = -1
-
-            if block_h > my_height + 1:
-                return False, (
-                    f"Bloco #{block_h}: salto de altura "
-                    f"(tip local #{my_height}); rejeitado para evitar fork"
-                )
-
-            log.warning(
-                f"[SIG] Bloco #{block_h}: aceito em MODO BOOTSTRAP "
-                f"(set local tem {len(validators)} validador(es), "
-                f"{got_foreign} assinatura(s) estrangeira(s) válida(s)). "
-                f"Para multi-sig real, sincronize trust_network.json "
-                f"entre os nós (GET /api/trust/download no Origin)."
+        got = len(valid_pubkeys)
+        if got < required:
+            missing = [p[:12] + "…" for p in validators if p not in valid_pubkeys]
+            return False, (
+                f"Bloco #{block['height']} precisa de {required}/{len(validators)} "
+                f"assinaturas, tem {got}. Faltam: {', '.join(missing[:5])}"
             )
-            return True, ""
-
-        # ---------------------------------------------------------
-        # FALHA — diagnóstico útil
-        # ---------------------------------------------------------
-        if got == 0 and got_foreign == 0:
-            return False, f"Bloco #{block.get('height')}: sem assinaturas válidas"
-
-        missing = [p[:12] + "…" for p in validators if p not in verified_pubkeys]
-        return False, (
-            f"Bloco #{block['height']} precisa de {required}/{len(validators)} "
-            f"assinaturas do set local, tem {got}. "
-            f"Faltam: {', '.join(missing[:5])}. "
-            f"({got_foreign} assinatura(s) estrangeira(s) ignorada(s))"
-        )
+        return True, ""
 
     def validate_block(self, block: dict, prev_block=None, validators: Optional[list] = None) -> tuple:
         if block["height"] == 0 and prev_block is None:
@@ -964,6 +959,23 @@ class Blockchain:
                         self._apply_contract_tx(t)
                     except Exception as e:
                         print(f"[CONTRACT] tx {t['txid'][:16]}... falhou: {e}")
+
+        # [v9.4.7] Persiste ativação do multi-sig na 1ª vez que um bloco
+        # ASSINADO é aceito. Blocos anteriores ficam legacy automaticamente.
+        try:
+            if (int(block.get("height", 0)) > 0
+                    and block.get("validators_sig")
+                    and not self.db.get_meta("multisig_active_from")
+                    and MULTISIG_START_HEIGHT == 0):
+                self.db.set_meta("multisig_active_from", str(block["height"]))
+                log.info(
+                    "[SIG] multisig_active_from = %d "
+                    "(primeiro bloco assinado aceito)",
+                    block["height"],
+                )
+        except Exception as _e:
+            log.warning("[SIG] falha ao persistir multisig_active_from: %s", _e)
+
         return True, block["hash"]
 
     def _attach_auth_tag(self, block: dict) -> dict:
@@ -1129,6 +1141,8 @@ class Blockchain:
             "validators_active": n_validators,
             "require_all_sigs": REQUIRE_ALL_SIGS,
             "validator_quorum": VALIDATOR_QUORUM,
+            "multisig_activation": self._multisig_activation_height(),
+            "checkpoint_heights": sorted(CHECKPOINT_HEIGHTS_SET),
         }
 
 
