@@ -1,22 +1,22 @@
-"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.9.1)
+"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.9.2)
 ================================================================
+v3.9.2 (2026-10-30):
+  [FIX CRÍTICO] pool_start_mining / pool_stop_mining / pool_status
+                agora chamam /api/pool/start_local, /api/pool/stop_local
+                e /api/pool/local_status. Antes, criavam um segundo
+                PoolClient em memória, que ficava desalinhado do
+                PoolClient injetado pelo main.py — a GUI mostrava
+                "minerando" mas o /api/pool/local_status ficava
+                "running: false". Agora há um único PoolClient,
+                compartilhado entre GUI e API.
+  [FIX] Removido WalletApi(wallet_password=...) inexistente.
+  [KEEP] v3.9.1: AttributeError 'NoneType' corrigido em mining_status
+         e stop_mining (get_miner(None) substituía a chain).
 v3.9.1 (2026-10-28):
-  [FIX CRÍTICO] AttributeError 'NoneType' object has no attribute 
-                'rede_descentralizada'. As funções mining_status e 
-                stop_mining chamavam get_miner(None), o que substituía 
-                a chain real do minerador por None. Agora importam 
-                _get_chain() do server e passam a chain correta.
+  [FIX CRÍTICO] AttributeError 'NoneType' object has no attribute
+                'rede_descentralizada'.
 v3.9.0 (2026-10-26):
-  [NEW] Suporte a multi-sig dos Top 5 validadores (blockchain v9.4.0):
-        - consensus_validators() — lista os validadores ativos
-        - get_multi_sig_status() — quantas assinaturas são necessárias
-        - block_signatures(height) — assinaturas de um bloco específico
-        - mining_status() agora inclui validators_active e sigs_required
-  [FIX] _resolve_pool_url() restaura uso de BRN_POOL_URL.
-v3.8.2 (2026-10-23):
-  [NEW] get_trust_stats() e get_trust_nodes()
-v3.8.1:
-  [FIX CRÍTICO] sync_info() traduz error -> erro
+  [NEW] Suporte a multi-sig dos Top 5 validadores.
 ================================================================
 """
 from __future__ import annotations
@@ -30,7 +30,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "3.9.1"
+__version__ = "3.9.2"
 
 try:
     import requests
@@ -50,8 +50,6 @@ MAX_RETRIES  = int(os.environ.get("BRN_API_RETRIES", "2"))
 RETRY_DELAY  = float(os.environ.get("BRN_API_RETRY_DELAY", "0.5"))
 
 
-_POOL_CLIENT: object = None
-_POOL_LOCK = threading.RLock()
 _WALLET_SESSION: dict = {}
 
 
@@ -485,7 +483,7 @@ class WalletApi:
             return {"ok": False, "msg": str(e)}
 
     # ========================================================
-    # MINERAÇÃO (CORRIGIDO AQUI)
+    # MINERAÇÃO LOCAL (miner_loop)
     # ========================================================
     def start_mining(self, address: str, pubkey: str) -> dict:
         try:
@@ -500,11 +498,10 @@ class WalletApi:
         try:
             from miner_loop import get_miner
             from server import _get_chain
-            
-            # [FIX v3.9.1] Pega a chain real do server
+
             chain = _get_chain()
             m = get_miner(chain)
-            
+
             if m:
                 ok, msg = m.stop()
                 return {"ok": ok, "msg": msg, "count": m.blocks_mined}
@@ -514,13 +511,6 @@ class WalletApi:
 
     def mining_status(self) -> dict:
         try:
-            from miner_loop import get_miner
-            from server import _get_chain
-            
-            # [FIX v3.9.1] Pega a chain real do server
-            chain = _get_chain()
-            m = get_miner(chain)
-            
             r = _get("/api/miner/status", timeout=GET_TIMEOUT)
             if "error" not in r:
                 r.setdefault("validators_active", 0)
@@ -531,7 +521,7 @@ class WalletApi:
             return {"running": False, "error": str(e)}
 
     # ========================================================
-    # POOL
+    # POOL — [FIX v3.9.2] Usa /api/pool/*_local (PoolClient do main.py)
     # ========================================================
     def _resolve_pool_url(self) -> str:
         env_pool = (os.environ.get("BRN_POOL_URL", "") or "").strip()
@@ -540,64 +530,50 @@ class WalletApi:
         return API_BASE
 
     def pool_start_mining(self, address: str, pubkey: str) -> dict:
-        global _POOL_CLIENT
-        with _POOL_LOCK:
-            if not address or not pubkey:
-                return {"ok": False, "msg": "address e pubkey obrigatorios"}
-            try:
-                from miner_pool_client import PoolClient
-            except ImportError as e:
-                return {"ok": False, "msg": f"miner_pool_client indisponivel: {e}"}
+        """
+        [FIX v3.9.2] Inicia o PoolClient que o main.py JÁ injetou
+        no server.py via set_pool_client_local().
 
-            if _POOL_CLIENT is not None and _POOL_CLIENT.is_running():
-                if _POOL_CLIENT.address == address:
-                    return {"ok": True, "msg": "ja minerando", "miner_id": _POOL_CLIENT.miner_id}
-                try:
-                    _POOL_CLIENT.stop_mining()
-                except Exception:
-                    pass
-                _POOL_CLIENT = None
+        Antes, este método criava um PoolClient próprio (via
+        miner_pool_client.PoolClient). Isso gerava desalinhamento:
+          - a GUI minerava usando o PoolClient dela
+          - /api/pool/local_status lia o PoolClient do main.py
+          - resultado: "running: false" na API, "minerando" na GUI
 
-            pool_url = self._resolve_pool_url()
-            try:
-                _POOL_CLIENT = PoolClient(
-                    address=address, pubkey=pubkey, pool_url=pool_url,
-                )
-                ok, msg = _POOL_CLIENT.start_mining()
-                if ok:
-                    return {"ok": True,
-                            "msg": "Pool miner iniciado",
-                            "miner_id": _POOL_CLIENT.miner_id,
-                            "pool_url": pool_url}
-                _POOL_CLIENT = None
-                return {"ok": False, "msg": msg}
-            except Exception as e:
-                _POOL_CLIENT = None
-                return {"ok": False, "msg": str(e)}
+        Agora a GUI só chama a rota, e o PoolClient injetado é o
+        mesmo para todos os canais (GUI, API, logs).
+        """
+        if not address or not pubkey:
+            return {"ok": False, "msg": "address e pubkey obrigatorios"}
+
+        try:
+            r = _post("/api/pool/start_local", {}, timeout=30.0)
+            if r.get("ok"):
+                return r
+            return {"ok": False, "msg": r.get("msg", "start_local falhou")}
+        except Exception as e:
+            return {"ok": False, "msg": str(e)}
 
     def pool_stop_mining(self) -> dict:
-        global _POOL_CLIENT
-        with _POOL_LOCK:
-            if _POOL_CLIENT is None:
-                return {"ok": False, "msg": "nao esta a minerar"}
-            try:
-                ok, msg = _POOL_CLIENT.stop_mining()
-            except Exception as e:
-                _POOL_CLIENT = None
-                return {"ok": False, "msg": str(e)}
-            if ok:
-                _POOL_CLIENT = None
-            return {"ok": ok, "msg": msg}
+        """[FIX v3.9.2] Para o PoolClient injetado pelo main.py."""
+        try:
+            r = _post("/api/pool/stop_local", {}, timeout=30.0)
+            if r.get("ok"):
+                return r
+            return {"ok": False, "msg": r.get("msg", "stop_local falhou")}
+        except Exception as e:
+            return {"ok": False, "msg": str(e)}
 
     def pool_status(self) -> dict:
-        global _POOL_CLIENT
-        with _POOL_LOCK:
-            if _POOL_CLIENT is None:
-                return {"ok": True, "running": False, "hashrate": 0.0, "shares_accepted": 0}
-            try:
-                return _POOL_CLIENT.status()
-            except Exception as e:
-                return {"ok": False, "msg": str(e)}
+        """[FIX v3.9.2] Consulta o status do PoolClient injetado."""
+        try:
+            r = _get("/api/pool/local_status", timeout=10.0)
+            if not isinstance(r, dict):
+                return {"ok": False, "running": False,
+                        "msg": "resposta invalida"}
+            return r
+        except Exception as e:
+            return {"ok": False, "running": False, "msg": str(e)}
 
     def pool_stats(self) -> dict:
         try:
@@ -671,15 +647,20 @@ class WalletApi:
         except Exception:
             pass
 
+        pool_running = False
+        try:
+            ps = self.pool_status()
+            pool_running = bool(ps.get("running", False))
+        except Exception:
+            pass
+
         return {
             "version":  __version__,
             "api_base": API_BASE,
             "has_requests": _HAS_REQUESTS,
             "wallet_locked": not bool(_WALLET_SESSION.get("address")),
             "wallet_address": _WALLET_SESSION.get("address", ""),
-            "pool_client_running": bool(
-                _POOL_CLIENT is not None and _POOL_CLIENT.is_running()
-            ),
+            "pool_client_running": pool_running,
             "pool_url_resolved": self._resolve_pool_url(),
             "consensus": consensus_info,
             "env": {
@@ -759,6 +740,17 @@ def _self_test() -> int:
     print("\n[8] has_wallet...")
     r = api.has_wallet()
     print(f"    exists={r.get('exists')}")
+
+    print("\n[9] pool_status...")
+    r = api.pool_status()
+    print(f"    ok={r.get('ok')} running={r.get('running')} "
+          f"hashrate_khs={r.get('hashrate_khs', 0)}")
+
+    print("\n[10] miner/status...")
+    r = api.mining_status()
+    print(f"    running={r.get('running')} "
+          f"blocks={r.get('blocks_mined', 0)} "
+          f"height={r.get('height', '?')}")
 
     print("\n" + "=" * 60)
     print(" SELF-TEST CONCLUIDO")
