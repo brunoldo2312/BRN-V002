@@ -1,6 +1,30 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.4.6 | Data: 30/10/2026
+Versão: 9.4.7 | Data: 30/10/2026
 ================================================================
+v9.4.7 (2026-10-30):
+  [FIX CRÍTICO] _validate_validators_sig agora aceita blocos com
+                assinaturas ESTRANGEIRAS (válidas criptograficamente
+                mas fora do set local) em MODO BOOTSTRAP quando:
+                  - o set local tem < 2 validadores, E
+                  - nenhum validador local assinou, E
+                  - há >= 1 assinatura estrangeira válida, E
+                  - o bloco não "salta" altura (block_h <= tip+1).
+                Antes (v9.4.6), QUALQUER sig de pubkey fora do set
+                era descartada silenciosamente, fazendo o cliente
+                rejeitar eternamente os blocos do Origin — a chain
+                local travava em #3 e nunca subia.
+                SEGURANÇA PRESERVADA:
+                  * assinatura inválida (Ed25519/Schnorr falha) →
+                    rejeitado em QUALQUER modo
+                  * set local >= 2 validadores → multi-sig ESTRITO
+                    (comportamento idêntico a v9.4.6)
+                  * anti-fork de genesis: block_h > tip+1 → rejeitado
+                    mesmo em bootstrap (evita reorg a partir de #0)
+                  * toda aceitação em bootstrap emite WARNING explícito
+                    pedindo sync do trust_network.json
+  [NEW] Log de quorum em tempo real mantido (v9.4.6).
+  [KEEP] Tudo da v9.4.6 (trust.get_active_validators, genesis sem
+         multi-sig, whitelist removida).
 v9.4.6 (2026-10-30):
   [FIX] _get_active_validators() agora usa trust.get_active_validators()
         (filtra por last_seen recente) em vez de get_top_validators()
@@ -726,6 +750,9 @@ class Blockchain:
         log.info(f"[SIG] quorum={VALIDATOR_QUORUM} → {need}/{n} assinaturas")
         return need
 
+    # ============================================================
+    # [FIX v9.4.7] Multi-sig com MODO BOOTSTRAP seguro
+    # ============================================================
     def _validate_validators_sig(self, block: dict, validators: Optional[list] = None) -> tuple:
         if validators is None:
             validators = self._get_active_validators()
@@ -741,7 +768,10 @@ class Blockchain:
             return False, "validators_sig inválido"
 
         valid_set = set(validators)
-        valid_pubkeys: set = set()
+        # [NEW v9.4.7] Separa assinaturas verificadas em "conhecidas" e
+        # "estrangeiras" (válidas criptograficamente mas fora do set local).
+        verified_pubkeys: set = set()      # Ed25519 OK + está no set local
+        foreign_pubkeys: set = set()       # Ed25519 OK, mas não está no set
 
         for entry in sigs:
             if not isinstance(entry, dict):
@@ -750,24 +780,80 @@ class Blockchain:
             signature = (entry.get("signature") or "").strip()
             if not pubkey or not signature:
                 continue
-            if pubkey not in valid_set:
-                log.warning(f"[SIG] pubkey fora do set: {pubkey[:16]}")
+            if pubkey in verified_pubkeys or pubkey in foreign_pubkeys:
                 continue
-            if pubkey in valid_pubkeys:
-                continue
-            if verify_block_signature(pubkey, block, signature):
-                valid_pubkeys.add(pubkey)
-            else:
-                log.warning(f"[SIG] assinatura inválida de {pubkey[:16]}")
 
-        got = len(valid_pubkeys)
-        if got < required:
-            missing = [p[:12] + "…" for p in validators if p not in valid_pubkeys]
-            return False, (
-                f"Bloco #{block['height']} precisa de {required}/{len(validators)} "
-                f"assinaturas, tem {got}. Faltam: {', '.join(missing[:5])}"
+            # [v9.4.7] Verifica a assinatura PRIMEIRO. Se inválida, rejeita
+            # (não conta nem como conhecida nem como estrangeira).
+            if not verify_block_signature(pubkey, block, signature):
+                log.warning(f"[SIG] assinatura inválida de {pubkey[:16]}")
+                continue
+
+            if pubkey in valid_set:
+                verified_pubkeys.add(pubkey)
+            else:
+                foreign_pubkeys.add(pubkey)
+
+        got = len(verified_pubkeys)
+        got_foreign = len(foreign_pubkeys)
+
+        # ---------------------------------------------------------
+        # CAMINHO FELIZ — quorum do set local atingido
+        # ---------------------------------------------------------
+        if got >= required:
+            return True, ""
+
+        # ---------------------------------------------------------
+        # MODO BOOTSTRAP [NEW v9.4.7]
+        #
+        # Aceitação controlada de sigs estrangeiras APENAS se:
+        #   1. Temos < 2 validadores no set local (multi-sig real
+        #      não é possível de qualquer forma)
+        #   2. Nenhum dos nossos assinou (got == 0)
+        #   3. Há >= 1 assinatura estrangeira criptograficamente válida
+        #   4. O bloco não "salta" além de tip+1 (proteção contra fork
+        #      de longa distância a partir da genesis)
+        #
+        # Isso permite que um cliente com trust_network.json
+        # desatualizado sincronize blocos do Origin SEM abrir mão da
+        # segurança em redes com multi-sig real (>= 2 validadores).
+        # ---------------------------------------------------------
+        if len(validators) < 2 and got == 0 and got_foreign >= 1:
+            try:
+                block_h = int(block.get("height", -1))
+                my_height = self.db.height()
+            except Exception:
+                block_h = -1
+                my_height = -1
+
+            if block_h > my_height + 1:
+                return False, (
+                    f"Bloco #{block_h}: salto de altura "
+                    f"(tip local #{my_height}); rejeitado para evitar fork"
+                )
+
+            log.warning(
+                f"[SIG] Bloco #{block_h}: aceito em MODO BOOTSTRAP "
+                f"(set local tem {len(validators)} validador(es), "
+                f"{got_foreign} assinatura(s) estrangeira(s) válida(s)). "
+                f"Para multi-sig real, sincronize trust_network.json "
+                f"entre os nós (GET /api/trust/download no Origin)."
             )
-        return True, ""
+            return True, ""
+
+        # ---------------------------------------------------------
+        # FALHA — diagnóstico útil
+        # ---------------------------------------------------------
+        if got == 0 and got_foreign == 0:
+            return False, f"Bloco #{block.get('height')}: sem assinaturas válidas"
+
+        missing = [p[:12] + "…" for p in validators if p not in verified_pubkeys]
+        return False, (
+            f"Bloco #{block['height']} precisa de {required}/{len(validators)} "
+            f"assinaturas do set local, tem {got}. "
+            f"Faltam: {', '.join(missing[:5])}. "
+            f"({got_foreign} assinatura(s) estrangeira(s) ignorada(s))"
+        )
 
     def validate_block(self, block: dict, prev_block=None, validators: Optional[list] = None) -> tuple:
         if block["height"] == 0 and prev_block is None:
