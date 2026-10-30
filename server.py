@@ -1,16 +1,18 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.19)
+server.py — Backend HTTP do nó BRN (v9.9.21)
 ================================================================
+v9.9.21 (2026-10-30):
+  [NEW] /api/trust/download     — serve o trust_network.json assinado
+  [NEW] /api/trust/add_node     — adiciona peer ao trust (manual)
+  [NEW] /api/trust/remove_node  — remove peer do trust (manual)
+  [NEW] /api/pool/start_local   — GUI ativa a mineração com 1 clique
+  [NEW] /api/pool/stop_local    — GUI para a mineração
+  [NEW] /api/pool/local_status  — status do PoolClient local
+  [NEW] set_pool_client_local   — injeção do main.py
 v9.9.19 (2026-10-28):
-  [NEW] OFFRAMP (BRN → BTC): 6 endpoints + OfframpManager.
-        - GET  /api/l2/offramp/quote?brn_sats=N
-        - POST /api/l2/offramp/create      (valida SK, move BRN p/ cofre)
-        - GET  /api/l2/offramp/status/<id>
-        - GET  /api/l2/offramp/list?buyer=&status=
-        - POST /api/l2/offramp/cancel/<id>
-        - GET  /api/l2/offramp/stats
+  [NEW] OFFRAMP (BRN -> BTC): 6 endpoints + OfframpManager.
   [NEW] set_offramp_manager / _get_offramp
-  [NEW] helper _send_brn_to_treasury (assina tx BRN buyer → cofre)
+  [NEW] helper _send_brn_to_treasury (assina tx BRN buyer -> cofre)
   [NEW] /health reporta offramp_injected
 v9.9.18 (2026-10-28):
   [FIX] /api/pool/submit repassa job_id (anti-replay).
@@ -34,7 +36,7 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from functools import wraps
 from pathlib import Path
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 
 from wallet import Wallet, WalletManager
@@ -142,7 +144,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
                 headers={"Content-Type": "application/json",
-                         "User-Agent": "brn-server/9.9.19"},
+                         "User-Agent": "brn-server/9.9.21"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -249,7 +251,25 @@ def _get_trust_network():
 
 
 # ============================================================
-# [NEW v9.9.19] OFFRAMP MANAGER
+# [NEW v9.9.21] POOL CLIENT LOCAL (injetado pelo main.py)
+# ============================================================
+_POOL_CLIENT_LOCAL = None
+_POOL_CLIENT_LOCK = threading.Lock()
+
+
+def set_pool_client_local(pc) -> None:
+    global _POOL_CLIENT_LOCAL
+    with _POOL_CLIENT_LOCK:
+        _POOL_CLIENT_LOCAL = pc
+    log.info(f"server: PoolClient local {'injetado' if pc else 'removido'}")
+
+
+def _get_pool_client_local():
+    return _POOL_CLIENT_LOCAL
+
+
+# ============================================================
+# [NEW v9.9.21] OFFRAMP MANAGER
 # ============================================================
 _OFFRAMP = None
 _OFFRAMP_LOCK = threading.Lock()
@@ -1318,6 +1338,67 @@ def pool_miners():
 
 
 # ============================================================
+# [NEW v9.9.21] POOL CLIENT LOCAL (para a GUI ativar com clique)
+# ============================================================
+@app.route("/api/pool/start_local", methods=["POST"])
+@require_rate_limit("pool_register")
+def pool_start_local():
+    """
+    Inicia o PoolClient LOCAL (registra na fila e minera).
+    Chamado pela GUI quando o usuário clica em "Minerar Pool".
+    """
+    pc = _get_pool_client_local()
+    if pc is None:
+        return jsonify({
+            "ok": False,
+            "msg": "PoolClient local indisponivel (carteira nao carregada?)",
+        }), 503
+
+    try:
+        ok, msg = pc.start_mining()
+        if ok:
+            audit_log("pool_start_local", {"address": pc.address[:16]})
+            return jsonify({
+                "ok": True,
+                "msg": msg,
+                "address": pc.address,
+                "pool_url": pc.pool_url,
+            })
+        return jsonify({"ok": False, "msg": msg}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/pool/stop_local", methods=["POST"])
+@require_rate_limit("pool_disconnect")
+def pool_stop_local():
+    """Para o PoolClient LOCAL."""
+    pc = _get_pool_client_local()
+    if pc is None:
+        return jsonify({"ok": False, "msg": "PoolClient local indisponivel"}), 503
+    try:
+        ok, msg = pc.stop_mining()
+        return jsonify({"ok": ok, "msg": msg})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/pool/local_status", methods=["GET"])
+def pool_local_status():
+    """Status do PoolClient LOCAL."""
+    pc = _get_pool_client_local()
+    if pc is None:
+        return jsonify({
+            "ok": True, "running": False,
+            "msg": "PoolClient local nao injetado",
+        })
+    try:
+        return jsonify(pc.status())
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+# ============================================================
 # BLOCOS
 # ============================================================
 @app.route("/api/blocks", methods=["GET"])
@@ -1585,6 +1666,94 @@ def trust_nodes():
 
 
 # ============================================================
+# [NEW v9.9.21] DOWNLOAD / ADD / REMOVE DO TRUST NETWORK
+# ============================================================
+@app.route("/api/trust/download", methods=["GET"])
+def trust_download():
+    """
+    Disponibiliza o trust_network.json assinado para os clientes.
+    Os clientes baixam e verificam a assinatura Ed25519.
+    """
+    try:
+        path = BASE_DIR / "trust_network.json"
+        if not path.exists():
+            return jsonify({"ok": False, "msg": "arquivo nao encontrado"}), 404
+
+        response = send_file(
+            path,
+            mimetype="application/json",
+            as_attachment=True,
+            download_name="trust_network.json",
+        )
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        return response
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/trust/add_node", methods=["POST"])
+def trust_add_node():
+    """Adiciona um peer ao trust_network manualmente (apenas Origin)."""
+    trust = _get_trust_network()
+    if trust is None:
+        return jsonify({"ok": False, "msg": "TrustNetwork indisponivel"}), 503
+
+    data = request.get_json(force=True) or {}
+    pubkey = (data.get("pubkey") or "").strip()
+    address = (data.get("address") or "").strip()
+
+    if not pubkey or not address:
+        return jsonify({
+            "ok": False, "msg": "pubkey e address obrigatorios"
+        }), 400
+    if not address.startswith("brn1"):
+        return jsonify({"ok": False, "msg": "address invalido"}), 400
+
+    try:
+        node = trust.register_node(pubkey, address, pubkey)
+        audit_log("trust_add_node", {
+            "pubkey": pubkey[:16], "address": address[:16],
+        })
+        return jsonify({
+            "ok": True,
+            "node_id": node.node_id,
+            "address": node.address,
+            "trust_score": node.trust_score,
+            "trust_level": node.trust_level,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/trust/remove_node", methods=["POST"])
+def trust_remove_node():
+    """Remove um peer do trust_network (apenas Origin)."""
+    trust = _get_trust_network()
+    if trust is None:
+        return jsonify({"ok": False, "msg": "TrustNetwork indisponivel"}), 503
+
+    data = request.get_json(force=True) or {}
+    pubkey = (data.get("pubkey") or "").strip()
+    if not pubkey:
+        return jsonify({"ok": False, "msg": "pubkey obrigatoria"}), 400
+
+    try:
+        with trust._lock:
+            removed = False
+            for nid, n in list(trust.nodes.items()):
+                if n.public_key == pubkey or nid == pubkey:
+                    del trust.nodes[nid]
+                    removed = True
+            if removed:
+                trust._mark_dirty()
+                audit_log("trust_remove_node", {"pubkey": pubkey[:16]})
+                return jsonify({"ok": True, "msg": "removido"})
+            return jsonify({"ok": False, "msg": "pubkey nao encontrada"}), 404
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+# ============================================================
 # SYNC
 # ============================================================
 @app.route("/api/sync-info", methods=["GET"])
@@ -1785,7 +1954,7 @@ def contracts_list():
 
 
 # ============================================================
-# L2 — ONRAMP (BTC → BRN) — pre-existente
+# L2 — ONRAMP (BTC -> BRN) — pre-existente
 # ============================================================
 @app.route("/api/l2/quote", methods=["GET"])
 def l2_quote():
@@ -2056,7 +2225,7 @@ def l2_cancel(escrow_id):
 
 
 # ============================================================
-# [NEW v9.9.19] L2 — OFFRAMP (BRN → BTC)
+# L2 — OFFRAMP (BRN -> BTC)
 # ============================================================
 def _send_brn_to_treasury(wallet, buyer: str, brn_sats: int,
                           treasury: str) -> dict:
@@ -2181,7 +2350,6 @@ def offramp_create():
         escrow = r["escrow"]
         escrow_id = escrow["escrow_id"]
 
-        # Envia BRN do usuário para o cofre
         r2 = _send_brn_to_treasury(
             wallet=w,
             buyer=buyer_brn,
@@ -2189,7 +2357,6 @@ def offramp_create():
             treasury=off.treasury_brn,
         )
         if not r2.get("ok"):
-            # Cancela escrow se a tx BRN falhou
             off.cancel(escrow_id)
             return jsonify({"error": f"tx BRN falhou: {r2.get('msg')}"}), 500
 
@@ -2345,13 +2512,14 @@ def health():
         return jsonify({
             "ok": True,
             "height": _get_chain().db.height(),
-            "version": "9.9.19",
+            "version": "9.9.21",
             "chain_injected": _CHAIN is not None,
             "p2p_injected": _P2P_MANAGER is not None,
             "pool_injected": _POOL_MANAGER is not None,
             "sync_injected": _SYNC_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
             "offramp_injected": _OFFRAMP is not None,
+            "pool_client_injected": _POOL_CLIENT_LOCAL is not None,
             "l2_enabled": L2_ENABLED,
             "hd_wallet": _HAS_HD,
         })
@@ -2363,10 +2531,11 @@ def health():
 def index():
     return jsonify({
         "name": "BRN Node API",
-        "version": "9.9.19",
+        "version": "9.9.21",
         "mode": "modo2_aberto",
         "l2_enabled": L2_ENABLED,
         "pool_enabled": _POOL_MANAGER is not None,
+        "pool_client_injected": _POOL_CLIENT_LOCAL is not None,
         "offramp_enabled": _OFFRAMP is not None,
         "admin_protected": bool(ADMIN_TOKEN),
     })
@@ -2389,7 +2558,7 @@ def _shutdown():
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.19 (Proxy + Trust + Multi-Sig + History + Offramp)")
+    print(f"BRN Server v9.9.21 (Proxy + Trust + Multi-Sig + History + Offramp + PoolClient)")
     print(f"  → http://{WEB_HOST}:{port}")
     print(f"  L2: {'ATIVO' if L2_ENABLED else 'DESABILITADO'}")
     print(f"  Admin token: {'SIM' if ADMIN_TOKEN else 'NÃO'}")
