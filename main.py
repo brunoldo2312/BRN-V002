@@ -1,14 +1,12 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.7.9)
+"""main.py — Entrypoint unificado do nó BRN (v13.7.10)
 ================================================================
-v13.7.9 (2026-10-30):
-  [NEW] Origin é registrado como protegido em trust_net.set_origin_pubkey()
-        após criar o TrustNetwork. Isso evita que o pruning da v3.5
-        o remova por inatividade.
-  [NEW] Heartbeat do Origin a cada 30s em run_status_loop, mantendo
-        seu last_seen fresco (nunca será podado).
-  [KEEP] v13.7.8: PoolClient opt-in (não inicia por padrão), injeção
-        no server via set_pool_client_local, verificação de
-        integridade do código.
+v13.7.10 (2026-10-30):
+  [FIX CRÍTICO] Origin agora é registrado no trust_network com a
+        pubkey da CARTEIRA (validator_sk.pub_hex), não com a chave
+        P2P (node_sk). Antes, set_origin_pubkey() usava a pubkey
+        errada, e o Origin nunca era incluído no consenso.
+  [FIX] Heartbeat do run_status_loop aponta para validator_sk.pub_hex.
+  [KEEP] v13.7.9: pooling opt-in, heartbeat, pruning.
 ================================================================
 """
 from __future__ import annotations
@@ -92,7 +90,6 @@ if _applied:
 
 
 def _verificar_integridade_codigo() -> None:
-    """Verifica se blockchain.py e trust_network.py foram alterados."""
     HASHES_OFICIAIS = {
         "blockchain.py":    "COLE_O_HASH_SHA256_AQUI",
         "trust_network.py": "COLE_O_HASH_SHA256_AQUI",
@@ -311,8 +308,7 @@ def parse_args():
     p.add_argument("--no-sync", action="store_true")
     p.add_argument("--no-pool", action="store_true")
     p.add_argument("--pool-client", action="store_true",
-                   help="Inicia o PoolClient automaticamente. SEM esta flag, "
-                        "o nó NÃO minera por padrão.")
+                   help="Inicia o PoolClient automaticamente.")
     p.add_argument("--no-pool-client", action="store_true",
                    help="Força não iniciar o PoolClient.")
     p.add_argument("--pool-stats", action="store_true")
@@ -655,9 +651,6 @@ def run_explorer():
     )
 
 
-# ============================================================
-# STATUS LOOP (com heartbeat do Origin + peers.json)
-# ============================================================
 def run_status_loop(chain, p2p, sync=None, pool=None, pool_client=None,
                     trust_net=None, node_id_short="", origin_pub=""):
     log = get_logger("status")
@@ -670,7 +663,6 @@ def run_status_loop(chain, p2p, sync=None, pool=None, pool_client=None,
     while not _shutdown.is_set():
         time.sleep(30)
         try:
-            # [NEW v13.7.9] Heartbeat do Origin (nunca será podado)
             if trust_net and origin_pub:
                 agora_hb = time.time()
                 if agora_hb - last_trust_hb >= TRUST_HB_INTERVAL:
@@ -1012,7 +1004,6 @@ def main():
 
     log.info("Nó ID: " + node_pub[:16] + "...")
 
-    # ---- blockchain ----
     from blockchain import Blockchain
     chain = Blockchain(
         cfg["db_path"],
@@ -1023,7 +1014,6 @@ def main():
     chain.is_origin = is_origin
     log.info("Blockchain pronta (altura=" + str(chain.db.height()) + ")")
 
-    # ---- Trust Network ----
     trust_net = None
     if _HAS_TRUST:
         try:
@@ -1036,21 +1026,11 @@ def main():
                 chain.set_trust_net(trust_net)
             except AttributeError:
                 chain.trust_net = trust_net
-
-            # [NEW v13.7.9] Marca o Origin como protegido (nunca é podado)
-            if is_origin and node_sk is not None:
-                try:
-                    origin_pub = node_sk.public_key().public_bytes_raw().hex()
-                    trust_net.set_origin_pubkey(origin_pub)
-                except Exception as e:
-                    log.warning(f"set_origin_pubkey falhou: {e}")
-
             log.info("TrustNetwork: " + str(len(trust_net.nodes)) + " nós carregados")
         except Exception as e:
             log.warning("TrustNetwork desativada: " + str(e))
             trust_net = None
 
-    # ---- verify ----
     if args.verify_only:
         st = _verify_chain(chain)
         try:
@@ -1072,7 +1052,6 @@ def main():
         if st == VERIFY_ERROR:
             log.warning("Verificação não conclusiva — seguindo com cautela")
 
-    # ---- P2P ----
     p2p = None
     if not args.no_p2p:
         try:
@@ -1091,12 +1070,27 @@ def main():
             log.error("Falha ao iniciar P2P: " + str(e))
             p2p = None
 
-    # ---- SK do validador local + coletor de assinaturas ----
     validator_sk = _load_validator_sk()
     if validator_sk is not None:
         try:
             chain.set_local_validator_sk(validator_sk)
             log.info(f"Validator SK carregada: {validator_sk.pub_hex[:16]}...")
+
+            # [FIX v13.7.10] Registra o Origin com a pubkey da CARTEIRA
+            if is_origin and trust_net is not None:
+                try:
+                    trust_net.set_origin_pubkey(validator_sk.pub_hex)
+                    trust_net.register_node(
+                        validator_sk.pub_hex,
+                        validator_sk.address,
+                        validator_sk.pub_hex,
+                    )
+                    log.info(
+                        f"[Trust] ORIGIN registrado: "
+                        f"{validator_sk.pub_hex[:16]}... ({validator_sk.address[:16]}...)"
+                    )
+                except Exception as e:
+                    log.warning(f"[Trust] Falha registrando ORIGIN: {e}")
 
             if p2p is not None:
                 try:
@@ -1133,7 +1127,6 @@ def main():
         except Exception as e:
             log.warning(f"Falha configurando coletor: {e}")
 
-    # ---- Sync ----
     sync = None
     if not args.no_sync and p2p is not None:
         try:
@@ -1155,7 +1148,6 @@ def main():
     elif args.no_sync:
         log.info("Sync: pulado por --no-sync")
 
-    # ---- ForkGuard ----
     fork_guard_started = False
     if sync is not None or p2p is not None:
         try:
@@ -1173,7 +1165,6 @@ def main():
     else:
         log.info("ForkGuard: pulado (sem sync nem p2p)")
 
-    # ---- Pool server ----
     pool = None
     if not args.no_pool and _pool_disponivel():
         try:
@@ -1186,7 +1177,6 @@ def main():
     elif args.no_pool:
         log.info("Pool: desativado por --no-pool")
 
-    # ---- Offramp (BRN -> BTC) ----
     offramp = None
     if L2_ENABLED and btc_config is not None and getattr(btc_config, "BTC_WIF", "").strip():
         try:
@@ -1213,7 +1203,6 @@ def main():
     else:
         log.info("OfframpManager: desativado (BRN_BTC_WIF ausente ou L2 indisponível).")
 
-    # ---- HTTP ----
     http_app = _init_http_server(chain, log)
     if http_app is not None:
         threading.Thread(
@@ -1223,7 +1212,6 @@ def main():
     else:
         log.error("HTTP não pôde ser inicializado — seguindo sem API")
 
-    # ---- Injeções no server.py ----
     if p2p is not None:
         _inject_into_server("p2p", p2p, log)
     else:
@@ -1249,7 +1237,6 @@ def main():
     else:
         log.info("Sem OfframpManager — rotas /api/l2/offramp/* indisponiveis")
 
-    # ---- PoolClient (OPT-IN) ----
     pool_client = None
     if wants_pool_client:
         pool_client = _setup_pool_client_local(
@@ -1292,10 +1279,8 @@ def main():
         else:
             log.info("PoolClient: não preparado (carteira ausente?)")
 
-    # ---- Broadcast local → P2P + ForkGuard ----
     _setup_local_miner_broadcast(chain, p2p, log)
 
-    # ---- Miner local ----
     quer_miner_local = bool(args.mine or AUTO_MINE)
     if quer_miner_local and (pool is not None or pool_client is not None):
         log.warning("Miner local IGNORADO: pool/pool_client está ativo (evita forks).")
@@ -1332,15 +1317,18 @@ def main():
         except Exception as e:
             log.warning("Miner local falhou: " + str(e))
 
-    # ---- Status loop (com heartbeat do Origin) ----
     node_id_short = node_pub[:16]
+
+    # [FIX v13.7.10] heartbeat aponta para a pubkey da CARTEIRA (não a P2P)
+    _origin_pub_for_hb = validator_sk.pub_hex if validator_sk is not None else ""
+
     threading.Thread(
         target=_thread_wrap(
             "StatusLoop",
             lambda: run_status_loop(
                 chain, p2p, sync, pool, pool_client, trust_net,
                 node_id_short=node_id_short,
-                origin_pub=node_pub,
+                origin_pub=_origin_pub_for_hb,
             ),
         ),
         daemon=True, name="StatusLoop",
