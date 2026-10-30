@@ -1,10 +1,13 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.7.7)
+"""main.py — Entrypoint unificado do nó BRN (v13.7.8)
 ================================================================
-v13.7.7 (2026-10-28):
-  [SECURITY] Verificação de integridade do código (Code Integrity).
-        O nó calcula o SHA-256 do blockchain.py e trust_network.py.
-        Se um cliente alterar o código para burlar o consenso, o
-        nó detecta a mudança e aborta a inicialização.
+v13.7.8 (2026-10-29):
+  [CHANGE] PoolClient NÃO inicia mais automaticamente.
+        Por padrão, o nó carrega a carteira e abre a GUI, mas
+        NÃO entra no pool. Para minerar:
+          - Passe --pool-client, OU
+          - Defina BRN_AUTO_POOL_CLIENT=1 no .env
+        Isso evita que o nó minerar sem o usuário saber.
+  [KEEP] Verificação de integridade do código (v13.7.7).
   [KEEP] Assinatura digital do trust_network.json (v13.7.6).
   [KEEP] OfframpManager (BRN -> BTC) e BTCSender (v13.7.5).
   [KEEP] Migração Flask→FastAPI via WSGIMiddleware.
@@ -74,6 +77,7 @@ _HARDCODED_DEFAULTS = {
     "BRN_WEB_PASS":            "",
     "BRN_FORCE_HEADLESS":      "0",
     "BRN_UVICORN_WORKERS":     "1",
+    "BRN_AUTO_POOL_CLIENT":    "0",
 }
 
 
@@ -798,7 +802,7 @@ def run_wallet_main_thread():
 # ============================================================
 def _setup_pool_client_local(chain, pool, log, disabled: bool, is_origin: bool):
     if disabled:
-        log.info("PoolClient: desativado por --no-pool-client")
+        log.info("PoolClient: desativado (mineração sob demanda)")
         return None
     if PoolClient is None:
         log.info("PoolClient: miner_pool_client indisponível")
@@ -1055,7 +1059,6 @@ def main():
     trust_net = None
     if _HAS_TRUST:
         try:
-            # [SECURITY v13.7.6] Passa is_origin e a chave privada (node_sk)
             trust_net = TrustNetwork(
                 str(BASE_DIR / "trust_network.json"),
                 is_origin=is_origin,
@@ -1064,7 +1067,7 @@ def main():
             try:
                 chain.set_trust_net(trust_net)
             except AttributeError:
-                chain.trust_net = trust_net  # fallback: atributo direto
+                chain.trust_net = trust_net
             log.info("TrustNetwork: " + str(len(trust_net.nodes)) + " nós carregados")
         except Exception as e:
             log.warning("TrustNetwork desativada: " + str(e))
@@ -1269,10 +1272,17 @@ def main():
     else:
         log.info("Sem OfframpManager — rotas /api/l2/offramp/* indisponiveis")
 
-    # ---- PoolClient ----
-    disabled_pool_client = args.no_pool_client
-    if args.pool_client:
+    # ---- PoolClient (mineração sob demanda) ----
+    # [CHANGE v13.7.8] Por padrão, NÃO inicia o PoolClient.
+    # Só inicia se --pool-client for passado, OU se
+    # BRN_AUTO_POOL_CLIENT=1 estiver no .env.
+    # Isso permite abrir a carteira sem minerar automaticamente.
+    auto_pool = os.environ.get("BRN_AUTO_POOL_CLIENT", "0") == "1"
+    disabled_pool_client = True
+    if args.pool_client or auto_pool:
         disabled_pool_client = False
+    if args.no_pool_client:
+        disabled_pool_client = True
 
     pool_client = _setup_pool_client_local(
         chain, pool, log,
