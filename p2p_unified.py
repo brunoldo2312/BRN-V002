@@ -9,26 +9,18 @@ v6.7.6 (2026-11-01):
                 chicken-and-egg: peer precisa assinar mas exige
                 que o bloco já esteja assinado.
                 Resultado: peer retornava {"pubkey": "", ...} em
-                TODOS os sign_block. Origin via
-                "(0 assinatura(s) estrangeira(s) ignorada(s))".
+                TODOS os sign_block.
                 Fix: validators=[] → _validate_validators_sig()
                 retorna (True, "") imediatamente (skip) e
-                validate_block() ainda valida TODO o resto
-                (header hash, PoW, altura, prev_hash, txs,
-                coinbase, merkle, UTXOs, fee, assinaturas de tx).
-                O peer agora assina blocos legítimos, e o Origin
-                consegue o quórum 2/3 ou 3/4.
+                validate_block() ainda valida TODO o resto.
 v6.7.5 (2026-10-30):
   [SECURITY] _handle_sign_block valida o bloco COMPLETO antes de
-             assinar (5 validações: header hash, PoW, altura,
-             prev_hash, validate_block).
+             assinar (5 validações).
 v6.7.4 (2026-10-29):
   [SECURITY/UX] announce_validator NÃO registra no trust_network
                 automaticamente.
 v6.7.3 (2026-10-28):
   [FIX] Tratamento de erro se local_sk for inválido.
-  [KEEP] broadcast_validator_registration().
-  [KEEP] Multi-sig sign_block.
 ================================================================
 """
 from __future__ import annotations
@@ -479,18 +471,6 @@ class P2PServer(threading.Thread):
         """
         [v6.7.6] Valida o bloco antes de assinar, MAS pula a checagem
         de validators_sig (validators=[]) para evitar chicken-and-egg.
-
-        Validações aplicadas (em ordem, todas obrigatórias):
-          1. Header hash recomputado bate com block["hash"]
-          2. PoW suficiente (meets_difficulty)
-          3. Altura do bloco == tip local + 1
-          4. prev_hash bate com o tip local atual
-          5. validate_block() com validators=[] (txs, coinbase,
-             merkle, UTXOs, fee — mas NÃO validators_sig, que está
-             sendo gerada AGORA)
-
-        Se QUALQUER validação falhar, retorna pubkey vazia e NÃO
-        assina.
         """
         block = msg.get("block")
         if not block or not isinstance(block, dict):
