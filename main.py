@@ -132,6 +132,16 @@ def _verificar_integridade_codigo() -> None:
             sys.exit(1)
 
 
+# <<< NOVO port_guard (v1.0): aborta se portas do BRN já estão em uso
+try:
+    import port_guard
+    _HAS_PORT_GUARD = True
+except ImportError:
+    port_guard = None
+    _HAS_PORT_GUARD = False
+    print("[boot] aviso: port_guard.py ausente — não vou checar portas")
+
+
 from brn_config import Config
 from brn_logger import setup_logger, get_logger
 from version import VERSION, BUILD_DATE, GITHUB_USER, GITHUB_REPO
@@ -918,6 +928,12 @@ def _graceful_shutdown(log, trust_net=None) -> None:
 
 
 def main():
+    # <<< NOVO port_guard (v1.0): aborta se portas do BRN já estão em uso.
+    # Impede que o nó suba em modo degradado quando há um processo antigo
+    # (ex: v13.6.0) segurando 5000/6001. Ver MATAR_ANTIGO.py.
+    if _HAS_PORT_GUARD and port_guard is not None:
+        port_guard.check_brn_ports()
+
     _verificar_integridade_codigo()
 
     args = parse_args()
