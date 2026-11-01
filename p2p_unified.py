@@ -1,16 +1,32 @@
 """
-p2p_unified.py — BRN P2P Network v6.7.4
+p2p_unified.py — BRN P2P Network v6.7.6
 ================================================================
+v6.7.6 (2026-11-01):
+  [FIX CRÍTICO] _handle_sign_block chamava validate_block() com
+                validators=None, que internamente usava
+                get_active_validators() = 3 ou 4. Isso exigia que o
+                bloco JÁ TIVESSE 3 sigs antes do peer assinar —
+                chicken-and-egg: peer precisa assinar mas exige
+                que o bloco já esteja assinado.
+                Resultado: peer retornava {"pubkey": "", ...} em
+                TODOS os sign_block. Origin via
+                "(0 assinatura(s) estrangeira(s) ignorada(s))".
+                Fix: validators=[] → _validate_validators_sig()
+                retorna (True, "") imediatamente (skip) e
+                validate_block() ainda valida TODO o resto
+                (header hash, PoW, altura, prev_hash, txs,
+                coinbase, merkle, UTXOs, fee, assinaturas de tx).
+                O peer agora assina blocos legítimos, e o Origin
+                consegue o quórum 2/3 ou 3/4.
+v6.7.5 (2026-10-30):
+  [SECURITY] _handle_sign_block valida o bloco COMPLETO antes de
+             assinar (5 validações: header hash, PoW, altura,
+             prev_hash, validate_block).
 v6.7.4 (2026-10-29):
-  [SECURITY/UX] announce_validator NÃO registra mais o peer no
-                trust_network automaticamente. Apenas loga.
-                O registro só acontece quando o peer chama
-                /api/pool/register (ou seja, quando o usuário
-                pede para minerar via --pool-client ou GUI).
-                Isso evita que peers "fantasmas" entrem no
-                consenso sem autorização explícita.
+  [SECURITY/UX] announce_validator NÃO registra no trust_network
+                automaticamente.
 v6.7.3 (2026-10-28):
-  [FIX] Tratamento de erro se local_sk for inválido no _handle_sign_block.
+  [FIX] Tratamento de erro se local_sk for inválido.
   [KEEP] broadcast_validator_registration().
   [KEEP] Multi-sig sign_block.
 ================================================================
@@ -293,9 +309,6 @@ class Metrics:
             return d
 
 
-# ============================================================
-# SERVIDOR TCP
-# ============================================================
 class P2PServer(threading.Thread):
     def __init__(self, blockchain, port: int, metrics: Metrics,
                  on_new_block=None, on_new_tx=None, on_peer_bad=None,
@@ -463,6 +476,22 @@ class P2PServer(threading.Thread):
                 pass
 
     def _handle_sign_block(self, msg: dict, addr, peer_id) -> dict:
+        """
+        [v6.7.6] Valida o bloco antes de assinar, MAS pula a checagem
+        de validators_sig (validators=[]) para evitar chicken-and-egg.
+
+        Validações aplicadas (em ordem, todas obrigatórias):
+          1. Header hash recomputado bate com block["hash"]
+          2. PoW suficiente (meets_difficulty)
+          3. Altura do bloco == tip local + 1
+          4. prev_hash bate com o tip local atual
+          5. validate_block() com validators=[] (txs, coinbase,
+             merkle, UTXOs, fee — mas NÃO validators_sig, que está
+             sendo gerada AGORA)
+
+        Se QUALQUER validação falhar, retorna pubkey vazia e NÃO
+        assina.
+        """
         block = msg.get("block")
         if not block or not isinstance(block, dict):
             return {"type": "sign_block_response", "pubkey": "", "signature": ""}
@@ -483,27 +512,112 @@ class P2PServer(threading.Thread):
 
             validators = trust.get_top_validators(count=5)
             if my_pub not in validators:
+                log.info(
+                    "[SIG] peer %s: pubkey %s não está em get_top_validators() "
+                    "— não assina",
+                    addr[0], my_pub[:16],
+                )
                 return {"type": "sign_block_response", "pubkey": "", "signature": ""}
 
+            # ---- 1. Header hash recomputado ----
             try:
-                h_calc = _bh(block["prev_hash"], block["merkle"], block["timestamp"], block["nonce"], block["difficulty"])
+                h_calc = _bh(
+                    block["prev_hash"], block["merkle"], block["timestamp"],
+                    block["nonce"], block["difficulty"],
+                )
                 if h_calc != block["hash"]:
                     self.metrics.inc("block_sigs_invalid")
+                    log.warning(
+                        "[SIG] rejeitando assinatura de %s: header hash diverge",
+                        addr[0],
+                    )
                     return {"type": "sign_block_response", "pubkey": "", "signature": ""}
-            except KeyError:
+            except KeyError as e:
+                log.warning("[SIG] bloco malformado (campo ausente: %s)", e)
                 return {"type": "sign_block_response", "pubkey": "", "signature": ""}
 
+            # ---- 2. PoW suficiente ----
+            try:
+                if not meets_difficulty(block["hash"], int(block["difficulty"])):
+                    self.metrics.inc("block_sigs_invalid")
+                    log.warning(
+                        "[SIG] rejeitando assinatura de %s: PoW insuficiente",
+                        addr[0],
+                    )
+                    return {"type": "sign_block_response", "pubkey": "", "signature": ""}
+            except Exception as e:
+                log.warning("[SIG] falha checando PoW: %s", e)
+                return {"type": "sign_block_response", "pubkey": "", "signature": ""}
+
+            # ---- 3. Altura = local + 1 ----
+            try:
+                local_h = int(self.bc.db.height())
+                block_h = int(block.get("height", -1))
+                if block_h != local_h + 1:
+                    log.info(
+                        "[SIG] rejeitando assinatura de %s: altura %d != local+1 (%d) "
+                        "— aguardando sync",
+                        addr[0], block_h, local_h + 1,
+                    )
+                    return {"type": "sign_block_response", "pubkey": "", "signature": ""}
+            except Exception as e:
+                log.warning("[SIG] falha checando altura: %s", e)
+                return {"type": "sign_block_response", "pubkey": "", "signature": ""}
+
+            # ---- 4. prev_hash = tip local ----
+            try:
+                local_tip = self.bc.db.tip_hash()
+                if block.get("prev_hash") != local_tip:
+                    log.info(
+                        "[SIG] rejeitando assinatura de %s: prev_hash em fork "
+                        "(local_tip=%s... vs block=%s...)",
+                        addr[0],
+                        (local_tip or "")[:16],
+                        (block.get("prev_hash") or "")[:16],
+                    )
+                    return {"type": "sign_block_response", "pubkey": "", "signature": ""}
+            except Exception as e:
+                log.warning("[SIG] falha checando prev_hash: %s", e)
+                return {"type": "sign_block_response", "pubkey": "", "signature": ""}
+
+            # ---- 5. validate_block SEM checar validators_sig ----
+            # [FIX v6.7.6] validators=[] faz _validate_validators_sig
+            # retornar (True, "") imediatamente (skip). Todas as outras
+            # validações de validate_block continuam ativas.
+            try:
+                ok_val, msg_val = self.bc.validate_block(
+                    block, prev_block=None, validators=[],
+                )
+                if not ok_val:
+                    self.metrics.inc("block_sigs_invalid")
+                    log.warning(
+                        "[SIG] rejeitando assinatura de %s: validate_block: %s",
+                        addr[0], msg_val,
+                    )
+                    return {"type": "sign_block_response", "pubkey": "", "signature": ""}
+            except Exception as e:
+                log.warning("[SIG] validate_block exceção: %s", e)
+                return {"type": "sign_block_response", "pubkey": "", "signature": ""}
+
+            # ============================================================
+            # Todas as validações passaram — assina
+            # ============================================================
             entry = sign_block_as_validator(block, local_sk)
             if not entry:
                 return {"type": "sign_block_response", "pubkey": "", "signature": ""}
 
             self.metrics.inc("block_sigs_provided")
+            log.info(
+                "[SIG] assinando bloco #%d para %s (validação completa OK)",
+                int(block.get("height", -1)), addr[0],
+            )
             return {
                 "type": "sign_block_response",
                 "pubkey": entry["pubkey"],
                 "signature": entry["signature"],
             }
-        except Exception:
+        except Exception as e:
+            log.warning("[SIG] _handle_sign_block exceção: %s", e)
             return {"type": "sign_block_response", "pubkey": "", "signature": ""}
 
     def _process_message(self, msg: dict, addr, peer_id: Optional[str]) -> Optional[dict]:
@@ -568,9 +682,6 @@ class P2PServer(threading.Thread):
                 self.metrics.inc("block_sigs_requested")
                 return self._handle_sign_block(msg, addr, peer_id)
 
-            # [FIX v6.7.4] announce_validator NÃO registra mais no trust_network.
-            # Apenas loga. O registro só acontece via /api/pool/register
-            # quando o usuário pede explicitamente para minerar.
             if mtype == "announce_validator":
                 pub = (msg.get("pubkey") or "").strip()
                 addr_v = (msg.get("address") or "").strip()
@@ -617,9 +728,6 @@ class P2PServer(threading.Thread):
         return {"type": "error", "message": "Tipo desconhecido"}
 
 
-# ============================================================
-# CLIENTE TCP
-# ============================================================
 class P2PClient:
     @staticmethod
     def send_message(ip: str, port: int, message: dict, timeout: Optional[float] = None):
@@ -711,9 +819,6 @@ class P2PClient:
         return {"pubkey": pubkey, "signature": signature}
 
 
-# ============================================================
-# DESCOBERTA (UDP multicast)
-# ============================================================
 class PeerDiscovery:
     def __init__(self, tcp_port: int, node_uuid: str, on_peer_found=None, blockchain=None):
         self.tcp_port = tcp_port
@@ -968,9 +1073,6 @@ class PeerDiscovery:
             ]
 
 
-# ============================================================
-# MANAGER
-# ============================================================
 class P2PManager:
     def __init__(self, blockchain, node_id_priv=None, tcp_port: int = TCP_PORT_DEFAULT, enable_upnp: bool = True):
         self.bc = blockchain
@@ -1291,9 +1393,6 @@ class P2PManager:
         except Exception: pass
 
 
-# ============================================================
-# UPnP (cliente minimalista — usa a lib se disponível)
-# ============================================================
 try:
     from upnp_client import UPnPClient  # type: ignore
 except ImportError:
