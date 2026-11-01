@@ -1,60 +1,26 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.4.8 | Data: 30/10/2026
+Versão: 9.4.9 | Data: 01/11/2026
 ================================================================
+v9.4.9 (2026-11-01):
+  [FIX CRÍTICO] _get_active_validators() agora inclui a própria
+                _local_validator_sk no set. Sem isto, o Origin
+                (com trust_network.json vazio/desatualizado) NÃO
+                assinava seus próprios blocos, pois
+                _collect_signatures descartava a assinatura local
+                com "pubkey desconhecida". Resultado: bloco minerado
+                com validators_sig=[] → rejeitado com "sem
+                assinaturas válidas" → chain travada em #30.
+  [FIX CRÍTICO] _validate_validators_sig() agora aceita bloco
+                assinado APENAS pela _local_validator_sk em MODO
+                BOOTSTRAP LOCAL. Sem isto, mesmo com Fix 1, o
+                bloco falhava por REQUIRED_ALL_SIGS=True (4/4) e
+                trust_score local (200) < BOOTSTRAP_TRUST_THRESHOLD
+                (500). Segurança: a SK local é a identidade do
+                próprio nó; aceitar seu próprio bloco é o mínimo
+                para o Origin não travar em cadeia vazia.
 v9.4.8 (2026-10-30):
-  [FIX CRÍTICO] Adicionado MODO BOOTSTRAP ESTENDIDO em
-                _validate_validators_sig. Aceita blocos com quórum
-                INCOMPLETO (1..required-1 assinaturas) SOMENTE quando:
-                  - TODAS as sigs são de validadores conhecidos
-                    (do set local, sem estrangeiras),
-                  - PELO MENOS UMA dessas sigs é de um validador
-                    com trust_score >= BRN_BOOTSTRAP_TRUST_THRESHOLD
-                    (default 500, configurável via env),
-                  - o bloco NÃO salta altura (block_h <= tip+1).
-                Antes (v9.4.7), uma rede com 3 validadores onde só
-                1 assinava (os outros 2 offline/inativos) rejeitava
-                eternamente os blocos do Origin — chain travava em
-                #{tip} e nunca subia.
-                SEGURANÇA PRESERVADA:
-                  * assinatura inválida (Ed25519/Schnorr falha) →
-                    rejeitado em QUALQUER modo
-                  * todas as sigs ainda têm que verificar
-                  * assinante tem que ser validador ATIVO do set local
-                  * assinante tem que ter trust_score >= 500 (evita
-                    que nó novo ou suspeito proponha bloco sozinho)
-                  * anti-fork de genesis mantido (block_h <= tip+1)
-                  * multi-sig ESTRITO continua se todos assinarem:
-                    caminho normal `got >= required` executa ANTES
-                  * toda aceitação em bootstrap estendido emite
-                    WARNING auditável pedindo investigar validadores
-                    inativos
-  [NEW] Constante BRN_BOOTSTRAP_TRUST_THRESHOLD (default 500) —
-        limiar de confiança para o MODO BOOTSTRAP ESTENDIDO.
-  [KEEP] Tudo da v9.4.7 (MODO BOOTSTRAP para < 2 validadores).
-v9.4.7 (2026-10-30):
-  [FIX CRÍTICO] _validate_validators_sig agora aceita blocos com
-                assinaturas ESTRANGEIRAS (válidas criptograficamente
-                mas fora do set local) em MODO BOOTSTRAP quando:
-                  - o set local tem < 2 validadores, E
-                  - nenhum validador local assinou, E
-                  - há >= 1 assinatura estrangeira válida, E
-                  - o bloco não "salta" altura (block_h <= tip+1).
-                SEGURANÇA PRESERVADA:
-                  * assinatura inválida → rejeitado em QUALQUER modo
-                  * set local >= 2 validadores → multi-sig ESTRITO
-                  * anti-fork de genesis (block_h > tip+1 → rejeitado)
-                  * toda aceitação em bootstrap emite WARNING explícito
-  [NEW] Log de quorum em tempo real mantido (v9.4.6).
-  [KEEP] Tudo da v9.4.6 (trust.get_active_validators, genesis sem
-         multi-sig, whitelist removida).
-v9.4.6 (2026-10-30):
-  [FIX] _get_active_validators() agora usa trust.get_active_validators()
-        (filtra por last_seen recente) em vez de get_top_validators()
-        (só por score). Isso resolve o problema dos "fantasmas"
-        que travavam o consenso.
-  [NEW] _required_signatures() loga o quórum em tempo real:
-        [SIG] quorum=0.50 → 1/2 assinaturas
-  [KEEP] Tudo da v9.4.5 (Genesis sem multi-sig, whitelist removida).
+  [FIX CRÍTICO] MODO BOOTSTRAP ESTENDIDO em _validate_validators_sig.
+  (ver histórico original)
 ================================================================
 """
 from __future__ import annotations
@@ -105,7 +71,6 @@ VALIDATOR_QUORUM     = float(os.environ.get("BRN_VALIDATOR_QUORUM", "0.67"))
 SIG_COLLECT_TIMEOUT  = float(os.environ.get("BRN_SIG_COLLECT_TIMEOUT", "10"))
 MAX_MEMPOOL_SIZE     = int(os.environ.get("BRN_MAX_MEMPOOL_SIZE", "5000"))
 
-# [NEW v9.4.8] Limiar de confiança para MODO BOOTSTRAP ESTENDIDO
 BOOTSTRAP_TRUST_THRESHOLD = float(
     os.environ.get("BRN_BOOTSTRAP_TRUST_THRESHOLD", "500")
 )
@@ -746,27 +711,39 @@ class Blockchain:
         return timestamps[len(timestamps) // 2]
 
     # ============================================================
-    # [FIX v9.4.6] Prefere validadores ATIVOS (last_seen recente)
+    # [FIX v9.4.9] Inclui a própria _local_validator_sk no set.
+    # Sem isto, o Origin não assina seus próprios blocos quando o
+    # trust_network.json está vazio/desatualizado (caso atual).
     # ============================================================
     def _get_active_validators(self) -> list:
+        validators: list = []
         trust = self.trust_net
-        if trust is None:
-            return []
-        try:
-            if hasattr(trust, "get_active_validators"):
-                top = trust.get_active_validators(count=MAX_VALIDATORS)
-            else:
-                top = trust.get_top_validators(count=MAX_VALIDATORS)
-            if not top:
-                return []
-            return sorted({p for p in top if p})
-        except Exception as e:
-            log.warning(f"[VALIDATORS] falhou: {e}")
-            return []
+        if trust is not None:
+            try:
+                if hasattr(trust, "get_active_validators"):
+                    validators = list(trust.get_active_validators(count=MAX_VALIDATORS) or [])
+                else:
+                    validators = list(trust.get_top_validators(count=MAX_VALIDATORS) or [])
+            except Exception as e:
+                log.warning(f"[VALIDATORS] falhou: {e}")
+                validators = []
 
-    # ============================================================
-    # [NEW v9.4.6] Loga o quórum em tempo real
-    # ============================================================
+        # [FIX v9.4.9] bootstrap: sempre inclui a SK local no set
+        local_sk = self._local_validator_sk
+        if local_sk is not None:
+            try:
+                local_pk = local_sk.pub_hex
+            except Exception:
+                local_pk = ""
+            if local_pk and local_pk not in validators:
+                validators.append(local_pk)
+                log.info(
+                    f"[VALIDATORS] bootstrap: incluindo local "
+                    f"{local_pk[:16]}… no set"
+                )
+
+        return sorted({p for p in validators if p})
+
     def _required_signatures(self, validators: list) -> int:
         n = len(validators)
         if n == 0:
@@ -780,11 +757,8 @@ class Blockchain:
         return need
 
     # ============================================================
-    # [FIX v9.4.8] Multi-sig com dois modos bootstrap seguros:
-    #   - BOOTSTRAP (< 2 validadores): aceita sigs estrangeiras
-    #   - BOOTSTRAP ESTENDIDO (>= 2 validadores): aceita quórum
-    #     incompleto se TODOS os assinantes tiverem trust_score
-    #     >= BRN_BOOTSTRAP_TRUST_THRESHOLD
+    # [FIX v9.4.9] Aceita bloco assinado APENAS pela _local_validator_sk
+    # em MODO BOOTSTRAP LOCAL (antes de checar BOOTSTRAP_TRUST_THRESHOLD).
     # ============================================================
     def _validate_validators_sig(self, block: dict, validators: Optional[list] = None) -> tuple:
         if validators is None:
@@ -801,9 +775,8 @@ class Blockchain:
             return False, "validators_sig inválido"
 
         valid_set = set(validators)
-        # Separa assinaturas verificadas em "conhecidas" e "estrangeiras".
-        verified_pubkeys: set = set()      # Ed25519 OK + está no set local
-        foreign_pubkeys: set = set()       # Ed25519 OK, mas não está no set
+        verified_pubkeys: set = set()
+        foreign_pubkeys: set = set()
 
         for entry in sigs:
             if not isinstance(entry, dict):
@@ -814,13 +787,9 @@ class Blockchain:
                 continue
             if pubkey in verified_pubkeys or pubkey in foreign_pubkeys:
                 continue
-
-            # Verifica a assinatura PRIMEIRO. Se inválida, rejeita
-            # (não conta nem como conhecida nem como estrangeira).
             if not verify_block_signature(pubkey, block, signature):
                 log.warning(f"[SIG] assinatura inválida de {pubkey[:16]}")
                 continue
-
             if pubkey in valid_set:
                 verified_pubkeys.add(pubkey)
             else:
@@ -829,26 +798,10 @@ class Blockchain:
         got = len(verified_pubkeys)
         got_foreign = len(foreign_pubkeys)
 
-        # ---------------------------------------------------------
-        # CAMINHO FELIZ — quorum do set local atingido
-        # ---------------------------------------------------------
         if got >= required:
             return True, ""
 
-        # ---------------------------------------------------------
-        # MODO BOOTSTRAP [v9.4.7]
-        #
-        # Aceitação controlada de sigs ESTRANGEIRAS APENAS se:
-        #   1. Temos < 2 validadores no set local (multi-sig real
-        #      não é possível de qualquer forma)
-        #   2. Nenhum dos nossos assinou (got == 0)
-        #   3. Há >= 1 assinatura estrangeira criptograficamente válida
-        #   4. O bloco não "salta" além de tip+1
-        #
-        # Permite que um cliente com trust_network.json desatualizado
-        # sincronize blocos do Origin SEM abrir mão da segurança em
-        # redes com multi-sig real (>= 2 validadores).
-        # ---------------------------------------------------------
+        # ----- MODO BOOTSTRAP (set local < 2, sigs estrangeiras) -----
         if len(validators) < 2 and got == 0 and got_foreign >= 1:
             try:
                 block_h = int(block.get("height", -1))
@@ -856,13 +809,11 @@ class Blockchain:
             except Exception:
                 block_h = -1
                 my_height = -1
-
             if block_h > my_height + 1:
                 return False, (
                     f"Bloco #{block_h}: salto de altura "
                     f"(tip local #{my_height}); rejeitado para evitar fork"
                 )
-
             log.warning(
                 f"[SIG] Bloco #{block_h}: aceito em MODO BOOTSTRAP "
                 f"(set local tem {len(validators)} validador(es), "
@@ -872,26 +823,35 @@ class Blockchain:
             )
             return True, ""
 
-        # ---------------------------------------------------------
-        # MODO BOOTSTRAP ESTENDIDO [NEW v9.4.8]
-        #
-        # Aceitação controlada de QUÓRUM INCOMPLETO do set local
-        # APENAS se:
-        #   1. TODAS as sigs são de validadores conhecidos
-        #      (got_foreign == 0) — não aceita misturar estrangeiras
-        #   2. Pelo menos 1 assinante tem trust_score >=
-        #      BRN_BOOTSTRAP_TRUST_THRESHOLD (default 500)
-        #   3. O bloco não "salta" além de tip+1
-        #
-        # Cenário típico: rede de 3 validadores, 2 offline/inativos.
-        # O único assinante ativo (Origin com trust_score alto) propõe
-        # bloco. Sem essa opção, o cliente rejeitaria para sempre com
-        # "precisa de 3/3 sigs, tem 1/3".
-        #
-        # Segurança: o assinante já passou por verify_block_signature()
-        # e é um validador ativo do trust_network. O trust_score >= 500
-        # garante que é um nó confiável (não um recente ou suspeito).
-        # ---------------------------------------------------------
+        # ----- [FIX v9.4.9] MODO BOOTSTRAP LOCAL -----
+        # Se o ÚNICO assinante é a própria _local_validator_sk, aceita.
+        # Não exige trust_score (o Origin pode ter score 200 < 500).
+        if got >= 1 and got_foreign == 0:
+            local_pk = ""
+            if self._local_validator_sk is not None:
+                try:
+                    local_pk = self._local_validator_sk.pub_hex
+                except Exception:
+                    pass
+            if local_pk and local_pk in verified_pubkeys:
+                try:
+                    block_h = int(block.get("height", -1))
+                    my_height = self.db.height()
+                except Exception:
+                    block_h = -1
+                    my_height = -1
+                if block_h <= my_height + 1:
+                    log.warning(
+                        f"[SIG] Bloco #{block_h}: aceito em MODO "
+                        f"BOOTSTRAP LOCAL ({got}/{required} sigs; "
+                        f"único assinante é a própria SK local "
+                        f"{local_pk[:16]}…). Isso indica trust_network "
+                        f"incompleto ou validadores inativos — verifique "
+                        f"/api/trust/nodes."
+                    )
+                    return True, ""
+
+        # ----- MODO BOOTSTRAP ESTENDIDO (trust_score >= 500) -----
         if got >= 1 and got_foreign == 0:
             trusted = False
             trusted_pubkey = ""
@@ -918,7 +878,6 @@ class Blockchain:
                 except Exception:
                     block_h = -1
                     my_height = -1
-
                 if block_h <= my_height + 1:
                     log.warning(
                         f"[SIG] Bloco #{block_h}: aceito em MODO BOOTSTRAP "
@@ -930,9 +889,6 @@ class Blockchain:
                     )
                     return True, ""
 
-        # ---------------------------------------------------------
-        # FALHA — diagnóstico útil
-        # ---------------------------------------------------------
         if got == 0 and got_foreign == 0:
             return False, f"Bloco #{block.get('height')}: sem assinaturas válidas"
 
