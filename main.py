@@ -1,22 +1,18 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.7.11)
+"""main.py — Entrypoint unificado do nó BRN (v13.7.12)
 ================================================================
+v13.7.12 (2026-11-01):
+  [FIX CRÍTICO] run_status_loop agora chama trust_net.heartbeat()
+                a cada 30s. Sem isso, o Origin (e clientes sem
+                PoolClient ativo) tinha last_seen expirado após 5min
+                e sua própria assinatura era DESCARTADA em
+                _collect_signatures (porque a pubkey local não
+                estava em get_active_validators()). Resultado:
+                required=2, got=1, chain travada.
 v13.7.11 (2026-11-01):
-  [FIX CRÍTICO] Self-registration na TrustNetwork agora é aplicado a
-                TODOS os nós (Origin E clientes). Antes, apenas o
-                Origin se registrava. Peers que rodam com
-                BRN_IS_ORIGIN=0 nunca apareciam no próprio
-                trust_network.json, fazendo get_top_validators()
-                retornar lista SEM o próprio peer. Resultado:
-                _handle_sign_block rejeitava silenciosamente
-                (retornava pubkey=""), e o Origin via
-                "(0 assinatura(s) estrangeira(s) ignorada(s))" —
-                quórum nunca atingido em 2/3, chain travada.
-  [FIX] register_node agora passa peer_addr=<WEB_HOST>:<p2p_port>
-        para diagnóstico. Antes ficava vazio "(sem addr)".
-  [KEEP] v13.7.10: Origin registration + set_checkpoint_priv +
-         PoolClient sempre injetado + log duplicado consolidado.
+  [FIX] Self-registration na TrustNetwork para TODOS os nós.
+  [FIX] register_node passa peer_addr.
 v13.7.10 (2026-10-30):
-  [FIX] Origin registrado na TrustNetwork (só Origin).
+  [FIX] Origin registrado na TrustNetwork.
   [NEW] set_checkpoint_priv() chamado com Validator SK.
   [FIX] PoolClient sempre injetado em server.py.
   [FIX] Log duplicado "PoolClient preparado" consolidado.
@@ -61,9 +57,6 @@ def _bootstrap_env() -> None:
         print("[boot] aviso: falha lendo " + str(env_file) + ": " + str(e))
 
 
-# ============================================================
-# [SECURITY] APENAS defaults NÃO-SENSÍVEIS
-# ============================================================
 _HARDCODED_DEFAULTS = {
     "BRN_BOOTSTRAP_PEERS":     "",
     "BRN_IS_ORIGIN":           "0",
@@ -111,33 +104,21 @@ if _applied:
     print(f"[boot] defaults não-sensíveis aplicados: {_applied} variáveis")
 
 
-# ============================================================
-# [SECURITY v13.7.7] VERIFICAÇÃO DE INTEGRIDADE DO CÓDIGO
-# ============================================================
 def _verificar_integridade_codigo() -> None:
-    """
-    Verifica se o blockchain.py e trust_network.py foram alterados.
-    Gere os hashes usando:
-    python -c "import hashlib; print(hashlib.sha256(open('blockchain.py','rb').read()).hexdigest())"
-    """
     HASHES_OFICIAIS = {
         "blockchain.py":    "COLE_O_HASH_SHA256_AQUI",
         "trust_network.py": "COLE_O_HASH_SHA256_AQUI",
     }
-
     for arquivo, hash_esperado in HASHES_OFICIAIS.items():
         if hash_esperado == "COLE_O_HASH_SHA256_AQUI":
             continue
-
         caminho = BASE_DIR / arquivo
         if not caminho.exists():
             print(f"[ALERTA CRÍTICO] Arquivo crítico {arquivo} não encontrado! Abortando.")
             sys.exit(1)
-
         try:
             with open(caminho, "rb") as f:
                 hash_real = hashlib.sha256(f.read()).hexdigest()
-
             if hash_real != hash_esperado:
                 print("=" * 64)
                 print(f"[ALERTA CRÍTICO] O arquivo {arquivo} foi MODIFICADO!")
@@ -224,9 +205,6 @@ def _check_required_modules() -> list:
     return missing
 
 
-# ============================================================
-# L2 (ONRAMP + OFFRAMP)
-# ============================================================
 L2_ENABLED = False
 btc_config = None
 BTCWatcher = None
@@ -257,9 +235,6 @@ def _l2_disponivel() -> bool:
     )
 
 
-# ============================================================
-# POOL
-# ============================================================
 POOL_ENABLED = os.environ.get("BRN_POOL_ENABLED", "1") == "1"
 PoolManager = None
 PoolClient = None
@@ -283,9 +258,6 @@ def _pool_disponivel() -> bool:
     return bool(POOL_ENABLED and PoolManager is not None)
 
 
-# ============================================================
-# AUDIT
-# ============================================================
 def _audit(event: str, data: dict = None) -> None:
     try:
         from security import audit_log
@@ -302,9 +274,6 @@ def _close_audit() -> None:
         pass
 
 
-# ============================================================
-# TAILSCALE
-# ============================================================
 def _setup_tailscale_auto(log) -> bool:
     auth_key = os.environ.get("TS_AUTH_KEY", "").strip()
     if not auth_key:
@@ -324,9 +293,6 @@ def _setup_tailscale_auto(log) -> bool:
         return False
 
 
-# ============================================================
-# ARGS
-# ============================================================
 def parse_args():
     p = argparse.ArgumentParser(prog="main.py", description="BRN Node v13")
     p.add_argument("--status", action="store_true")
@@ -352,20 +318,14 @@ def parse_args():
     p.add_argument("--no-tailscale", action="store_true")
     p.add_argument("--no-sync", action="store_true")
     p.add_argument("--no-pool", action="store_true")
-    p.add_argument("--pool-client", action="store_true",
-                   help="Inicia o PoolClient automaticamente (registra na fila e minera). "
-                        "SEM esta flag, o nó NÃO minera por padrão.")
-    p.add_argument("--no-pool-client", action="store_true",
-                   help="Força não iniciar o PoolClient (mesmo se BRN_POOL_CLIENT=1).")
+    p.add_argument("--pool-client", action="store_true")
+    p.add_argument("--no-pool-client", action="store_true")
     p.add_argument("--pool-stats", action="store_true")
     p.add_argument("--gui", action="store_true")
     p.add_argument("--no-gui", action="store_true")
     return p.parse_args()
 
 
-# ============================================================
-# [SECURITY] Validação de segredos — FALHA FECHADO
-# ============================================================
 def _validate_required_secrets(log, is_origin: bool, wants_mining: bool) -> bool:
     critical = {
         "BRN_NODE_PASSWORD": "senha da identidade Ed25519 do no",
@@ -429,9 +389,6 @@ def _resolve_wallet_password() -> str:
     )
 
 
-# ============================================================
-# SK DO VALIDADOR LOCAL
-# ============================================================
 def _load_validator_sk():
     try:
         from secure_store import load_current_wallet
@@ -450,30 +407,23 @@ def _load_validator_sk():
         return None
 
 
-# ============================================================
-# COLETOR DE ASSINATURAS VIA P2P
-# ============================================================
 def _make_sign_collector(p2p, trust_net):
     def _collect(block: dict) -> list:
         if p2p is None or trust_net is None:
             return []
-
         try:
             validators = trust_net.get_top_validators(count=5)
         except Exception:
             return []
         if len(validators) <= 1:
             return []
-
         if not hasattr(p2p, "request_block_signature"):
             return []
-
         sigs = []
         try:
             peers = p2p.discovery.listar_peers()
         except Exception:
             return sigs
-
         for peer in peers:
             if ":" not in peer:
                 continue
@@ -492,13 +442,9 @@ def _make_sign_collector(p2p, trust_net):
             except Exception:
                 continue
         return sigs
-
     return _collect
 
 
-# ============================================================
-# IDENTIDADE + A/B TEST
-# ============================================================
 def load_or_create_node_identity(password: str, rotate: bool = False):
     from crypto import Ed25519PrivateKey
     from secure_store import save_wallet, load_wallet
@@ -538,9 +484,6 @@ def load_or_create_node_identity(password: str, rotate: bool = False):
     return sk, pub_hex
 
 
-# ============================================================
-# PAPEL
-# ============================================================
 def _read_role() -> str:
     try:
         p = BASE_DIR / "brn_role.txt"
@@ -559,9 +502,6 @@ def _is_origin(client_mode: bool) -> bool:
     return _read_role() in ("origin", "hub", "servidor")
 
 
-# ============================================================
-# VERIFY
-# ============================================================
 VERIFY_OK      = "ok"
 VERIFY_INVALID = "invalid"
 VERIFY_ERROR   = "error"
@@ -607,9 +547,6 @@ def _verify_chain(chain) -> str:
     return VERIFY_INVALID
 
 
-# ============================================================
-# INJEÇÃO NO SERVER.PY
-# ============================================================
 def _inject_into_server(what: str, obj, log) -> bool:
     setter_name = {
         "p2p":         "set_p2p_manager",
@@ -639,9 +576,6 @@ def _inject_into_server(what: str, obj, log) -> bool:
         return False
 
 
-# ============================================================
-# HTTP / EXPLORER
-# ============================================================
 def _init_http_server(chain, log):
     try:
         from server import set_chain, auto_registrar_carteira_atual
@@ -667,25 +601,14 @@ def _init_http_server(chain, log):
 
 
 def run_http(app_instance):
-    """
-    [v13.7.9] Servidor HTTP otimizado para aceitar mais mineradores.
-
-    IMPORTANTE: workers NUNCA > 1.
-    O PoolManager, ChainDB, TrustNetwork e P2PManager são singletons
-    em memória. Com workers > 1, cada processo teria seu próprio estado
-    e os mineradores não se veriam entre si.
-    """
     log = get_logger("http")
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-
-    # --- Limite de threads AnyIO (usado pelo WSGI do FastAPI) ---
     try:
         thread_limit = max(20, int(os.environ.get("ANYIO_THREAD_LIMIT", "100")))
     except (TypeError, ValueError):
         thread_limit = 100
     os.environ["ANYIO_THREAD_LIMIT"] = str(thread_limit)
 
-    # --- Workers Uvicorn: NUNCA > 1 ---
     try:
         workers_env = max(1, int(os.environ.get("BRN_UVICORN_WORKERS", "1")))
     except (TypeError, ValueError):
@@ -700,7 +623,6 @@ def run_http(app_instance):
 
     try:
         import uvicorn
-
         log.info(
             f"HTTP Uvicorn (FastAPI) - http://{WEB_HOST}:{port} "
             f"(threads={thread_limit}, workers=1, "
@@ -749,10 +671,10 @@ def run_explorer():
 
 
 # ============================================================
-# STATUS LOOP (com heartbeat peers.json)
+# STATUS LOOP — [FIX v13.7.12] heartbeat do próprio validador
 # ============================================================
 def run_status_loop(chain, p2p, sync=None, pool=None, pool_client=None,
-                    trust_net=None, node_id_short=""):
+                    trust_net=None, node_id_short="", own_pubkey=""):
     log = get_logger("status")
     last_peers_hb = 0.0
     PEERS_HB_INTERVAL = 60.0
@@ -761,6 +683,16 @@ def run_status_loop(chain, p2p, sync=None, pool=None, pool_client=None,
     while not _shutdown.is_set():
         time.sleep(30)
         try:
+            # [FIX v13.7.12] Renova last_seen do PRÓPRIO nó na TrustNetwork
+            # a cada 30s. Sem isto, o Origin (e clientes sem PoolClient
+            # ativo) expiravam após 5min (ACTIVE_TTL_SECONDS=300) e sua
+            # assinatura era descartada em _collect_signatures.
+            if trust_net is not None and own_pubkey:
+                try:
+                    trust_net.heartbeat(own_pubkey)
+                except Exception as _hb_err:
+                    log.debug("trust_net.heartbeat falhou: " + str(_hb_err))
+
             peer_count = 0
             if p2p:
                 try:
@@ -858,15 +790,7 @@ def run_wallet_main_thread():
         return False
 
 
-# ============================================================
-# POOL CLIENT LOCAL — NÃO INICIA AUTOMATICAMENTE
-# ============================================================
 def _setup_pool_client_local(chain, pool, log, is_origin: bool):
-    """
-    [FIX v13.7.8] Cria o PoolClient mas NÃO chama start_mining().
-    O start só acontece se o usuário pedir explicitamente (via GUI
-    ou chamando /api/pool/start_local no server.py).
-    """
     if PoolClient is None:
         log.info("PoolClient: miner_pool_client indisponível")
         return None
@@ -909,9 +833,6 @@ def _setup_pool_client_local(chain, pool, log, is_origin: bool):
         return None
 
 
-# ============================================================
-# BROADCAST + FORKGUARD ENCADEADOS
-# ============================================================
 def _setup_local_miner_broadcast(chain, p2p, log):
     prev_cb = getattr(chain, "on_block_mined", None)
 
@@ -944,9 +865,6 @@ def _setup_local_miner_broadcast(chain, p2p, log):
     return True
 
 
-# ============================================================
-# SHUTDOWN
-# ============================================================
 def _stop_with_timeout(name: str, svc, timeout: float = 5.0, log=None) -> None:
     try:
         if hasattr(svc, "stop"):
@@ -999,9 +917,6 @@ def _graceful_shutdown(log, trust_net=None) -> None:
     _close_audit()
 
 
-# ============================================================
-# MAIN
-# ============================================================
 def main():
     _verificar_integridade_codigo()
 
@@ -1109,7 +1024,6 @@ def main():
 
     log.info("Nó ID: " + node_pub[:16] + "...")
 
-    # ---- blockchain ----
     from blockchain import Blockchain
     chain = Blockchain(
         cfg["db_path"],
@@ -1120,7 +1034,6 @@ def main():
     chain.is_origin = is_origin
     log.info("Blockchain pronta (altura=" + str(chain.db.height()) + ")")
 
-    # ---- Trust Network ----
     trust_net = None
     if _HAS_TRUST:
         try:
@@ -1138,7 +1051,6 @@ def main():
             log.warning("TrustNetwork desativada: " + str(e))
             trust_net = None
 
-    # ---- verify ----
     if args.verify_only:
         st = _verify_chain(chain)
         try:
@@ -1160,7 +1072,6 @@ def main():
         if st == VERIFY_ERROR:
             log.warning("Verificação não conclusiva — seguindo com cautela")
 
-    # ---- P2P ----
     p2p = None
     if not args.no_p2p:
         try:
@@ -1179,27 +1090,17 @@ def main():
             log.error("Falha ao iniciar P2P: " + str(e))
             p2p = None
 
-    # ---- SK do validador local + coletor de assinaturas ----
     validator_sk = _load_validator_sk()
     if validator_sk is not None:
         try:
             chain.set_local_validator_sk(validator_sk)
             log.info(f"Validator SK carregada: {validator_sk.pub_hex[:16]}...")
 
-            # ============================================================
-            # [FIX v13.7.11] Self-register para TODOS os nós, não só Origin.
-            # Clientes precisam do PRÓPRIO pubkey no próprio
-            # trust_network.json para passar em `if my_pub not in validators`
-            # no _handle_sign_block. Sem isto, peers respondem sign_block
-            # com pubkey vazia (silencioso) e o Origin vê
-            # "(0 assinatura(s) estrangeira(s) ignorada(s))".
-            # ============================================================
             if trust_net is not None:
                 try:
                     if is_origin:
                         trust_net.set_origin_pubkey(validator_sk.pub_hex)
 
-                    # peer_addr para diagnóstico (evita "(sem addr)" no /api/trust/nodes)
                     try:
                         p2p_port_self = int(os.environ.get("BRN_P2P_PORT", "6001"))
                     except (TypeError, ValueError):
@@ -1215,7 +1116,6 @@ def main():
                     if hasattr(trust_net, "mark_connected"):
                         trust_net.mark_connected(validator_sk.pub_hex)
 
-                    # Garante score mínimo de validador (threshold=150)
                     try:
                         with trust_net._lock:
                             n = trust_net.nodes.get(validator_sk.pub_hex)
@@ -1235,7 +1135,6 @@ def main():
                         "Falha registrando self na TrustNetwork: " + str(e)
                     )
 
-            # [NEW v13.7.10] Habilita assinatura de checkpoints.
             try:
                 from blockchain import set_checkpoint_priv
                 set_checkpoint_priv(validator_sk)
@@ -1251,11 +1150,6 @@ def main():
                             address=validator_sk.address,
                         )
                         log.info("Auto-registro P2P: announce_validator enviado")
-                    else:
-                        log.info(
-                            "Auto-registro P2P: broadcast_validator_registration "
-                            "não implementado em P2PManager (opcional)"
-                        )
                 except Exception as e:
                     log.warning(
                         "Auto-registro P2P falhou (não é fatal): " + str(e)
@@ -1278,7 +1172,6 @@ def main():
         except Exception as e:
             log.warning(f"Falha configurando coletor: {e}")
 
-    # ---- Sync ----
     sync = None
     if not args.no_sync and p2p is not None:
         try:
@@ -1300,7 +1193,6 @@ def main():
     elif args.no_sync:
         log.info("Sync: pulado por --no-sync")
 
-    # ---- ForkGuard ----
     fork_guard_started = False
     if sync is not None or p2p is not None:
         try:
@@ -1318,7 +1210,6 @@ def main():
     else:
         log.info("ForkGuard: pulado (sem sync nem p2p)")
 
-    # ---- Pool server ----
     pool = None
     if not args.no_pool and _pool_disponivel():
         try:
@@ -1331,7 +1222,6 @@ def main():
     elif args.no_pool:
         log.info("Pool: desativado por --no-pool")
 
-    # ---- Offramp (BRN -> BTC) ----
     offramp = None
     if L2_ENABLED and btc_config is not None and getattr(btc_config, "BTC_WIF", "").strip():
         try:
@@ -1358,7 +1248,6 @@ def main():
     else:
         log.info("OfframpManager: desativado (BRN_BTC_WIF ausente ou L2 indisponível).")
 
-    # ---- HTTP ----
     http_app = _init_http_server(chain, log)
     if http_app is not None:
         threading.Thread(
@@ -1368,7 +1257,6 @@ def main():
     else:
         log.error("HTTP não pôde ser inicializado — seguindo sem API")
 
-    # ---- Injeções no server.py ----
     if p2p is not None:
         _inject_into_server("p2p", p2p, log)
     else:
@@ -1394,9 +1282,6 @@ def main():
     else:
         log.info("Sem OfframpManager — rotas /api/l2/offramp/* indisponiveis")
 
-    # ---- PoolClient (OPT-IN) ----
-    # [FIX v13.7.10] SEMPRE injeta em server.py, independente de
-    # ter sido iniciado via --pool-client ou apenas preparado.
     pool_client = _setup_pool_client_local(
         chain, pool, log,
         is_origin=is_origin,
@@ -1433,10 +1318,8 @@ def main():
     else:
         log.info("PoolClient: não preparado (carteira ausente?)")
 
-    # ---- Broadcast local → P2P + ForkGuard ----
     _setup_local_miner_broadcast(chain, p2p, log)
 
-    # ---- Miner local ----
     quer_miner_local = bool(args.mine or AUTO_MINE)
     if quer_miner_local and (pool is not None or pool_client is not None):
         log.warning("Miner local IGNORADO: pool/pool_client está ativo (evita forks).")
@@ -1473,20 +1356,22 @@ def main():
         except Exception as e:
             log.warning("Miner local falhou: " + str(e))
 
-    # ---- Status loop ----
     node_id_short = node_pub[:16]
+    own_pubkey_for_hb = validator_sk.pub_hex if validator_sk is not None else ""
+
+    # [FIX v13.7.12] Passa own_pubkey_for_hb para o status loop
     threading.Thread(
         target=_thread_wrap(
             "StatusLoop",
             lambda: run_status_loop(
                 chain, p2p, sync, pool, pool_client, trust_net,
                 node_id_short=node_id_short,
+                own_pubkey=own_pubkey_for_hb,
             ),
         ),
         daemon=True, name="StatusLoop",
     ).start()
 
-    # ---- Cliente aguarda genesis ----
     if not is_origin and chain.db.height() < 0:
         log.info("Aguardando genesis (timeout "
                  + str(CLIENT_BOOT_TIMEOUT) + "s)...")
@@ -1496,7 +1381,6 @@ def main():
                and not _shutdown.is_set()):
             time.sleep(1)
 
-    # ---- AUDIT ----
     _audit("node_start", {
         "mode":        "origin" if is_origin else "client",
         "l2":          bool(args.l2 and _l2_disponivel()),
@@ -1517,7 +1401,6 @@ def main():
 
     log.info("Nó pronto. Ctrl+C para encerrar.")
 
-    # ---- GUI ou headless ----
     try:
         if not cfg["headless"]:
             log.info("Abrindo carteira desktop (pywebview)...")
@@ -1533,7 +1416,6 @@ def main():
     except KeyboardInterrupt:
         log.info("Encerrando por Ctrl+C...")
 
-    # ---- shutdown ----
     log.info("Encerrando...")
     _shutdown.set()
     _graceful_shutdown(log, trust_net)
@@ -1548,9 +1430,6 @@ def main():
     return 0
 
 
-# ============================================================
-# SIGNAL HANDLERS
-# ============================================================
 _signal_count = 0
 
 
