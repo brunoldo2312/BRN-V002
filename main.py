@@ -1,33 +1,28 @@
 """main.py — Entrypoint unificado do nó BRN (v13.7.11)
 ================================================================
-v13.7.11 (2026-10-30):
-  [FIX] --verify-only agora registra o Origin na TrustNetwork
-        ANTES de chamar _verify_chain(). Sem isto, o verify
-        lia o trust_network.json "frio", achava o Origin
-        inativo (last_seen > 5min) e skipava TODAS as assinaturas
-        — resultando em "OK cadeia" sem validar nenhuma sig
-        (falso positivo).
-  [DOC] A altura de ativação do multi-sig agora é controlada
-        EXCLUSIVAMENTE por BRN_MULTISIG_START_HEIGHT no env.
-        Setar =40 no brn_network.env ignora o valor persistido
-        em DB (multisig_active_from=30 da chain antiga) e faz
-        os blocos 0-39 serem "legacy" (sem sig). Blocos 40+
-        exigem assinatura.
+v13.7.11 (2026-11-01):
+  [FIX CRÍTICO] Self-registration na TrustNetwork agora é aplicado a
+                TODOS os nós (Origin E clientes). Antes, apenas o
+                Origin se registrava. Peers que rodam com
+                BRN_IS_ORIGIN=0 nunca apareciam no próprio
+                trust_network.json, fazendo get_top_validators()
+                retornar lista SEM o próprio peer. Resultado:
+                _handle_sign_block rejeitava silenciosamente
+                (retornava pubkey=""), e o Origin via
+                "(0 assinatura(s) estrangeira(s) ignorada(s))" —
+                quórum nunca atingido em 2/3, chain travada.
+  [FIX] register_node agora passa peer_addr=<WEB_HOST>:<p2p_port>
+        para diagnóstico. Antes ficava vazio "(sem addr)".
+  [KEEP] v13.7.10: Origin registration + set_checkpoint_priv +
+         PoolClient sempre injetado + log duplicado consolidado.
 v13.7.10 (2026-10-30):
-  [FIX CRÍTICO] Origin não era registrado na TrustNetwork,
-                forçando o consenso multi-sig em bootstrap eterno.
-  [NEW] set_checkpoint_priv() chamado com a Validator SK,
-        permitindo checkpoints em BRN_CHECKPOINT_HEIGHTS.
+  [FIX] Origin registrado na TrustNetwork (só Origin).
+  [NEW] set_checkpoint_priv() chamado com Validator SK.
   [FIX] PoolClient sempre injetado em server.py.
   [FIX] Log duplicado "PoolClient preparado" consolidado.
 v13.7.9 (2026-10-30):
-  [PERF] run_http() otimizado: threads=100, workers=1,
-         limit_concurrency=200, keep_alive=30s.
-v13.7.8 (2026-10-29):
-  [SECURITY/UX] PoolClient NÃO inicia automaticamente.
-  [KEEP] Verificação de integridade do código (v13.7.7).
-  [KEEP] Assinatura digital do trust_network.json (v13.7.6).
-  [KEEP] OfframpManager e BTCSender (v13.7.5).
+  [PERF] run_http() otimizado: threads=100, keepalive=30s,
+         limit_concurrency=200, workers=1 FORÇADO.
 ================================================================
 """
 from __future__ import annotations
@@ -613,55 +608,6 @@ def _verify_chain(chain) -> str:
 
 
 # ============================================================
-# REGISTRO DO ORIGIN NA TRUSTNETWORK (helper reutilizável)
-# ============================================================
-def _register_origin_in_trust(trust_net, validator_sk, log,
-                               context: str = "") -> bool:
-    """
-    Registra a pubkey do validador local como Origin na TrustNetwork
-    e força score mínimo de validador (>=200). Usado tanto no boot
-    normal quanto no --verify-only (v13.7.11).
-
-    Retorna True se conseguiu registrar, False se nada foi feito.
-    """
-    if trust_net is None or validator_sk is None:
-        return False
-    try:
-        if hasattr(trust_net, "set_origin_pubkey"):
-            trust_net.set_origin_pubkey(validator_sk.pub_hex)
-
-        trust_net.register_node(
-            node_id=validator_sk.pub_hex,
-            address=validator_sk.address,
-            public_key=validator_sk.pub_hex,
-        )
-
-        if hasattr(trust_net, "mark_connected"):
-            trust_net.mark_connected(validator_sk.pub_hex)
-
-        # Garante score mínimo de validador (TRUST_THRESHOLD_VALIDATOR = 150)
-        try:
-            with trust_net._lock:
-                n = trust_net.nodes.get(validator_sk.pub_hex)
-                if n is not None and n.trust_score < 200.0:
-                    n.trust_score = 200.0
-                    n.update_trust_level()
-        except Exception as _e:
-            log.debug(f"Ajuste de score do Origin falhou: {_e}")
-
-        prefix = f"[{context}] " if context else ""
-        log.info(
-            "%sOrigin registrado na TrustNetwork: %s... (score>=200)",
-            prefix, validator_sk.pub_hex[:16],
-        )
-        return True
-    except Exception as e:
-        prefix = f"[{context}] " if context else ""
-        log.warning("%sFalha registrando Origin na TrustNetwork: %s", prefix, e)
-        return False
-
-
-# ============================================================
 # INJEÇÃO NO SERVER.PY
 # ============================================================
 def _inject_into_server(what: str, obj, log) -> bool:
@@ -1192,18 +1138,8 @@ def main():
             log.warning("TrustNetwork desativada: " + str(e))
             trust_net = None
 
-    # ============================================================
-    # [FIX v13.7.11] Registra Origin ANTES do verify.
-    # Sem isto, _verify_chain roda com get_active_validators()==[]
-    # (Origin inativo no snapshot do JSON), skipa TODAS as sigs
-    # e retorna "OK cadeia" sem validar nada.
-    # ============================================================
+    # ---- verify ----
     if args.verify_only:
-        if is_origin and trust_net is not None:
-            _sk_verify = _load_validator_sk()
-            if _sk_verify is not None:
-                _register_origin_in_trust(trust_net, _sk_verify, log, context="verify")
-
         st = _verify_chain(chain)
         try:
             chain.db.close()
@@ -1250,9 +1186,54 @@ def main():
             chain.set_local_validator_sk(validator_sk)
             log.info(f"Validator SK carregada: {validator_sk.pub_hex[:16]}...")
 
-            # [FIX v13.7.10] Registra o Origin na TrustNetwork.
-            if trust_net is not None and is_origin:
-                _register_origin_in_trust(trust_net, validator_sk, log, context="boot")
+            # ============================================================
+            # [FIX v13.7.11] Self-register para TODOS os nós, não só Origin.
+            # Clientes precisam do PRÓPRIO pubkey no próprio
+            # trust_network.json para passar em `if my_pub not in validators`
+            # no _handle_sign_block. Sem isto, peers respondem sign_block
+            # com pubkey vazia (silencioso) e o Origin vê
+            # "(0 assinatura(s) estrangeira(s) ignorada(s))".
+            # ============================================================
+            if trust_net is not None:
+                try:
+                    if is_origin:
+                        trust_net.set_origin_pubkey(validator_sk.pub_hex)
+
+                    # peer_addr para diagnóstico (evita "(sem addr)" no /api/trust/nodes)
+                    try:
+                        p2p_port_self = int(os.environ.get("BRN_P2P_PORT", "6001"))
+                    except (TypeError, ValueError):
+                        p2p_port_self = 6001
+                    self_addr = f"{WEB_HOST}:{p2p_port_self}"
+
+                    trust_net.register_node(
+                        node_id=validator_sk.pub_hex,
+                        address=validator_sk.address,
+                        public_key=validator_sk.pub_hex,
+                        peer_addr=self_addr,
+                    )
+                    if hasattr(trust_net, "mark_connected"):
+                        trust_net.mark_connected(validator_sk.pub_hex)
+
+                    # Garante score mínimo de validador (threshold=150)
+                    try:
+                        with trust_net._lock:
+                            n = trust_net.nodes.get(validator_sk.pub_hex)
+                            if n is not None and n.trust_score < 200.0:
+                                n.trust_score = 200.0
+                                n.update_trust_level()
+                    except Exception as _e:
+                        log.debug(f"Ajuste de score falhou: {_e}")
+
+                    role_label = "Origin" if is_origin else "Client"
+                    log.info(
+                        "%s registrado na TrustNetwork: %s... (peer_addr=%s)",
+                        role_label, validator_sk.pub_hex[:16], self_addr,
+                    )
+                except Exception as e:
+                    log.warning(
+                        "Falha registrando self na TrustNetwork: " + str(e)
+                    )
 
             # [NEW v13.7.10] Habilita assinatura de checkpoints.
             try:
@@ -1414,6 +1395,8 @@ def main():
         log.info("Sem OfframpManager — rotas /api/l2/offramp/* indisponiveis")
 
     # ---- PoolClient (OPT-IN) ----
+    # [FIX v13.7.10] SEMPRE injeta em server.py, independente de
+    # ter sido iniciado via --pool-client ou apenas preparado.
     pool_client = _setup_pool_client_local(
         chain, pool, log,
         is_origin=is_origin,
