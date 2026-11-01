@@ -18,12 +18,27 @@ Uso (via factory):
     from contracts.factory import ContractFactory
     f = ContractFactory(db)
     e = f.create_btc_to_brn("BRN_TREASURY", 100_000, "brn1q...")
+
+----------------------------------------------------------------
+NOTA: os endereços de exemplo/teste abaixo foram atualizados para
+      "brn1smurtcup2s55lu60rwvpa28r339ml2xsd4tmh5" (endereço
+      da carteira local do operador). Em produção, o endereço é
+      passado como parâmetro em create_new() ou via ContractFactory.
 ================================================================
 """
 from __future__ import annotations
 
 import hashlib
 import time
+
+
+# ============================================================
+# ENDEREÇO BRN PADRÃO (carteira local do operador)
+# ============================================================
+# Usado apenas como valor default nos exemplos / testes deste módulo.
+# Em produção, o endereço deve ser passado explicitamente em
+# create_new() ou via ContractFactory.create_btc_to_brn().
+DEFAULT_BRN_ADDRESS = "brn1smurtcup2s55lu60rwvpa28r339ml2xsd4tmh5"
 
 
 # ============================================================
@@ -268,10 +283,13 @@ def create_new(
 # ============================================================
 if __name__ == "__main__":
     print("Testando EscrowBTCtoBRN...")
+    print(f"  Endereço BRN padrão: {DEFAULT_BRN_ADDRESS}")
+    print()
 
+    # Teste 1 — treasury cria escrow para o operador
     e = create_new(
         creator="BRN_TREASURY",
-        buyer="brn1qtestaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        buyer=DEFAULT_BRN_ADDRESS,
         brn_amount=100_000,
         btc_expected_sats=10_000,
         btc_address="bc1qtest",
@@ -282,15 +300,20 @@ if __name__ == "__main__":
     assert not e.is_terminal()
     assert e.can_cancel()
     assert not e.can_release()
+    assert e.buyer == DEFAULT_BRN_ADDRESS
     print(f"  [ok] criado: {e}")
+    print(f"       buyer = {e.buyer}")
 
+    # Teste 2 — serialização roundtrip
     d = e.to_dict()
     assert d["status"] == STATUS_OPEN
+    assert d["buyer"] == DEFAULT_BRN_ADDRESS
     e2 = EscrowBTCtoBRN.from_dict(d)
     assert e2 == e
     assert e2.to_dict() == d
     print("  [ok] to_dict/from_dict")
 
+    # Teste 3 — transição OPEN → BTC_DETECTED
     e.mark_detected("deadbeef" * 8)
     assert e.status == STATUS_BTC_DETECTED
     assert e.is_detected()
@@ -298,15 +321,17 @@ if __name__ == "__main__":
     assert not e.can_cancel()
     print("  [ok] mark_detected")
 
+    # Teste 4 — BTC_DETECTED → RELEASED
     e.mark_released()
     assert e.is_released()
     assert e.is_terminal()
     print("  [ok] mark_released")
 
+    # Teste 5 — expiração
     e3 = EscrowBTCtoBRN(
         escrow_id=generate_escrow_id(),
-        creator="X",
-        buyer="brn1qtestbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        creator=DEFAULT_BRN_ADDRESS,
+        buyer=DEFAULT_BRN_ADDRESS,
         brn_amount=1,
         btc_expected_sats=1,
         btc_address="bc1qtest",
@@ -318,9 +343,10 @@ if __name__ == "__main__":
     assert e3.status == STATUS_EXPIRED
     print("  [ok] mark_expired")
 
+    # Teste 6 — cancelamento
     e4 = create_new(
-        creator="X",
-        buyer="brn1qtestccccccccccccccccccccccccccccccc",
+        creator=DEFAULT_BRN_ADDRESS,
+        buyer=DEFAULT_BRN_ADDRESS,
         brn_amount=1,
         btc_expected_sats=1,
         btc_address="bc1qtest",
@@ -330,10 +356,11 @@ if __name__ == "__main__":
     assert e4.is_terminal()
     print("  [ok] mark_cancelled")
 
+    # Teste 7 — validações de entrada
     for bad in (
         dict(buyer="not_brn", brn_amount=1, btc_expected_sats=1),
-        dict(buyer="brn1qtest", brn_amount=0, btc_expected_sats=1),
-        dict(buyer="brn1qtest", brn_amount=1, btc_expected_sats=0),
+        dict(buyer=DEFAULT_BRN_ADDRESS, brn_amount=0, btc_expected_sats=1),
+        dict(buyer=DEFAULT_BRN_ADDRESS, brn_amount=1, btc_expected_sats=0),
     ):
         try:
             create_new(creator="X", btc_address="x", **bad)
@@ -342,9 +369,10 @@ if __name__ == "__main__":
             pass
     print("  [ok] validacoes de entrada")
 
+    # Teste 8 — transições inválidas rejeitadas
     e5 = create_new(
-        creator="X",
-        buyer="brn1qtestddddddddddddddddddddddddddddddd",
+        creator=DEFAULT_BRN_ADDRESS,
+        buyer=DEFAULT_BRN_ADDRESS,
         brn_amount=1,
         btc_expected_sats=1,
         btc_address="x",
@@ -361,4 +389,26 @@ if __name__ == "__main__":
         pass
     print("  [ok] transicoes invalidas rejeitadas")
 
+    print()
     print("EscrowBTCtoBRN OK.")
+    print()
+    print("=" * 60)
+    print(" Para criar um escrow REAL com sua carteira:")
+    print("=" * 60)
+    print()
+    print("   from contracts.escrow_btc_brn import create_new, DEFAULT_BRN_ADDRESS")
+    print()
+    print("   e = create_new(")
+    print('       creator="BRN_TREASURY",        # ou seu endereço')
+    print(f'       buyer=DEFAULT_BRN_ADDRESS,     # {DEFAULT_BRN_ADDRESS}')
+    print('       brn_amount=100_000,            # 0.001 BRN')
+    print('       btc_expected_sats=10_000,      # 0.0001 BTC')
+    print('       btc_address="bc1q...",         # seu endereço BTC')
+    print("   )")
+    print()
+    print("   Ou via ContractFactory (persistente no DB):")
+    print()
+    print("   from contracts.factory import ContractFactory")
+    print("   f = ContractFactory(db)")
+    print(f'   e = f.create_btc_to_brn("BRN_TREASURY", 100_000, DEFAULT_BRN_ADDRESS)')
+    print()
