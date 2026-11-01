@@ -1,9 +1,19 @@
-"""trust_network.py — Rede de confiança e reputação do BRN (v3.6)
+"""trust_network.py — Rede de confiança e reputação do BRN (v3.7)
 ================================================================
+v3.7 (2026-11-01):
+  [NEW] Persistência cliente-local em trust_network.local.json.
+        Clientes (is_origin=False) NÃO podem assinar o
+        trust_network.json (só o Origin assina). Antes, no flush()
+        salvavam sem assinatura, e no próximo boot _load() rejeitava
+        o arquivo → cliente recomeçava vazio → perdia o self-register
+        do main.py → não assinava sign_block.
+        Agora clientes salvam em .local.json e carregam ambos.
+  [NEW] heartbeat_self(pubkey) — convenience que só chama heartbeat().
+        Chamado pelo run_status_loop do main.py v13.7.12 para
+        renovar last_seen do próprio nó a cada 30s.
 v3.6 (2026-10-30):
-  [FIX] get_active_validators() agora SEMPRE inclui o Origin, mesmo
-        que ele esteja fora de ACTIVE_TTL_SECONDS. Isso evita que o
-        Origin seja excluído do consenso por inatividade.
+  [FIX] get_active_validators() SEMPRE inclui o Origin, mesmo que
+        ele esteja fora de ACTIVE_TTL_SECONDS.
         Também removido o fallback para "top score" (que retornava
         fantasmas quando ninguém estava ativo).
 v3.5 (2026-10-30):
@@ -14,7 +24,7 @@ v3.4 (2026-10-29):
 """
 from __future__ import annotations
 
-__version__ = "3.6"
+__version__ = "3.7"
 
 import json
 import logging
@@ -130,6 +140,8 @@ class NodeRecord:
 class TrustNetwork:
     def __init__(self, data_file: str = DEFAULT_DATA_FILE, is_origin: bool = False, node_sk=None):
         self.data_file = Path(data_file)
+        # [v3.7] Cliente-local: trust_network.local.json (ao lado do principal)
+        self.local_file = self.data_file.with_suffix(".local.json")
         self.is_origin = is_origin
         self.node_sk = node_sk
 
@@ -143,17 +155,25 @@ class TrustNetwork:
 
         self._lock = threading.RLock()
         self._dirty = False
+        self._dirty_local = False
         self._last_flush = 0.0
 
         self._load()
-        log.info("[TrustNetwork] v%s Inicializada — %d nós, %d validadores",
-                 __version__, len(self.nodes), len(self.active_validators))
+        log.info("[TrustNetwork] v%s Inicializada — %d nós, %d validadores "
+                 "(origin=%s, local_file=%s)",
+                 __version__, len(self.nodes), len(self.active_validators),
+                 "sim" if is_origin else "não",
+                 str(self.local_file) if not is_origin else "n/a")
 
     def set_origin_pubkey(self, pk: str) -> None:
         self._origin_pubkey = (pk or "").strip().lower()
         if self._origin_pubkey:
             log.info("[TrustNetwork] origin_pubkey=%s… (protegida)",
                      self._origin_pubkey[:16])
+
+    def heartbeat_self(self, pubkey: str) -> None:
+        """[v3.7] Convenience: renova last_seen do próprio nó."""
+        self.heartbeat(pubkey)
 
     def _prune_inactive(self) -> int:
         now = time.time()
@@ -184,26 +204,42 @@ class TrustNetwork:
 
     def _mark_dirty(self) -> None:
         self._dirty = True
+        if not self.is_origin:
+            self._dirty_local = True
         agora = time.time()
         if agora - self._last_flush > FLUSH_INTERVAL_S:
             self.flush()
 
     def flush(self) -> None:
         with self._lock:
-            if not self._dirty:
+            if not self._dirty and not self._dirty_local:
                 return
 
             self._prune_inactive()
 
-            try:
-                data = {
-                    "nodes": {nid: n.to_dict() for nid, n in self.nodes.items()},
-                    "last_decay_time": self.last_decay_time,
-                    "active_validators": list(self.active_validators),
-                    "last_rotation_height": self._last_rotation_height,
-                }
+            data = {
+                "nodes": {nid: n.to_dict() for nid, n in self.nodes.items()},
+                "last_decay_time": self.last_decay_time,
+                "active_validators": list(self.active_validators),
+                "last_rotation_height": self._last_rotation_height,
+            }
 
-                if self.is_origin and self.node_sk is not None:
+            # [v3.7] Client: salva em .local.json (sem assinatura)
+            if not self.is_origin:
+                try:
+                    data["saved_at"] = time.time()
+                    data["client_written"] = True
+                    with open(self.local_file, "w", encoding="utf-8") as f:
+                        json.dump(data, f, indent=2, ensure_ascii=False)
+                    self._dirty_local = False
+                    self._last_flush = time.time()
+                except Exception as e:
+                    log.error("[TrustNetwork] flush local falhou: %s", e)
+                return
+
+            # Origin: salva main + assinatura (mantém local também)
+            try:
+                if self.node_sk is not None:
                     payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
                     sig = self.node_sk.sign(payload)
                     data["signature"] = sig.hex()
@@ -213,7 +249,16 @@ class TrustNetwork:
 
                 with open(self.data_file, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
+
+                # Origin também atualiza seu próprio local (compat)
+                try:
+                    with open(self.local_file, "w", encoding="utf-8") as f:
+                        json.dump(data, f, indent=2, ensure_ascii=False)
+                except Exception:
+                    pass
+
                 self._dirty = False
+                self._dirty_local = False
                 self._last_flush = time.time()
             except Exception as e:
                 log.error("[TrustNetwork] flush falhou: %s", e)
@@ -222,46 +267,82 @@ class TrustNetwork:
         self.flush()
 
     def _load(self) -> None:
-        if not self.data_file.exists():
-            return
-        try:
-            with open(self.data_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
+        # ─── 1. Carrega arquivo principal (Origin-signed) ───
+        if self.data_file.exists():
+            try:
+                with open(self.data_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
 
-            sig_hex = data.pop("signature", None)
-            origin_pub_hex = data.pop("origin_pubkey", None)
-            data.pop("saved_at", None)
+                sig_hex = data.pop("signature", None)
+                origin_pub_hex = data.pop("origin_pubkey", None)
+                data.pop("saved_at", None)
+                data.pop("client_written", None)
 
-            if sig_hex and origin_pub_hex:
-                payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
-                try:
-                    pub_bytes = bytes.fromhex(origin_pub_hex)
-                    pk = Ed25519PublicKey.from_public_bytes(pub_bytes)
-                    pk.verify(bytes.fromhex(sig_hex), payload)
-                    log.info("[TrustNetwork] Assinatura do Origem VALIDADA.")
-                except Exception as e:
-                    log.error("[TrustNetwork] ASSINATURA INVÁLIDA! O arquivo foi alterado.")
+                if sig_hex and origin_pub_hex:
+                    payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                    try:
+                        pub_bytes = bytes.fromhex(origin_pub_hex)
+                        pk = Ed25519PublicKey.from_public_bytes(pub_bytes)
+                        pk.verify(bytes.fromhex(sig_hex), payload)
+                        log.info("[TrustNetwork] Assinatura do Origem VALIDADA.")
+                    except Exception as e:
+                        log.error("[TrustNetwork] ASSINATURA INVÁLIDA! O arquivo foi alterado.")
+                        if not self.is_origin:
+                            # Cliente: ignora main inválido, mas ainda carrega local abaixo
+                            data = {"nodes": {}}
+                        else:
+                            log.warning("[TrustNetwork] Origem ignorando falha de assinatura.")
+                else:
                     if not self.is_origin:
-                        return
+                        log.info("[TrustNetwork] main sem assinatura — cliente carrega só local")
+                        data = {"nodes": {}}
                     else:
-                        log.warning("[TrustNetwork] Origem ignorando falha de assinatura.")
-            else:
-                if not self.is_origin:
-                    log.warning("[TrustNetwork] Arquivo sem assinatura. Iniciando vazio.")
-                    return
+                        log.info("[TrustNetwork] Origin iniciando sem assinatura (normal)")
 
-            with self._lock:
-                self.nodes = {
-                    nid: NodeRecord.from_dict(nd)
-                    for nid, nd in data.get("nodes", {}).items()
-                }
-                self.last_decay_time = data.get("last_decay_time", time.time())
-                self.active_validators = set(data.get("active_validators", []))
-                self._last_rotation_height = int(data.get("last_rotation_height", 0))
-            log.info("[TrustNetwork] Carregada — %d nós, %d validadores",
-                     len(self.nodes), len(self.active_validators))
-        except Exception as e:
-            log.error("[TrustNetwork] Load falhou: %s — iniciando vazio", e)
+                with self._lock:
+                    for nid, nd in data.get("nodes", {}).items():
+                        try:
+                            self.nodes[nid] = NodeRecord.from_dict(nd)
+                        except Exception as e:
+                            log.warning("[TrustNetwork] node %s inválido: %s", nid[:12], e)
+                    self.last_decay_time = data.get("last_decay_time", time.time())
+                    self.active_validators = set(data.get("active_validators", []))
+                    self._last_rotation_height = int(data.get("last_rotation_height", 0))
+                log.info("[TrustNetwork] main carregado — %d nós", len(self.nodes))
+            except Exception as e:
+                log.error("[TrustNetwork] load main falhou: %s", e)
+
+        # ─── 2. Cliente: carrega local (merge) ───
+        if not self.is_origin and self.local_file.exists():
+            try:
+                with open(self.local_file, "r", encoding="utf-8") as f:
+                    local = json.load(f)
+                local.pop("saved_at", None)
+                local.pop("client_written", None)
+                with self._lock:
+                    merged = 0
+                    for nid, nd in local.get("nodes", {}).items():
+                        if nid not in self.nodes:
+                            try:
+                                self.nodes[nid] = NodeRecord.from_dict(nd)
+                                merged += 1
+                            except Exception:
+                                pass
+                        else:
+                            # Preserva o local (last_seen mais recente ganha)
+                            try:
+                                local_rec = NodeRecord.from_dict(nd)
+                                if local_rec.last_seen > self.nodes[nid].last_seen:
+                                    self.nodes[nid] = local_rec
+                            except Exception:
+                                pass
+                log.info("[TrustNetwork] local merge — %d nós novos, total %d",
+                         merged, len(self.nodes))
+            except Exception as e:
+                log.warning("[TrustNetwork] load local falhou: %s", e)
+
+        log.info("[TrustNetwork] Carregada — %d nós, %d validadores",
+                 len(self.nodes), len(self.active_validators))
 
     def register_node(self, node_id: str, address: str, public_key: str,
                       peer_addr: str = "") -> NodeRecord:
@@ -515,9 +596,6 @@ class TrustNetwork:
                     break
             return out
 
-    # ============================================================
-    # [FIX v3.6] Sempre inclui o Origin, sem fallback para top score
-    # ============================================================
     def get_active_validators(self, count: int = 5) -> List[str]:
         try:
             n_target = max(1, int(count))
@@ -612,6 +690,7 @@ class TrustNetwork:
                         "node_id": n.node_id,
                         "address": n.address,
                         "public_key": n.public_key,
+                        "peer_addr": n.peer_addr,
                         "trust_score": round(n.trust_score, 1),
                         "trust_level": n.trust_level,
                         "connected": n.connected,
