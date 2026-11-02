@@ -1153,7 +1153,8 @@ class Blockchain:
             except Exception:
                 continue
         txs = [cb] + selected
-        merkle = compute_merkle_root([t["txid"] for t in txs])
+        from brn_merkle import compute_merkle_root_fast
+merkle = compute_merkle_root_fast([t["txid"] for t in txs])
         prev_hash = self.db.tip_hash()
         ts = int(time.time())
         nonce, h_hex, _ = _pow_search(prev_hash, merkle, ts, diff, should_continue=should_continue, progress_cb=progress_cb)
