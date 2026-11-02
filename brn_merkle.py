@@ -1,8 +1,8 @@
 import ctypes
 import os
 import platform
+import hashlib
 
-# Carrega a biblioteca compilada (DLL no Windows, SO no Linux)
 _lib_name = "brn_merkle.dll" if platform.system() == "Windows" else "brn_merkle.so"
 _lib_path = os.path.join(os.path.dirname(__file__), _lib_name)
 
@@ -12,13 +12,12 @@ try:
     lib.compute_merkle_root_c.restype = None
     HAS_C_MERKLE = True
 except Exception as e:
-    print(f"[brn_merkle] Aviso: C indisponivel, usando Python puro. Erro: {e}")
+    print(f"[brn_merkle] C indisponivel. Usando Python puro. ({e})")
     HAS_C_MERKLE = False
 
 def compute_merkle_root_fast(txids: list[str]) -> str:
     if not HAS_C_MERKLE:
-        # Fallback para Python se o C não estiver compilado
-        import hashlib
+        # Fallback Python
         if not txids: return "0" * 64
         layer = [bytes.fromhex(t) for t in txids]
         while len(layer) > 1:
