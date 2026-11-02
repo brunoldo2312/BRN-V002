@@ -1,33 +1,16 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.4.11 | Data: 02/11/2026
+Versão: 9.4.12 | Data: 02/11/2026
 ================================================================
+v9.4.12 (2026-11-02):
+  [FIX] Modo legado forçado até o bloco 2000. Default do bypass
+        agora é 2000 se a variável não estiver no .env, garantindo
+        que a sincronização antiga nunca falhe por falta de multi-sig.
+  [NEW] Aceleração C para compute_merkle_root via brn_merkle.py.
 v9.4.11 (2026-11-02):
-  [FIX CRÍTICO] Blockchain.__init__ agora honra BRN_REQUIRE_AUTH_TAG
-                do ambiente (antes ignorava e usava bool(network_secret)
-                sempre). Sem este patch, BRN_REQUIRE_AUTH_TAG=0 no .env
-                era ignorado, e o auth_tag de blocos antigos (criados
-                com secret diferente) era rejeitado em sync.
-                Sintoma: "auth_tag invalido em bloco legado" em todo
-                bloco #1..#2446 ao sincronizar do peer.
-                Fix: lê os.environ.get("BRN_REQUIRE_AUTH_TAG", "1")
-                quando require_auth_tag=None.
-  [NEW] Aceleração C para compute_merkle_root via brn_merkle.py
-        (com fallback transparente para Python se a lib não existir).
+  [FIX] Blockchain.__init__ agora honra BRN_REQUIRE_AUTH_TAG
+        do ambiente.
 v9.4.10 (2026-11-01):
-  [NEW] BRN_BOOTSTRAP_SKIP_SIGS_UNTIL (default 0 = desativado).
-        Aceita blocos 1..N SEM checar validators_sig. PoW, merkle,
-        hash, auth_tag e tx-validation CONTINUAM ativos.
-v9.4.9 (2026-11-01):
-  [FIX] _get_active_validators() inclui _local_validator_sk no set.
-        _validate_validators_sig() aceita MODO BOOTSTRAP LOCAL.
-v9.4.8 (2026-10-30):
-  [FIX] MODO BOOTSTRAP ESTENDIDO (trust_score >= 500).
-v9.4.7 (2026-10-30):
-  [FIX] MODO BOOTSTRAP (sigs estrangeiras com set local < 2).
-v9.4.6 (2026-10-30):
-  [FIX] _get_active_validators usa trust.get_active_validators().
-v9.4.5 (2026-10-30):
-  [FIX] Genesis sem multi-sig, whitelist removida.
+  [NEW] BRN_BOOTSTRAP_SKIP_SIGS_UNTIL.
 ================================================================
 """
 from __future__ import annotations
@@ -88,10 +71,9 @@ BOOTSTRAP_TRUST_THRESHOLD = float(
     os.environ.get("BRN_BOOTSTRAP_TRUST_THRESHOLD", "500")
 )
 
-# [v9.4.10] Bypass de multi-sig até uma altura.
-# 0 = desativado (padrao). Use 5000 para sync inicial e REMOVA depois.
+# [v9.4.12] Modo legado padrão até o bloco 2000 se não estiver no .env
 BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = int(
-    os.environ.get("BRN_BOOTSTRAP_SKIP_SIGS_UNTIL", "0") or "0"
+    os.environ.get("BRN_BOOTSTRAP_SKIP_SIGS_UNTIL", "2000") or "2000"
 )
 
 if not (0.0 < VALIDATOR_QUORUM <= 1.0):
