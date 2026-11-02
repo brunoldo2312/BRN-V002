@@ -1,31 +1,19 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.7.13)
+"""main.py — Entrypoint unificado do nó BRN (v13.7.14)
 ================================================================
+v13.7.14 (2026-11-02):
+  [NEW] _auto_trust_discovery() roda em thread separada 15s após
+        o boot. Consulta /api/trust/nodes de cada peer ativo,
+        consolida o trust_network.json (remove fantasmas) e
+        recarrega em memória.
+        Modos:
+          BRN_AUTO_TRUST_RESET=auto (padrão) → limpa se trust > 10 nós
+          BRN_AUTO_TRUST_RESET=1            → sempre limpa
+          BRN_AUTO_TRUST_RESET=0            → só adiciona novos
+  [KEEP] v13.7.13: last_seen de todos os nós no boot.
+  [KEEP] v13.7.12: heartbeat do próprio nó a cada 30s.
+  [KEEP] v13.7.11: self-registration na TrustNetwork.
 v13.7.13 (2026-11-02):
-  [FIX CRÍTICO] No boot, atualiza last_seen de TODOS os nós do
-                trust_network.json. Sem isso, get_active_validators()
-                retornava [] após 5min (ACTIVE_TTL_SECONDS=300),
-                pois apenas a própria SK recebia heartbeat.
-                Resultado: _validate_validators_sig caía em
-                BOOTSTRAP (1 sig) mesmo com 3 validadores no trust.
-                O log mostrava:
-                  "get_active_validators: nenhum nó ativo e Origin
-                   ausente — retornando [] (modo bootstrap)"
-                Agora o boot marca todos como "vistos agora", e o
-                heartbeat() do v13.7.12 mantém a própria SK fresca.
-v13.7.12 (2026-11-01):
-  [FIX CRÍTICO] run_status_loop agora chama trust_net.heartbeat()
-                a cada 30s.
-v13.7.11 (2026-11-01):
-  [FIX] Self-registration na TrustNetwork para TODOS os nós.
-  [FIX] register_node passa peer_addr.
-v13.7.10 (2026-10-30):
-  [FIX] Origin registrado na TrustNetwork.
-  [NEW] set_checkpoint_priv() chamado com Validator SK.
-  [FIX] PoolClient sempre injetado em server.py.
-  [FIX] Log duplicado "PoolClient preparado" consolidado.
-v13.7.9 (2026-10-30):
-  [PERF] run_http() otimizado: threads=100, keepalive=30s,
-         limit_concurrency=200, workers=1 FORÇADO.
+  [FIX] last_seen de todos os nós no boot.
 ================================================================
 """
 from __future__ import annotations
@@ -93,6 +81,7 @@ _HARDCODED_DEFAULTS = {
     "ANYIO_THREAD_LIMIT":      "100",
     "BRN_MULTISIG_START_HEIGHT": "",
     "BRN_CHECKPOINT_HEIGHTS":    "",
+    "BRN_AUTO_TRUST_RESET":      "auto",
 }
 
 
@@ -139,7 +128,6 @@ def _verificar_integridade_codigo() -> None:
             sys.exit(1)
 
 
-# <<< NOVO port_guard (v1.0): aborta se portas do BRN já estão em uso
 try:
     import port_guard
     _HAS_PORT_GUARD = True
@@ -424,6 +412,199 @@ def _load_validator_sk():
         return None
 
 
+# ============================================================
+# [v13.7.14] AUTO-TRUST DISCOVERY
+# ============================================================
+def _auto_trust_discovery(chain, trust_net, p2p, log):
+    """Descobre pubkeys dos peers ativos e consolida trust_network.json.
+
+    Roda em thread separada. Espera 15s (P2P conectar), consulta
+    /api/trust/nodes de cada peer, e:
+      - BRN_AUTO_TRUST_RESET=auto (padrão): limpa se trust > 10 nós
+      - BRN_AUTO_TRUST_RESET=1:            sempre limpa
+      - BRN_AUTO_TRUST_RESET=0:            só adiciona novos
+    """
+    time.sleep(15)
+
+    if _shutdown.is_set():
+        return
+
+    try:
+        MINHA = ""
+        sk = getattr(chain, "_local_validator_sk", None)
+        if sk is not None:
+            try:
+                MINHA = sk.pub_hex
+            except Exception:
+                pass
+
+        # Coleta peers (bootstrap + P2P descobertos)
+        peers = set()
+        try:
+            if p2p is not None:
+                for p in p2p.discovery.listar_peers():
+                    peers.add(p)
+        except Exception:
+            pass
+        try:
+            from p2p_unified import _carregar_bootstrap
+            peers.update(_carregar_bootstrap())
+        except Exception:
+            pass
+
+        if not peers:
+            log.info("[AutoTrust] nenhum peer para consultar — pulando")
+            return
+
+        log.info(f"[AutoTrust] consultando {len(peers)} peer(s) para descobrir pubkeys")
+
+        pubkeys = set()
+        if MINHA:
+            pubkeys.add(MINHA)
+
+        for peer in peers:
+            if _shutdown.is_set():
+                return
+            if ":" not in peer:
+                continue
+            try:
+                ip, _ = peer.rsplit(":", 1)
+            except Exception:
+                continue
+
+            # Consulta /api/trust/nodes
+            try:
+                r = urllib.request.urlopen(f"http://{ip}:5000/api/trust/nodes?limit=50", timeout=4)
+                data = json.loads(r.read())
+                if data.get("ok"):
+                    for n in data.get("nodes", []):
+                        pk = n.get("pubkey_full") or n.get("node_id") or n.get("public_key") or ""
+                        if pk and len(pk) == 66:
+                            pubkeys.add(pk)
+            except Exception:
+                pass
+
+            # Consulta /api/status como fallback (pega a pubkey do pool/servidor)
+            try:
+                r = urllib.request.urlopen(f"http://{ip}:5000/api/status", timeout=3)
+                data = json.loads(r.read())
+                # só para confirmar que peer está vivo; pubkey não vem aqui
+            except Exception:
+                pass
+
+        if not pubkeys:
+            log.info("[AutoTrust] nenhuma pubkey descoberta — trust mantido")
+            return
+
+        log.info(f"[AutoTrust] {len(pubkeys)} pubkey(s) descoberta(s) (incluindo a própria)")
+
+        # Decisão de reset
+        reset_mode = os.environ.get("BRN_AUTO_TRUST_RESET", "auto").strip().lower()
+        try:
+            max_val = int(os.environ.get("BRN_MAX_VALIDATORS", "5"))
+        except (TypeError, ValueError):
+            max_val = 5
+
+        existing_count = len(trust_net.nodes)
+        threshold = max(max_val * 2, 10)
+
+        should_reset = False
+        if reset_mode in ("1", "true", "yes"):
+            should_reset = True
+        elif reset_mode in ("0", "false", "no"):
+            should_reset = False
+        else:  # auto
+            should_reset = existing_count > threshold
+
+        if should_reset:
+            log.warning(
+                "[AutoTrust] RESET (modo=%s, trust tinha %d nós). "
+                "Mantendo só %d pubkeys ativas.",
+                reset_mode, existing_count, len(pubkeys),
+            )
+            try:
+                lock = getattr(trust_net, "_lock", None)
+                if lock is not None:
+                    with lock:
+                        trust_net.nodes.clear()
+                        for pk in pubkeys:
+                            trust_net.register_node(
+                                node_id=pk, address="", public_key=pk, peer_addr=""
+                            )
+                            if hasattr(trust_net, "mark_connected"):
+                                trust_net.mark_connected(pk)
+                else:
+                    trust_net.nodes.clear()
+                    for pk in pubkeys:
+                        trust_net.register_node(
+                            node_id=pk, address="", public_key=pk, peer_addr=""
+                        )
+                        if hasattr(trust_net, "mark_connected"):
+                            trust_net.mark_connected(pk)
+            except Exception as e:
+                log.warning("[AutoTrust] falha no reset: %s", e)
+                return
+        else:
+            adicionadas = 0
+            for pk in pubkeys:
+                if pk not in trust_net.nodes:
+                    try:
+                        trust_net.register_node(
+                            node_id=pk, address="", public_key=pk, peer_addr=""
+                        )
+                        if hasattr(trust_net, "mark_connected"):
+                            trust_net.mark_connected(pk)
+                        adicionadas += 1
+                    except Exception:
+                        pass
+            if adicionadas > 0:
+                log.info("[AutoTrust] +%d pubkey(s) adicionada(s) ao trust", adicionadas)
+
+        # Salva trust_network.json
+        try:
+            if hasattr(trust_net, "save"):
+                trust_net.save()
+            elif hasattr(trust_net, "save_data"):
+                trust_net.save_data()
+            elif hasattr(trust_net, "_save"):
+                trust_net._save()
+            else:
+                # Fallback manual: serializa nó a nó
+                path = BASE_DIR / "trust_network.json"
+                data = {"nodes": {}}
+                lock = getattr(trust_net, "_lock", None)
+                nodes_copy = {}
+                if lock is not None:
+                    with lock:
+                        nodes_copy = dict(trust_net.nodes)
+                else:
+                    nodes_copy = dict(trust_net.nodes)
+                for k, v in nodes_copy.items():
+                    if hasattr(v, "__dict__"):
+                        data["nodes"][k] = v.__dict__
+                    elif isinstance(v, dict):
+                        data["nodes"][k] = v
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+            log.info("[AutoTrust] trust_network.json salvo (%d nós)", len(trust_net.nodes))
+        except Exception as e:
+            log.warning("[AutoTrust] falha ao salvar trust: %s", e)
+
+        # Resumo final
+        try:
+            ativos = chain._get_active_validators()
+            req = chain._required_signatures(ativos)
+            log.info(
+                "[AutoTrust] estado final: %d nós no trust, %d ativos, required=%d/%d",
+                len(trust_net.nodes), len(ativos), req, len(ativos),
+            )
+        except Exception:
+            pass
+
+    except Exception as e:
+        log.warning("[AutoTrust] exceção: %s", e)
+
+
 def _make_sign_collector(p2p, trust_net):
     def _collect(block: dict) -> list:
         if p2p is None or trust_net is None:
@@ -687,9 +868,6 @@ def run_explorer():
     )
 
 
-# ============================================================
-# STATUS LOOP — [FIX v13.7.12] heartbeat do próprio validador
-# ============================================================
 def run_status_loop(chain, p2p, sync=None, pool=None, pool_client=None,
                     trust_net=None, node_id_short="", own_pubkey=""):
     log = get_logger("status")
@@ -700,10 +878,6 @@ def run_status_loop(chain, p2p, sync=None, pool=None, pool_client=None,
     while not _shutdown.is_set():
         time.sleep(30)
         try:
-            # [FIX v13.7.12] Renova last_seen do PRÓPRIO nó na TrustNetwork
-            # a cada 30s. Sem isto, o Origin (e clientes sem PoolClient
-            # ativo) expiravam após 5min (ACTIVE_TTL_SECONDS=300) e sua
-            # assinatura era descartada em _collect_signatures.
             if trust_net is not None and own_pubkey:
                 try:
                     trust_net.heartbeat(own_pubkey)
@@ -935,7 +1109,6 @@ def _graceful_shutdown(log, trust_net=None) -> None:
 
 
 def main():
-    # <<< NOVO port_guard (v1.0): aborta se portas do BRN já estão em uso.
     if _HAS_PORT_GUARD and port_guard is not None:
         port_guard.check_brn_ports()
 
@@ -1069,11 +1242,7 @@ def main():
                 chain.trust_net = trust_net
             log.info("TrustNetwork: " + str(len(trust_net.nodes)) + " nós carregados")
 
-            # [FIX v13.7.13] Atualiza last_seen de TODOS os nós no boot.
-            # Sem isto, get_active_validators() retornava [] depois de 5min
-            # (ACTIVE_TTL_SECONDS=300) e o nó caía em MODO BOOTSTRAP (1 sig)
-            # mesmo com 3 validadores no trust. O heartbeat() do v13.7.12
-            # só renova a própria SK.
+            # [v13.7.13] Atualiza last_seen de TODOS no boot
             try:
                 import time as _t
                 _lock = getattr(trust_net, "_lock", None)
@@ -1153,8 +1322,6 @@ def main():
                         p2p_port_self = int(os.environ.get("BRN_P2P_PORT", "6001"))
                     except (TypeError, ValueError):
                         p2p_port_self = 6001
-                    # [FIX v13.7.13] Corrige peer_addr=127.0.0.1: usa
-                    # BRN_SEU_ENDERECO se setado, senão o IP local real
                     _seu = os.environ.get("BRN_SEU_ENDERECO", "").strip()
                     if _seu and ":" in _seu:
                         self_addr = _seu
@@ -1221,6 +1388,17 @@ def main():
             log.warning(f"Falha injetando SK: {e}")
     else:
         log.info("Validator SK não carregada — nó não vai assinar blocos")
+
+    # [v13.7.14] Auto-trust discovery (roda em background 15s depois)
+    if trust_net is not None and p2p is not None:
+        threading.Thread(
+            target=_thread_wrap(
+                "AutoTrust",
+                lambda: _auto_trust_discovery(chain, trust_net, p2p, log),
+            ),
+            daemon=True, name="AutoTrust",
+        ).start()
+        log.info("[AutoTrust] thread iniciada (descoberta em 15s)")
 
     if p2p is not None and trust_net is not None:
         try:
@@ -1419,7 +1597,6 @@ def main():
     node_id_short = node_pub[:16]
     own_pubkey_for_hb = validator_sk.pub_hex if validator_sk is not None else ""
 
-    # [FIX v13.7.12] Passa own_pubkey_for_hb para o status loop
     threading.Thread(
         target=_thread_wrap(
             "StatusLoop",
