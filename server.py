@@ -1,20 +1,16 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.18)
+server.py — Backend HTTP do nó BRN (v9.9.19)
 ================================================================
-v9.9.18 (2026-11-02):
+v9.9.19 (2026-11-02):
+  [FIX CRÍTICO] Adicionadas as rotas /api/pool/start_local,
+                /api/pool/stop_local e /api/pool/local_status.
+                O app_wallet_v3.py v3.9.2 (GUI) usa essas rotas
+                para controlar o PoolClient injetado pelo main.py.
+                Sem elas, clicar em "Minerar Pool" na GUI gerava
+                HTTP 404 (resposta não-JSON).
   [FIX] /api/consensus/validators agora calcula required_sigs via
-        chain._required_signatures() em vez de hardcoded len(top5).
-        Antes, mesmo com BRN_VALIDATOR_QUORUM=0.25 no .env
-        (required=1/3), o endpoint reportava 4/4 — confundindo
-        check_sigs.py e diagnóstico. A execução real SEMPRE usou
-        _required_signatures() (blockchain.py) corretamente.
-  [NEW] Resposta inclui validator_quorum e total_validators.
-v9.9.17 (2026-10-25):
-  [NEW] Multi-sig / Top 5 validadores (/api/consensus/validators
-        e /api/block/<h>/signatures).
-  [NEW] /api/miner/stop, /api/pool/disconnect.
-v9.9.16 (2026-10-25):
-  [FIX CRÍTICO] Re-adicionada a rota /api/minhas-txs.
+        chain._required_signatures() (respeita BRN_VALIDATOR_QUORUM).
+  [KEEP] Todas as rotas das versões anteriores.
 ================================================================
 """
 from __future__ import annotations
@@ -123,7 +119,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
             req = urllib.request.Request(
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
-                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.18"},
+                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.19"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -161,7 +157,7 @@ CHAIN = _LazyChain()
 
 
 # ============================================================
-# P2P / POOL / SYNC / TRUST MANAGERS
+# P2P / POOL / SYNC / TRUST / OFFRAMP / POOL_CLIENT LOCAIS
 # ============================================================
 _P2P_MANAGER = None
 _P2P_LOCK = threading.Lock()
@@ -411,7 +407,7 @@ threading.Thread(target=_cleanup_loop, daemon=True, name="CacheCleanup").start()
 
 
 # ============================================================
-# ROTAS BÁSICAS (BOOTSTRAP / CARTEIRA / TRANSFER / HISTÓRICO)
+# ROTAS BÁSICAS
 # ============================================================
 @app.route("/api/bootstrap/add", methods=["POST"])
 @require_rate_limit("bootstrap_add")
@@ -764,7 +760,6 @@ def miner_status():
         chain = _get_chain()
         st = get_miner(chain).status()
 
-        # [FIX v9.9.18] validators_active e required_sigs REAIS
         trust = _get_trust_network()
         validators_list = []
         if trust is not None:
@@ -793,7 +788,7 @@ def miner_status():
 
 
 # ============================================================
-# POOL (COM PROXY PARA CLIENTES)
+# POOL MANAGER E PROXY
 # ============================================================
 def _proxy_pool_request(path: str, method: str = "POST") -> tuple:
     remote_pool = os.environ.get("BRN_POOL_URL", "").strip().rstrip("/")
@@ -940,6 +935,44 @@ def pool_miners():
 
 
 # ============================================================
+# POOL CLIENT LOCAL (v3.9.2 GUI)
+# ============================================================
+@app.route("/api/pool/start_local", methods=["POST"])
+def pool_start_local():
+    pc = _get_pool_client_local()
+    if pc is None:
+        return jsonify({"ok": False, "msg": "PoolClient nao preparado"}), 503
+    try:
+        ok, msg = pc.start_mining()
+        return jsonify({"ok": ok, "msg": msg, "status": pc.status()})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/pool/stop_local", methods=["POST"])
+def pool_stop_local():
+    pc = _get_pool_client_local()
+    if pc is None:
+        return jsonify({"ok": False, "msg": "PoolClient nao preparado"}), 503
+    try:
+        ok, msg = pc.stop_mining()
+        return jsonify({"ok": ok, "msg": msg, "status": pc.status()})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/pool/local_status", methods=["GET"])
+def pool_local_status():
+    pc = _get_pool_client_local()
+    if pc is None:
+        return jsonify({"ok": False, "running": False, "msg": "PoolClient nao preparado"})
+    try:
+        return jsonify(pc.status())
+    except Exception as e:
+        return jsonify({"ok": False, "running": False, "msg": str(e)})
+
+
+# ============================================================
 # TRUST NETWORK
 # ============================================================
 @app.route("/api/trust/stats", methods=["GET"])
@@ -1054,9 +1087,10 @@ def api_peers():
 def health():
     try:
         return jsonify({
-            "ok": True, "height": _get_chain().db.height(), "version": "9.9.18",
+            "ok": True, "height": _get_chain().db.height(), "version": "9.9.19",
             "chain_injected": _CHAIN is not None, "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
+            "pool_client_injected": _POOL_CLIENT_LOCAL is not None,
         })
     except Exception as e: return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -1159,7 +1193,7 @@ def verificar_recebimento(address, txid_str):
 
 
 # ============================================================
-# [FIX v9.9.18] Multi-sig / Top 5 validadores — required_sigs REAL
+# CONSENSUS MULTI-SIG
 # ============================================================
 @app.route("/api/consensus/validators", methods=["GET"])
 @require_rate_limit("status")
@@ -1171,7 +1205,6 @@ def consensus_validators():
 
         top5_pubkeys = trust.get_top_validators(count=5) if hasattr(trust, "get_top_validators") else []
 
-        # Encontra os NodeRecords que correspondem a essas pubkeys
         nodes = list(trust.nodes.values()) if hasattr(trust, "nodes") else []
         validators = []
         for n in nodes:
@@ -1187,11 +1220,6 @@ def consensus_validators():
                 })
         validators.sort(key=lambda x: -x["trust_score"])
 
-        # [FIX v9.9.18] Calcula required_sigs REAL via
-        # chain._required_signatures() — que respeita BRN_VALIDATOR_QUORUM
-        # e BRN_REQUIRE_ALL_SIGS do .env. Antes era hardcoded
-        # "len(top5_pubkeys)", mostrando 4/4 mesmo com quorum=0.25 (1/3),
-        # confundindo o check_sigs.py.
         chain = _get_chain()
         try:
             required_sigs = chain._required_signatures(top5_pubkeys)
@@ -1260,5 +1288,5 @@ def _shutdown():
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.18 (Proxy + Trust + History)")
+    print(f"BRN Server v9.9.19 (Proxy + Trust + History)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
