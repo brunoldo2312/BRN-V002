@@ -18,13 +18,6 @@ Uso (via factory):
     from contracts.factory import ContractFactory
     f = ContractFactory(db)
     e = f.create_btc_to_brn("BRN_TREASURY", 100_000, "brn1...")
-
-----------------------------------------------------------------
-NOTA: os endereços de exemplo/teste abaixo foram atualizados para
-      "brn1gws9efphhx477dldund0f8zus8jv8nt4ye9fz6" (endereço
-      público da carteira local do operador). Em produção, o
-      endereço é passado como parâmetro em create_new() ou via
-      ContractFactory.
 ================================================================
 """
 from __future__ import annotations
@@ -36,13 +29,7 @@ import time
 # ============================================================
 # ENDEREÇO BRN PADRÃO (carteira local do operador)
 # ============================================================
-# Usado apenas como valor default nos exemplos / testes deste módulo.
-# Em produção, o endereço deve ser passado explicitamente em
-# create_new() ou via ContractFactory.create_btc_to_brn().
-#
-# ⚠️ Endereço PÚBLICO — pode ir no código.
-# ⚠️ A chave privada correspondente NUNCA vai no código.
-DEFAULT_BRN_ADDRESS = "brn1gws9efphhx477dldund0f8zus8jv8nt4ye9fz6"
+DEFAULT_BRN_ADDRESS = "brn1x9v8xq6v7dgrszl3ep6zupk28y7jfr8a0cwmgu"
 
 
 # ============================================================
@@ -67,22 +54,6 @@ VALID_STATUSES = {
 # CLASSE
 # ============================================================
 class EscrowBTCtoBRN:
-    """Ordem de câmbio BTC→BRN.
-
-    Campos:
-        escrow_id          : ID único (esc_<hex>)
-        creator            : endereço BRN que criou a ordem
-        buyer               : endereço BRN que receberá os BRN
-        brn_amount          : quantidade de BRN (unidades mínimas)
-        btc_expected_sats   : quantidade de BTC (satoshis) esperada
-        btc_address         : endereço BTC de recebimento
-        btc_txid            : txid da transação BTC recebida (se houver)
-        status              : estado atual do escrow
-        created_at          : timestamp (unix)
-        expires_at          : timestamp de expiração
-        l2_hash             : hash determinístico do escrow
-    """
-
     def __init__(
         self,
         escrow_id: str,
@@ -122,9 +93,6 @@ class EscrowBTCtoBRN:
         self.expires_at = int(expires_at)
         self.l2_hash = str(l2_hash or self._compute_hash())
 
-    # ============================================================
-    # HASH
-    # ============================================================
     def _compute_hash(self) -> str:
         raw = (
             f"{self.escrow_id}:{self.creator}:{self.buyer}:"
@@ -133,9 +101,6 @@ class EscrowBTCtoBRN:
         ).encode("utf-8")
         return hashlib.sha256(raw).hexdigest()
 
-    # ============================================================
-    # ESTADO
-    # ============================================================
     def is_expired(self, now: int | None = None) -> bool:
         n = int(now if now is not None else time.time())
         return n >= self.expires_at and self.status == STATUS_OPEN
@@ -153,25 +118,15 @@ class EscrowBTCtoBRN:
         return self.status in (STATUS_RELEASED, STATUS_EXPIRED, STATUS_CANCELLED)
 
     def can_release(self) -> bool:
-        """Indica se a ordem está no estado anterior à liberação.
-
-        Isto não confirma um depósito BTC. A confirmação, valor, endereço,
-        número de confirmações e proteção contra reutilização do txid devem
-        ser verificados pelo watcher/factory antes de creditar BRN.
-        """
         return self.status == STATUS_BTC_DETECTED
 
     def can_cancel(self) -> bool:
-        """Pode ser cancelado enquanto está OPEN."""
         return self.status == STATUS_OPEN
 
     def seconds_until_expiry(self, now: int | None = None) -> int:
         n = int(now if now is not None else time.time())
         return max(0, self.expires_at - n)
 
-    # ============================================================
-    # MUTAÇÕES (in-place — não persistem no DB)
-    # ============================================================
     def mark_detected(self, btc_txid: str) -> None:
         if self.status != STATUS_OPEN:
             raise ValueError(f"mark_detected em estado {self.status}")
@@ -196,9 +151,6 @@ class EscrowBTCtoBRN:
             raise ValueError(f"mark_cancelled em estado {self.status}")
         self.status = STATUS_CANCELLED
 
-    # ============================================================
-    # SERIALIZAÇÃO
-    # ============================================================
     def to_dict(self) -> dict:
         return {
             "escrow_id": self.escrow_id,
@@ -247,13 +199,8 @@ class EscrowBTCtoBRN:
         return hash(self.escrow_id)
 
 
-# ============================================================
-# HELPERS
-# ============================================================
 def generate_escrow_id() -> str:
-    """Gera ID único de escrow: esc_<16 hex>."""
     import secrets
-
     return "esc_" + secrets.token_hex(8)
 
 
@@ -265,7 +212,6 @@ def create_new(
     btc_address: str,
     ttl_s: int = 24 * 3600,
 ) -> EscrowBTCtoBRN:
-    """Cria um escrow em estado OPEN (ttl_s padrão de 24 horas)."""
     ttl = int(ttl_s)
     if ttl <= 0:
         raise ValueError("ttl_s deve ser > 0")
@@ -282,15 +228,11 @@ def create_new(
     )
 
 
-# ============================================================
-# AUTO-TESTE
-# ============================================================
 if __name__ == "__main__":
     print("Testando EscrowBTCtoBRN...")
     print(f"  Endereço BRN padrão: {DEFAULT_BRN_ADDRESS}")
     print()
 
-    # Teste 1 — treasury cria escrow para o operador
     e = create_new(
         creator="BRN_TREASURY",
         buyer=DEFAULT_BRN_ADDRESS,
@@ -308,7 +250,6 @@ if __name__ == "__main__":
     print(f"  [ok] criado: {e}")
     print(f"       buyer = {e.buyer}")
 
-    # Teste 2 — serialização roundtrip
     d = e.to_dict()
     assert d["status"] == STATUS_OPEN
     assert d["buyer"] == DEFAULT_BRN_ADDRESS
@@ -317,7 +258,6 @@ if __name__ == "__main__":
     assert e2.to_dict() == d
     print("  [ok] to_dict/from_dict")
 
-    # Teste 3 — transição OPEN → BTC_DETECTED
     e.mark_detected("deadbeef" * 8)
     assert e.status == STATUS_BTC_DETECTED
     assert e.is_detected()
@@ -325,13 +265,11 @@ if __name__ == "__main__":
     assert not e.can_cancel()
     print("  [ok] mark_detected")
 
-    # Teste 4 — BTC_DETECTED → RELEASED
     e.mark_released()
     assert e.is_released()
     assert e.is_terminal()
     print("  [ok] mark_released")
 
-    # Teste 5 — expiração
     e3 = EscrowBTCtoBRN(
         escrow_id=generate_escrow_id(),
         creator=DEFAULT_BRN_ADDRESS,
@@ -347,7 +285,6 @@ if __name__ == "__main__":
     assert e3.status == STATUS_EXPIRED
     print("  [ok] mark_expired")
 
-    # Teste 6 — cancelamento
     e4 = create_new(
         creator=DEFAULT_BRN_ADDRESS,
         buyer=DEFAULT_BRN_ADDRESS,
@@ -360,7 +297,6 @@ if __name__ == "__main__":
     assert e4.is_terminal()
     print("  [ok] mark_cancelled")
 
-    # Teste 7 — validações de entrada
     for bad in (
         dict(buyer="not_brn", brn_amount=1, btc_expected_sats=1),
         dict(buyer=DEFAULT_BRN_ADDRESS, brn_amount=0, btc_expected_sats=1),
