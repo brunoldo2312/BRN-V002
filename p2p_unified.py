@@ -1,18 +1,23 @@
 """
-p2p_unified.py — BRN P2P Network v6.7.6
+p2p_unified.py — BRN P2P Network v6.7.7
 ================================================================
+v6.7.7 (2026-11-02):
+  [FIX CRÍTICO] _handle_sign_block agora aceita DOIS cenários:
+                a) block_h == local_h + 1 (normal)
+                b) block_h == local_h     (RACE RECOVERY)
+                O cenário (b) acontece quando o peer JÁ recebeu o
+                bloco via broadcast (new_block) ANTES de processar o
+                pedido de assinatura. Antes, o peer recusava com
+                "altura N != local+1 (N+1)" e a chain ficava com
+                apenas 1 assinante.
+  [NEW] Todos os returns de _handle_sign_block agora incluem um
+        campo "error" com o motivo exato da recusa.
+  [FIX] validate_block() agora recebe prev_block=prev_block (não
+        mais None) dentro de _handle_sign_block.
 v6.7.6 (2026-11-01):
   [FIX CRÍTICO] _handle_sign_block chamava validate_block() com
-                validators=None, que internamente usava
-                get_active_validators() = 3 ou 4. Isso exigia que o
-                bloco JÁ TIVESSE 3 sigs antes do peer assinar —
-                chicken-and-egg: peer precisa assinar mas exige
-                que o bloco já esteja assinado.
-                Resultado: peer retornava {"pubkey": "", ...} em
-                TODOS os sign_block.
-                Fix: validators=[] → _validate_validators_sig()
-                retorna (True, "") imediatamente (skip) e
-                validate_block() ainda valida TODO o resto.
+                validators=None (chicken-and-egg).
+                Fix: validators=[] → skip de _validate_validators_sig.
 v6.7.5 (2026-10-30):
   [SECURITY] _handle_sign_block valida o bloco COMPLETO antes de
              assinar (5 validações).
@@ -469,18 +474,23 @@ class P2PServer(threading.Thread):
 
     def _handle_sign_block(self, msg: dict, addr, peer_id) -> dict:
         """
-        [v6.7.6] Valida o bloco antes de assinar, MAS pula a checagem
-        de validators_sig (validators=[]) para evitar chicken-and-egg.
+        [v6.7.7] Valida o bloco antes de assinar. Aceita 2 cenários:
+          a) block_h == local_h + 1 (normal)
+          b) block_h == local_h     (RACE RECOVERY — bloco já é o tip)
+        Todos os retornos de recusa incluem "error" com o motivo.
         """
         block = msg.get("block")
         if not block or not isinstance(block, dict):
-            return {"type": "sign_block_response", "pubkey": "", "signature": ""}
+            return {"type": "sign_block_response", "pubkey": "", "signature": "",
+                    "error": "block_invalido"}
 
         trust = getattr(self.bc, "trust_net", None)
         local_sk = getattr(self.bc, "_local_validator_sk", None)
 
         if trust is None or local_sk is None:
-            return {"type": "sign_block_response", "pubkey": "", "signature": ""}
+            return {"type": "sign_block_response", "pubkey": "", "signature": "",
+                    "error": "sem_config trust=%s sk=%s" % (
+                        "ok" if trust else "None", "ok" if local_sk else "None")}
 
         try:
             from wallet import Wallet
@@ -497,7 +507,8 @@ class P2PServer(threading.Thread):
                     "— não assina",
                     addr[0], my_pub[:16],
                 )
-                return {"type": "sign_block_response", "pubkey": "", "signature": ""}
+                return {"type": "sign_block_response", "pubkey": "", "signature": "",
+                        "error": "nao_no_top5 my_pub=%s top5=%d" % (my_pub[:16], len(validators))}
 
             # ---- 1. Header hash recomputado ----
             try:
@@ -511,10 +522,13 @@ class P2PServer(threading.Thread):
                         "[SIG] rejeitando assinatura de %s: header hash diverge",
                         addr[0],
                     )
-                    return {"type": "sign_block_response", "pubkey": "", "signature": ""}
+                    return {"type": "sign_block_response", "pubkey": "", "signature": "",
+                            "error": "header_hash_diverge calc=%s recv=%s" % (
+                                h_calc[:16], block["hash"][:16])}
             except KeyError as e:
                 log.warning("[SIG] bloco malformado (campo ausente: %s)", e)
-                return {"type": "sign_block_response", "pubkey": "", "signature": ""}
+                return {"type": "sign_block_response", "pubkey": "", "signature": "",
+                        "error": "bloco_malformado campo=%s" % e}
 
             # ---- 2. PoW suficiente ----
             try:
@@ -524,49 +538,69 @@ class P2PServer(threading.Thread):
                         "[SIG] rejeitando assinatura de %s: PoW insuficiente",
                         addr[0],
                     )
-                    return {"type": "sign_block_response", "pubkey": "", "signature": ""}
+                    return {"type": "sign_block_response", "pubkey": "", "signature": "",
+                            "error": "pow_insuf diff=%s" % block.get("difficulty")}
             except Exception as e:
                 log.warning("[SIG] falha checando PoW: %s", e)
-                return {"type": "sign_block_response", "pubkey": "", "signature": ""}
+                return {"type": "sign_block_response", "pubkey": "", "signature": "",
+                        "error": "excecao_pow %s" % e}
 
-            # ---- 3. Altura = local + 1 ----
+            # ---- 3+4. Altura e prev_hash (race recovery + motivo) ----
+            # [FIX v6.7.7] Aceita 2 cenarios:
+            #   a) block_h == local_h + 1 (normal)
+            #   b) block_h == local_h (race: bloco já é o tip local,
+            #      aceito via broadcast antes do pedido de assinatura)
             try:
                 local_h = int(self.bc.db.height())
-                block_h = int(block.get("height", -1))
-                if block_h != local_h + 1:
-                    log.info(
-                        "[SIG] rejeitando assinatura de %s: altura %d != local+1 (%d) "
-                        "— aguardando sync",
-                        addr[0], block_h, local_h + 1,
-                    )
-                    return {"type": "sign_block_response", "pubkey": "", "signature": ""}
-            except Exception as e:
-                log.warning("[SIG] falha checando altura: %s", e)
-                return {"type": "sign_block_response", "pubkey": "", "signature": ""}
-
-            # ---- 4. prev_hash = tip local ----
-            try:
                 local_tip = self.bc.db.tip_hash()
-                if block.get("prev_hash") != local_tip:
+                block_h = int(block.get("height", -1))
+
+                if block_h == local_h + 1:
+                    if block.get("prev_hash") != local_tip:
+                        log.info(
+                            "[SIG] rejeitando: prev_hash em fork "
+                            "(local_tip=%s... block=%s...)",
+                            (local_tip or "")[:16],
+                            (block.get("prev_hash") or "")[:16],
+                        )
+                        return {"type": "sign_block_response", "pubkey": "", "signature": "",
+                                "error": "prev_hash_fork local_tip=%s block_prev=%s" % (
+                                    (local_tip or "")[:16],
+                                    (block.get("prev_hash") or "")[:16])}
+                    prev_block = self.bc.db.get_block(local_h)
+                elif block_h == local_h:
+                    if block.get("hash") != local_tip:
+                        log.info(
+                            "[SIG] altura %d == local mas hash %s != tip %s",
+                            block_h,
+                            (block.get("hash") or "")[:16],
+                            (local_tip or "")[:16],
+                        )
+                        return {"type": "sign_block_response", "pubkey": "", "signature": "",
+                                "error": "hash_fork local_tip=%s block_hash=%s" % (
+                                    (local_tip or "")[:16],
+                                    (block.get("hash") or "")[:16])}
+                    prev_block = self.bc.db.get_block(block_h - 1) if block_h > 0 else None
+                    log.info("[SIG] assinando bloco #%d em RACE RECOVERY (já é o tip local)", block_h)
+                else:
                     log.info(
-                        "[SIG] rejeitando assinatura de %s: prev_hash em fork "
-                        "(local_tip=%s... vs block=%s...)",
-                        addr[0],
-                        (local_tip or "")[:16],
-                        (block.get("prev_hash") or "")[:16],
+                        "[SIG] altura %d fora da janela [%d, %d]",
+                        block_h, local_h, local_h + 1,
                     )
-                    return {"type": "sign_block_response", "pubkey": "", "signature": ""}
+                    return {"type": "sign_block_response", "pubkey": "", "signature": "",
+                            "error": "altura_fora local_h=%d block_h=%d" % (local_h, block_h)}
             except Exception as e:
-                log.warning("[SIG] falha checando prev_hash: %s", e)
-                return {"type": "sign_block_response", "pubkey": "", "signature": ""}
+                log.warning("[SIG] falha checando altura/prev_hash: %s", e)
+                return {"type": "sign_block_response", "pubkey": "", "signature": "",
+                        "error": "excecao_altura %s" % e}
 
             # ---- 5. validate_block SEM checar validators_sig ----
             # [FIX v6.7.6] validators=[] faz _validate_validators_sig
-            # retornar (True, "") imediatamente (skip). Todas as outras
-            # validações de validate_block continuam ativas.
+            # retornar (True, "") imediatamente (skip).
+            # [FIX v6.7.7] prev_block=prev_block (antes era None).
             try:
                 ok_val, msg_val = self.bc.validate_block(
-                    block, prev_block=None, validators=[],
+                    block, prev_block=prev_block, validators=[],
                 )
                 if not ok_val:
                     self.metrics.inc("block_sigs_invalid")
@@ -574,17 +608,20 @@ class P2PServer(threading.Thread):
                         "[SIG] rejeitando assinatura de %s: validate_block: %s",
                         addr[0], msg_val,
                     )
-                    return {"type": "sign_block_response", "pubkey": "", "signature": ""}
+                    return {"type": "sign_block_response", "pubkey": "", "signature": "",
+                            "error": "validate_block %s" % msg_val[:80]}
             except Exception as e:
                 log.warning("[SIG] validate_block exceção: %s", e)
-                return {"type": "sign_block_response", "pubkey": "", "signature": ""}
+                return {"type": "sign_block_response", "pubkey": "", "signature": "",
+                        "error": "excecao_validate %s" % e}
 
             # ============================================================
             # Todas as validações passaram — assina
             # ============================================================
             entry = sign_block_as_validator(block, local_sk)
             if not entry:
-                return {"type": "sign_block_response", "pubkey": "", "signature": ""}
+                return {"type": "sign_block_response", "pubkey": "", "signature": "",
+                        "error": "sign_falhou (wallet retornou vazio)"}
 
             self.metrics.inc("block_sigs_provided")
             log.info(
@@ -598,7 +635,8 @@ class P2PServer(threading.Thread):
             }
         except Exception as e:
             log.warning("[SIG] _handle_sign_block exceção: %s", e)
-            return {"type": "sign_block_response", "pubkey": "", "signature": ""}
+            return {"type": "sign_block_response", "pubkey": "", "signature": "",
+                    "error": "excecao %s" % e}
 
     def _process_message(self, msg: dict, addr, peer_id: Optional[str]) -> Optional[dict]:
         mtype = msg.get("type")
@@ -795,7 +833,11 @@ class P2PClient:
         if resp.get("type") != "sign_block_response": return None
         pubkey = (resp.get("pubkey") or "").strip()
         signature = (resp.get("signature") or "").strip()
-        if not pubkey or not signature: return None
+        if not pubkey or not signature:
+            err = resp.get("error", "")
+            if err:
+                log.info("[SIG] peer %s:%s recusou: %s", ip, port, err)
+            return None
         return {"pubkey": pubkey, "signature": signature}
 
 
