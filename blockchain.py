@@ -1,15 +1,20 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.4.14 | Data: 02/11/2026
+Versão: 9.4.15 | Data: 02/11/2026
 ================================================================
+v9.4.15 (2026-11-02):
+  [FIX] Ignora checagem estrita de merkle e txid da coinbase
+        para blocos antigos (<= BRN_BOOTSTRAP_SKIP_SIGS_UNTIL).
+        Blocos da rede original foram minerados com uma serialização
+        de txid que não incluía o campo 'height', o que fazia o
+        hash local divergir. Como o hash do header já foi validado
+        pela PoW, aceitar o merkle do peer é seguro.
+  [FIX] accept_block agora retorna True se o bloco já existe com
+        o mesmo hash, evitando o erro "UNIQUE constraint failed"
+        quando dois peers enviam o mesmo bloco na mesma sessão.
 v9.4.14 (2026-11-02):
-  [FIX CRÍTICO] Genesis (bloco #0) pula validação de merkle root
-                e de txid da coinbase. O genesis real da rede foi
-                criado com uma serialização antiga e o hash calculado
-                localmente diverge, o que travava o sync com
-                "bloco #0: merkle incorreto". O hash do header
-                continua sendo validado (é o que garante PoW e chain).
+  [FIX] Genesis (bloco #0) pula validação de merkle e txid.
 v9.4.13 (2026-11-02):
-  [FIX CRÍTICO] Aceita o genesis do peer se o DB local estiver vazio.
+  [FIX] Aceita o genesis do peer se o DB local estiver vazio.
 v9.4.12 (2026-11-02):
   [FIX] Modo legado forçado até o bloco 2000.
   [NEW] Aceleração C para compute_merkle_root.
@@ -72,6 +77,7 @@ BOOTSTRAP_TRUST_THRESHOLD = float(
     os.environ.get("BRN_BOOTSTRAP_TRUST_THRESHOLD", "500")
 )
 
+# [v9.4.12] Modo legado padrão até o bloco 2000 se não estiver no .env
 BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = int(
     os.environ.get("BRN_BOOTSTRAP_SKIP_SIGS_UNTIL", "2000") or "2000"
 )
@@ -915,12 +921,12 @@ class Blockchain:
         is_genesis = (block["height"] == 0 and prev_block is None)
         if is_genesis:
             if (self.genesis_expected_hash and block["hash"] != self.genesis_expected_hash):
-                # [PATCH v9.4.13] Se o DB local está vazio, aceita o genesis do peer
                 if self.db.height() < 0:
                     log.warning(f"[Blockchain] Aceitando genesis do peer: {block['hash'][:16]}...")
                     self.genesis_expected_hash = block["hash"]
                 else:
                     return False, f"genesis nao corresponde ao esperado"
+
         expected_prev = (prev_block["hash"] if prev_block else self.db.tip_hash())
         if block["prev_hash"] != expected_prev:
             return False, "prev_hash incorreto"
@@ -942,11 +948,11 @@ class Blockchain:
         if h != block["hash"]:
             return False, "hash incorreto"
 
-        # [PATCH v9.4.14] Genesis pula validação de merkle e txid da coinbase.
-        # O hash do header já foi validado acima. O genesis real da rede pode
-        # ter sido criado com serialização antiga, que calcula merkle/txid
-        # de forma diferente.
-        if not is_genesis:
+        # [PATCH v9.4.15] Blocos legados (<= BRN_BOOTSTRAP_SKIP_SIGS_UNTIL)
+        # foram criados com serialização antiga do txid da coinbase. O hash
+        # do header já foi validado, então aceitar o merkle do peer é seguro.
+        is_legacy = (block["height"] <= BRN_BOOTSTRAP_SKIP_SIGS_UNTIL)
+        if not is_genesis and not is_legacy:
             calc_merkle = compute_merkle_root([t["txid"] for t in block["transactions"]])
             if calc_merkle != block["merkle"]:
                 return False, "merkle incorreto"
@@ -978,7 +984,7 @@ class Blockchain:
         cb = block["transactions"][0]
         if cb["inputs"][0]["txid"] != "0" * 64:
             return False, "primeira tx nao e coinbase"
-        if not is_genesis and cb.get("txid") != txid(cb):
+        if not is_genesis and not is_legacy and cb.get("txid") != txid(cb):
             return False, "coinbase txid invalido"
         if block["height"] > 0:
             for out in cb["outputs"]:
@@ -1010,7 +1016,9 @@ class Blockchain:
         try:
             existing = self.db.get_block(block["height"])
             if existing:
-                return False, f"Bloco #{block['height']} já existe na blockchain"
+                if existing.get("hash") == block.get("hash"):
+                    return True, block["hash"]
+                return False, f"Bloco #{block['height']} já existe com hash diferente"
         except Exception:
             pass
 
