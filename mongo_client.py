@@ -1,446 +1,329 @@
-"""mongo_client.py — Cliente MongoDB opcional do BRN
+"""miner_pool_client.py — Cliente do pool de mineração BRN (v5.3)
 ================================================================
-Wrapper fino sobre pymongo com detecção de configuração,
-reconexão preguiçosa e fallback silencioso.
-
-API pública (usada por main.py, server.py, rendezvous_mongo.py):
-    mongo.is_configured() -> bool
-    mongo.db()            -> Database | None
-    mongo.ping()          -> (ok: bool, err: str | None)
-    mongo.close()
-    mongo.uri             -> str
-    mongo.db_name         -> str
-
-Campos:
-    user, password, host, db_name, uri
-
-Env vars:
-    MONGO_USER     (default: "")
-    MONGO_PASS     (default: "")
-    MONGO_HOST     (default: "")
-    MONGO_DB       (default: "brn_analytics")
-    MONGO_URI      (override direto — se definido, ignora os outros)
-    MONGO_TIMEOUT  (default: 3s)
-
-Comportamento:
-    - Se MONGO_PASS vazio → is_configured() retorna False
-    - Se pymongo não instalado → db() retorna None (silencioso)
-    - Reconecta automaticamente em caso de falha transiente
-    - close() idempotente
-
-Requer (opcional):
-    pip install "pymongo[srv]"
-================================================================
+v5.3 (2026-11-02):
+  [FIX CRÍTICO] Removida a herança de threading.Thread.
+                Agora o PoolClient usa uma thread interna (self._thread).
+                Isso resolve o erro "threads can only be started once"
+                que ocorria ao clicar em "Minerar Pool" mais de uma vez
+                ou ao rodar a GUI e o script juntos.
+  [FIX] Tratamento de Rate Limit (HTTP 429) mantido.
 """
 from __future__ import annotations
 
-import logging
 import os
-import threading
 import time
-from typing import Optional, Tuple
+import json
+import uuid
+import socket
+import hashlib
+import threading
+import urllib.request
+import urllib.error
+import logging
 
 
-log = logging.getLogger("mongo")
+log = logging.getLogger("pool-client")
+
+# ============================================================
+# CONFIG
+# ============================================================
+POOL_URL           = os.environ.get("BRN_POOL_URL", "http://127.0.0.1:5000")
+HEARTBEAT_S        = 5.0
+WORK_REFRESH_S     = 15.0
+HASH_BATCH         = 50000
+HTTP_TIMEOUT_S     = 10.0
+
+try:
+    import brn_miner as _brn_miner_c
+    _HAS_C = _brn_miner_c.is_available()
+except Exception:
+    _brn_miner_c = None
+    _HAS_C = False
 
 
 # ============================================================
-# CONFIG (lido do ambiente)
+# HTTP
 # ============================================================
-DEFAULT_TIMEOUT_MS = int(os.environ.get("MONGO_TIMEOUT", "3")) * 1000
-
-
-class _Mongo:
-    """
-    Cliente MongoDB singleton com reconexão preguiçosa.
-
-    Não abre conexão até o primeiro db()/ping().
-    Se pymongo ausente ou config vazia, opera em modo no-op.
-    """
-
-    def __init__(self):
-        self.user = os.environ.get("MONGO_USER", "").strip()
-        self.password = os.environ.get("MONGO_PASS", "").strip()
-        self.host = os.environ.get("MONGO_HOST", "").strip()
-        self.db_name = os.environ.get("MONGO_DB", "brn_analytics").strip()
-        self.uri_override = os.environ.get("MONGO_URI", "").strip()
-
-        self._client = None
-        self._db = None
-        self._last_ping = 0.0
-        self._last_error: Optional[str] = None
-        self._lock = threading.RLock()
-
-        # cacheia o uri final
-        self.uri = self._build_uri()
-
-    # ============================================================
-    # URI
-    # ============================================================
-    def _build_uri(self) -> str:
-        """Monta o URI mongodb+srv:// a partir das credenciais."""
-        if self.uri_override:
-            return self.uri_override
-
-        if not (self.user and self.password and self.host):
-            return ""
-
-        # URL-encode user e password (podem ter @, :, etc.)
-        try:
-            from urllib.parse import quote_plus
-            u = quote_plus(self.user)
-            p = quote_plus(self.password)
-        except Exception:
-            u = self.user
-            p = self.password
-
-        return (
-            f"mongodb+srv://{u}:{p}@{self.host}/"
-            f"?retryWrites=true&w=majority"
+def _http_post(base_url: str, path: str, body: dict, timeout: float = HTTP_TIMEOUT_S) -> dict:
+    url = base_url.rstrip("/") + path
+    data = json.dumps(body).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            url, data=data,
+            headers={"Content-Type": "application/json", "User-Agent": "brn-pool-client/5.3"},
+            method="POST",
         )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try: return json.loads(e.read().decode("utf-8"))
+        except Exception: return {"ok": False, "msg": f"HTTP {e.code}"}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
 
-    # ============================================================
-    # CONFIG CHECK
-    # ============================================================
-    def is_configured(self) -> bool:
-        """
-        True se todos os campos necessários estão preenchidos.
-        Não verifica conectividade.
-        """
-        return bool(self.uri)
 
-    # ============================================================
-    # CLIENTE (lazy)
-    # ============================================================
-    def _get_client(self):
-        """
-        Retorna o MongoClient, criando-o na primeira chamada.
-        Retorna None se pymongo indisponível ou config vazia.
-        """
-        if not self.uri:
-            return None
+# ============================================================
+# HASH RATE METER
+# ============================================================
+class HashrateMeter:
+    def __init__(self, window=10.0):
+        self.window = window
+        self._samples = []
+        self._lock = threading.Lock()
 
-        with self._lock:
-            if self._client is not None:
-                return self._client
-
-            try:
-                from pymongo import MongoClient
-            except ImportError:
-                log.debug("pymongo nao instalado — Mongo desabilitado")
-                self._last_error = "pymongo nao instalado"
-                return None
-
-            try:
-                client = MongoClient(
-                    self.uri,
-                    serverSelectionTimeoutMS=DEFAULT_TIMEOUT_MS,
-                    connectTimeoutMS=DEFAULT_TIMEOUT_MS,
-                    socketTimeoutMS=DEFAULT_TIMEOUT_MS * 3,
-                    appname="brn-node",
-                )
-                self._client = client
-                return client
-            except Exception as e:
-                self._last_error = str(e)
-                log.warning(f"falha criando MongoClient: {e}")
-                return None
-
-    # ============================================================
-    # DB
-    # ============================================================
-    def db(self):
-        """
-        Retorna a database configurada, ou None se indisponível.
-        Não valida conectividade — só retorna a referência.
-        """
-        if not self.uri:
-            return None
-
-        with self._lock:
-            if self._db is not None:
-                return self._db
-
-            client = self._get_client()
-            if client is None:
-                return None
-
-            try:
-                self._db = client[self.db_name]
-                return self._db
-            except Exception as e:
-                self._last_error = str(e)
-                log.warning(f"falha obtendo database: {e}")
-                return None
-
-    # ============================================================
-    # PING
-    # ============================================================
-    def ping(self) -> Tuple[bool, Optional[str]]:
-        """
-        Testa a conexão.
-
-        Retorna:
-            (True, None)       — conexão OK
-            (False, "motivo")  — falhou
-        """
-        if not self.uri:
-            return False, "nao configurado"
-
-        client = self._get_client()
-        if client is None:
-            return False, self._last_error or "pymongo indisponivel"
-
-        try:
-            client.admin.command("ping")
-            self._last_ping = time.time()
-            self._last_error = None
-            return True, None
-        except Exception as e:
-            self._last_error = str(e)
-            return False, str(e)
-
-    # ============================================================
-    # CLOSE
-    # ============================================================
-    def close(self) -> None:
-        """Fecha a conexão. Idempotente."""
-        with self._lock:
-            client = self._client
-            self._client = None
-            self._db = None
-
-        if client is not None:
-            try:
-                client.close()
-            except Exception:
-                pass
-
-    # ============================================================
-    # RECONNECT (útil em falha transiente)
-    # ============================================================
-    def reconnect(self) -> None:
-        """Fecha e recria o cliente na próxima chamada."""
-        self.close()
-        log.info("mongo: cliente resetado (reconnect na proxima chamada)")
-
-    # ============================================================
-    # STATUS
-    # ============================================================
-    def status(self) -> dict:
-        """Estado atual (para /api/diagnostico)."""
+    def add(self, total_hashes: int):
         now = time.time()
-        return {
-            "configured":     self.is_configured(),
-            "db_name":        self.db_name,
-            "host":           self.host,
-            "user":           self.user[:8] + "..." if self.user else "",
-            "uri_prefix":     self.uri.split("@")[0][:20] + "..." if self.uri else "",
-            "has_client":     self._client is not None,
-            "has_db":         self._db is not None,
-            "last_ping_ago":  (int(now - self._last_ping)
-                               if self._last_ping else None),
-            "last_error":     self._last_error,
-        }
+        with self._lock:
+            self._samples.append((now, int(total_hashes)))
+            cutoff = now - self.window
+            self._samples = [(t, h) for (t, h) in self._samples if t >= cutoff]
 
-    # ============================================================
-    # HELPERS DE ALTO NÍVEL
-    # ============================================================
-    def collection(self, name: str):
-        """Retorna uma collection ou None."""
-        db = self.db()
-        if db is None:
-            return None
+    def rate(self) -> float:
+        with self._lock:
+            if len(self._samples) < 2: return 0.0
+            t0, h0 = self._samples[0]
+            t1, h1 = self._samples[-1]
+            dt = t1 - t0
+            if dt <= 0: return 0.0
+            return max(0.0, (h1 - h0) / dt)
+
+
+# ============================================================
+# POW SEARCH
+# ============================================================
+def _target_from_difficulty(diff: int) -> int:
+    return int("0" * int(diff) + "f" * (64 - int(diff)), 16)
+
+
+def _mine_batch(prev_hash: str, merkle: str, ts: int, diff: int, share_difficulty: int,
+                nonce_start: int, batch: int, share_target: int) -> tuple:
+    if _HAS_C and _brn_miner_c is not None:
+        prefix = prev_hash + merkle + str(ts)
+        diff_str = str(int(diff))
         try:
-            return db[name]
-        except Exception:
-            return None
+            result = _brn_miner_c.pow_search(prefix, diff_str, int(share_difficulty), nonce_start=nonce_start, max_iters=batch)
+        except Exception: result = None
+        if result is not None:
+            found_nonce, found_hash, hashes = result
+            if found_nonce is not None: return found_nonce, found_hash, hashes, found_nonce + 1
+            else: return None, None, hashes, nonce_start + hashes
 
-    def is_available(self) -> bool:
-        """Ping rápido — True se responde em < timeout."""
-        ok, _ = self.ping()
-        return ok
+    prefix = (prev_hash + merkle + str(ts)).encode()
+    diff_bytes = str(diff).encode()
+    sha = hashlib.sha256
+    nonce = nonce_start
+    for i in range(batch):
+        data = prefix + str(nonce).encode() + diff_bytes
+        h = sha(sha(data).digest()).digest()
+        if int.from_bytes(h, "big") <= share_target:
+            return nonce, h.hex(), i + 1, nonce + 1
+        nonce += 1
+    return None, None, batch, nonce
+
+
+# ============================================================
+# POOL CLIENT
+# ============================================================
+class PoolClient:
+    def __init__(self, address: str, pubkey: str, pool_url: str = None, miner_id: str = None):
+        self.address = address
+        self.pubkey = pubkey
+        self.pool_url = (pool_url or POOL_URL).rstrip("/")
+        self.miner_id = miner_id or uuid.uuid4().hex[:12]
+
+        self._stop = threading.Event()
+        self._running = False
+        self._lock = threading.RLock()
+        self._thread = None  # <--- Thread principal (NÃO herda de Thread)
+
+        self.hashrate_meter = HashrateMeter(window=10.0)
+        self.hashes_total = 0
+        self.shares_submitted = 0
+        self.shares_accepted = 0
+        self.shares_rejected = 0
+        self.blocks_found = 0
+        self.last_share_at = 0.0
+        self.last_block_at = 0.0
+        self.last_error = ""
+        self.started_at = 0.0
+
+        self._job = None
+        self._job_lock = threading.RLock()
+        self._rate_limit_until = 0.0
+
+    def start_mining(self) -> tuple:
+        if self._running:
+            return False, "ja rodando"
+
+        r = _http_post(self.pool_url, "/api/pool/register", {
+            "miner_id": self.miner_id, "address": self.address, "pubkey": self.pubkey,
+        })
+        if not r.get("ok"): return False, r.get("msg", "register falhou")
+
+        self.miner_id = r.get("miner_id", self.miner_id)
+        self._stop.clear()
+        self._running = True
+        self.started_at = time.time()
+
+        threading.Thread(target=self._loop_heartbeat, daemon=True, name="Pool-HB").start()
+        threading.Thread(target=self._loop_work, daemon=True, name="Pool-Work").start()
+        
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(target=self.run, daemon=True, name="Pool-Main")
+            self._thread.start()
+
+        log.info("pool client: iniciado (miner_id=%s)", self.miner_id)
+        return True, "iniciado"
+
+    def stop_mining(self) -> tuple:
+        if not self._running: return False, "nao estava rodando"
+        self._stop.set()
+        self._running = False
+        try: _http_post(self.pool_url, "/api/pool/disconnect", {"miner_id": self.miner_id})
+        except Exception: pass
+        log.info("pool client: parado")
+        return True, "parado"
+
+    def is_running(self) -> bool: return self._running
+
+    def _handle_rate_limit(self, msg: str) -> None:
+        import re
+        m = re.search(r'Tente em (\d+)s', msg)
+        wait_s = int(m.group(1)) if m else 60
+        self._rate_limit_until = time.time() + wait_s
+        log.warning("pool client: BLOQUEADO PELO POOL. Aguardando %ds...", wait_s)
+
+    def _loop_heartbeat(self):
+        while not self._stop.wait(HEARTBEAT_S):
+            if time.time() < self._rate_limit_until: continue
+            try:
+                r = _http_post(self.pool_url, "/api/pool/heartbeat", {
+                    "miner_id": self.miner_id, "hashrate": self.hashrate_meter.rate(), "hashes_total": self.hashes_total,
+                }, timeout=5.0)
+                if not r.get("ok") and "muitas requisições" in (r.get("msg") or "").lower():
+                    self._handle_rate_limit(r.get("msg", ""))
+            except Exception: pass
+
+    def _loop_work(self):
+        while not self._stop.wait(WORK_REFRESH_S):
+            if time.time() < self._rate_limit_until: continue
+            try: self._fetch_work()
+            except Exception: pass
+
+    def _fetch_work(self):
+        if time.time() < self._rate_limit_until: return
+        r = _http_post(self.pool_url, "/api/pool/work", {"miner_id": self.miner_id})
+        if not r.get("ok"):
+            msg = r.get("msg", "")
+            if "Muitas requisições" in msg: self._handle_rate_limit(msg)
+            return
+        job = r.get("job") or {}
+        with self._job_lock:
+            if self._job is None or self._job.get("job_id") != job.get("job_id"):
+                self._job = job
+
+    def run(self):
+        # Busca trabalho inicial
+        for _ in range(10):
+            if self._stop.is_set(): break
+            try: self._fetch_work()
+            except Exception: pass
+            with self._job_lock:
+                if self._job: break
+            time.sleep(1.0)
+
+        nonce = 0
+        last_job_id = None
+        last_share_diff = None
+
+        while not self._stop.is_set():
+            if time.time() < self._rate_limit_until:
+                time.sleep(1.0)
+                continue
+
+            with self._job_lock: job = self._job
+            if not job:
+                time.sleep(1.0)
+                continue
+
+            if job.get("job_id") != last_job_id:
+                last_job_id = job.get("job_id")
+                nonce = 0
+
+            share_diff = int(job.get("share_difficulty", 4))
+            last_share_diff = share_diff
+            share_target = _target_from_difficulty(share_diff)
+
+            try:
+                found_nonce, found_hash, hashes, nonce = _mine_batch(
+                    prev_hash=job["prev_hash"], merkle=job["merkle"], ts=int(job["timestamp"]),
+                    diff=int(job["difficulty"]), share_difficulty=share_diff,
+                    nonce_start=nonce, batch=HASH_BATCH, share_target=share_target,
+                )
+            except Exception as e:
+                time.sleep(1.0); continue
+
+            self.hashes_total += hashes
+            self.hashrate_meter.add(self.hashes_total)
+
+            if found_nonce is None: continue
+
+            self.shares_submitted += 1
+            self.last_share_at = time.time()
+
+            try:
+                r = _http_post(self.pool_url, "/api/pool/submit", {
+                    "miner_id": self.miner_id, "job_id": job.get("job_id"),
+                    "nonce": int(found_nonce), "hash": found_hash,
+                })
+            except Exception: continue
+
+            if r.get("ok"):
+                self.shares_accepted += 1
+                if r.get("block_found"): self.blocks_found += 1
+            else:
+                self.shares_rejected += 1
+                err = (r.get("msg") or "").lower()
+                if "muitas requisições" in err: self._handle_rate_limit(r.get("msg", ""))
+                elif "job expirado" in err:
+                    with self._job_lock: self._job = None
+
+    def status(self) -> dict:
+        with self._lock:
+            return {
+                "ok": True, "running": self._running, "miner_id": self.miner_id,
+                "address": self.address, "hashrate": round(self.hashrate_meter.rate(), 2),
+                "hashrate_khs": round(self.hashrate_meter.rate() / 1000, 3),
+                "hashes_total": self.hashes_total, "shares_submitted": self.shares_submitted,
+                "shares_accepted": self.shares_accepted, "shares_rejected": self.shares_rejected,
+                "blocks_found": self.blocks_found, "uptime_s": (int(time.time() - self.started_at) if self.started_at else 0),
+                "last_error": self.last_error, "job_id": (self._job.get("job_id") if self._job else None),
+                "job_height": (self._job.get("height") if self._job else None),
+                "job_share_diff": (self._job.get("share_difficulty") if self._job else None),
+                "pool_url": self.pool_url,
+            }
 
 
 # ============================================================
 # SINGLETON
 # ============================================================
-mongo = _Mongo()
+_INSTANCE = None
+_INSTANCE_LOCK = threading.RLock()
 
+def get_pool_client(address: str = None, pubkey: str = None) -> PoolClient:
+    global _INSTANCE
+    with _INSTANCE_LOCK:
+        if _INSTANCE is None:
+            if not address or not pubkey: return None
+            _INSTANCE = PoolClient(address, pubkey)
+        elif address and _INSTANCE.address != address:
+            if _INSTANCE.is_running(): _INSTANCE.stop_mining()
+            _INSTANCE = PoolClient(address, pubkey)
+        return _INSTANCE
 
-# ============================================================
-# API DE MÓDULO (compat com rendezvous_mongo)
-# ============================================================
-def is_configured() -> bool:
-    return mongo.is_configured()
-
-
-def db():
-    return mongo.db()
-
-
-def ping() -> Tuple[bool, Optional[str]]:
-    return mongo.ping()
-
-
-def close() -> None:
-    mongo.close()
-
-
-def status() -> dict:
-    return mongo.status()
-
-
-# ============================================================
-# AUTO-TESTE
-# ============================================================
-if __name__ == "__main__":
-    import json
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-
-    print("=" * 60)
-    print(" mongo_client.py — Auto-teste")
-    print("=" * 60)
-
-    # ------------------------------------------------------------
-    # 1. Sem config
-    # ------------------------------------------------------------
-    print("\n[1] Sem config (env vars vazias):")
-
-    # Salva e limpa
-    saved_env = {k: os.environ.pop(k, None)
-                 for k in ("MONGO_USER", "MONGO_PASS",
-                           "MONGO_HOST", "MONGO_DB", "MONGO_URI")}
-
-    try:
-        # Cria nova instância limpa
-        import importlib
-        importlib.reload(__import__("mongo_client"))
-
-        from mongo_client import _Mongo
-        m = _Mongo()
-
-        print(f"    is_configured: {m.is_configured()}")
-        print(f"    db():          {m.db()}")
-        ok, err = m.ping()
-        print(f"    ping():        ok={ok} err={err!r}")
-        assert m.is_configured() is False
-        assert m.db() is None
-        assert ok is False
-        print("    [ok] no-op silencioso")
-    finally:
-        for k, v in saved_env.items():
-            if v is not None:
-                os.environ[k] = v
-
-    # ------------------------------------------------------------
-    # 2. Config completa (host fake)
-    # ------------------------------------------------------------
-    print("\n[2] Config completa (host fake, sem conectar):")
-
-    os.environ["MONGO_USER"] = "user_test"
-    os.environ["MONGO_PASS"] = "pass_test"
-    os.environ["MONGO_HOST"] = "cluster0.fake.mongodb.net"
-    os.environ["MONGO_DB"] = "test_db"
-
-    try:
-        import importlib
-        import mongo_client as mc
-        importlib.reload(mc)
-
-        m2 = mc._Mongo()
-        print(f"    is_configured: {m2.is_configured()}")
-        print(f"    uri:           {m2.uri[:60]}...")
-        print(f"    db_name:       {m2.db_name}")
-        print(f"    user:          {m2.user}")
-        print(f"    host:          {m2.host}")
-
-        assert m2.is_configured() is True
-        assert m2.db_name == "test_db"
-        assert "user_test" in m2.uri
-        assert "test_db" not in m2.uri  # db nome fica separado
-        print("    [ok] config lida corretamente")
-
-        # status()
-        st = m2.status()
-        print(f"\n    status:")
-        for k, v in st.items():
-            print(f"      {k}: {v}")
-    finally:
-        for k in ("MONGO_USER", "MONGO_PASS", "MONGO_HOST", "MONGO_DB"):
-            os.environ.pop(k, None)
-
-    # ------------------------------------------------------------
-    # 3. URI override
-    # ------------------------------------------------------------
-    print("\n[3] MONGO_URI override:")
-
-    os.environ["MONGO_URI"] = (
-        "mongodb+srv://alice:secret@cluster.example.mongodb.net/"
-        "?retryWrites=true&w=majority"
-    )
-
-    try:
-        import importlib
-        import mongo_client as mc
-        importlib.reload(mc)
-
-        m3 = mc._Mongo()
-        print(f"    is_configured: {m3.is_configured()}")
-        print(f"    uri:           {m3.uri[:60]}...")
-        assert m3.is_configured() is True
-        assert "cluster.example" in m3.uri
-        print("    [ok] override funcionou")
-    finally:
-        os.environ.pop("MONGO_URI", None)
-
-    # ------------------------------------------------------------
-    # 4. Recarregar singleton
-    # ------------------------------------------------------------
-    print("\n[4] Singleton module-level:")
-
-    import importlib
-    import mongo_client as mc
-    importlib.reload(mc)
-
-    print(f"    mongo.is_configured(): {mc.mongo.is_configured()}")
-    print(f"    is_configured():       {mc.is_configured()}")
-    print(f"    db():                  {mc.db()}")
-    ok, err = mc.ping()
-    print(f"    ping():                ok={ok} err={err!r}")
-    print(f"    status():              {json.dumps(mc.status(), default=str)}")
-
-    # ------------------------------------------------------------
-    # 5. close idempotente
-    # ------------------------------------------------------------
-    print("\n[5] close() idempotente:")
-    mc.close()
-    mc.close()
-    mc.close()
-    print("    [ok] sem erro")
-
-    # ------------------------------------------------------------
-    # 6. Reconnect
-    # ------------------------------------------------------------
-    print("\n[6] reconnect():")
-    mc.mongo.reconnect()
-    print(f"    has_client após reconnect: {mc.mongo._client is not None}")
-    print("    [ok]")
-
-    # ------------------------------------------------------------
-    # 7. Se pymongo disponível, tenta conexão real?
-    # ------------------------------------------------------------
-    print("\n[7] pymongo instalado?")
-    try:
-        import pymongo
-        print(f"    pymongo versao: {pymongo.version}")
-    except ImportError:
-        print("    pymongo NAO instalado (Mongo desabilitado)")
-        print("    Para ativar: pip install \"pymongo[srv]\"")
-
-    print("\n" + "=" * 60)
-    print(" mongo_client.py OK.")
-    print("=" * 60)
+def stop_pool_client() -> bool:
+    global _INSTANCE
+    with _INSTANCE_LOCK:
+        if _INSTANCE is None: return False
+        if _INSTANCE.is_running(): _INSTANCE.stop_mining()
+        return True
