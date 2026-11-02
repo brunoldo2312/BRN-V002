@@ -1,6 +1,21 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.4.9 | Data: 01/11/2026
+Versão: 9.4.10 | Data: 01/11/2026
 ================================================================
+v9.4.10 (2026-11-01):
+  [NEW] EMERGENCIA: bypass de multi-sig até uma altura configurável
+        via BRN_BOOTSTRAP_SKIP_SIGS_UNTIL (default 0 = desativado).
+        Blocos 0 < h <= N são aceitos SEM checar validators_sig.
+        PoW, merkle, hash, auth_tag e validação de txs CONTINUAM
+        ativos (validate_block). Apenas o quórum de assinaturas é
+        ignorado no intervalo.
+        Cenário: sync inicial onde o trust_network.json do cliente
+        está desatualizado e o peer tem altura muito maior
+        (ex: cliente em #57, peer em #169). Sem o bypass, todos
+        os blocos do peer são rejeitados por falta de quórum.
+        SEGURANÇA: só aceita h <= N; acima de N volta ao
+        multi-sig estrito. O log emite WARNING por bloco aceito.
+        REMOVER BRN_BOOTSTRAP_SKIP_SIGS_UNTIL do .env e reiniciar
+        assim que altura local > N.
 v9.4.9 (2026-11-01):
   [FIX CRÍTICO] _get_active_validators() agora inclui a própria
                 _local_validator_sk no set. Sem isto, o Origin
@@ -12,15 +27,9 @@ v9.4.9 (2026-11-01):
                 assinaturas válidas" → chain travada em #30.
   [FIX CRÍTICO] _validate_validators_sig() agora aceita bloco
                 assinado APENAS pela _local_validator_sk em MODO
-                BOOTSTRAP LOCAL. Sem isto, mesmo com Fix 1, o
-                bloco falhava por REQUIRED_ALL_SIGS=True (4/4) e
-                trust_score local (200) < BOOTSTRAP_TRUST_THRESHOLD
-                (500). Segurança: a SK local é a identidade do
-                próprio nó; aceitar seu próprio bloco é o mínimo
-                para o Origin não travar em cadeia vazia.
+                BOOTSTRAP LOCAL.
 v9.4.8 (2026-10-30):
   [FIX CRÍTICO] MODO BOOTSTRAP ESTENDIDO em _validate_validators_sig.
-  (ver histórico original)
 ================================================================
 """
 from __future__ import annotations
@@ -75,12 +84,20 @@ BOOTSTRAP_TRUST_THRESHOLD = float(
     os.environ.get("BRN_BOOTSTRAP_TRUST_THRESHOLD", "500")
 )
 
+# [EMERGENCIA v9.4.10] Bypass de multi-sig ate uma altura.
+# 0 = desativado (padrao). Use 300 para sync inicial e REMOVA depois.
+BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = int(
+    os.environ.get("BRN_BOOTSTRAP_SKIP_SIGS_UNTIL", "0") or "0"
+)
+
 if not (0.0 < VALIDATOR_QUORUM <= 1.0):
     VALIDATOR_QUORUM = 0.67
 if SIG_COLLECT_TIMEOUT <= 0:
     SIG_COLLECT_TIMEOUT = 10.0
 if BOOTSTRAP_TRUST_THRESHOLD < 0:
     BOOTSTRAP_TRUST_THRESHOLD = 500.0
+if BRN_BOOTSTRAP_SKIP_SIGS_UNTIL < 0:
+    BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = 0
 
 GENESIS_PREV      = "0" * 64
 GENESIS_TIMESTAMP = 1700000000
@@ -712,8 +729,6 @@ class Blockchain:
 
     # ============================================================
     # [FIX v9.4.9] Inclui a própria _local_validator_sk no set.
-    # Sem isto, o Origin não assina seus próprios blocos quando o
-    # trust_network.json está vazio/desatualizado (caso atual).
     # ============================================================
     def _get_active_validators(self) -> list:
         validators: list = []
@@ -757,10 +772,29 @@ class Blockchain:
         return need
 
     # ============================================================
-    # [FIX v9.4.9] Aceita bloco assinado APENAS pela _local_validator_sk
-    # em MODO BOOTSTRAP LOCAL (antes de checar BOOTSTRAP_TRUST_THRESHOLD).
+    # [FIX v9.4.9] + [EMERGENCIA v9.4.10] Bypass por altura.
     # ============================================================
     def _validate_validators_sig(self, block: dict, validators: Optional[list] = None) -> tuple:
+        # [EMERGENCIA v9.4.10] Bypass de multi-sig ate BRN_BOOTSTRAP_SKIP_SIGS_UNTIL.
+        # Aceita o bloco SEM checar validators_sig (mas PoW, merkle, hash,
+        # auth_tag e tx-validation CONTINUAM ativos em validate_block).
+        # Cenario: sync inicial onde o trust_network.json do cliente
+        # esta vazio/desatualizado e o peer tem altura muito maior.
+        # REMOVER o .env e reiniciar assim que a altura local passar
+        # de BRN_BOOTSTRAP_SKIP_SIGS_UNTIL.
+        if BRN_BOOTSTRAP_SKIP_SIGS_UNTIL > 0:
+            try:
+                _bh = int(block.get("height", -1))
+            except Exception:
+                _bh = -1
+            if 0 < _bh <= BRN_BOOTSTRAP_SKIP_SIGS_UNTIL:
+                log.warning(
+                    f"[SIG] EMERGENCIA: bloco #{_bh} aceito SEM multi-sig "
+                    f"(BRN_BOOTSTRAP_SKIP_SIGS_UNTIL={BRN_BOOTSTRAP_SKIP_SIGS_UNTIL}). "
+                    f"REMOVA essa env e reinicie apos altura > {BRN_BOOTSTRAP_SKIP_SIGS_UNTIL}."
+                )
+                return True, ""
+
         if validators is None:
             validators = self._get_active_validators()
         if not validators:
@@ -824,8 +858,6 @@ class Blockchain:
             return True, ""
 
         # ----- [FIX v9.4.9] MODO BOOTSTRAP LOCAL -----
-        # Se o ÚNICO assinante é a própria _local_validator_sk, aceita.
-        # Não exige trust_score (o Origin pode ter score 200 < 500).
         if got >= 1 and got_foreign == 0:
             local_pk = ""
             if self._local_validator_sk is not None:
@@ -1175,6 +1207,7 @@ class Blockchain:
             "require_all_sigs": REQUIRE_ALL_SIGS,
             "validator_quorum": VALIDATOR_QUORUM,
             "bootstrap_trust_threshold": BOOTSTRAP_TRUST_THRESHOLD,
+            "bootstrap_skip_sigs_until": BRN_BOOTSTRAP_SKIP_SIGS_UNTIL,
         }
 
 
