@@ -1,21 +1,33 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.4.10 | Data: 01/11/2026
+Versão: 9.4.11 | Data: 02/11/2026
 ================================================================
+v9.4.11 (2026-11-02):
+  [FIX CRÍTICO] Blockchain.__init__ agora honra BRN_REQUIRE_AUTH_TAG
+                do ambiente (antes ignorava e usava bool(network_secret)
+                sempre). Sem este patch, BRN_REQUIRE_AUTH_TAG=0 no .env
+                era ignorado, e o auth_tag de blocos antigos (criados
+                com secret diferente) era rejeitado em sync.
+                Sintoma: "auth_tag invalido em bloco legado" em todo
+                bloco #1..#2446 ao sincronizar do peer.
+                Fix: lê os.environ.get("BRN_REQUIRE_AUTH_TAG", "1")
+                quando require_auth_tag=None.
+  [NEW] Aceleração C para compute_merkle_root via brn_merkle.py
+        (com fallback transparente para Python se a lib não existir).
 v9.4.10 (2026-11-01):
-  [NEW] EMERGENCIA: bypass de multi-sig até uma altura configurável
-        via BRN_BOOTSTRAP_SKIP_SIGS_UNTIL (default 0 = desativado).
-        Blocos 0 < h <= N são aceitos SEM checar validators_sig.
-        PoW, merkle, hash, auth_tag e validação de txs CONTINUAM
-        ativos (validate_block). Apenas o quórum de assinaturas é
-        ignorado no intervalo.
+  [NEW] BRN_BOOTSTRAP_SKIP_SIGS_UNTIL (default 0 = desativado).
+        Aceita blocos 1..N SEM checar validators_sig. PoW, merkle,
+        hash, auth_tag e tx-validation CONTINUAM ativos.
 v9.4.9 (2026-11-01):
-  [FIX CRÍTICO] _get_active_validators() agora inclui a própria
-                _local_validator_sk no set.
-  [FIX CRÍTICO] _validate_validators_sig() agora aceita bloco
-                assinado APENAS pela _local_validator_sk em MODO
-                BOOTSTRAP LOCAL.
+  [FIX] _get_active_validators() inclui _local_validator_sk no set.
+        _validate_validators_sig() aceita MODO BOOTSTRAP LOCAL.
 v9.4.8 (2026-10-30):
-  [FIX CRÍTICO] MODO BOOTSTRAP ESTENDIDO em _validate_validators_sig.
+  [FIX] MODO BOOTSTRAP ESTENDIDO (trust_score >= 500).
+v9.4.7 (2026-10-30):
+  [FIX] MODO BOOTSTRAP (sigs estrangeiras com set local < 2).
+v9.4.6 (2026-10-30):
+  [FIX] _get_active_validators usa trust.get_active_validators().
+v9.4.5 (2026-10-30):
+  [FIX] Genesis sem multi-sig, whitelist removida.
 ================================================================
 """
 from __future__ import annotations
@@ -34,6 +46,12 @@ import orjson
 from crypto import double_sha256, sha256
 from db import ChainDB
 
+# [NEW] Aceleração C do Merkle Root (com fallback)
+try:
+    from brn_merkle import compute_merkle_root_fast
+    _HAS_MERKLE_C = True
+except ImportError:
+    _HAS_MERKLE_C = False
 
 log = logging.getLogger("blockchain")
 
@@ -70,7 +88,8 @@ BOOTSTRAP_TRUST_THRESHOLD = float(
     os.environ.get("BRN_BOOTSTRAP_TRUST_THRESHOLD", "500")
 )
 
-# [EMERGENCIA v9.4.10] Bypass de multi-sig ate uma altura.
+# [v9.4.10] Bypass de multi-sig até uma altura.
+# 0 = desativado (padrao). Use 5000 para sync inicial e REMOVA depois.
 BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = int(
     os.environ.get("BRN_BOOTSTRAP_SKIP_SIGS_UNTIL", "0") or "0"
 )
@@ -245,6 +264,12 @@ def work_from_difficulty(difficulty) -> int:
 def compute_merkle_root(txids: list) -> str:
     if not txids:
         return "0" * 64
+    if _HAS_MERKLE_C:
+        try:
+            return compute_merkle_root_fast(txids)
+        except Exception as e:
+            log.warning(f"[MERKLE] C falhou, usando fallback Python: {e}")
+    
     layer = [bytes.fromhex(t) for t in txids]
     while len(layer) > 1:
         if len(layer) % 2:
@@ -379,8 +404,8 @@ class Blockchain:
         self.db = ChainDB(db_path)
         self.genesis_expected_hash = None
         self.network_secret = network_secret if network_secret is not None else NETWORK_SECRET
-        
-        # [PATCH] Respeita a variável BRN_REQUIRE_AUTH_TAG do .env
+
+        # [v9.4.11] Honra BRN_REQUIRE_AUTH_TAG do .env quando require_auth_tag=None
         if require_auth_tag is None:
             require_auth_tag = os.environ.get("BRN_REQUIRE_AUTH_TAG", "1") == "1"
         self.require_auth_tag = bool(require_auth_tag) and bool(self.network_secret)
@@ -717,6 +742,9 @@ class Blockchain:
         timestamps.sort()
         return timestamps[len(timestamps) // 2]
 
+    # ============================================================
+    # [FIX v9.4.9] Inclui a própria _local_validator_sk no set.
+    # ============================================================
     def _get_active_validators(self) -> list:
         validators: list = []
         trust = self.trust_net
@@ -757,7 +785,11 @@ class Blockchain:
         log.info(f"[SIG] quorum={VALIDATOR_QUORUM} → {need}/{n} assinaturas")
         return need
 
+    # ============================================================
+    # [FIX v9.4.9] + [EMERGENCIA v9.4.10] Bypass por altura.
+    # ============================================================
     def _validate_validators_sig(self, block: dict, validators: Optional[list] = None) -> tuple:
+        # [EMERGENCIA v9.4.10] Bypass de multi-sig ate BRN_BOOTSTRAP_SKIP_SIGS_UNTIL.
         if BRN_BOOTSTRAP_SKIP_SIGS_UNTIL > 0:
             try:
                 _bh = int(block.get("height", -1))
@@ -1184,6 +1216,7 @@ class Blockchain:
             "validator_quorum": VALIDATOR_QUORUM,
             "bootstrap_trust_threshold": BOOTSTRAP_TRUST_THRESHOLD,
             "bootstrap_skip_sigs_until": BRN_BOOTSTRAP_SKIP_SIGS_UNTIL,
+            "require_auth_tag": self.require_auth_tag,
         }
 
 
