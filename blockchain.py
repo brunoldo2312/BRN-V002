@@ -379,7 +379,12 @@ class Blockchain:
         self.db = ChainDB(db_path)
         self.genesis_expected_hash = None
         self.network_secret = network_secret if network_secret is not None else NETWORK_SECRET
-        self.require_auth_tag = bool(self.network_secret) if require_auth_tag is None else bool(require_auth_tag)
+        
+        # [PATCH] Respeita a variável BRN_REQUIRE_AUTH_TAG do .env
+        if require_auth_tag is None:
+            require_auth_tag = os.environ.get("BRN_REQUIRE_AUTH_TAG", "1") == "1"
+        self.require_auth_tag = bool(require_auth_tag) and bool(self.network_secret)
+
         self.on_block_mined = None
         self._fork_signal = None
 
