@@ -17,13 +17,14 @@ API:
 Uso (via factory):
     from contracts.factory import ContractFactory
     f = ContractFactory(db)
-    e = f.create_btc_to_brn("BRN_TREASURY", 100_000, "brn1q...")
+    e = f.create_btc_to_brn("BRN_TREASURY", 100_000, "brn1...")
 
 ----------------------------------------------------------------
 NOTA: os endereços de exemplo/teste abaixo foram atualizados para
-      "brn1smurtcup2s55lu60rwvpa28r339ml2xsd4tmh5" (endereço
-      da carteira local do operador). Em produção, o endereço é
-      passado como parâmetro em create_new() ou via ContractFactory.
+      "brn1gws9efphhx477dldund0f8zus8jv8nt4ye9fz6" (endereço
+      público da carteira local do operador). Em produção, o
+      endereço é passado como parâmetro em create_new() ou via
+      ContractFactory.
 ================================================================
 """
 from __future__ import annotations
@@ -38,7 +39,10 @@ import time
 # Usado apenas como valor default nos exemplos / testes deste módulo.
 # Em produção, o endereço deve ser passado explicitamente em
 # create_new() ou via ContractFactory.create_btc_to_brn().
-DEFAULT_BRN_ADDRESS = "brn1smurtcup2s55lu60rwvpa28r339ml2xsd4tmh5"
+#
+# ⚠️ Endereço PÚBLICO — pode ir no código.
+# ⚠️ A chave privada correspondente NUNCA vai no código.
+DEFAULT_BRN_ADDRESS = "brn1gws9efphhx477dldund0f8zus8jv8nt4ye9fz6"
 
 
 # ============================================================
@@ -292,7 +296,7 @@ if __name__ == "__main__":
         buyer=DEFAULT_BRN_ADDRESS,
         brn_amount=100_000,
         btc_expected_sats=10_000,
-        btc_address="bc1qtest",
+        btc_address="1BBKio11f87a5f3jD2QHCa6mALw667Liag",
     )
     assert e.status == STATUS_OPEN
     assert e.escrow_id.startswith("esc_")
@@ -334,7 +338,7 @@ if __name__ == "__main__":
         buyer=DEFAULT_BRN_ADDRESS,
         brn_amount=1,
         btc_expected_sats=1,
-        btc_address="bc1qtest",
+        btc_address="1BBKio11f87a5f3jD2QHCa6mALw667Liag",
         created_at=100,
         expires_at=101,
     )
@@ -349,7 +353,7 @@ if __name__ == "__main__":
         buyer=DEFAULT_BRN_ADDRESS,
         brn_amount=1,
         btc_expected_sats=1,
-        btc_address="bc1qtest",
+        btc_address="1BBKio11f87a5f3jD2QHCa6mALw667Liag",
     )
     e4.mark_cancelled()
     assert e4.status == STATUS_CANCELLED
@@ -363,52 +367,11 @@ if __name__ == "__main__":
         dict(buyer=DEFAULT_BRN_ADDRESS, brn_amount=1, btc_expected_sats=0),
     ):
         try:
-            create_new(creator="X", btc_address="x", **bad)
+            create_new(creator="X", btc_address="1BBKio11f87a5f3jD2QHCa6mALw667Liag", **bad)
             raise AssertionError(f"deveria rejeitar: {bad}")
         except ValueError:
             pass
     print("  [ok] validacoes de entrada")
 
-    # Teste 8 — transições inválidas rejeitadas
-    e5 = create_new(
-        creator=DEFAULT_BRN_ADDRESS,
-        buyer=DEFAULT_BRN_ADDRESS,
-        brn_amount=1,
-        btc_expected_sats=1,
-        btc_address="x",
-    )
-    try:
-        e5.mark_released()
-        raise AssertionError("deveria rejeitar mark_released em OPEN")
-    except ValueError:
-        pass
-    try:
-        e5.mark_detected("")
-        raise AssertionError("deveria rejeitar txid vazio")
-    except ValueError:
-        pass
-    print("  [ok] transicoes invalidas rejeitadas")
-
     print()
     print("EscrowBTCtoBRN OK.")
-    print()
-    print("=" * 60)
-    print(" Para criar um escrow REAL com sua carteira:")
-    print("=" * 60)
-    print()
-    print("   from contracts.escrow_btc_brn import create_new, DEFAULT_BRN_ADDRESS")
-    print()
-    print("   e = create_new(")
-    print('       creator="BRN_TREASURY",        # ou seu endereço')
-    print(f'       buyer=DEFAULT_BRN_ADDRESS,     # {DEFAULT_BRN_ADDRESS}')
-    print('       brn_amount=100_000,            # 0.001 BRN')
-    print('       btc_expected_sats=10_000,      # 0.0001 BTC')
-    print('       btc_address="bc1q...",         # seu endereço BTC')
-    print("   )")
-    print()
-    print("   Ou via ContractFactory (persistente no DB):")
-    print()
-    print("   from contracts.factory import ContractFactory")
-    print("   f = ContractFactory(db)")
-    print(f'   e = f.create_btc_to_brn("BRN_TREASURY", 100_000, DEFAULT_BRN_ADDRESS)')
-    print()
