@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================
-REM   iniciar_cliente.bat - BRN Node Auto-Setup (v4.3 - Final)
+REM   iniciar_cliente.bat - BRN Node Auto-Setup (v4.4 - GUI Default)
 REM   Fluxo: Env -> Deps -> Tailscale -> Sync -> GUI (Carteira)
 REM ============================================================
 setlocal EnableDelayedExpansion
@@ -12,29 +12,31 @@ set "PYTHONIOENCODING=utf-8"
 set "PYTHONUTF8=1"
 set "PYTHONUNBUFFERED=1"
 
+REM Padrao: GUI (carteira grafica). Use --headless para desativar.
+set "FORCE_HEADLESS=0"
 set "SKIP_DEPS=0"
 set "SKIP_SYNC=0"
-set "FORCE_HEADLESS=0"
 
 :parse_args
 if "%~1"=="" goto args_done
 if /i "%~1"=="--skip-deps" set "SKIP_DEPS=1"
 if /i "%~1"=="--skip-sync" set "SKIP_SYNC=1"
 if /i "%~1"=="--headless"  set "FORCE_HEADLESS=1"
+if /i "%~1"=="--gui"       set "FORCE_HEADLESS=0"
 shift
 goto parse_args
 :args_done
 
 echo.
 echo ============================================================
-echo   BRN Node - AUTO SETUP E INICIALIZACAO (v4.3)
+echo   BRN Node - AUTO SETUP E INICIALIZACAO (v4.4)
 echo ============================================================
 echo   Pasta: %CD%
 echo   Data:  %DATE% %TIME%
 if "%FORCE_HEADLESS%"=="1" (
-    echo   Modo:  HEADLESS ^(API^)
+    echo   Modo:  HEADLESS ^(API HTTP sem GUI^)
 ) else (
-    echo   Modo:  GUI ^(Carteira Grafica^)
+    echo   Modo:  GUI ^(Carteira Grafica via pywebview^)
 )
 echo ============================================================
 echo.
@@ -75,7 +77,7 @@ REM ============================================================
 if "%SKIP_DEPS%"=="1" goto deps_skip
 
 echo [2/5] Verificando dependencias (isso pode demorar)...
-REM Adicionado zeroconf, bitcoinlib, pythonnet
+REM zeroconf, bitcoinlib, pythonnet, pywebview sao necessarios para a GUI
 set "PKGS=flask flask-cors fastapi uvicorn requests orjson waitress cryptography argon2-cffi mnemonic pymongo pywebview pythonnet bitcoinlib zeroconf"
 
 for %%P in (!PKGS!) do (
@@ -142,26 +144,78 @@ echo.
 :sync_skip
 
 REM ============================================================
-REM 5. INICIAR CARTEIRA GRAFICA
+REM 5. PREPARAR MODO (GUI x HEADLESS) e CARTEIRA
 REM ============================================================
-echo [5/5] Iniciando BRN Node...
+echo [5/5] Preparando modo de execucao e carteira...
+
+if "%FORCE_HEADLESS%"=="1" (
+    REM ============ MODO HEADLESS ============
+    set "HEADLESS_FLAG=--headless"
+    set "BRN_FORCE_HEADLESS=1"
+    echo        Modo HEADLESS: apenas API HTTP, sem janela grafica.
+) else (
+    REM ============ MODO GUI ============
+    REM (1) Verifica se pywebview importa de verdade
+    python -c "import webview" >nul 2>&1
+    if errorlevel 1 (
+        echo        [AVISO] pywebview nao instalado. Tentando instalar...
+        python -m pip install --quiet pywebview
+        python -c "import webview" >nul 2>&1
+        if errorlevel 1 (
+            echo        [ERRO] pywebview continua indisponivel. Caindo para HEADLESS.
+            set "HEADLESS_FLAG=--headless"
+            set "BRN_FORCE_HEADLESS=1"
+            goto gui_check_done
+        )
+    )
+
+    REM (2) Verifica BRN_WEB_PASS no .env (main.py exige para abrir a GUI)
+    set "HAS_WEB_PASS=0"
+    for /f "tokens=1,* delims==" %%A in ('findstr /B /C:"BRN_WEB_PASS=" brn_network.env 2^>nul') do (
+        if not "%%B"=="" set "HAS_WEB_PASS=1"
+    )
+    if "!HAS_WEB_PASS!"=="0" (
+        echo.
+        echo        [AVISO] BRN_WEB_PASS vazia no brn_network.env.
+        echo                A GUI pode falhar ao abrir a carteira.
+        echo                Adicione a linha: BRN_WEB_PASS=suasenha
+        echo.
+        timeout /t 3 >nul
+    )
+
+    REM (3) Forca GUI: limpa HEADLESS_FLAG e sobrepoe BRN_FORCE_HEADLESS
+    REM     (isso anula a env se estiver setada em outro lugar)
+    set "HEADLESS_FLAG="
+    set "BRN_FORCE_HEADLESS=0"
+    echo        Modo GUI: carteira grafica sera aberta em instantes.
+)
+:gui_check_done
 echo.
 
-REM Cria a carteira se nao existir (Lendo o .env para pegar a senha correta!)
+REM ============================================================
+REM 6. CRIAR CARTEIRA SE NAO EXISTIR
+REM ============================================================
 if not exist "current_wallet.enc" (
     echo        Criando carteira nova...
     python -c "import os; from pathlib import Path; [os.environ.setdefault(k.strip(), v.strip()) for line in Path('brn_network.env').read_text(encoding='utf-8').splitlines() if '=' in line and not line.strip().startswith('#') for k,v in [line.split('=',1)]]; from wallet import Wallet, WalletManager; w = Wallet.create(); pw = os.environ.get('BRN_WALLET_SESSION_PASS', '12345678'); WalletManager.save_current(w.address, w.priv_hex, w.pub_hex, pw); print('Carteira criada:', w.address)"
 )
 
-set "HEADLESS_FLAG=--headless"
-if "%FORCE_HEADLESS%"=="0" set "HEADLESS_FLAG="
-
+REM ============================================================
+REM 7. INICIAR O NO
+REM ============================================================
 echo ============================================================
-echo   INICIANDO O NO...
+if "%FORCE_HEADLESS%"=="1" (
+    echo   INICIANDO O NO - MODO HEADLESS
+) else (
+    echo   INICIANDO O NO - MODO GUI ^(carteira grafica^)
+)
+echo ============================================================
 echo   python main.py %HEADLESS_FLAG% --skip-verify
 echo ============================================================
 echo.
 
+REM Seta BRN_FORCE_HEADLESS no ambiente desta sessao para o main.py herdar
+set "BRN_FORCE_HEADLESS=%FORCE_HEADLESS%"
 python main.py %HEADLESS_FLAG% --skip-verify
 
 if errorlevel 1 (
