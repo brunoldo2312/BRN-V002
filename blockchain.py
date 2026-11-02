@@ -1,14 +1,18 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.4.12 | Data: 02/11/2026
+Versão: 9.4.13 | Data: 02/11/2026
 ================================================================
+v9.4.13 (2026-11-02):
+  [FIX CRÍTICO] Aceita o genesis do peer se o DB local estiver
+                vazio. Antes, o nó recusava o bloco #0 do peer com
+                "genesis nao corresponde ao esperado" se o hash
+                hardcoded fosse diferente do real da rede.
+                Agora, se db.height() < 0, o hash do bloco #0 do
+                peer é adotado como o genesis esperado.
 v9.4.12 (2026-11-02):
-  [FIX] Modo legado forçado até o bloco 2000. Default do bypass
-        agora é 2000 se a variável não estiver no .env, garantindo
-        que a sincronização antiga nunca falhe por falta de multi-sig.
-  [NEW] Aceleração C para compute_merkle_root via brn_merkle.py.
+  [FIX] Modo legado forçado até o bloco 2000.
+  [NEW] Aceleração C para compute_merkle_root.
 v9.4.11 (2026-11-02):
-  [FIX] Blockchain.__init__ agora honra BRN_REQUIRE_AUTH_TAG
-        do ambiente.
+  [FIX] Honra BRN_REQUIRE_AUTH_TAG do ambiente.
 v9.4.10 (2026-11-01):
   [NEW] BRN_BOOTSTRAP_SKIP_SIGS_UNTIL.
 ================================================================
@@ -925,7 +929,12 @@ class Blockchain:
     def validate_block(self, block: dict, prev_block=None, validators: Optional[list] = None) -> tuple:
         if block["height"] == 0 and prev_block is None:
             if (self.genesis_expected_hash and block["hash"] != self.genesis_expected_hash):
-                return False, f"genesis nao corresponde ao esperado"
+                # [PATCH v9.4.13] Se o DB local está vazio, aceita o genesis do peer
+                if self.db.height() < 0:
+                    log.warning(f"[Blockchain] Aceitando genesis do peer: {block['hash'][:16]}...")
+                    self.genesis_expected_hash = block["hash"]
+                else:
+                    return False, f"genesis nao corresponde ao esperado"
         expected_prev = (prev_block["hash"] if prev_block else self.db.tip_hash())
         if block["prev_hash"] != expected_prev:
             return False, "prev_hash incorreto"
