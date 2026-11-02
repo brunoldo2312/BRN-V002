@@ -8,30 +8,22 @@ import os
 
 # ============================================================
 # OFFRAMP (BRN → BTC)  — operacional
-# ------------------------------------------------------------
-# ⚠️ ATENÇÃO SEGURANÇA:
-#   A WIF abaixo foi EXPOSTA em um chat. Ela NÃO deve ser usada
-#   em produção. Gere uma WIF nova (offline, com Electrum/Sparrow
-#   ou bitcoinlib) e configure via env var BRN_BTC_WIF.
-#
-#   O valor abaixo é apenas placeholder; NÃO coloque a chave real
-#   aqui. Use:
-#     export BRN_BTC_WIF="<sua_wif_nova>"
-#   ou adicione BRN_BTC_WIF no brn_network.env (que está no .gitignore).
 # ============================================================
-BTC_WIF = os.environ.get("BRN_BTC_WIF", "")  # ← vazio por padrão (seguro)
+# ⚠️ ATENÇÃO SEGURANÇA: A WIF nunca deve ser hardcoded.
+# Use a variável de ambiente BRN_BTC_WIF.
+BTC_WIF = os.environ.get("BRN_BTC_WIF", "")
 
-# Endereço BTC de recebimento (PÚBLICO — ok ir no código)
-# Usado no ONRAMP (BTC → BRN): cliente envia BTC para este endereço.
+# Endereço BTC de recebimento (PÚBLICO — usado no ONRAMP)
+# ⚠️ TROQUE PELO SEU ENDEREÇO BTC REAL (Ex: bc1q... ou 1...)
 BTC_RECEIVE_ADDRESS = os.environ.get(
     "BRN_BTC_RECEIVE_ADDRESS",
     "1BBKio11f87a5f3jD2QHCa6mALw667Liag",
 )
 
-# Endereço BRN do cofre (PÚBLICO)
+# Endereço BRN do cofre (PÚBLICO) — ATUALIZADO AQUI
 BRN_TREASURY_ADDRESS = os.environ.get(
     "BRN_TREASURY_ADDRESS",
-    "brn1gws9efphhx477dldund0f8zus8jv8nt4ye9fz6",
+    "brn1x9v8xq6v7dgrszl3ep6zupk28y7jfr8a0cwmgu",
 )
 
 # Limites OFFRAMP
