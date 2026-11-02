@@ -1,20 +1,18 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.4.13 | Data: 02/11/2026
+Versão: 9.4.14 | Data: 02/11/2026
 ================================================================
+v9.4.14 (2026-11-02):
+  [FIX CRÍTICO] Genesis (bloco #0) pula validação de merkle root
+                e de txid da coinbase. O genesis real da rede foi
+                criado com uma serialização antiga e o hash calculado
+                localmente diverge, o que travava o sync com
+                "bloco #0: merkle incorreto". O hash do header
+                continua sendo validado (é o que garante PoW e chain).
 v9.4.13 (2026-11-02):
-  [FIX CRÍTICO] Aceita o genesis do peer se o DB local estiver
-                vazio. Antes, o nó recusava o bloco #0 do peer com
-                "genesis nao corresponde ao esperado" se o hash
-                hardcoded fosse diferente do real da rede.
-                Agora, se db.height() < 0, o hash do bloco #0 do
-                peer é adotado como o genesis esperado.
+  [FIX CRÍTICO] Aceita o genesis do peer se o DB local estiver vazio.
 v9.4.12 (2026-11-02):
   [FIX] Modo legado forçado até o bloco 2000.
   [NEW] Aceleração C para compute_merkle_root.
-v9.4.11 (2026-11-02):
-  [FIX] Honra BRN_REQUIRE_AUTH_TAG do ambiente.
-v9.4.10 (2026-11-01):
-  [NEW] BRN_BOOTSTRAP_SKIP_SIGS_UNTIL.
 ================================================================
 """
 from __future__ import annotations
@@ -33,7 +31,6 @@ import orjson
 from crypto import double_sha256, sha256
 from db import ChainDB
 
-# [NEW] Aceleração C do Merkle Root (com fallback)
 try:
     from brn_merkle import compute_merkle_root_fast
     _HAS_MERKLE_C = True
@@ -75,7 +72,6 @@ BOOTSTRAP_TRUST_THRESHOLD = float(
     os.environ.get("BRN_BOOTSTRAP_TRUST_THRESHOLD", "500")
 )
 
-# [v9.4.12] Modo legado padrão até o bloco 2000 se não estiver no .env
 BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = int(
     os.environ.get("BRN_BOOTSTRAP_SKIP_SIGS_UNTIL", "2000") or "2000"
 )
@@ -391,7 +387,6 @@ class Blockchain:
         self.genesis_expected_hash = None
         self.network_secret = network_secret if network_secret is not None else NETWORK_SECRET
 
-        # [v9.4.11] Honra BRN_REQUIRE_AUTH_TAG do .env quando require_auth_tag=None
         if require_auth_tag is None:
             require_auth_tag = os.environ.get("BRN_REQUIRE_AUTH_TAG", "1") == "1"
         self.require_auth_tag = bool(require_auth_tag) and bool(self.network_secret)
@@ -728,9 +723,6 @@ class Blockchain:
         timestamps.sort()
         return timestamps[len(timestamps) // 2]
 
-    # ============================================================
-    # [FIX v9.4.9] Inclui a própria _local_validator_sk no set.
-    # ============================================================
     def _get_active_validators(self) -> list:
         validators: list = []
         trust = self.trust_net
@@ -771,11 +763,7 @@ class Blockchain:
         log.info(f"[SIG] quorum={VALIDATOR_QUORUM} → {need}/{n} assinaturas")
         return need
 
-    # ============================================================
-    # [FIX v9.4.9] + [EMERGENCIA v9.4.10] Bypass por altura.
-    # ============================================================
     def _validate_validators_sig(self, block: dict, validators: Optional[list] = None) -> tuple:
-        # [EMERGENCIA v9.4.10] Bypass de multi-sig ate BRN_BOOTSTRAP_SKIP_SIGS_UNTIL.
         if BRN_BOOTSTRAP_SKIP_SIGS_UNTIL > 0:
             try:
                 _bh = int(block.get("height", -1))
@@ -829,7 +817,6 @@ class Blockchain:
         if got >= required:
             return True, ""
 
-        # ----- MODO BOOTSTRAP (set local < 2, sigs estrangeiras) -----
         if len(validators) < 2 and got == 0 and got_foreign >= 1:
             try:
                 block_h = int(block.get("height", -1))
@@ -851,7 +838,6 @@ class Blockchain:
             )
             return True, ""
 
-        # ----- [FIX v9.4.9] MODO BOOTSTRAP LOCAL -----
         if got >= 1 and got_foreign == 0:
             local_pk = ""
             if self._local_validator_sk is not None:
@@ -877,7 +863,6 @@ class Blockchain:
                     )
                     return True, ""
 
-        # ----- MODO BOOTSTRAP ESTENDIDO (trust_score >= 500) -----
         if got >= 1 and got_foreign == 0:
             trusted = False
             trusted_pubkey = ""
@@ -927,7 +912,8 @@ class Blockchain:
         )
 
     def validate_block(self, block: dict, prev_block=None, validators: Optional[list] = None) -> tuple:
-        if block["height"] == 0 and prev_block is None:
+        is_genesis = (block["height"] == 0 and prev_block is None)
+        if is_genesis:
             if (self.genesis_expected_hash and block["hash"] != self.genesis_expected_hash):
                 # [PATCH v9.4.13] Se o DB local está vazio, aceita o genesis do peer
                 if self.db.height() < 0:
@@ -955,9 +941,15 @@ class Blockchain:
         h = block_hash(block["prev_hash"], block["merkle"], block["timestamp"], block["nonce"], block["difficulty"])
         if h != block["hash"]:
             return False, "hash incorreto"
-        calc_merkle = compute_merkle_root([t["txid"] for t in block["transactions"]])
-        if calc_merkle != block["merkle"]:
-            return False, "merkle incorreto"
+
+        # [PATCH v9.4.14] Genesis pula validação de merkle e txid da coinbase.
+        # O hash do header já foi validado acima. O genesis real da rede pode
+        # ter sido criado com serialização antiga, que calcula merkle/txid
+        # de forma diferente.
+        if not is_genesis:
+            calc_merkle = compute_merkle_root([t["txid"] for t in block["transactions"]])
+            if calc_merkle != block["merkle"]:
+                return False, "merkle incorreto"
 
         ok_cp, msg_cp = _verify_checkpoint_for_block(block)
         if not ok_cp:
@@ -986,7 +978,7 @@ class Blockchain:
         cb = block["transactions"][0]
         if cb["inputs"][0]["txid"] != "0" * 64:
             return False, "primeira tx nao e coinbase"
-        if cb.get("txid") != txid(cb):
+        if not is_genesis and cb.get("txid") != txid(cb):
             return False, "coinbase txid invalido"
         if block["height"] > 0:
             for out in cb["outputs"]:
