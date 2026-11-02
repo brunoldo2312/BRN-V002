@@ -1,13 +1,20 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.7.12)
+"""main.py — Entrypoint unificado do nó BRN (v13.7.13)
 ================================================================
+v13.7.13 (2026-11-02):
+  [FIX CRÍTICO] No boot, atualiza last_seen de TODOS os nós do
+                trust_network.json. Sem isso, get_active_validators()
+                retornava [] após 5min (ACTIVE_TTL_SECONDS=300),
+                pois apenas a própria SK recebia heartbeat.
+                Resultado: _validate_validators_sig caía em
+                BOOTSTRAP (1 sig) mesmo com 3 validadores no trust.
+                O log mostrava:
+                  "get_active_validators: nenhum nó ativo e Origin
+                   ausente — retornando [] (modo bootstrap)"
+                Agora o boot marca todos como "vistos agora", e o
+                heartbeat() do v13.7.12 mantém a própria SK fresca.
 v13.7.12 (2026-11-01):
   [FIX CRÍTICO] run_status_loop agora chama trust_net.heartbeat()
-                a cada 30s. Sem isso, o Origin (e clientes sem
-                PoolClient ativo) tinha last_seen expirado após 5min
-                e sua própria assinatura era DESCARTADA em
-                _collect_signatures (porque a pubkey local não
-                estava em get_active_validators()). Resultado:
-                required=2, got=1, chain travada.
+                a cada 30s.
 v13.7.11 (2026-11-01):
   [FIX] Self-registration na TrustNetwork para TODOS os nós.
   [FIX] register_node passa peer_addr.
@@ -929,8 +936,6 @@ def _graceful_shutdown(log, trust_net=None) -> None:
 
 def main():
     # <<< NOVO port_guard (v1.0): aborta se portas do BRN já estão em uso.
-    # Impede que o nó suba em modo degradado quando há um processo antigo
-    # (ex: v13.6.0) segurando 5000/6001. Ver MATAR_ANTIGO.py.
     if _HAS_PORT_GUARD and port_guard is not None:
         port_guard.check_brn_ports()
 
@@ -1063,6 +1068,33 @@ def main():
             except AttributeError:
                 chain.trust_net = trust_net
             log.info("TrustNetwork: " + str(len(trust_net.nodes)) + " nós carregados")
+
+            # [FIX v13.7.13] Atualiza last_seen de TODOS os nós no boot.
+            # Sem isto, get_active_validators() retornava [] depois de 5min
+            # (ACTIVE_TTL_SECONDS=300) e o nó caía em MODO BOOTSTRAP (1 sig)
+            # mesmo com 3 validadores no trust. O heartbeat() do v13.7.12
+            # só renova a própria SK.
+            try:
+                import time as _t
+                _lock = getattr(trust_net, "_lock", None)
+                if _lock is not None:
+                    with _lock:
+                        for _n in trust_net.nodes.values():
+                            try:
+                                _n.last_seen = _t.time()
+                            except Exception:
+                                pass
+                else:
+                    for _n in trust_net.nodes.values():
+                        try:
+                            _n.last_seen = _t.time()
+                        except Exception:
+                            pass
+                log.info("[TrustNetwork] last_seen de %d nós atualizado no boot"
+                         % len(trust_net.nodes))
+            except Exception as _e:
+                log.warning("[TrustNetwork] falha atualizando last_seen: %s" % _e)
+
         except Exception as e:
             log.warning("TrustNetwork desativada: " + str(e))
             trust_net = None
@@ -1121,7 +1153,19 @@ def main():
                         p2p_port_self = int(os.environ.get("BRN_P2P_PORT", "6001"))
                     except (TypeError, ValueError):
                         p2p_port_self = 6001
-                    self_addr = f"{WEB_HOST}:{p2p_port_self}"
+                    # [FIX v13.7.13] Corrige peer_addr=127.0.0.1: usa
+                    # BRN_SEU_ENDERECO se setado, senão o IP local real
+                    _seu = os.environ.get("BRN_SEU_ENDERECO", "").strip()
+                    if _seu and ":" in _seu:
+                        self_addr = _seu
+                    elif WEB_HOST in ("0.0.0.0", "", "::", "127.0.0.1"):
+                        try:
+                            from p2p_unified import _get_local_ip
+                            self_addr = f"{_get_local_ip()}:{p2p_port_self}"
+                        except Exception:
+                            self_addr = f"127.0.0.1:{p2p_port_self}"
+                    else:
+                        self_addr = f"{WEB_HOST}:{p2p_port_self}"
 
                     trust_net.register_node(
                         node_id=validator_sk.pub_hex,
