@@ -1,16 +1,4 @@
 """contracts/factory.py — Fábrica de escrows L2 BTC→BRN.
-
-Cria ordens com limites BTC, cotação fixa, taxa e persistência via ChainDB.
-A criação de um escrow não comprova depósito BTC nem autoriza crédito de BRN;
-isso depende da validação on-chain e do fluxo seguro de liberação.
-
-----------------------------------------------------------------
-NOTA: os endereços de teste neste módulo foram atualizados para
-      DEFAULT_BRN_ADDRESS = "brn1smurtcup2s55lu60rwvpa28r339ml2xsd4tmh5"
-      (carteira local do operador). Em produção, o buyer é passado
-      como parâmetro em create_btc_to_brn() e a validação completa
-      ocorre em server.py + L2Manager + BTCWatcher.
-================================================================
 """
 from __future__ import annotations
 
@@ -22,7 +10,7 @@ import time
 from .escrow_btc_brn import (
     EscrowBTCtoBRN,
     generate_escrow_id,
-    DEFAULT_BRN_ADDRESS,          # [NEW] carteira local do operador
+    DEFAULT_BRN_ADDRESS,
     STATUS_OPEN,
     STATUS_BTC_DETECTED,
     STATUS_RELEASED,
@@ -42,7 +30,6 @@ DEFAULT_ESCROW_TTL_S = 24 * 3600
 
 
 def _cfg(name: str, default):
-    """Lê btc_config.py com fallback seguro."""
     try:
         import btc_config
         return getattr(btc_config, name, default)
@@ -87,12 +74,10 @@ def _btc_address() -> str:
 
 
 def compute_brn_amounts(btc_sats: int) -> dict:
-    """Calcula BRN em unidades mínimas; 1 BTC equivale a 1e8 satoshis."""
     if isinstance(btc_sats, bool) or not isinstance(btc_sats, int) or btc_sats <= 0:
         raise ValueError("btc_sats deve ser int > 0")
     rate = _rate()
     fee_pct = _fee_pct()
-    # satoshis BTC × BRN/BTC = unidades mínimas de BRN.
     brn_gross = int(btc_sats * rate)
     fee = int(brn_gross * fee_pct / 100)
     brn_net = brn_gross - fee
@@ -106,8 +91,6 @@ def compute_brn_amounts(btc_sats: int) -> dict:
 
 
 class ContractFactory:
-    """Cria, consulta e atualiza escrows usando a interface L2 do ChainDB."""
-
     def __init__(self, db):
         if db is None:
             raise ValueError("db obrigatorio")
@@ -140,7 +123,6 @@ class ContractFactory:
         buyer_wallet: str,
         ttl_s: int = DEFAULT_ESCROW_TTL_S,
     ) -> EscrowBTCtoBRN:
-        """Cria e persiste um escrow OPEN. Não credita BRN neste estágio."""
         self._validate_buyer(buyer_wallet)
         self._validate_btc_amount(btc_amount_sats)
         if isinstance(ttl_s, bool) or not isinstance(ttl_s, int) or ttl_s <= 0:
@@ -223,7 +205,6 @@ class ContractFactory:
             return None
 
     def cancel(self, escrow_id: str) -> dict:
-        """Cancela apenas escrows OPEN."""
         escrow = self.get(escrow_id)
         if not escrow:
             return {"ok": False, "msg": "escrow nao existe"}
@@ -277,7 +258,6 @@ class ContractFactory:
 
 
 if __name__ == "__main__":
-    # Endereço BTC fictício apenas para os autotestes; nunca usado em produção.
     _btc_address = lambda: "bc1qtestaddress000000000000000000000000000000"
 
     print("Testando ContractFactory...")
@@ -302,18 +282,14 @@ if __name__ == "__main__":
 
     db = FakeDB()
     factory = ContractFactory(db)
-
-    # [UPDATED] buyer = carteira local do operador
     buyer = DEFAULT_BRN_ADDRESS
 
-    # 1) Cotação básica
     quote = compute_brn_amounts(100_000)
     assert quote["brn_gross"] > quote["brn_net"] > 0
     assert quote["fee"] > 0
     print(f"  [ok] cotação: 100000 sats → brn_net={quote['brn_net']} "
           f"(fee={quote['fee']}, rate={quote['rate']})")
 
-    # 2) Criar escrow com o buyer padrão
     escrow = factory.create_btc_to_brn("BRN_TREASURY", 100_000, buyer)
     assert escrow.status == STATUS_OPEN
     assert escrow.buyer == DEFAULT_BRN_ADDRESS
@@ -321,18 +297,15 @@ if __name__ == "__main__":
     print(f"  [ok] escrow criado: {escrow.escrow_id}")
     print(f"       buyer = {escrow.buyer}")
 
-    # 3) Listar por buyer
     lst = factory.list_by_buyer(buyer, "OPEN")
     assert len(lst) == 1
     print(f"  [ok] list_by_buyer: 1 escrow")
 
-    # 4) Cancelar
     assert factory.cancel(escrow.escrow_id)["ok"]
     assert factory.get(escrow.escrow_id).status == STATUS_CANCELLED
     assert factory.stats()["cancelled"] == 1
     print(f"  [ok] cancelado")
 
-    # 5) Validações de entrada
     try:
         factory.create_btc_to_brn("BRN_TREASURY", 100_000, buyer, ttl_s=-1)
         raise AssertionError("ttl negativo deveria ser rejeitado")
@@ -346,7 +319,6 @@ if __name__ == "__main__":
             pass
     print(f"  [ok] validações de entrada")
 
-    # 6) Expiração
     expiring = factory.create_btc_to_brn("BRN_TREASURY", 100_000, buyer, ttl_s=1)
     db.rows[expiring.escrow_id]["created_at"] = int(time.time()) - 10
     db.rows[expiring.escrow_id]["expires_at"] = int(time.time()) - 1
@@ -356,28 +328,3 @@ if __name__ == "__main__":
 
     print()
     print("ContractFactory OK.")
-    print()
-    print("=" * 60)
-    print(" Para criar um escrow REAL com sua carteira:")
-    print("=" * 60)
-    print()
-    print("   from contracts.factory import ContractFactory")
-    print("   from contracts.escrow_btc_brn import DEFAULT_BRN_ADDRESS")
-    print()
-    print("   factory = ContractFactory(chain.db)")
-    print()
-    print("   e = factory.create_btc_to_brn(")
-    print('       creator_wallet="BRN_TREASURY",')
-    print("       btc_amount_sats=100_000,")
-    print(f"       buyer_wallet=DEFAULT_BRN_ADDRESS,   # {DEFAULT_BRN_ADDRESS}")
-    print("       ttl_s=24 * 3600,")
-    print("   )")
-    print()
-    print("   print(e.escrow_id, e.btc_address, e.btc_expected_sats)")
-    print()
-    print("=" * 60)
-    print(" IMPORTANTE: BTC_RECEIVE_ADDRESS precisa ser um endereço")
-    print(" BTC real (mainnet ou testnet) do cofre. Configure via:")
-    print("   btc_config.BTC_RECEIVE_ADDRESS")
-    print("   ou env var BRN_BTC_RECEIVE_ADDRESS")
-    print("=" * 60)
