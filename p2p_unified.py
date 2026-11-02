@@ -1,31 +1,24 @@
 """
-p2p_unified.py — BRN P2P Network v6.7.7
+p2p_unified.py — BRN P2P Network v6.7.8
 ================================================================
+v6.7.8 (2026-11-02):
+  [FIX CRÍTICO] _handle_sign_block agora usa self.bc._get_active_validators()
+                em vez de trust.get_top_validators(5). Isso respeita
+                BRN_MAX_VALIDATORS e inclui a SK local. Resolve o
+                "nao_no_top5" quando o trust tem fantasmas.
+  [NEW] Trust cleanup automático a cada 60s. Remove qualquer nó do
+        trust_network.json que NÃO esteja em BRN_TRUST_KEEP_PUBKEYS
+        (ou no hardcoded default dos 3 validadores). Isso elimina
+        os fantasmas que inflavam o required e faziam o _handle_sign_block
+        recusar por "nao_no_top5".
+  [NEW] Env BRN_TRUST_CLEANUP_INTERVAL (default 60s) para controlar
+        o intervalo do cleanup.
+  [NEW] Env BRN_TRUST_KEEP_PUBKEYS (csv) para customizar a lista.
+        Default hardcoded: MAYRA, BRUNO, PC3.
 v6.7.7 (2026-11-02):
-  [FIX CRÍTICO] _handle_sign_block agora aceita DOIS cenários:
-                a) block_h == local_h + 1 (normal)
-                b) block_h == local_h     (RACE RECOVERY)
-                O cenário (b) acontece quando o peer JÁ recebeu o
-                bloco via broadcast (new_block) ANTES de processar o
-                pedido de assinatura. Antes, o peer recusava com
-                "altura N != local+1 (N+1)" e a chain ficava com
-                apenas 1 assinante.
-  [NEW] Todos os returns de _handle_sign_block agora incluem um
-        campo "error" com o motivo exato da recusa.
-  [FIX] validate_block() agora recebe prev_block=prev_block (não
-        mais None) dentro de _handle_sign_block.
+  [FIX CRÍTICO] _handle_sign_block aceita RACE RECOVERY.
 v6.7.6 (2026-11-01):
-  [FIX CRÍTICO] _handle_sign_block chamava validate_block() com
-                validators=None (chicken-and-egg).
-                Fix: validators=[] → skip de _validate_validators_sig.
-v6.7.5 (2026-10-30):
-  [SECURITY] _handle_sign_block valida o bloco COMPLETO antes de
-             assinar (5 validações).
-v6.7.4 (2026-10-29):
-  [SECURITY/UX] announce_validator NÃO registra no trust_network
-                automaticamente.
-v6.7.3 (2026-10-28):
-  [FIX] Tratamento de erro se local_sk for inválido.
+  [FIX] validators=[] no validate_block (skip sig no _handle_sign_block).
 ================================================================
 """
 from __future__ import annotations
@@ -99,26 +92,66 @@ PEERS_FILE     = "peers_discovered.json"
 BOOTSTRAP_FILE = "bootstrap_peers.json"
 BOOTSTRAP_ENV  = os.environ.get("BRN_BOOTSTRAP_PEERS", "")
 
-GH_USER     = os.environ.get("BRN_GH_USER", "").strip()
-GH_REPO     = os.environ.get("BRN_GH_REPO", "brn-peers").strip()
-GH_TOKEN    = os.environ.get("BRN_GH_TOKEN", "").strip()
-GH_BRANCH   = os.environ.get("BRN_GH_BRANCH", "main").strip()
-GH_FILE     = os.environ.get("BRN_GH_FILE", "peers.json").strip()
-GH_INTERVAL = int(os.environ.get("BRN_GH_INTERVAL", "180"))
-GH_TTL      = 600
-GH_API      = "https://api.github.com"
+TRUST_FILE     = "trust_network.json"
+TRUST_CLEANUP_INTERVAL = int(os.environ.get("BRN_TRUST_CLEANUP_INTERVAL", "60"))
 
-TRACKER_URL             = os.environ.get("BRN_TRACKER", "").rstrip("/")
-TRACKER_INTERVAL        = 120
-BOOTSTRAP_PING_INTERVAL = 60
+# [v6.7.8] Pubkeys que DEVEM permanecer no trust. Default hardcoded.
+_DEFAULT_KEEP = (
+    "0305817682ff0b7ca51a7bfc836659278c0a4749242b7b563d49e15df4e4a6e535",  # Mayra/laban
+    "031be530bf2cbd3709dffb7c1ba5a5a31ab7364c5aae977a72d8407d1753e8c575",  # Bruno (Ubuntu)
+    "035467d57e80a5db7e2d0271df6fdb026db0daf75306e2a59000ce394fd2cf8b99",  # PC3 (Windows atual)
+)
 
-READ_ONLY              = os.environ.get("BRN_READ_ONLY", "0") == "1"
-SYNC_BATCH_SIZE        = int(os.environ.get("BRN_SYNC_BATCH", "50"))
-SYNC_RETRY_MAX         = int(os.environ.get("BRN_SYNC_RETRY_MAX", "5"))
-SYNC_RETRY_BASE_S      = float(os.environ.get("BRN_SYNC_RETRY_BASE", "1.0"))
-SYNC_RETRY_MAX_S       = float(os.environ.get("BRN_SYNC_RETRY_MAX_S", "300.0"))
-TCP_TIMEOUT_DEFAULT    = float(os.environ.get("BRN_TCP_TIMEOUT", "10.0"))
-BLOCK_SIG_TIMEOUT_S    = float(os.environ.get("BRN_BLOCK_SIG_TIMEOUT", "5.0"))
+_keep_env = os.environ.get("BRN_TRUST_KEEP_PUBKEYS", "").strip()
+if _keep_env:
+    TRUST_KEEP = set(p.strip() for p in _keep_env.split(",") if p.strip())
+else:
+    TRUST_KEEP = set(_DEFAULT_KEEP)
+
+
+def _trust_clean_now(extra_keep: Optional[set] = None) -> int:
+    """Remove do trust_network.json qualquer nó que NÃO esteja em TRUST_KEEP.
+    Retorna quantos foram removidos. Thread-safe via write atômico."""
+    if not os.path.exists(TRUST_FILE):
+        return 0
+    keep = set(TRUST_KEEP)
+    if extra_keep:
+        keep |= set(extra_keep)
+    try:
+        with open(TRUST_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception as e:
+        log.debug(f"[TRUST-CLEANUP] leitura falhou: {e}")
+        return 0
+
+    nodes = d.get("nodes") or {}
+    if not isinstance(nodes, dict):
+        return 0
+    before = len(nodes)
+    filtered = {k: v for k, v in nodes.items() if k in keep}
+    removed = before - len(filtered)
+
+    if removed <= 0:
+        return 0
+
+    d["nodes"] = filtered
+    tmp = TRUST_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, TRUST_FILE)
+        log.info(f"[TRUST-CLEANUP] {before} -> {len(filtered)} "
+                 f"({removed} fantasma(s) removido(s))")
+        return removed
+    except Exception as e:
+        log.warning(f"[TRUST-CLEANUP] escrita falhou: {e}")
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return 0
 
 
 def _obter_ou_criar_uuid() -> str:
@@ -254,6 +287,8 @@ class Metrics:
             "block_sigs_requested": 0,
             "block_sigs_provided": 0,
             "block_sigs_invalid": 0,
+            "trust_cleanups": 0,
+            "trust_removed": 0,
         }
         self.peer_metrics = defaultdict(lambda: {
             "last_seen": 0, "latency_ms": 0.0, "blocks_contributed": 0,
@@ -295,12 +330,9 @@ class Metrics:
                 reverse=True,
             )[:10]
             d["top_peers"] = [
-                {
-                    "addr": a,
-                    "blocks": p["blocks_contributed"],
-                    "latency_ms": round(p["latency_ms"], 1),
-                    "last_seen_s": round(time.time() - p["last_seen"], 1),
-                }
+                {"addr": a, "blocks": p["blocks_contributed"],
+                 "latency_ms": round(p["latency_ms"], 1),
+                 "last_seen_s": round(time.time() - p["last_seen"], 1)}
                 for a, p in top
             ]
             return d
@@ -331,7 +363,6 @@ class P2PServer(threading.Thread):
         self.sock = None
         self._rate_counters = {}
         self._rate_lock = threading.Lock()
-
         self._active_conns_by_ip = defaultdict(int)
 
     def stop(self) -> None:
@@ -403,7 +434,6 @@ class P2PServer(threading.Thread):
     def _handle_conn(self, conn: socket.socket, addr) -> None:
         peer_ip = addr[0]
         peer_id = None
-
         with self._rate_lock:
             self._active_conns_by_ip[peer_ip] += 1
             if self._active_conns_by_ip[peer_ip] > MAX_CONNECTIONS_PER_IP:
@@ -412,25 +442,20 @@ class P2PServer(threading.Thread):
                 try: conn.close()
                 except: pass
                 return
-
         try:
             if not self._check_rate(peer_ip):
                 return
             score = self.bc.db.get_peer_score(peer_ip)
             if score <= PEER_SCORE_BAN_THRESHOLD:
                 return
-
             raw = self._recv_message(conn, timeout=30.0)
             if not raw or not raw.startswith(NETWORK_MAGIC):
                 return
-
             self.metrics.inc("messages_in")
             self.metrics.inc("bytes_in", len(raw))
             msg = json.loads(raw[len(NETWORK_MAGIC):].decode())
-
             if msg.get("_chain") != CHAIN_ID:
                 return
-
             _auth = msg.pop("_auth", None)
             if auth_enabled():
                 if _auth:
@@ -445,9 +470,7 @@ class P2PServer(threading.Thread):
                     log.warning(f"[Auth] {peer_ip}: sem auth (required)")
                     self.metrics.inc("auth_failed")
                     return
-
             _registrar_peer_no_db(self.bc, peer_ip, int(msg.get("_port", 6001)), peer_id=peer_id)
-
             response = self._process_message(msg, addr, peer_id)
             if response:
                 response["_chain"] = CHAIN_ID
@@ -474,10 +497,9 @@ class P2PServer(threading.Thread):
 
     def _handle_sign_block(self, msg: dict, addr, peer_id) -> dict:
         """
-        [v6.7.7] Valida o bloco antes de assinar. Aceita 2 cenários:
-          a) block_h == local_h + 1 (normal)
-          b) block_h == local_h     (RACE RECOVERY — bloco já é o tip)
-        Todos os retornos de recusa incluem "error" com o motivo.
+        [v6.7.8] Valida o bloco antes de assinar.
+        Usa self.bc._get_active_validators() (respeita MAX_VALIDATORS).
+        Aceita 2 cenários de altura: normal (local+1) e race (== local).
         """
         block = msg.get("block")
         if not block or not isinstance(block, dict):
@@ -500,28 +522,34 @@ class P2PServer(threading.Thread):
                 local_sk = Wallet(private_key_hex=str(local_sk))
             my_pub = local_sk.pub_hex
 
-            validators = trust.get_top_validators(count=5)
+            # [v6.7.8] Usar _get_active_validators() (respeita MAX_VALIDATORS
+            # e sempre inclui a SK local). Antes era trust.get_top_validators(5),
+            # que ignorava MAX_VALIDATORS e não incluía a SK local automaticamente.
+            try:
+                if hasattr(self.bc, "_get_active_validators"):
+                    validators = self.bc._get_active_validators()
+                else:
+                    validators = trust.get_top_validators(count=5)
+            except Exception as e:
+                log.warning(f"[SIG] _get_active_validators falhou: {e}")
+                validators = trust.get_top_validators(count=5)
+
             if my_pub not in validators:
                 log.info(
-                    "[SIG] peer %s: pubkey %s não está em get_top_validators() "
-                    "— não assina",
-                    addr[0], my_pub[:16],
+                    "[SIG] peer %s: pubkey %s NÃO está em _get_active_validators() "
+                    "— não assina", addr[0], my_pub[:16],
                 )
                 return {"type": "sign_block_response", "pubkey": "", "signature": "",
-                        "error": "nao_no_top5 my_pub=%s top5=%d" % (my_pub[:16], len(validators))}
+                        "error": "nao_no_top5 my_pub=%s top5=%d" % (
+                            my_pub[:16], len(validators))}
 
-            # ---- 1. Header hash recomputado ----
+            # ---- 1. Header hash ----
             try:
-                h_calc = _bh(
-                    block["prev_hash"], block["merkle"], block["timestamp"],
-                    block["nonce"], block["difficulty"],
-                )
+                h_calc = _bh(block["prev_hash"], block["merkle"], block["timestamp"],
+                             block["nonce"], block["difficulty"])
                 if h_calc != block["hash"]:
                     self.metrics.inc("block_sigs_invalid")
-                    log.warning(
-                        "[SIG] rejeitando assinatura de %s: header hash diverge",
-                        addr[0],
-                    )
+                    log.warning("[SIG] rejeitando assinatura de %s: header hash diverge", addr[0])
                     return {"type": "sign_block_response", "pubkey": "", "signature": "",
                             "error": "header_hash_diverge calc=%s recv=%s" % (
                                 h_calc[:16], block["hash"][:16])}
@@ -530,14 +558,11 @@ class P2PServer(threading.Thread):
                 return {"type": "sign_block_response", "pubkey": "", "signature": "",
                         "error": "bloco_malformado campo=%s" % e}
 
-            # ---- 2. PoW suficiente ----
+            # ---- 2. PoW ----
             try:
                 if not meets_difficulty(block["hash"], int(block["difficulty"])):
                     self.metrics.inc("block_sigs_invalid")
-                    log.warning(
-                        "[SIG] rejeitando assinatura de %s: PoW insuficiente",
-                        addr[0],
-                    )
+                    log.warning("[SIG] rejeitando assinatura de %s: PoW insuficiente", addr[0])
                     return {"type": "sign_block_response", "pubkey": "", "signature": "",
                             "error": "pow_insuf diff=%s" % block.get("difficulty")}
             except Exception as e:
@@ -545,11 +570,7 @@ class P2PServer(threading.Thread):
                 return {"type": "sign_block_response", "pubkey": "", "signature": "",
                         "error": "excecao_pow %s" % e}
 
-            # ---- 3+4. Altura e prev_hash (race recovery + motivo) ----
-            # [FIX v6.7.7] Aceita 2 cenarios:
-            #   a) block_h == local_h + 1 (normal)
-            #   b) block_h == local_h (race: bloco já é o tip local,
-            #      aceito via broadcast antes do pedido de assinatura)
+            # ---- 3+4. Altura e prev_hash (race recovery) ----
             try:
                 local_h = int(self.bc.db.height())
                 local_tip = self.bc.db.tip_hash()
@@ -557,36 +578,26 @@ class P2PServer(threading.Thread):
 
                 if block_h == local_h + 1:
                     if block.get("prev_hash") != local_tip:
-                        log.info(
-                            "[SIG] rejeitando: prev_hash em fork "
-                            "(local_tip=%s... block=%s...)",
-                            (local_tip or "")[:16],
-                            (block.get("prev_hash") or "")[:16],
-                        )
+                        log.info("[SIG] rejeitando: prev_hash em fork "
+                                 "(local_tip=%s block=%s)",
+                                 (local_tip or "")[:16], (block.get("prev_hash") or "")[:16])
                         return {"type": "sign_block_response", "pubkey": "", "signature": "",
                                 "error": "prev_hash_fork local_tip=%s block_prev=%s" % (
-                                    (local_tip or "")[:16],
-                                    (block.get("prev_hash") or "")[:16])}
+                                    (local_tip or "")[:16], (block.get("prev_hash") or "")[:16])}
                     prev_block = self.bc.db.get_block(local_h)
                 elif block_h == local_h:
                     if block.get("hash") != local_tip:
-                        log.info(
-                            "[SIG] altura %d == local mas hash %s != tip %s",
-                            block_h,
-                            (block.get("hash") or "")[:16],
-                            (local_tip or "")[:16],
-                        )
+                        log.info("[SIG] altura %d == local mas hash %s != tip %s",
+                                 block_h, (block.get("hash") or "")[:16],
+                                 (local_tip or "")[:16])
                         return {"type": "sign_block_response", "pubkey": "", "signature": "",
                                 "error": "hash_fork local_tip=%s block_hash=%s" % (
-                                    (local_tip or "")[:16],
-                                    (block.get("hash") or "")[:16])}
+                                    (local_tip or "")[:16], (block.get("hash") or "")[:16])}
                     prev_block = self.bc.db.get_block(block_h - 1) if block_h > 0 else None
                     log.info("[SIG] assinando bloco #%d em RACE RECOVERY (já é o tip local)", block_h)
                 else:
-                    log.info(
-                        "[SIG] altura %d fora da janela [%d, %d]",
-                        block_h, local_h, local_h + 1,
-                    )
+                    log.info("[SIG] altura %d fora da janela [%d, %d]",
+                             block_h, local_h, local_h + 1)
                     return {"type": "sign_block_response", "pubkey": "", "signature": "",
                             "error": "altura_fora local_h=%d block_h=%d" % (local_h, block_h)}
             except Exception as e:
@@ -594,20 +605,14 @@ class P2PServer(threading.Thread):
                 return {"type": "sign_block_response", "pubkey": "", "signature": "",
                         "error": "excecao_altura %s" % e}
 
-            # ---- 5. validate_block SEM checar validators_sig ----
-            # [FIX v6.7.6] validators=[] faz _validate_validators_sig
-            # retornar (True, "") imediatamente (skip).
-            # [FIX v6.7.7] prev_block=prev_block (antes era None).
+            # ---- 5. validate_block SEM sig ----
             try:
                 ok_val, msg_val = self.bc.validate_block(
-                    block, prev_block=prev_block, validators=[],
-                )
+                    block, prev_block=prev_block, validators=[])
                 if not ok_val:
                     self.metrics.inc("block_sigs_invalid")
-                    log.warning(
-                        "[SIG] rejeitando assinatura de %s: validate_block: %s",
-                        addr[0], msg_val,
-                    )
+                    log.warning("[SIG] rejeitando assinatura de %s: validate_block: %s",
+                                addr[0], msg_val)
                     return {"type": "sign_block_response", "pubkey": "", "signature": "",
                             "error": "validate_block %s" % msg_val[:80]}
             except Exception as e:
@@ -615,24 +620,17 @@ class P2PServer(threading.Thread):
                 return {"type": "sign_block_response", "pubkey": "", "signature": "",
                         "error": "excecao_validate %s" % e}
 
-            # ============================================================
-            # Todas as validações passaram — assina
-            # ============================================================
+            # ---- Assina ----
             entry = sign_block_as_validator(block, local_sk)
             if not entry:
                 return {"type": "sign_block_response", "pubkey": "", "signature": "",
                         "error": "sign_falhou (wallet retornou vazio)"}
 
             self.metrics.inc("block_sigs_provided")
-            log.info(
-                "[SIG] assinando bloco #%d para %s (validação completa OK)",
-                int(block.get("height", -1)), addr[0],
-            )
-            return {
-                "type": "sign_block_response",
-                "pubkey": entry["pubkey"],
-                "signature": entry["signature"],
-            }
+            log.info("[SIG] assinando bloco #%d para %s (validação completa OK)",
+                     int(block.get("height", -1)), addr[0])
+            return {"type": "sign_block_response",
+                    "pubkey": entry["pubkey"], "signature": entry["signature"]}
         except Exception as e:
             log.warning("[SIG] _handle_sign_block exceção: %s", e)
             return {"type": "sign_block_response", "pubkey": "", "signature": "",
@@ -643,22 +641,26 @@ class P2PServer(threading.Thread):
         peer_ip = addr[0]
         try:
             if mtype == "ping":
-                return {"type": "pong", "version": PROTOCOL_VERSION, "height": self.bc.db.height(), "work": self.bc.cumulative_work(), "decentralized": self.bc.rede_descentralizada, "queue_size": len(self.bc.fila_mineracao)}
-
+                return {"type": "pong", "version": PROTOCOL_VERSION,
+                        "height": self.bc.db.height(), "work": self.bc.cumulative_work(),
+                        "decentralized": self.bc.rede_descentralizada,
+                        "queue_size": len(self.bc.fila_mineracao)}
             if mtype == "get_chain_height":
-                return {"type": "chain_height", "height": self.bc.db.height(), "hash": self.bc.db.tip_hash(), "work": self.bc.cumulative_work(), "decentralized": self.bc.rede_descentralizada, "queue_size": len(self.bc.fila_mineracao)}
-
+                return {"type": "chain_height", "height": self.bc.db.height(),
+                        "hash": self.bc.db.tip_hash(), "work": self.bc.cumulative_work(),
+                        "decentralized": self.bc.rede_descentralizada,
+                        "queue_size": len(self.bc.fila_mineracao)}
             if mtype == "join_mining_queue":
                 req_addr = msg.get("address", "").strip()
                 req_pub = msg.get("pubkey", "").strip()
                 if req_addr and req_pub:
                     self.bc.adicionar_na_fila(req_addr, req_pub)
                     self.metrics.inc("queue_joined")
-                return {"type": "queue_ack", "ok": True, "queue_size": len(self.bc.fila_mineracao), "decentralized": self.bc.rede_descentralizada}
-
+                return {"type": "queue_ack", "ok": True,
+                        "queue_size": len(self.bc.fila_mineracao),
+                        "decentralized": self.bc.rede_descentralizada}
             if mtype == "get_block":
                 return {"type": "block", "block": self.bc.db.get_block(int(msg.get("height", 0)))}
-
             if mtype == "get_blocks_range":
                 start = int(msg.get("start", 0))
                 end = int(msg.get("end", start + 50))
@@ -666,7 +668,6 @@ class P2PServer(threading.Thread):
                 blocks = self.bc.db.get_blocks_range(start, end)
                 self.metrics.peer_add_tokens(peer_ip, len(blocks))
                 return {"type": "blocks_range", "blocks": blocks}
-
             if mtype == "new_block":
                 if READ_ONLY: return {"type": "ack", "ok": False, "reason": "read_only"}
                 block_dict = msg.get("block")
@@ -676,7 +677,6 @@ class P2PServer(threading.Thread):
                     elif not ok and self.on_peer_bad: self.on_peer_bad(peer_ip, peer_id)
                     return {"type": "ack", "ok": bool(ok)}
                 return {"type": "ack", "ok": False}
-
             if mtype == "new_tx":
                 if READ_ONLY: return {"type": "ack", "ok": False, "reason": "read_only"}
                 tx_dict = msg.get("tx")
@@ -685,62 +685,49 @@ class P2PServer(threading.Thread):
                     if ok and self.on_peer_good: self.on_peer_good(peer_ip, peer_id)
                     return {"type": "ack", "ok": bool(ok)}
                 return {"type": "ack", "ok": False}
-
             if mtype == "get_mempool":
                 return {"type": "mempool", "txs": self.bc.db.all_mempool(limit=200)}
-
             if mtype == "get_peers":
                 peers = []
                 if self.get_peers_callback:
                     try: peers = self.get_peers_callback()
                     except Exception: pass
                 return {"type": "peers", "peers": peers[:MAX_PEERS_PER_PEX]}
-
             if mtype == "sign_block":
                 self.metrics.inc("block_sigs_requested")
                 return self._handle_sign_block(msg, addr, peer_id)
-
             if mtype == "announce_validator":
                 pub = (msg.get("pubkey") or "").strip()
                 addr_v = (msg.get("address") or "").strip()
                 if pub and addr_v:
-                    log.info(
-                        "[P2P] announce_validator recebido de %s (%s) — "
-                        "APENAS LOG. Registro só via /api/pool/register.",
-                        pub[:16] + "…", addr_v[:16] + "…",
-                    )
+                    log.info("[P2P] announce_validator recebido de %s (%s) — APENAS LOG.",
+                             pub[:16] + "…", addr_v[:16] + "…")
                 return {"type": "ack", "ok": True}
-
             if mtype == "relay_capabilities":
                 if self.on_relay_caps and peer_id:
                     try: self.on_relay_caps(peer_ip, peer_id, msg)
                     except Exception: pass
                 return {"ok": True, "type": "ack"}
-
             if mtype == "relay_connect_request":
                 if self.on_relay_request:
                     try: return self.on_relay_request(peer_ip, peer_id, msg)
                     except Exception: pass
                 return {"ok": False, "error": "relay_disabled"}
-
             if mtype == "relay_connect_incoming":
                 if self.on_relay_incoming:
                     try: return self.on_relay_incoming(peer_ip, peer_id, msg)
                     except Exception: pass
                 return {"ok": False, "error": "relay_disabled"}
-
             if mtype == "relay_connect_accepted":
                 if self.on_relay_accepted:
                     try: self.on_relay_accepted(peer_ip, peer_id, msg)
                     except Exception: pass
                 return {"ok": True, "type": "ack"}
-
             if mtype == "relay_data":
                 if self.on_relay_data:
                     try: return self.on_relay_data(peer_ip, peer_id, msg)
                     except Exception: pass
                 return {"ok": False, "error": "relay_disabled"}
-
         except Exception as e:
             return {"type": "error", "message": str(e)}
         return {"type": "error", "message": "Tipo desconhecido"}
@@ -755,21 +742,17 @@ class P2PClient:
             s.settimeout(timeout)
             t0 = time.time()
             s.connect((ip, port))
-
             message = dict(message)
             message["_chain"] = CHAIN_ID
             message["_port"] = int(os.environ.get("BRN_P2P_PORT", "6001"))
-
             if auth_enabled():
                 try:
                     msg_sem = {k: v for k, v in message.items() if k != "_auth"}
                     message["_auth"] = build_auth(msg=msg_sem)
                 except Exception:
                     pass
-
             payload = NETWORK_MAGIC + json.dumps(message).encode()
             s.sendall(payload)
-
             raw = b""
             while True:
                 try: chunk = s.recv(65536)
@@ -783,10 +766,8 @@ class P2PClient:
                         break
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         continue
-
             latency_ms = (time.time() - t0) * 1000
             s.close()
-
             if raw.startswith(NETWORK_MAGIC):
                 resp = json.loads(raw[len(NETWORK_MAGIC):].decode())
                 if resp.get("_chain") != CHAIN_ID:
@@ -820,8 +801,7 @@ class P2PClient:
     @staticmethod
     def announce_validator(ip, port, pubkey, address, timeout=None):
         return P2PClient.send_message(
-            ip, port,
-            {"type": "announce_validator", "pubkey": pubkey, "address": address},
+            ip, port, {"type": "announce_validator", "pubkey": pubkey, "address": address},
             timeout=timeout,
         )
 
@@ -1090,7 +1070,8 @@ class PeerDiscovery:
         with self._height_cache_lock:
             now = time.time()
             return [
-                {"address": a, "height": h, "work": w, "latency_ms": round(lat, 1), "age_s": round(now - ts, 1)}
+                {"address": a, "height": h, "work": w,
+                 "latency_ms": round(lat, 1), "age_s": round(now - ts, 1)}
                 for a, (ts, h, w, lat) in self._height_cache.items() if now - ts < HEIGHT_CACHE_TTL
             ]
 
@@ -1106,6 +1087,17 @@ class P2PManager:
         self.metrics = Metrics()
         self.external_ip = None
         self.upnp = None
+
+        # [v6.7.8] Trust cleanup — inclui SK local automaticamente
+        self._trust_keep = set(TRUST_KEEP)
+        local_sk = getattr(blockchain, "_local_validator_sk", None)
+        if local_sk is not None:
+            try:
+                self._trust_keep.add(local_sk.pub_hex)
+            except Exception:
+                pass
+        self._trust_cleanup_stop = threading.Event()
+        self._trust_cleanup_thread = None
 
         if node_id_priv is not None:
             _auth_set_priv(node_id_priv)
@@ -1131,13 +1123,46 @@ class P2PManager:
         if enable_upnp and not READ_ONLY:
             threading.Thread(target=self._setup_upnp, daemon=True, name="UPnP").start()
 
+    def _trust_cleanup_loop(self) -> None:
+        """[v6.7.8] Remove fantasmas do trust a cada N segundos."""
+        # Roda uma vez imediato
+        removed = _trust_clean_now(self._trust_keep)
+        if removed > 0:
+            self.metrics.inc("trust_cleanups", 1)
+            self.metrics.inc("trust_removed", removed)
+        while not self._trust_cleanup_stop.is_set():
+            if self._trust_cleanup_stop.wait(TRUST_CLEANUP_INTERVAL):
+                break
+            try:
+                removed = _trust_clean_now(self._trust_keep)
+                if removed > 0:
+                    self.metrics.inc("trust_cleanups", 1)
+                    self.metrics.inc("trust_removed", removed)
+                    # Recarrega trust no blockchain
+                    try:
+                        from trust_network import TrustNetwork
+                        new_trust = TrustNetwork(TRUST_FILE)
+                        self.bc.set_trust_net(new_trust)
+                    except Exception as e:
+                        log.debug(f"[TRUST-CLEANUP] recarga falhou: {e}")
+            except Exception as e:
+                log.debug(f"[TRUST-CLEANUP] loop erro: {e}")
+
     def start(self) -> None:
         mode = "READ-ONLY" if self.read_only else "FULL"
         log.info(f"[P2P] iniciado node_id={self.node_uuid[:8]} modo={mode} chain={CHAIN_ID}")
+        log.info(f"[P2P] trust cleanup a cada {TRUST_CLEANUP_INTERVAL}s "
+                 f"(keep={len(self._trust_keep)} pubkeys)")
         self.server.start()
         self.discovery.run()
+        # [v6.7.8] Inicia cleanup
+        self._trust_cleanup_thread = threading.Thread(
+            target=self._trust_cleanup_loop, daemon=True, name="Trust-Cleanup"
+        )
+        self._trust_cleanup_thread.start()
 
     def stop(self) -> None:
+        self._trust_cleanup_stop.set()
         self.server.stop()
         self.discovery.stop()
         try: self._broadcast_pool.shutdown(wait=False, cancel_futures=True)
@@ -1159,6 +1184,8 @@ class P2PManager:
             "work": self.bc.cumulative_work(), "bootstrap": list(_carregar_bootstrap()),
             "read_only": self.read_only, "protocol": PROTOCOL_VERSION, "chain": CHAIN_ID,
             "decentralized": self.bc.rede_descentralizada, "queue_size": len(self.bc.fila_mineracao),
+            "trust_keep": sorted(self._trust_keep),
+            "trust_cleanup_interval_s": TRUST_CLEANUP_INTERVAL,
         }
 
     def get_metrics(self) -> dict: return self.metrics.snapshot()
@@ -1169,35 +1196,23 @@ class P2PManager:
         return P2PClient.request_block_signature(ip, port, block, timeout=timeout)
 
     def broadcast_validator_registration(self, pubkey: str, address: str) -> None:
-        if self.read_only:
-            return
+        if self.read_only: return
         if not pubkey or not address:
             log.debug("[P2P] broadcast_validator_registration: pubkey/address vazios")
             return
-        payload = {
-            "type": "announce_validator",
-            "pubkey": pubkey,
-            "address": address,
-        }
+        payload = {"type": "announce_validator", "pubkey": pubkey, "address": address}
         enviados = 0
         falhas = 0
         for peer in self.discovery.listar_peers():
             try:
                 ip, port_s = peer.rsplit(":", 1)
                 port = int(port_s)
-            except Exception:
-                continue
+            except Exception: continue
             try:
-                self._broadcast_pool.submit(
-                    P2PClient.send_message, ip, port, payload
-                )
+                self._broadcast_pool.submit(P2PClient.send_message, ip, port, payload)
                 enviados += 1
-            except Exception:
-                falhas += 1
-        log.info(
-            f"[P2P] announce_validator enviado para "
-            f"{enviados} peer(s) (falhas={falhas})"
-        )
+            except Exception: falhas += 1
+        log.info(f"[P2P] announce_validator enviado para {enviados} peer(s) (falhas={falhas})")
 
     def _setup_upnp(self) -> None:
         try:
@@ -1221,16 +1236,13 @@ class P2PManager:
             if not resp: return
             self.metrics.peer_update(f"{ip}:{port}", latency_ms=latency)
             if resp.get("_uuid"): self.discovery.register_uuid(resp["_uuid"], ip, port)
-
             if resp.get("decentralized") and not self.bc.rede_descentralizada:
                 log.warning("[P2P] Rede descentralizada detectada via peer!")
                 self.bc.rede_descentralizada = True
-
             remote_work = resp.get("work", 0)
             local_work = self.bc.cumulative_work()
             if remote_work > local_work:
                 threading.Thread(target=self._sync_with_retry, args=(ip, port), daemon=True, name=f"Sync-{ip}-{port}").start()
-
             peers_resp, _ = P2PClient.get_peers(ip, port)
             if peers_resp and "peers" in peers_resp:
                 novos = 0
@@ -1276,19 +1288,15 @@ class P2PManager:
         resp, latency = P2PClient.get_chain_height(ip, port)
         if not resp: return SyncResult.RETRYABLE, "peer não respondeu"
         self.metrics.peer_update(addr, latency_ms=latency)
-
         remote_height = resp.get("height", -1)
         remote_work = resp.get("work", 0)
         local_height = self.bc.db.height()
         local_work = self.bc.cumulative_work()
-
         if remote_work <= local_work and remote_height <= local_height:
             return SyncResult.UP_TO_DATE, "sem mais trabalho"
-
         start = local_height + 1
         if start > remote_height:
             return SyncResult.UP_TO_DATE, "nada novo"
-
         log.info(f"[Sync] {addr}: {local_height} -> {remote_height}")
         blocks_to_apply = []
         cursor = start
@@ -1302,10 +1310,8 @@ class P2PManager:
             self.metrics.peer_update(addr, latency_ms=lat)
             blocks_to_apply.extend(lote)
             cursor = end
-
         if not blocks_to_apply: return SyncResult.RETRYABLE, "nenhum bloco recebido"
         if not _HAS_BLOCKCHAIN_HELPERS: return SyncResult.FATAL, "blockchain helpers ausentes"
-
         prev = self.bc.db.get_block(local_height)
         prev_hash = prev["hash"] if prev else "0" * 64
         expected_height = local_height + 1
@@ -1320,7 +1326,6 @@ class P2PManager:
                 expected_height += 1
             except Exception as e:
                 return SyncResult.FATAL, f"pré-validação falhou: {e}"
-
         self.metrics.inc("blocks_received", len(blocks_to_apply))
         applied = 0
         for blk in blocks_to_apply:
@@ -1331,14 +1336,12 @@ class P2PManager:
             ok_blk, msg_blk = self.bc.accept_block(blk)
             if not ok_blk: return SyncResult.FATAL, f"bloco #{blk['height']}: {msg_blk}"
             applied += 1
-
         dt_ms = (time.time() - t0) * 1000
         self.metrics.set("last_sync_duration_ms", round(dt_ms, 1))
         self.metrics.set("last_sync_height", self.bc.db.height())
         self.metrics.inc("sync_blocks_applied", applied)
         self.metrics.inc("blocks_accepted", applied)
         self.metrics.peer_update(addr, blocks_contributed=applied)
-
         log.info(f"[Sync] {addr}: OK — +{applied} blocos em {dt_ms:.0f}ms")
         return SyncResult.OK, f"+{applied} blocos"
 
@@ -1416,10 +1419,10 @@ class P2PManager:
 
 
 try:
-    from upnp_client import UPnPClient  # type: ignore
+    from upnp_client import UPnPClient
 except ImportError:
     try:
-        import miniupnpc  # type: ignore
+        import miniupnpc
         class UPnPClient:
             def __init__(self):
                 self.upnp = miniupnpc.UPnP()
@@ -1427,17 +1430,14 @@ except ImportError:
                 self.upnp.discover()
                 self.upnp.selectigd()
                 self.control_url = self.upnp.controlURL if hasattr(self.upnp, "controlURL") else None
-
             def add_port_mapping(self, external, internal, ip, description=""):
                 try:
                     self.upnp.addportmapping(external, "TCP", ip, internal, description, "")
                     return True
                 except Exception: return False
-
             def get_external_ip(self):
                 try: return self.upnp.externalipaddress()
                 except Exception: return ""
-
             def delete_port_mapping(self, port, proto):
                 try: self.upnp.deleteportmapping(port, proto)
                 except Exception: pass
