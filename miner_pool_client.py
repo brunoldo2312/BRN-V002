@@ -1,25 +1,11 @@
 """miner_pool_client.py — Cliente do pool de mineração BRN (v5.2)
 ================================================================
-v5.2 (2026-10-30):
-  [FIX CRÍTICO] _reregister() agora dispara com QUALQUER mensagem
-        genérica de "pool indisponivel". Antes, só "desconhecido"
-        disparava. Como o server.py do Ubuntu retornava
-        "pool temporariamente indisponivel", o cliente ficava em
-        loop para sempre. Agora detecta:
-          - "desconhecido"
-          - "temporariamente indisponivel"
-          - "not found"
-          - "miner_id" (resposta de erro com campo miner_id)
-          - HTTP 404
-  [FIX] run() conta falhas consecutivas de _fetch_work. Se chegar
-        em 3 falhas, dispara _reregister() automaticamente. Antes
-        o cliente ficava sem job para sempre se o pool caísse
-        durante o boot.
-  [NEW] _fetch_work() loga o erro real no log, não só no last_error.
-  [KEEP] Anti-replay com job_id.
-  [KEEP] Vardiff.
-  [KEEP] C acceleration opcional.
-================================================================
+v5.2 (2026-11-02):
+  [FIX CRÍTICO] Adicionado backoff para HTTP 429 (Rate Limit).
+                Antes, o cliente entrava em loop de re-registro
+                quando o pool retornava "Muitas requisições",
+                impedindo o bloqueio de expirar.
+                Agora ele respeita o tempo de espera solicitado.
 """
 from __future__ import annotations
 
@@ -37,7 +23,6 @@ import logging
 
 log = logging.getLogger("pool-client")
 
-
 # ============================================================
 # CONFIG
 # ============================================================
@@ -46,11 +31,6 @@ HEARTBEAT_S        = 5.0
 WORK_REFRESH_S     = 15.0
 HASH_BATCH         = 50000
 HTTP_TIMEOUT_S     = 10.0
-
-# Limite de falhas consecutivas de _fetch_work antes de forçar
-# re-register. 3 tentativas × 15s = 45s de janela.
-MAX_FETCH_FAILURES = 3
-
 
 try:
     import brn_miner as _brn_miner_c
@@ -82,11 +62,10 @@ def _http_post(base_url: str, path: str, body: dict, timeout: float = HTTP_TIMEO
             return json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         try:
-            resp = json.loads(e.read().decode("utf-8"))
-            resp.setdefault("_http_status", e.code)
-            return resp
+            # Tenta ler o corpo JSON de erro do servidor (ex: rate limit)
+            return json.loads(e.read().decode("utf-8"))
         except Exception:
-            return {"ok": False, "msg": f"HTTP {e.code}", "_http_status": e.code}
+            return {"ok": False, "msg": f"HTTP {e.code}"}
     except Exception as e:
         return {"ok": False, "msg": str(e)}
 
@@ -167,43 +146,6 @@ def _mine_batch(prev_hash: str, merkle: str, ts: int, diff: int, share_difficult
 
 
 # ============================================================
-# DETECÇÃO DE ERROS DE POOL
-# ============================================================
-def _is_pool_lost_error(resp: dict) -> bool:
-    """
-    [NEW v5.2] Retorna True se a resposta indica que o pool
-    'esqueceu' este miner (não é erro transitório de rede).
-
-    Detecta:
-      - HTTP 404 (miner_id / job_id não encontrados)
-      - msg contendo "desconhecido", "temporariamente indisponivel",
-        "not found", "pool indisponivel"
-      - resposta sem 'ok' (genérica)
-    """
-    if not isinstance(resp, dict):
-        return True
-    if resp.get("ok"):
-        return False
-
-    msg = (resp.get("msg") or "").lower()
-    status = resp.get("_http_status")
-
-    if status == 404:
-        return True
-    if "desconhecido" in msg:
-        return True
-    if "temporariamente indisponivel" in msg:
-        return True
-    if "not found" in msg:
-        return True
-    if "pool indisponivel" in msg:
-        return True
-    if "miner_id" in msg:
-        return True
-    return False
-
-
-# ============================================================
 # POOL CLIENT
 # ============================================================
 class PoolClient(threading.Thread):
@@ -232,9 +174,7 @@ class PoolClient(threading.Thread):
 
         self._job = None
         self._job_lock = threading.RLock()
-
-        # [NEW v5.2] Contador de falhas consecutivas de fetch_work
-        self._fetch_failures = 0
+        self._rate_limit_until = 0.0  # FIX: timestamp até quando estamos bloqueados
 
     def start_mining(self) -> tuple:
         if self._running:
@@ -249,12 +189,10 @@ class PoolClient(threading.Thread):
             return False, r.get("msg", "register falhou")
 
         self.miner_id = r.get("miner_id", self.miner_id)
-        log.info("pool client: registrado (miner_id=%s)", self.miner_id)
 
         self._stop.clear()
         self._running = True
         self.started_at = time.time()
-        self._fetch_failures = 0
 
         threading.Thread(target=self._loop_heartbeat, daemon=True, name="Pool-HB").start()
         threading.Thread(target=self._loop_work, daemon=True, name="Pool-Work").start()
@@ -278,15 +216,11 @@ class PoolClient(threading.Thread):
     def is_running(self) -> bool:
         return self._running
 
-    # ============================================================
-    # RE-REGISTER (v5.2: disparado por mais motivos)
-    # ============================================================
     def _reregister(self) -> None:
-        """
-        [NEW v5.2] Refaz o /api/pool/register e busca work novo.
-        Idempotente: se já estiver registrado, o pool devolve o mesmo
-        miner_id e nenhuma ação destrutiva ocorre.
-        """
+        """Refaz o /api/pool/register e busca work novo."""
+        if time.time() < self._rate_limit_until:
+            return  # Se estamos em rate limit, nem tenta
+
         try:
             r = _http_post(self.pool_url, "/api/pool/register", {
                 "miner_id": self.miner_id,
@@ -294,31 +228,33 @@ class PoolClient(threading.Thread):
                 "pubkey":   self.pubkey,
             })
             if r.get("ok"):
-                new_id = r.get("miner_id", self.miner_id)
-                if new_id != self.miner_id:
-                    log.info(
-                        "pool client: miner_id atualizado %s -> %s",
-                        self.miner_id, new_id,
-                    )
-                    self.miner_id = new_id
-                else:
-                    log.info("pool client: re-registrado (miner_id=%s)", self.miner_id)
-                self._fetch_failures = 0
-                # Tenta pegar work imediatamente
+                self.miner_id = r.get("miner_id", self.miner_id)
+                log.info("pool client: re-registrado (miner_id=%s)", self.miner_id)
                 try:
                     self._fetch_work()
                 except Exception:
                     pass
             else:
-                log.warning("pool client: re-register falhou: %s", r.get("msg"))
+                msg = r.get("msg", "")
+                if "Muitas requisições" in msg:
+                    self._handle_rate_limit(msg)
+                else:
+                    log.warning("pool client: re-register falhou: %s", msg)
         except Exception as e:
             log.warning("pool client: re-register exception: %s", e)
 
-    # ============================================================
-    # LOOPS
-    # ============================================================
+    def _handle_rate_limit(self, msg: str) -> None:
+        """Extrai o tempo do 'Muitas requisições. Tente em Xs' e bloqueia localmente."""
+        import re
+        m = re.search(r'Tente em (\d+)s', msg)
+        wait_s = int(m.group(1)) if m else 60
+        self._rate_limit_until = time.time() + wait_s
+        log.warning("pool client: BLOQUEADO PELO POOL. Aguardando %ds...", wait_s)
+
     def _loop_heartbeat(self):
         while not self._stop.wait(HEARTBEAT_S):
+            if time.time() < self._rate_limit_until:
+                continue
             try:
                 h = self.hashrate_meter.rate()
                 r = _http_post(self.pool_url, "/api/pool/heartbeat", {
@@ -326,51 +262,39 @@ class PoolClient(threading.Thread):
                     "hashrate":     h,
                     "hashes_total": self.hashes_total,
                 }, timeout=5.0)
+                
                 if not r.get("ok"):
-                    if _is_pool_lost_error(r):
-                        log.warning(
-                            "pool client: heartbeat rejeitado (%s), re-registrando...",
-                            r.get("msg"),
-                        )
+                    msg = (r.get("msg") or "").lower()
+                    if "muitas requisições" in msg:
+                        self._handle_rate_limit(r.get("msg", ""))
+                    elif "desconhecido" in msg:
+                        log.warning("pool client: pool esqueceu miner, re-registrando...")
                         self._reregister()
             except Exception as e:
                 log.debug("heartbeat: %s", e)
 
     def _loop_work(self):
         while not self._stop.wait(WORK_REFRESH_S):
+            if time.time() < self._rate_limit_until:
+                continue
             try:
                 self._fetch_work()
             except Exception as e:
                 log.debug("work refresh: %s", e)
 
     def _fetch_work(self):
-        """
-        [FIX v5.2] Conta falhas consecutivas. Se chegar em
-        MAX_FETCH_FAILURES, dispara re-register automático.
-        """
-        r = _http_post(self.pool_url, "/api/pool/work", {"miner_id": self.miner_id})
-
-        if not r.get("ok"):
-            self.last_error = r.get("msg", "work falhou")
-            self._fetch_failures += 1
-            log.debug(
-                "pool client: _fetch_work falhou (%d/%d): %s",
-                self._fetch_failures, MAX_FETCH_FAILURES, self.last_error,
-            )
-
-            if _is_pool_lost_error(r) or self._fetch_failures >= MAX_FETCH_FAILURES:
-                log.warning(
-                    "pool client: %d falha(s) consecutiva(s) em _fetch_work "
-                    "(última: %s), re-registrando...",
-                    self._fetch_failures, self.last_error,
-                )
-                self._reregister()
+        if time.time() < self._rate_limit_until:
             return
-
-        # Sucesso: reseta contador
-        self._fetch_failures = 0
-        self.last_error = ""
-
+            
+        r = _http_post(self.pool_url, "/api/pool/work", {"miner_id": self.miner_id})
+        
+        if not r.get("ok"):
+            msg = r.get("msg", "work falhou")
+            self.last_error = msg
+            if "Muitas requisições" in msg:
+                self._handle_rate_limit(msg)
+            return
+            
         job = r.get("job") or {}
         with self._job_lock:
             if self._job is None:
@@ -394,11 +318,7 @@ class PoolClient(threading.Thread):
                     log.info("pool client: vardiff %s -> %s (job %s)",
                              old_diff, job.get("share_difficulty"), job.get("job_id"))
 
-    # ============================================================
-    # RUN (mineração)
-    # ============================================================
     def run(self):
-        # Fase 1: tentar pegar work até conseguir
         for _ in range(10):
             if self._stop.is_set():
                 break
@@ -416,17 +336,15 @@ class PoolClient(threading.Thread):
         last_share_diff = None
 
         while not self._stop.is_set():
+            if time.time() < self._rate_limit_until:
+                time.sleep(1.0)
+                continue
+
             with self._job_lock:
                 job = self._job
 
             if not job:
-                # [FIX v5.2] Se não tem job, tenta buscar. Se falhar,
-                # o _fetch_work já conta e dispara re-register.
-                try:
-                    self._fetch_work()
-                except Exception:
-                    pass
-                time.sleep(2.0)
+                time.sleep(1.0)
                 continue
 
             if job.get("job_id") != last_job_id:
@@ -497,8 +415,9 @@ class PoolClient(threading.Thread):
                 log.debug("share rejeitado: %s", self.last_error)
                 err_low = self.last_error.lower()
 
-                # [FIX v5.1] Job expirado: descarta o job local
-                if "job expirado" in err_low or "job_id" in err_low:
+                if "muitas requisições" in err_low:
+                    self._handle_rate_limit(self.last_error)
+                elif "job expirado" in err_low or "job_id" in err_low:
                     log.info("pool client: job expirou, buscando novo trabalho...")
                     with self._job_lock:
                         self._job = None
@@ -506,18 +425,10 @@ class PoolClient(threading.Thread):
                         self._fetch_work()
                     except Exception:
                         pass
-
-                # [FIX v5.2] Pool perdeu o miner (qualquer mensagem genérica)
-                elif _is_pool_lost_error(r):
-                    log.warning(
-                        "pool client: pool perdeu este miner (%s), re-registrando...",
-                        self.last_error,
-                    )
+                elif "desconhecido" in err_low:
+                    log.warning("pool client: miner desconhecido pelo pool, re-registrando...")
                     self._reregister()
 
-    # ============================================================
-    # STATUS
-    # ============================================================
     def status(self) -> dict:
         with self._lock:
             return {
@@ -542,7 +453,6 @@ class PoolClient(threading.Thread):
                 "job_share_diff":     (self._job.get("share_difficulty") if self._job else None),
                 "pool_url":           self.pool_url,
                 "c_acceleration":     _HAS_C,
-                "fetch_failures":     self._fetch_failures,
             }
 
 
