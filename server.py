@@ -8,6 +8,7 @@ v9.9.17 (2026-11-02):
         a GUI (app_wallet_v3 v3.9.2) recebia 404 e mostrava
         "PoolClient[parado]" mesmo com o cliente minerando.
   [NEW] set_pool_client_local() / _get_pool_client_local().
+  [NEW] /health agora reporta pool_client_local injetado.
 v9.9.16 (2026-10-25):
   [FIX CRÍTICO] Re-adicionada a rota /api/minhas-txs que havia sido
                 removida por engano na v9.9.15, causando erro 404.
@@ -1041,7 +1042,8 @@ def health():
     try:
         return jsonify({
             "ok": True, "height": _get_chain().db.height(), "version": "9.9.17",
-            "chain_injected": _CHAIN is not None, "pool_injected": _POOL_MANAGER is not None,
+            "chain_injected": _CHAIN is not None,
+            "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
             "pool_client_local": _POOL_CLIENT_LOCAL is not None,
         })
