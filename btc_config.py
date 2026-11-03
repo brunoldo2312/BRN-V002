@@ -1,9 +1,14 @@
 # ============================================================
 # btc_config.py — Configuração da ponte BTC ↔ BRN
+# v2 (2026-11-03): default BRN_TREASURY_ADDRESS atualizado
 # ============================================================
 from __future__ import annotations
 
 import os
+
+
+# Endereço BRN do cofre (default hardcoded — pode ser sobrescrito por env)
+DEFAULT_BRN_TREASURY = "brn176zsgk8vrn8js48npzjn8rm7cc70rwsxkxyy43"
 
 
 # ============================================================
@@ -20,10 +25,11 @@ BTC_RECEIVE_ADDRESS = os.environ.get(
     "1BBKio11f87a5f3jD2QHCa6mALw667Liag",
 )
 
-# Endereço BRN do cofre (PÚBLICO) — ATUALIZADO AQUI
+# Endereço BRN do cofre (PÚBLICO) — atualizado 03/11/2026
+# Precedência: env BRN_TREASURY_ADDRESS > DEFAULT_BRN_TREASURY
 BRN_TREASURY_ADDRESS = os.environ.get(
     "BRN_TREASURY_ADDRESS",
-    "brn1x9v8xq6v7dgrszl3ep6zupk28y7jfr8a0cwmgu",
+    DEFAULT_BRN_TREASURY,
 )
 
 # Limites OFFRAMP
