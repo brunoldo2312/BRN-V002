@@ -1,7 +1,7 @@
 @echo off
 REM ============================================================
-REM   iniciar_cliente.bat - BRN Node Auto-Setup (v4.4 - GUI Default)
-REM   Fluxo: Env -> Deps -> Tailscale -> Sync -> GUI (Carteira)
+REM   iniciar_cliente.bat - BRN Node Auto-Setup (v5.1 - GUI Manual)
+REM   Fluxo: Variaveis -> Deps -> Tailscale -> Sync -> GUI
 REM ============================================================
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
@@ -12,48 +12,53 @@ set "PYTHONIOENCODING=utf-8"
 set "PYTHONUTF8=1"
 set "PYTHONUNBUFFERED=1"
 
-REM Padrao: GUI (carteira grafica). Use --headless para desativar.
-set "FORCE_HEADLESS=0"
-set "SKIP_DEPS=0"
-set "SKIP_SYNC=0"
-
-:parse_args
-if "%~1"=="" goto args_done
-if /i "%~1"=="--skip-deps" set "SKIP_DEPS=1"
-if /i "%~1"=="--skip-sync" set "SKIP_SYNC=1"
-if /i "%~1"=="--headless"  set "FORCE_HEADLESS=1"
-if /i "%~1"=="--gui"       set "FORCE_HEADLESS=0"
-shift
-goto parse_args
-:args_done
-
-echo.
-echo ============================================================
-echo   BRN Node - AUTO SETUP E INICIALIZACAO (v4.4)
-echo ============================================================
-echo   Pasta: %CD%
-echo   Data:  %DATE% %TIME%
-if "%FORCE_HEADLESS%"=="1" (
-    echo   Modo:  HEADLESS ^(API HTTP sem GUI^)
-) else (
-    echo   Modo:  GUI ^(Carteira Grafica via pywebview^)
-)
-echo ============================================================
-echo.
-
 REM ============================================================
-REM 0. VERIFICAR ARQUIVO DE CONFIGURACAO (.env)
+REM 0. INJETAR VARIAVEIS DE AMBIENTE (Substitui o .env)
 REM ============================================================
-if not exist "brn_network.env" (
-    echo [AVISO] O arquivo brn_network.env NAO ENCONTRADO!
-    if exist "brn_network.env.example" (
-        copy "brn_network.env.example" "brn_network.env" >nul
-        echo         [IMPORTANTE] Copia criada. Edite o brn_network.env e preencha as senhas!
-    ) else (
-        echo [ERRO] brn_network.env.example tambem nao existe. Crie o .env manualmente.
-    )
-    pause
-)
+echo [0/5] Carregando configuracoes de rede e senhas...
+
+REM Segredos e Senhas
+set "BRN_NETWORK_SECRET=088641fd110a36bcb3a1bd3d497d8cd68287bf10e49eedfc52d1fc0329ef8d12"
+set "BRN_NODE_PASSWORD=senha-forte-windows-2026"
+set "BRN_WALLET_SESSION_PASS=carteira-windows-2026"
+set "BRN_WEB_PASS=web-windows-2026"
+
+REM Papel da Rede e Consenso
+set "BRN_IS_ORIGIN=0"
+set "BRN_POOL_ENABLED=0"
+set "BRN_MAX_VALIDATORS=3"
+set "BRN_VALIDATOR_QUORUM=0.51"
+set "BRN_REQUIRE_ALL_SIGS=0"
+
+REM Dificuldade
+set "BRN_MIN_DIFFICULTY=3"
+set "BRN_MAX_DIFFICULTY=6"
+set "BRN_DIFF_INTERVAL=6"
+
+REM Rede e Pool (Apontando para o Ubuntu)
+set "BRN_BOOTSTRAP_PEERS=100.70.107.15:6001,100.111.253.8:6001"
+set "BRN_POOL_URL=http://100.111.253.8:5000"
+set "BRN_SEU_ENDERECO=100.84.11.48:6001"
+set "BRN_P2P_PORT=6001"
+set "BRN_SKIP_TAILSCALE=0"
+
+REM Portas HTTP e API
+set "BRN_UVICORN_WORKERS=1"
+set "ANYIO_THREAD_LIMIT=200"
+set "BRN_WEB_HOST=0.0.0.0"
+set "BRN_WEB_PORT=5000"
+set "BRN_CORS_ORIGIN=*"
+
+REM Checkpoints e Logs
+set "BRN_CHECKPOINT_INTERVAL=100"
+set "BRN_ORIGIN_PUBKEY=03c0f4604d5264b5eda409eac8212267bd76ff46973bb14e01a16c290f437e0e6e"
+set "BRN_LOG_LEVEL=INFO"
+set "BRN_SKIP_VERIFY=1"
+set "BRN_TCP_TIMEOUT=30.0"
+set "BRN_ASSUME_VALID_UNTIL=4001"
+set "BRN_CHECKPOINT_AUTO_HEIGHT=4001"
+
+echo [ok] Configuracoes injetadas com sucesso!
 echo.
 
 REM ============================================================
@@ -63,7 +68,6 @@ echo [1/5] Verificando Python...
 where python >nul 2>&1
 if errorlevel 1 (
     echo [ERRO] Python nao encontrado no PATH.
-    echo        Instale em: https://www.python.org/downloads/ e marque "Add to PATH".
     pause
     exit /b 1
 )
@@ -72,12 +76,18 @@ echo [ok] Python encontrado.
 echo.
 
 REM ============================================================
-REM 2. INSTALAR DEPENDENCIAS
+REM 2. INSTALAR DEPENDENCIAS E CORRIGIR ANYIO
 REM ============================================================
-if "%SKIP_DEPS%"=="1" goto deps_skip
-
 echo [2/5] Verificando dependencias (isso pode demorar)...
-REM zeroconf, bitcoinlib, pythonnet, pywebview sao necessarios para a GUI
+
+REM Correcao do erro 'anyio' (GUI)
+python -c "import anyio; print(anyio.__version__)" 2>nul | findstr "4.15" >nul
+if not errorlevel 1 (
+    echo        [FIX] Corrigindo versao do anyio (removendo 4.15 quebrada)...
+    python -m pip install "anyio<4.15.0" --quiet
+    python -m pip install "starlette<0.40.0" --quiet
+)
+
 set "PKGS=flask flask-cors fastapi uvicorn requests orjson waitress cryptography argon2-cffi mnemonic pymongo pywebview pythonnet bitcoinlib zeroconf"
 
 for %%P in (!PKGS!) do (
@@ -85,17 +95,12 @@ for %%P in (!PKGS!) do (
     if errorlevel 1 (
         echo        Instalando %%P...
         python -m pip install --quiet %%P
-        if errorlevel 1 (
-            echo        [AVISO] Falha ao instalar %%P. Tentando com --user...
-            python -m pip install --quiet --user %%P
-        )
     ) else (
         echo        [ok] %%P ja instalado.
     )
 )
 echo [ok] Dependencias verificadas.
 echo.
-:deps_skip
 
 REM ============================================================
 REM 3. VERIFICAR TAILSCALE
@@ -106,7 +111,6 @@ if not exist "%TS_PATH%" set "TS_PATH=tailscale"
 
 "%TS_PATH%" status >nul 2>&1
 if errorlevel 1 (
-    echo        Tailscale nao esta rodando ou desconectado.
     start "" "C:\Program Files\Tailscale\tailscale.exe"
     timeout /t 3 >nul
     "%TS_PATH%" up
@@ -116,109 +120,33 @@ if errorlevel 1 (
 echo.
 
 REM ============================================================
-REM 4. SINCRONIZAR BLOCKCHAIN
+REM 4. VERIFICAR BLOCKCHAIN E CARTEIRA
 REM ============================================================
-if "%SKIP_SYNC%"=="1" goto sync_skip
+echo [4/5] Verificando blockchain e carteira...
+python -c "from db import ChainDB; d=ChainDB('brn_v2_chain.db'); print('Altura local:', d.height()); d.close()"
 
-echo [4/5] Verificando blockchain...
-set "DB_HEIGHT=-1"
-for /f "delims=" %%H in ('python -c "from db import ChainDB; d=ChainDB('brn_v2_chain.db'); print(d.height()); d.close()" 2^>nul') do set "DB_HEIGHT=%%H"
-
-echo        Altura local: !DB_HEIGHT!
-if not "!DB_HEIGHT!"=="-1" (
-    echo [ok] Blockchain ja sincronizada.
-    goto sync_done
-)
-
-echo        DB vazio - tentando sincronizar via HTTP...
-if exist "sync_direct.py" (
-    python sync_direct.py http://100.111.253.8:5000
-    if errorlevel 1 (
-        echo [AVISO] sync_direct falhou. O main.py tentara sync automatico.
-    )
-) else (
-    echo [INFO] sync_direct.py nao encontrado. Sync automatico no main.py.
-)
-:sync_done
-echo.
-:sync_skip
-
-REM ============================================================
-REM 5. PREPARAR MODO (GUI x HEADLESS) e CARTEIRA
-REM ============================================================
-echo [5/5] Preparando modo de execucao e carteira...
-
-if "%FORCE_HEADLESS%"=="1" (
-    REM ============ MODO HEADLESS ============
-    set "HEADLESS_FLAG=--headless"
-    set "BRN_FORCE_HEADLESS=1"
-    echo        Modo HEADLESS: apenas API HTTP, sem janela grafica.
-) else (
-    REM ============ MODO GUI ============
-    REM (1) Verifica se pywebview importa de verdade
-    python -c "import webview" >nul 2>&1
-    if errorlevel 1 (
-        echo        [AVISO] pywebview nao instalado. Tentando instalar...
-        python -m pip install --quiet pywebview
-        python -c "import webview" >nul 2>&1
-        if errorlevel 1 (
-            echo        [ERRO] pywebview continua indisponivel. Caindo para HEADLESS.
-            set "HEADLESS_FLAG=--headless"
-            set "BRN_FORCE_HEADLESS=1"
-            goto gui_check_done
-        )
-    )
-
-    REM (2) Verifica BRN_WEB_PASS no .env (main.py exige para abrir a GUI)
-    set "HAS_WEB_PASS=0"
-    for /f "tokens=1,* delims==" %%A in ('findstr /B /C:"BRN_WEB_PASS=" brn_network.env 2^>nul') do (
-        if not "%%B"=="" set "HAS_WEB_PASS=1"
-    )
-    if "!HAS_WEB_PASS!"=="0" (
-        echo.
-        echo        [AVISO] BRN_WEB_PASS vazia no brn_network.env.
-        echo                A GUI pode falhar ao abrir a carteira.
-        echo                Adicione a linha: BRN_WEB_PASS=suasenha
-        echo.
-        timeout /t 3 >nul
-    )
-
-    REM (3) Forca GUI: limpa HEADLESS_FLAG e sobrepoe BRN_FORCE_HEADLESS
-    REM     (isso anula a env se estiver setada em outro lugar)
-    set "HEADLESS_FLAG="
-    set "BRN_FORCE_HEADLESS=0"
-    echo        Modo GUI: carteira grafica sera aberta em instantes.
-)
-:gui_check_done
-echo.
-
-REM ============================================================
-REM 6. CRIAR CARTEIRA SE NAO EXISTIR
-REM ============================================================
 if not exist "current_wallet.enc" (
     echo        Criando carteira nova...
-    python -c "import os; from pathlib import Path; [os.environ.setdefault(k.strip(), v.strip()) for line in Path('brn_network.env').read_text(encoding='utf-8').splitlines() if '=' in line and not line.strip().startswith('#') for k,v in [line.split('=',1)]]; from wallet import Wallet, WalletManager; w = Wallet.create(); pw = os.environ.get('BRN_WALLET_SESSION_PASS', '12345678'); WalletManager.save_current(w.address, w.priv_hex, w.pub_hex, pw); print('Carteira criada:', w.address)"
+    python -c "import os; from wallet import Wallet, WalletManager; w = Wallet.create(); pw = os.environ.get('BRN_WALLET_SESSION_PASS', '12345678'); WalletManager.save_current(w.address, w.priv_hex, w.pub_hex, pw); print('Carteira criada:', w.address)"
 )
+echo.
 
 REM ============================================================
-REM 7. INICIAR O NO
+REM 5. INICIAR O NO (MODO GUI - SEM MINERAR AUTOMATICO)
 REM ============================================================
+echo [5/5] Iniciando o no...
 echo ============================================================
-if "%FORCE_HEADLESS%"=="1" (
-    echo   INICIANDO O NO - MODO HEADLESS
-) else (
-    echo   INICIANDO O NO - MODO GUI ^(carteira grafica^)
-)
-echo ============================================================
-echo   python main.py %HEADLESS_FLAG% --skip-verify
+echo   MODO: GUI (Carteira Grafica)
+echo   STATUS: AGUARDANDO CLIQUE NO BOTAO "MINERAR POOL"
 echo ============================================================
 echo.
 
-REM Seta BRN_FORCE_HEADLESS no ambiente desta sessao para o main.py herdar
-set "BRN_FORCE_HEADLESS=%FORCE_HEADLESS%"
-python main.py %HEADLESS_FLAG% --skip-verify
+REM Roda o main.py SEM a flag --pool-client.
+REM Assim, a GUI abre e o PoolClient fica "parado" esperando o seu clique.
+python main.py --skip-verify
 
 if errorlevel 1 (
-    echo [X] O programa saiu com erro.
+    echo.
+    echo [X] O programa saiu com um erro inesperado.
 )
 pause
