@@ -54,19 +54,42 @@ echo OK.
 echo.
 
 echo [2/5] Verificando dependencias (isso pode demorar)...
+python -m pip install --upgrade pip --quiet
+
+REM Corrige o erro do anyio 4.15 que quebra a interface grafica
 python -c "import anyio; print(anyio.__version__)" 2>nul | findstr "4.15" >nul
 if not errorlevel 1 (
     echo Corrigindo versao do anyio...
     python -m pip install "anyio<4.15.0" --quiet
+    python -m pip install "starlette<0.40.0" --quiet
 )
 
-set "PKGS=flask flask-cors fastapi uvicorn requests orjson waitress cryptography argon2-cffi mnemonic pymongo pywebview pythonnet bitcoinlib zeroconf"
+REM Instala os pacotes baseados no seu requirements.txt + os necessarios pro Windows
+REM Nota: Corrigido "p2webview" para "pywebview"
+set "PKGS=cryptography argon2-cffi orjson requests fastapi flask flask-cors waitress mnemonic pymongo pywebview pythonnet bitcoinlib zeroconf"
 
 for %%P in (!PKGS!) do (
     python -c "import %%P" >nul 2>&1
     if errorlevel 1 (
         echo Instalando %%P...
         python -m pip install --quiet %%P
+    ) else (
+        echo [ok] %%P ja instalado.
+    )
+)
+
+REM Uvicorn com os extras "standard" (do requirements.txt)
+python -c "import uvicorn" >nul 2>&1
+if errorlevel 1 (
+    echo Instalando uvicorn[standard]...
+    python -m pip install --quiet "uvicorn[standard]"
+)
+
+REM Instala o minerador C (se o arquivo existir)
+if exist "brn_miner.c" (
+    python -c "import brn_miner" >nul 2>&1
+    if errorlevel 1 (
+        echo [AVISO] Minerador C nao compilado. Usando Python puro.
     )
 )
 echo OK.
