@@ -1,6 +1,16 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.17)
+server.py — Backend HTTP do nó BRN (v9.9.18)
 ================================================================
+v9.9.18 (2026-11-03):
+  [NEW] Rota POST /api/wallet/set_validator_sk. Chamada pelo
+        app_wallet_v3.py v3.15 quando a GUI abre/cria/desbloqueia
+        carteira. Faz duas coisas:
+          1. chain.set_local_validator_sk(sk_hex) — atualiza a SK
+             ativa em runtime, sem reiniciar o nó.
+          2. trust_net.sync_local_validator(pubkey, address) —
+             registra a pubkey como nó ativo no trust (v3.10+).
+        Resolve o gap em que abrir a GUI não propagava a SK para
+        o consenso até o próximo boot.
 v9.9.17 (2026-11-02):
   [NEW] Rotas /api/pool/local_status, /api/pool/start_local e
         /api/pool/stop_local. Compartilham o PoolClient injetado
@@ -120,7 +130,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
             req = urllib.request.Request(
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
-                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.17"},
+                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.18"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -935,6 +945,95 @@ def pool_stop_local():
 
 
 # ============================================================
+# [v9.9.18] WALLET — sincroniza SK com chain e trust em runtime
+# ============================================================
+@app.route("/api/wallet/set_validator_sk", methods=["POST"])
+def api_wallet_set_validator_sk():
+    """
+    [v9.9.18] Atualiza a SK ativa do validador sem reiniciar o nó.
+
+    Chamado pelo app_wallet_v3.py v3.15 em create_and_unlock,
+    unlock_wallet e load_wallet. Faz:
+      1. chain.set_local_validator_sk(sk_hex) — a chain passa a
+         assinar blocos com essa SK imediatamente.
+      2. trust_net.sync_local_validator(pubkey, address) — registra
+         a pubkey como nó ativo no trust (v3.10+), persistindo em
+         trust_network.json (Origin) ou trust_network.local.json
+         (Cliente).
+    Retorna a pubkey efetivamente instalada para a GUI conferir.
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        sk_hex  = (data.get("sk_hex")  or "").strip()
+        address = (data.get("address") or "").strip()
+        pubkey  = (data.get("pubkey")  or "").strip()
+
+        if not sk_hex or len(sk_hex) != 64:
+            return jsonify({"ok": False,
+                            "msg": "sk_hex inválido (esperado 64 hex)"}), 400
+        # valida hex (sem import extra)
+        try:
+            int(sk_hex, 16)
+        except ValueError:
+            return jsonify({"ok": False, "msg": "sk_hex não é hex"}), 400
+
+        chain = _get_chain()
+        chain.set_local_validator_sk(sk_hex)
+
+        installed_pk = ""
+        try:
+            if chain._local_validator_sk is not None:
+                installed_pk = chain._local_validator_sk.pub_hex
+        except Exception:
+            installed_pk = ""
+
+        if not installed_pk:
+            return jsonify({
+                "ok": False,
+                "msg": "chain.set_local_validator_sk não instalou a SK",
+            }), 500
+
+        # Se a GUI não mandou pubkey, usa a derivada da SK
+        if not pubkey:
+            pubkey = installed_pk
+
+        trust_synced = False
+        trust = _get_trust_network()
+        if trust is not None:
+            try:
+                if hasattr(trust, "sync_local_validator"):
+                    trust.sync_local_validator(
+                        installed_pk, address or installed_pk[:16], "",
+                    )
+                    trust_synced = True
+                elif hasattr(trust, "register_node"):
+                    trust.register_node(
+                        node_id=installed_pk,
+                        address=address or installed_pk[:16],
+                        public_key=installed_pk,
+                    )
+                    if hasattr(trust, "mark_connected"):
+                        trust.mark_connected(installed_pk)
+                    trust_synced = True
+            except Exception as e:
+                log.warning("[wallet_sk] sync no trust falhou: %s", e)
+
+        log.info(
+            "[wallet_sk] SK atualizada em runtime — pk=%s… trust=%s",
+            installed_pk[:16],
+            "ok" if trust_synced else ("skip" if trust is None else "erro"),
+        )
+        return jsonify({
+            "ok": True,
+            "pubkey": installed_pk,
+            "trust_synced": trust_synced,
+        })
+    except Exception as e:
+        log.exception("api_wallet_set_validator_sk falhou: %s", e)
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+# ============================================================
 # TRUST NETWORK
 # ============================================================
 @app.route("/api/trust/stats", methods=["GET"])
@@ -1028,7 +1127,7 @@ def peers_discovered():
 def health():
     try:
         return jsonify({
-            "ok": True, "height": _get_chain().db.height(), "version": "9.9.17",
+            "ok": True, "height": _get_chain().db.height(), "version": "9.9.18",
             "chain_injected": _CHAIN is not None, "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
             "pool_client_local": _POOL_CLIENT_LOCAL is not None,
@@ -1288,5 +1387,5 @@ def api_tx_status(txid_str):
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.17 (Proxy + Trust + PoolClient Local)")
+    print(f"BRN Server v9.9.18 (Proxy + Trust + PoolClient Local + wallet_sk)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
