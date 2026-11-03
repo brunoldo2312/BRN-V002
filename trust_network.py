@@ -1,5 +1,14 @@
-"""trust_network.py — Rede de confiança e reputação do BRN (v3.9)
+"""trust_network.py — Rede de confiança e reputação do BRN (v3.10)
 ================================================================
+v3.10 (2026-11-03):
+  [NEW] sync_local_validator(pubkey, address, peer_addr) — registra
+        a pubkey local como nó ativo no trust em runtime. Chamado
+        quando a carteira muda via GUI (após /api/wallet/set_validator_sk).
+        Para Origin: persiste no trust_network.json com re-assinatura.
+        Para Cliente: persiste no trust_network.local.json.
+        Sem esse método, a pubkey da carteira nova só entrava no trust
+        no próximo boot (e o main.py não a registrava em runtime).
+  [KEEP] Todas as correções de v3.9.
 v3.9 (2026-11-03):
   [FIX CRÍTICO] get_active_validators() agora faz fallback para
         get_top_validators() em DOIS casos:
@@ -41,7 +50,7 @@ v3.4 (2026-10-29):
 """
 from __future__ import annotations
 
-__version__ = "3.9"
+__version__ = "3.10"
 
 import json
 import logging
@@ -187,6 +196,50 @@ class TrustNetwork:
         if self._origin_pubkey:
             log.info("[TrustNetwork] origin_pubkey=%s… (protegida)",
                      self._origin_pubkey[:16])
+
+    def sync_local_validator(self, pubkey: str, address: str = "",
+                             peer_addr: str = "") -> bool:
+        """
+        [v3.10] Registra a pubkey local como nó ativo no trust em runtime.
+
+        Chamado quando a carteira muda via GUI (após
+        /api/wallet/set_validator_sk, no server.py). Sem isso, a
+        carteira nova só entrava no trust no próximo boot — e o
+        main.py não registrava a pubkey em runtime, então o consenso
+        local ficava com required=1/1 mesmo com a GUI "ativa".
+
+        Comportamento:
+          - Origin: persiste no trust_network.json (re-assina com node_sk).
+          - Cliente: persiste no trust_network.local.json.
+          - Em ambos: marca nó como connected=True e atualiza last_seen.
+
+        Retorna True se registrou/atualizou, False se pubkey vazia.
+        """
+        if not pubkey:
+            return False
+        pk = pubkey.strip().lower()
+        if not pk:
+            return False
+
+        with self._lock:
+            self.register_node(pk, address or pk[:16], pk, peer_addr)
+            n = self.nodes.get(pk)
+            if n is not None:
+                n.last_seen = time.time()
+                n.connected = True
+                n.last_connect_time = time.time()
+                n.update_trust_level()
+            self._mark_dirty()
+            # Força flush imediato (não esperar FLUSH_INTERVAL_S)
+            try:
+                self._last_flush = 0.0
+                self.flush()
+            except Exception as e:
+                log.warning("[TrustNetwork] sync_local_validator flush falhou: %s", e)
+
+        log.info("[TrustNetwork] sync_local_validator: %s… (origin=%s)",
+                 pk[:16], "sim" if self.is_origin else "não")
+        return True
 
     def heartbeat_self(self, pubkey: str) -> None:
         """[v3.7] Convenience: renova last_seen do próprio nó."""
