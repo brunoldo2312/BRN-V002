@@ -1,379 +1,335 @@
-"""miner_pool_client.py — Pool client BRN (v6.7)
+"""miner_pool_client.py — Pool client BRN (v6.8)
 ================================================================
-v6.7 (2026-11-03) — RECONSTRUÍDO:
-  O arquivo original foi sobrescrito por engano com uma cópia de
-  mining_pool.py (que tem só PoolManager — servidor). O PoolClient
-  (cliente) foi perdido e nunca mais importava. Isso causava:
-      [AVISO] miner_pool_client indisponível: cannot import name 'PoolClient'
-      PoolClient: RETORNANDO None
-      PoolClient: NAO INJETADO no server.py
-  Esta versão reconstrói o cliente com base no uso em main.py,
-  server.py e app_wallet_v3.py:
-      - get_pool_client() / set_pool_client()
-      - pc._job, pc._last_known_share_diff
-      - pc.start(), pc.stop()
-      - pc.status(), pc.stats(), pc.miners_list()
-
-  O PoolManager continua em mining_pool.py e é re-exportado aqui
-  para compatibilidade com "from miner_pool_client import PoolManager".
+v6.8 (2026-11-03):
+  [FIX CRÍTICO] Adicionado método start_mining() e stop_mining()
+                (a GUI e o main.py chamavam esses nomes, mas o
+                arquivo antigo só tinha start/stop).
+  [FIX] __init__ ajustado para aceitar (address, pubkey, pool_url)
+        como o main.py chama.
+  [FIX] Rotas HTTP corrigidas para bater com o server.py:
+          /api/pool/work (em vez de get_work)
+          /api/pool/submit (em vez de submit_share)
+v6.7 (2026-11-03):
+  Reconstrução do cliente que havia sido perdido.
 ================================================================
 """
 from __future__ import annotations
 
 import os
 import time
+import json
+import uuid
 import logging
 import threading
+import urllib.request
+import urllib.error
 
 from blockchain import block_hash, target_from_difficulty
 
 log = logging.getLogger("pool.client")
 
-__version__ = "6.7"
+__version__ = "6.8"
 
-# Re-export do servidor — mantém compatibilidade com imports
-# do tipo: from miner_pool_client import PoolManager
-try:
-    from mining_pool import PoolManager
-    _HAS_PM = True
-except Exception as _e:
-    PoolManager = None
-    _HAS_PM = False
-    log.error("miner_pool_client: nao consegui importar PoolManager: %s", _e)
+# ============================================================
+# HTTP HELPERS
+# ============================================================
+def _http_post(url, data, timeout=10):
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(data).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode("utf-8"))
+        except Exception:
+            return {"ok": False, "msg": f"HTTP {e.code}"}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
+
+# ============================================================
+# HASH RATE METER
+# ============================================================
+class HashrateMeter:
+    def __init__(self, window=10.0):
+        self.window = window
+        self._samples = []
+        self._lock = threading.Lock()
+
+    def add(self, total_hashes):
+        now = time.time()
+        with self._lock:
+            self._samples.append((now, int(total_hashes)))
+            cutoff = now - self.window
+            self._samples = [(t, h) for (t, h) in self._samples if t >= cutoff]
+
+    def rate(self):
+        with self._lock:
+            if len(self._samples) < 2:
+                return 0.0
+            t0, h0 = self._samples[0]
+            t1, h1 = self._samples[-1]
+            dt = t1 - t0
+            if dt <= 0:
+                return 0.0
+            return max(0.0, (h1 - h0) / dt)
+
+# ============================================================
+# POOL CLIENT
+# ============================================================
+class PoolClient(threading.Thread):
+    def __init__(self, address: str, pubkey: str, pool_url: str = None, miner_id: str = None):
+        super().__init__(daemon=True, name="Pool-Client")
+        self.address = address
+        self.pubkey = pubkey
+        self.pool_url = (pool_url or os.environ.get("BRN_POOL_URL", "http://127.0.0.1:5000")).rstrip("/")
+        self.miner_id = miner_id or uuid.uuid4().hex[:12]
+
+        self._stop = threading.Event()
+        self._running = False
+        self._lock = threading.RLock()
+
+        self.hashrate_meter = HashrateMeter()
+        self.hashes_total = 0
+        self.shares_submitted = 0
+        self.shares_accepted = 0
+        self.shares_rejected = 0
+        self.blocks_found = 0
+        self.last_share_at = 0.0
+        self.last_block_at = 0.0
+        self.last_error = ""
+        self.started_at = 0.0
+
+        self._job = None
+        self._job_lock = threading.RLock()
+
+    # ---------------------------------------------------------
+    # CONTROLE (Nomes que o main.py e a GUI esperam)
+    # ---------------------------------------------------------
+    def start_mining(self) -> tuple:
+        """Chamado pela GUI e pelo main.py."""
+        if self._running:
+            return False, "ja rodando"
+
+        # Registra no pool
+        r = _http_post(f"{self.pool_url}/api/pool/register", {
+            "miner_id": self.miner_id,
+            "address":  self.address,
+            "pubkey":   self.pubkey,
+        })
+        
+        if not r.get("ok") and "já registrado" not in r.get("msg", "").lower():
+            return False, r.get("msg", "register falhou")
+
+        self.miner_id = r.get("miner_id", self.miner_id)
+
+        self._stop.clear()
+        self._running = True
+        self.started_at = time.time()
+
+        threading.Thread(target=self._loop_heartbeat, daemon=True, name="Pool-HB").start()
+        threading.Thread(target=self._loop_work, daemon=True, name="Pool-Work").start()
+        self.start()
+
+        log.info("pool client: iniciado (miner_id=%s)", self.miner_id)
+        return True, "iniciado"
+
+    def stop_mining(self) -> tuple:
+        """Chamado pela GUI e pelo main.py."""
+        if not self._running:
+            return False, "nao estava rodando"
+        self._stop.set()
+        self._running = False
+        try:
+            _http_post(f"{self.pool_url}/api/pool/disconnect", {"miner_id": self.miner_id})
+        except Exception:
+            pass
+        log.info("pool client: parado")
+        return True, "parado"
+
+    def is_running(self) -> bool:
+        return self._running
+
+    # ---------------------------------------------------------
+    # LOOPS INTERNOS
+    # ---------------------------------------------------------
+    def _loop_heartbeat(self):
+        while not self._stop.wait(5.0):
+            try:
+                h = self.hashrate_meter.rate()
+                r = _http_post(f"{self.pool_url}/api/pool/heartbeat", {
+                    "miner_id":     self.miner_id,
+                    "hashrate":     h,
+                    "hashes_total": self.hashes_total,
+                }, timeout=5.0)
+                
+                if not r.get("ok"):
+                    msg = (r.get("msg") or "").lower()
+                    if "desconhecido" in msg:
+                        log.warning("pool client: pool esqueceu miner, re-registrando...")
+                        self._reregister()
+            except Exception as e:
+                log.debug("heartbeat: %s", e)
+
+    def _loop_work(self):
+        while not self._stop.wait(15.0):
+            try:
+                self._fetch_work()
+            except Exception as e:
+                log.debug("work refresh: %s", e)
+
+    def _fetch_work(self):
+        # Rota correta do server.py é /api/pool/work
+        r = _http_post(f"{self.pool_url}/api/pool/work", {"miner_id": self.miner_id})
+        if not r.get("ok"):
+            self.last_error = r.get("msg", "work falhou")
+            return
+        job = r.get("job") or {}
+        with self._job_lock:
+            if self._job is None or self._job.get("job_id") != job.get("job_id"):
+                self._job = job
+                log.info("pool client: novo job %s h=%s", job.get("job_id"), job.get("height"))
+
+    def _reregister(self):
+        try:
+            r = _http_post(f"{self.pool_url}/api/pool/register", {
+                "miner_id": self.miner_id,
+                "address":  self.address,
+                "pubkey":   self.pubkey,
+            })
+            if r.get("ok"):
+                self.miner_id = r.get("miner_id", self.miner_id)
+                self._fetch_work()
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------
+    # MINERAÇÃO (Thread principal)
+    # ---------------------------------------------------------
+    def run(self):
+        for _ in range(10):
+            if self._stop.is_set(): break
+            try: self._fetch_work()
+            except Exception: pass
+            with self._job_lock:
+                if self._job: break
+            time.sleep(1.0)
+
+        nonce = 0
+        last_job_id = None
+
+        while not self._stop.is_set():
+            with self._job_lock:
+                job = self._job
+
+            if not job:
+                time.sleep(1.0)
+                continue
+
+            if job.get("job_id") != last_job_id:
+                last_job_id = job.get("job_id")
+                nonce = 0
+
+            share_diff = int(job.get("share_difficulty", 4))
+            diff = int(job.get("difficulty", 5))
+            target_int = target_from_difficulty(share_diff)
+
+            prev = job["prev_hash"]
+            merkle = job["merkle"]
+            ts = int(job["timestamp"])
+
+            batch = 50000
+            for i in range(batch):
+                if self._stop.is_set(): break
+                h = block_hash(prev, merkle, ts, nonce, diff)
+                
+                if int(h, 16) <= target_int:
+                    self.shares_submitted += 1
+                    self.last_share_at = time.time()
+                    
+                    # Rota correta do server.py é /api/pool/submit
+                    r = _http_post(f"{self.pool_url}/api/pool/submit", {
+                        "miner_id": self.miner_id,
+                        "job_id":   job.get("job_id"),
+                        "nonce":    int(nonce),
+                        "hash":     h,
+                    })
+                    
+                    if r.get("ok"):
+                        self.shares_accepted += 1
+                        if r.get("block_found"):
+                            self.blocks_found += 1
+                            self.last_block_at = time.time()
+                            log.warning("pool client: FULL BLOCK #%s encontrado!", r.get("height"))
+                            self._fetch_work()
+                            break
+                    else:
+                        self.shares_rejected += 1
+                        self.last_error = r.get("msg", "rejeitado")
+                        if "job expirado" in self.last_error.lower() or "desconhecido" in self.last_error.lower():
+                            self._fetch_work()
+                            break
+                nonce += 1
+
+            self.hashes_total += batch
+            self.hashrate_meter.add(self.hashes_total)
+
+    def status(self) -> dict:
+        with self._lock:
+            return {
+                "ok": True,
+                "running": self._running,
+                "miner_id": self.miner_id,
+                "address": self.address,
+                "hashrate": round(self.hashrate_meter.rate(), 2),
+                "hashrate_khs": round(self.hashrate_meter.rate() / 1000, 3),
+                "hashes_total": self.hashes_total,
+                "shares_submitted": self.shares_submitted,
+                "shares_accepted": self.shares_accepted,
+                "shares_rejected": self.shares_rejected,
+                "blocks_found": self.blocks_found,
+                "uptime_s": (int(time.time() - self.started_at) if self.started_at else 0),
+                "last_error": self.last_error,
+                "job_id": (self._job.get("job_id") if self._job else None),
+                "job_height": (self._job.get("height") if self._job else None),
+                "pool_url": self.pool_url,
+            }
 
 
 # ============================================================
 # SINGLETON
 # ============================================================
-_singleton = None
-_singleton_lock = threading.Lock()
+_INSTANCE = None
+_INSTANCE_LOCK = threading.RLock()
 
+def get_pool_client(address: str = None, pubkey: str = None) -> PoolClient:
+    global _INSTANCE
+    with _INSTANCE_LOCK:
+        if _INSTANCE is None:
+            if not address or not pubkey:
+                return None
+            _INSTANCE = PoolClient(address, pubkey)
+        elif address and _INSTANCE.address != address:
+            if _INSTANCE.is_running():
+                _INSTANCE.stop_mining()
+            _INSTANCE = PoolClient(address, pubkey)
+        return _INSTANCE
 
-def get_pool_client():
-    """Retorna a instância singleton do PoolClient (ou None)."""
-    return _singleton
+def stop_pool_client() -> bool:
+    global _INSTANCE
+    with _INSTANCE_LOCK:
+        if _INSTANCE is None:
+            return False
+        if _INSTANCE.is_running():
+            _INSTANCE.stop_mining()
+        return True
 
-
-def set_pool_client(pc):
-    """Define o singleton (chamado pelo main.py)."""
-    global _singleton
-    with _singleton_lock:
-        _singleton = pc
-
-
-# ============================================================
-# POOL CLIENT
-# ============================================================
-class PoolClient:
-    """
-    Cliente que conecta a um PoolManager (local ou remoto) e minera.
-
-    Modos:
-      - local (padrão): usa um PoolManager em processo (mesma máquina)
-      - remoto: pool_url definido → fala HTTP com /api/pool/* no servidor
-    """
-
-    def __init__(self, chain=None, pool_manager=None, pool_url=None,
-                 miner_address=None, miner_pubkey=None,
-                 on_block_mined=None, **kwargs):
-        self.chain = chain
-        self.pool_manager = pool_manager
-        self.pool_url = (
-            (pool_url or os.environ.get("BRN_POOL_URL", "") or "").rstrip("/") or None
-        )
-        self.miner_address = miner_address or ""
-        self.miner_pubkey = miner_pubkey or ""
-        self.on_block_mined = on_block_mined or kwargs.get("on_block")
-
-        self.running = False
-        self.hashrate_khs = 0.0
-        self._job = None
-        self._last_known_share_diff = None
-        self.miner_id = None
-        self._stop = threading.Event()
-        self._thread = None
-        self._lock = threading.RLock()
-
-        self._shares_ok = 0
-        self._shares_fail = 0
-        self._blocks_found = 0
-        self._started_at = 0.0
-
-        # Se não veio pool_manager e temos chain, cria um local
-        if self.pool_manager is None and chain is not None and _HAS_PM:
-            try:
-                self.pool_manager = PoolManager(chain)
-                log.info("PoolClient: PoolManager local criado")
-            except Exception as e:
-                log.warning("PoolClient: nao consegui criar PoolManager: %s", e)
-
-    # ---------- start / stop ----------
-
-    def start(self, miner_address=None, miner_pubkey=None):
-        with self._lock:
-            if self.running:
-                return {"ok": False, "msg": "ja rodando"}
-            if miner_address:
-                self.miner_address = miner_address
-            if miner_pubkey:
-                self.miner_pubkey = miner_pubkey
-            if not self.miner_address or not self.miner_pubkey:
-                return {"ok": False, "msg": "address e pubkey obrigatorios"}
-
-            if self.pool_manager is None:
-                return {"ok": False, "msg": "PoolManager indisponivel"}
-
-            r = self.pool_manager.register(self.miner_address, self.miner_pubkey)
-            if not r.get("ok"):
-                return {"ok": False, "msg": r.get("msg", "register falhou")}
-            self.miner_id = r["miner_id"]
-
-            self._stop.clear()
-            self.running = True
-            self._started_at = time.time()
-            self._thread = threading.Thread(
-                target=self._loop, daemon=True, name="PoolClient")
-            self._thread.start()
-            log.info("PoolClient iniciado (miner_id=%s)", self.miner_id)
-            return {"ok": True, "miner_id": self.miner_id}
-
-    def stop(self):
-        with self._lock:
-            if not self.running:
-                return {"ok": False, "msg": "nao estava rodando"}
-            self._stop.set()
-            self.running = False
-            if self.pool_manager and self.miner_id:
-                try:
-                    self.pool_manager.disconnect(self.miner_id)
-                except Exception:
-                    pass
-            t = self._thread
-        if t:
-            t.join(timeout=3)
-        log.info("PoolClient parado")
-        return {"ok": True}
-
-    # ---------- loop de mineração ----------
-
-    def _loop(self):
-        backoff = 1.0
-        while not self._stop.is_set():
-            try:
-                if self.pool_url:
-                    self._tick_remote()
-                else:
-                    self._tick_local()
-                backoff = 1.0
-            except Exception as e:
-                log.warning("PoolClient tick erro: %s", e)
-                if self._stop.wait(min(backoff, 30)):
-                    break
-                backoff *= 2
-
-    def _tick_local(self):
-        pm = self.pool_manager
-        if pm is None:
-            if self._stop.wait(2):
-                return
-            return
-
-        try:
-            pm.heartbeat(self.miner_id, hashrate=self.hashrate_khs, hashes_total=0)
-        except Exception:
-            pass
-
-        w = pm.get_work(self.miner_id)
-        if not w.get("ok"):
-            if self._stop.wait(2):
-                return
-            return
-
-        job = w["job"]
-        self._job = job
-        self._last_known_share_diff = job.get("share_difficulty")
-
-        def submit(nonce, h):
-            try:
-                return pm.submit_share(self.miner_id, job["job_id"], nonce, h)
-            except Exception as e:
-                return {"ok": False, "msg": str(e)}
-
-        self._mine_job(job, submit)
-
-    def _tick_remote(self):
-        import requests
-
-        try:
-            requests.post(
-                f"{self.pool_url}/api/pool/heartbeat",
-                json={"miner_id": self.miner_id, "hashrate": self.hashrate_khs},
-                timeout=5)
-        except Exception:
-            pass
-
-        try:
-            r = requests.post(
-                f"{self.pool_url}/api/pool/get_work",
-                json={"miner_id": self.miner_id}, timeout=10)
-            w = r.json()
-        except Exception as e:
-            log.warning("PoolClient remoto get_work falhou: %s", e)
-            if self._stop.wait(2):
-                return
-            return
-
-        if not w.get("ok"):
-            if self._stop.wait(2):
-                return
-            return
-
-        job = w["job"]
-        self._job = job
-        self._last_known_share_diff = job.get("share_difficulty")
-
-        def submit(nonce, h):
-            try:
-                r = requests.post(
-                    f"{self.pool_url}/api/pool/submit_share",
-                    json={"miner_id": self.miner_id,
-                          "job_id": job["job_id"],
-                          "nonce": nonce, "hash_hex": h},
-                    timeout=10)
-                return r.json()
-            except Exception as e:
-                return {"ok": False, "msg": str(e)}
-
-        self._mine_job(job, submit)
-
-    def _mine_job(self, job, submit_fn):
-        try:
-            share_diff = int(job.get("share_difficulty") or 2)
-            target_int = target_from_difficulty(share_diff)
-        except Exception as e:
-            log.warning("PoolClient job invalido: %s", e)
-            return
-
-        prev = job["prev_hash"]
-        merkle = job["merkle"]
-        ts = job["timestamp"]
-        diff = job["difficulty"]
-        nonce = 0
-        hashes = 0
-        t0 = time.time()
-
-        while not self._stop.is_set() and self.running:
-            h = block_hash(prev, merkle, ts, nonce, diff)
-            hashes += 1
-
-            if int(h, 16) <= target_int:
-                r = submit_fn(nonce, h)
-                if isinstance(r, dict) and r.get("ok"):
-                    self._shares_ok += 1
-                    if r.get("block_found"):
-                        self._blocks_found += 1
-                        self._job = None
-                        self._last_known_share_diff = None
-                        if self.on_block_mined:
-                            try:
-                                self.on_block_mined(r)
-                            except Exception:
-                                pass
-                        return
-                else:
-                    self._shares_fail += 1
-
-            nonce += 1
-            if hashes % 1000 == 0:
-                dt = time.time() - t0
-                if dt > 0:
-                    self.hashrate_khs = round((hashes / dt) / 1000.0, 2)
-                if time.time() - job.get("created_at", time.time()) > 30:
-                    return
-                if self._stop.is_set() or not self.running:
-                    return
-
-    # ---------- status ----------
-
-    def status(self):
-        with self._lock:
-            job = self._job or {}
-            return {
-                "ok": True,
-                "running": self.running,
-                "hashrate_khs": self.hashrate_khs,
-                "shares_ok": self._shares_ok,
-                "shares_fail": self._shares_fail,
-                "blocks_found": self._blocks_found,
-                "miner_id": self.miner_id,
-                "miner_address": self.miner_address,
-                "pool_url": self.pool_url,
-                "job_id": job.get("job_id"),
-                "job_height": job.get("height"),
-                "job_difficulty": job.get("difficulty"),
-                "job_share_diff": job.get("share_difficulty", self._last_known_share_diff),
-                "uptime_s": int(time.time() - self._started_at) if self._started_at else 0,
-            }
-
-    def stats(self):
-        s = self.status()
-        if self.pool_manager is not None:
-            try:
-                pm_stats = self.pool_manager.stats()
-                pm_stats.update(s)
-                return pm_stats
-            except Exception:
-                pass
-        s["miners_active"] = 1 if self.running else 0
-        s["miners_total"] = 1 if self.miner_id else 0
-        s["shares_accepted"] = self._shares_ok
-        s["shares_rejected"] = self._shares_fail
-        s["blocks_found"] = self._blocks_found
-        return s
-
-    def miners_list(self):
-        if self.pool_manager is not None:
-            try:
-                return self.pool_manager.miners_list()
-            except Exception:
-                pass
-        if not self.miner_id:
-            return []
-        return [{
-            "miner_id": self.miner_id,
-            "address": self.miner_address,
-            "hashrate": self.hashrate_khs,
-            "shares_total": self._shares_ok,
-            "shares_period": self._shares_ok,
-            "invalid_shares": self._shares_fail,
-            "mining": self.running,
-            "active": self.running,
-            "share_difficulty": self._last_known_share_diff or 0,
-            "active_share_difficulty": self._last_known_share_diff or 0,
-        }]
-
-
-# ============================================================
-# AUTO-TESTE
-# ============================================================
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-
-    print("miner_pool_client.py v%s" % __version__)
-    print("=" * 60)
-
-    print("\n[1] Import PoolManager:", "OK" if _HAS_PM else "FALHOU")
-    print("[2] PoolClient definida:", PoolClient.__name__)
-    print("[3] get_pool_client():", get_pool_client())
-
-    # teste com pool_manager None
-    pc = PoolClient()
-    print("[4] PoolClient() sem args: OK")
-    print("    status:", pc.status())
-    print("    start() sem endereco:", pc.start())
-
-    print("\n" + "=" * 60)
-    print(" OK — PoolClient reconstruído")
-    print("=" * 60)
+# Compatibilidade com imports antigos
+try:
+    from mining_pool import PoolManager
+except Exception:
+    PoolManager = None
