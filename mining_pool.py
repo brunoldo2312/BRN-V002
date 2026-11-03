@@ -1,12 +1,11 @@
-"""mining_pool.py — Pool de mineração BRN (v6.5)
+"""mining_pool.py — Pool de mineração BRN (v6.6)
 ================================================================
+v6.6 (2026-11-03):
+  [FIX] JOB_REFRESH_S aumentado de 20 para 60s. O job expirava antes
+        do cliente conseguir enviar a share, causando "job expirado".
 v6.5 (2026-10-29):
   [FIX CRÍTICO] O pool tentava creditar pontos no TrustNetwork
         usando a pubkey (m.pubkey) em vez do miner_id (m.miner_id).
-        Como o TrustNetwork indexa os nós pelo miner_id (UUID),
-        os pontos não eram contabilizados. Agora usa m.miner_id.
-  [KEEP] Multi-sig integrado no Pool.
-  [KEEP] Vardiff e Anti-Spam.
 ================================================================
 """
 from __future__ import annotations
@@ -23,7 +22,7 @@ log = logging.getLogger("pool")
 
 SHARE_DIFF_OFFSET   = 1
 MINER_TIMEOUT_S     = 60
-JOB_REFRESH_S       = 20
+JOB_REFRESH_S       = 60  # [FIX] Aumentado de 20 para 60s
 MAX_MINERS          = 50
 MAX_RECENT_JOBS     = 5
 
@@ -158,11 +157,8 @@ class PoolManager:
 
         self._stop = threading.Event()
         threading.Thread(target=self._maintenance_loop, daemon=True, name="Pool-Maint").start()
-        log.info("PoolManager iniciado (v6.5) — Anti-Spam, Multi-Sig e Trust ativos")
+        log.info("PoolManager iniciado (v6.6) — Anti-Spam, Multi-Sig e Trust ativos")
 
-    # ============================================================
-    # Helpers de integração com o trust network
-    # ============================================================
     def _register_in_trust(self, miner_id: str, address: str, pubkey: str) -> None:
         trust = getattr(self.chain, "trust_net", None)
         if trust is not None:
@@ -183,7 +179,6 @@ class PoolManager:
             for mid, m in self.miners.items():
                 if m.pubkey in output_pubkeys:
                     try:
-                        # [FIX v6.5] Usa m.miner_id
                         trust.record_block_validated(m.miner_id, height)
                         if hasattr(trust, "_adjust_score"):
                             trust._adjust_score(m.miner_id, 100.0, f"Block Winner #{height}")
@@ -192,9 +187,6 @@ class PoolManager:
                         log.warning("[Trust] record_block_validated falhou para %s: %s", mid, e)
                     return
 
-    # ============================================================
-    # Registro de mineradores
-    # ============================================================
     def register(self, address: str, pubkey: str, miner_id: Optional[str] = None) -> dict:
         if not address or not address.startswith("brn1"):
             return {"ok": False, "msg": "address invalido"}
@@ -238,9 +230,6 @@ class PoolManager:
             self.miners.pop(miner_id, None)
         return {"ok": True}
 
-    # ============================================================
-    # VARDIFF — Retarget por minerador
-    # ============================================================
     def _apply_vardiff(self, m: MinerState, job: Job) -> None:
         now = time.time()
         cutoff = now - VARDIFF_WINDOW_S
@@ -407,7 +396,6 @@ class PoolManager:
             self.accepted_shares += 1
             m.invalid_shares = 0
             
-            # [FIX v6.5] Atualiza o Trust Score passando o miner_id
             try:
                 trust = getattr(self.chain, "trust_net", None)
                 if trust:
@@ -453,9 +441,6 @@ class PoolManager:
             "share_difficulty": miner_share_diff,
         }
 
-    # ============================================================
-    # MONTAGEM E ASSINATURA MULTI-SIG DO BLOCO
-    # ============================================================
     def _assemble_and_accept_block(self, job: Job, nonce: int, hash_hex: str) -> bool:
         cb = job.transactions[0]
         for out in cb["outputs"]:
