@@ -1,5 +1,16 @@
-"""trust_network.py — Rede de confiança e reputação do BRN (v3.8)
+"""trust_network.py — Rede de confiança e reputação do BRN (v3.9)
 ================================================================
+v3.9 (2026-11-03):
+  [FIX CRÍTICO] get_active_validators() agora faz fallback para
+        get_top_validators() em DOIS casos:
+          (a) quando "active" está vazio (active=0, top=N)
+          (b) quando len(active) < count E top tem mais candidatos
+              (ex: active=1 local via origin_pubkey, top=4)
+        Antes, apenas o caso (a) caía em [] e nada mais — o caso (b)
+        retornava 1 validador só, forçando required=1/1 e desligando
+        o multi-sig de fato. Mesmo bug corrigido em blockchain.py
+        v9.4.12 (fallback lá é defesa em profundidade).
+  [KEEP] Todas as correções de v3.8.
 v3.8 (2026-11-03):
   [NEW] remove_ghosts(max_age_s) — Auto-limpeza de nós inativos.
         Remove da memória e dos arquivos (.json e .local.json) qualquer
@@ -30,7 +41,7 @@ v3.4 (2026-10-29):
 """
 from __future__ import annotations
 
-__version__ = "3.8"
+__version__ = "3.9"
 
 import json
 import logging
@@ -188,27 +199,27 @@ class TrustNetwork:
         """
         now = time.time()
         to_remove = []
-        
+
         with self._lock:
             for nid, n in list(self.nodes.items()):
                 age = now - n.last_seen
-                
+
                 # Nunca remove o próprio Origin (a não ser que esteja realmente morto)
                 if self._origin_pubkey and n.public_key.lower() == self._origin_pubkey:
                     continue
-                    
+
                 if age > max_age_s:
                     to_remove.append((nid, age))
-            
+
             for nid, age in to_remove:
-                log.info("[TrustNetwork] Auto-limpeza: removido fantasma %s… (inativo há %ds)", 
+                log.info("[TrustNetwork] Auto-limpeza: removido fantasma %s… (inativo há %ds)",
                          nid[:12], int(age))
                 del self.nodes[nid]
-            
+
             if to_remove:
                 self._mark_dirty()
                 self.flush() # Persiste as mudanças imediatamente
-                
+
         return len(to_remove)
 
     def _prune_inactive(self) -> int:
@@ -657,7 +668,17 @@ class TrustNetwork:
                 if origin is not None and origin not in active:
                     active.append(origin)
 
+            # [v3.9] Fallback (a): active totalmente vazio → usa top.
             if not active:
+                top = self.get_top_validators(count=n_target)
+                if top:
+                    log.warning(
+                        "[TrustNetwork] get_active_validators: nenhum nó "
+                        "ativo e Origin ausente — usando get_top_validators "
+                        "(%d, modo bootstrap)",
+                        len(top),
+                    )
+                    return top
                 log.warning(
                     "[TrustNetwork] get_active_validators: nenhum nó ativo "
                     "e Origin ausente — retornando [] (modo bootstrap)"
@@ -676,6 +697,19 @@ class TrustNetwork:
                 out.append(pk)
                 if len(out) >= n_target:
                     break
+
+            # [v3.9] Fallback (b): active incompleto (< n_target) e top
+            # tem mais candidatos → usa top para não reduzir o quórum.
+            # Ex.: active=1 (só local), top=4 → retorna os 4.
+            if len(out) < n_target:
+                top = self.get_top_validators(count=n_target)
+                if len(top) > len(out):
+                    log.warning(
+                        "[TrustNetwork] get_active_validators incompleto "
+                        "(%d/%d ativos, %d no trust) — usando top (%d)",
+                        len(out), n_target, len(cands), len(top),
+                    )
+                    return top
 
             log.info("[TrustNetwork] get_active_validators: %d/%d (total=%d, origin=%s)",
                      len(out), len(active), len(cands),
