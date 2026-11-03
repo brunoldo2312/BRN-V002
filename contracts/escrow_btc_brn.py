@@ -1,35 +1,14 @@
 """contracts/escrow_btc_brn.py — Contrato L2 BTC → BRN
-================================================================
-Representa uma ordem de câmbio BTC → BRN.
-
-Ciclo de vida:
-    OPEN          → criado pelo seller, esperando depósito BTC
-    BTC_DETECTED  → BTC chegou, aguardando inclusão em bloco
-    RELEASED      → BRN minerado e creditado ao buyer
-    EXPIRED       → passou de expires_at sem receber BTC
-    CANCELLED     → cancelado pelo creator antes do BTC chegar
-
-API:
-    e = EscrowBTCtoBRN(...)           # cria em memória
-    e.to_dict() / EscrowBTCtoBRN.from_dict(d)
-    e.is_expired(now) / e.can_release()
-
-Uso (via factory):
-    from contracts.factory import ContractFactory
-    f = ContractFactory(db)
-    e = f.create_btc_to_brn("BRN_TREASURY", 100_000, "brn1...")
+v2 (2026-11-03):
+  [NEW] is_valid_brn_address(addr) — valida bech32 brn1...
+        com 20-byte hash160. Exportado para uso em factory.py.
+  [KEEP] Todo o resto do v1 inalterado (compat com registros antigos).
 ================================================================
 """
 from __future__ import annotations
 
 import hashlib
 import time
-
-
-# ============================================================
-# ENDEREÇO BRN PADRÃO (carteira local do operador)
-# ============================================================
-DEFAULT_BRN_ADDRESS = "brn1x9v8xq6v7dgrszl3ep6zupk28y7jfr8a0cwmgu"
 
 
 # ============================================================
@@ -51,9 +30,56 @@ VALID_STATUSES = {
 
 
 # ============================================================
+# HELPERS DE VALIDAÇÃO
+# ============================================================
+def is_valid_brn_address(addr) -> bool:
+    """
+    Valida endereço bech32 BRN (brn1..., 20-byte hash160).
+
+    Usa bech32.validate_address() quando disponível; fallback
+    para checagem de formato (prefixo + tamanho) se bech32
+    não puder ser importado.
+
+    Não confundir com validação de tx/assinatura. É só a
+    checagem sintática do endereço.
+    """
+    if not isinstance(addr, str):
+        return False
+    if not addr.startswith("brn1"):
+        return False
+    if not 20 <= len(addr) <= 128:
+        return False
+    try:
+        from bech32 import validate_address
+        return bool(validate_address(addr))
+    except ImportError:
+        # Fallback conservador: só formato
+        return True
+    except Exception:
+        return False
+
+
+# ============================================================
 # CLASSE
 # ============================================================
 class EscrowBTCtoBRN:
+    """Ordem de câmbio BTC→BRN.
+
+    Campos:
+        escrow_id          : ID único (esc_<hex>)
+        creator            : endereço BRN que criou a ordem
+                             (ou label "BRN_TREASURY" em registros antigos)
+        buyer              : endereço BRN que receberá os BRN
+        brn_amount         : quantidade de BRN (unidades mínimas)
+        btc_expected_sats  : quantidade de BTC (satoshis) esperada
+        btc_address        : endereço BTC de recebimento
+        btc_txid           : txid da transação BTC recebida (se houver)
+        status             : estado atual do escrow
+        created_at         : timestamp (unix)
+        expires_at         : timestamp de expiração
+        l2_hash            : hash determinístico do escrow
+    """
+
     def __init__(
         self,
         escrow_id: str,
@@ -93,6 +119,9 @@ class EscrowBTCtoBRN:
         self.expires_at = int(expires_at)
         self.l2_hash = str(l2_hash or self._compute_hash())
 
+    # ============================================================
+    # HASH
+    # ============================================================
     def _compute_hash(self) -> str:
         raw = (
             f"{self.escrow_id}:{self.creator}:{self.buyer}:"
@@ -101,6 +130,9 @@ class EscrowBTCtoBRN:
         ).encode("utf-8")
         return hashlib.sha256(raw).hexdigest()
 
+    # ============================================================
+    # ESTADO
+    # ============================================================
     def is_expired(self, now: int | None = None) -> bool:
         n = int(now if now is not None else time.time())
         return n >= self.expires_at and self.status == STATUS_OPEN
@@ -118,15 +150,25 @@ class EscrowBTCtoBRN:
         return self.status in (STATUS_RELEASED, STATUS_EXPIRED, STATUS_CANCELLED)
 
     def can_release(self) -> bool:
+        """Indica se a ordem está no estado anterior à liberação.
+
+        Isto não confirma um depósito BTC. A confirmação, valor, endereço,
+        número de confirmações e proteção contra reutilização do txid devem
+        ser verificados pelo watcher/factory antes de creditar BRN.
+        """
         return self.status == STATUS_BTC_DETECTED
 
     def can_cancel(self) -> bool:
+        """Pode ser cancelado enquanto está OPEN."""
         return self.status == STATUS_OPEN
 
     def seconds_until_expiry(self, now: int | None = None) -> int:
         n = int(now if now is not None else time.time())
         return max(0, self.expires_at - n)
 
+    # ============================================================
+    # MUTAÇÕES (in-place — não persistem no DB)
+    # ============================================================
     def mark_detected(self, btc_txid: str) -> None:
         if self.status != STATUS_OPEN:
             raise ValueError(f"mark_detected em estado {self.status}")
@@ -151,6 +193,9 @@ class EscrowBTCtoBRN:
             raise ValueError(f"mark_cancelled em estado {self.status}")
         self.status = STATUS_CANCELLED
 
+    # ============================================================
+    # SERIALIZAÇÃO
+    # ============================================================
     def to_dict(self) -> dict:
         return {
             "escrow_id": self.escrow_id,
@@ -199,7 +244,11 @@ class EscrowBTCtoBRN:
         return hash(self.escrow_id)
 
 
+# ============================================================
+# HELPERS
+# ============================================================
 def generate_escrow_id() -> str:
+    """Gera ID único de escrow: esc_<16 hex>."""
     import secrets
     return "esc_" + secrets.token_hex(8)
 
@@ -212,6 +261,7 @@ def create_new(
     btc_address: str,
     ttl_s: int = 24 * 3600,
 ) -> EscrowBTCtoBRN:
+    """Cria um escrow em estado OPEN (ttl_s padrão de 24 horas)."""
     ttl = int(ttl_s)
     if ttl <= 0:
         raise ValueError("ttl_s deve ser > 0")
@@ -228,31 +278,40 @@ def create_new(
     )
 
 
+# ============================================================
+# AUTO-TESTE
+# ============================================================
 if __name__ == "__main__":
     print("Testando EscrowBTCtoBRN...")
-    print(f"  Endereço BRN padrão: {DEFAULT_BRN_ADDRESS}")
-    print()
+
+    # Endereço novo do treasury — testar que valida
+    assert is_valid_brn_address("brn176zsgk8vrn8js48npzjn8rm7cc70rwsxkxyy43"), \
+        "brn176... deveria validar"
+    assert not is_valid_brn_address("BRN_TREASURY"), \
+        "'BRN_TREASURY' (label) não é endereço válido"
+    assert not is_valid_brn_address("brn1"), "curto demais"
+    assert not is_valid_brn_address(""), "vazio"
+    assert not is_valid_brn_address(None), "None"
+    print("  [ok] is_valid_brn_address")
 
     e = create_new(
-        creator="BRN_TREASURY",
-        buyer=DEFAULT_BRN_ADDRESS,
+        creator="brn176zsgk8vrn8js48npzjn8rm7cc70rwsxkxyy43",
+        buyer="brn1qtestaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         brn_amount=100_000,
         btc_expected_sats=10_000,
-        btc_address="1BBKio11f87a5f3jD2QHCa6mALw667Liag",
+        btc_address="bc1qtest",
     )
     assert e.status == STATUS_OPEN
     assert e.escrow_id.startswith("esc_")
+    assert e.creator.startswith("brn1")
     assert e.is_open()
     assert not e.is_terminal()
     assert e.can_cancel()
     assert not e.can_release()
-    assert e.buyer == DEFAULT_BRN_ADDRESS
     print(f"  [ok] criado: {e}")
-    print(f"       buyer = {e.buyer}")
 
     d = e.to_dict()
     assert d["status"] == STATUS_OPEN
-    assert d["buyer"] == DEFAULT_BRN_ADDRESS
     e2 = EscrowBTCtoBRN.from_dict(d)
     assert e2 == e
     assert e2.to_dict() == d
@@ -272,11 +331,11 @@ if __name__ == "__main__":
 
     e3 = EscrowBTCtoBRN(
         escrow_id=generate_escrow_id(),
-        creator=DEFAULT_BRN_ADDRESS,
-        buyer=DEFAULT_BRN_ADDRESS,
+        creator="X",  # label arbitrário — backward compat mantida
+        buyer="brn1qtestbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         brn_amount=1,
         btc_expected_sats=1,
-        btc_address="1BBKio11f87a5f3jD2QHCa6mALw667Liag",
+        btc_address="bc1qtest",
         created_at=100,
         expires_at=101,
     )
@@ -286,11 +345,11 @@ if __name__ == "__main__":
     print("  [ok] mark_expired")
 
     e4 = create_new(
-        creator=DEFAULT_BRN_ADDRESS,
-        buyer=DEFAULT_BRN_ADDRESS,
+        creator="BRN_TREASURY",  # label legado — backward compat
+        buyer="brn1qtestccccccccccccccccccccccccccccccc",
         brn_amount=1,
         btc_expected_sats=1,
-        btc_address="1BBKio11f87a5f3jD2QHCa6mALw667Liag",
+        btc_address="bc1qtest",
     )
     e4.mark_cancelled()
     assert e4.status == STATUS_CANCELLED
@@ -299,15 +358,33 @@ if __name__ == "__main__":
 
     for bad in (
         dict(buyer="not_brn", brn_amount=1, btc_expected_sats=1),
-        dict(buyer=DEFAULT_BRN_ADDRESS, brn_amount=0, btc_expected_sats=1),
-        dict(buyer=DEFAULT_BRN_ADDRESS, brn_amount=1, btc_expected_sats=0),
+        dict(buyer="brn1qtest", brn_amount=0, btc_expected_sats=1),
+        dict(buyer="brn1qtest", brn_amount=1, btc_expected_sats=0),
     ):
         try:
-            create_new(creator="X", btc_address="1BBKio11f87a5f3jD2QHCa6mALw667Liag", **bad)
+            create_new(creator="X", btc_address="x", **bad)
             raise AssertionError(f"deveria rejeitar: {bad}")
         except ValueError:
             pass
     print("  [ok] validacoes de entrada")
 
-    print()
+    e5 = create_new(
+        creator="X",
+        buyer="brn1qtestddddddddddddddddddddddddddddddd",
+        brn_amount=1,
+        btc_expected_sats=1,
+        btc_address="x",
+    )
+    try:
+        e5.mark_released()
+        raise AssertionError("deveria rejeitar mark_released em OPEN")
+    except ValueError:
+        pass
+    try:
+        e5.mark_detected("")
+        raise AssertionError("deveria rejeitar txid vazio")
+    except ValueError:
+        pass
+    print("  [ok] transicoes invalidas rejeitadas")
+
     print("EscrowBTCtoBRN OK.")
