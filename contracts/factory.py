@@ -1,22 +1,38 @@
 """contracts/factory.py — Fábrica de escrows L2 BTC→BRN.
+
+Cria ordens com limites BTC, cotação fixa, taxa e persistência via ChainDB.
+A criação de um escrow não comprova depósito BTC nem autoriza crédito de BRN;
+isso depende da validação on-chain e do fluxo seguro de liberação.
+
+v2 (2026-11-03):
+  [NEW] DEFAULT_TREASURY_BRN — endereço BRN do cofre como fallback
+        quando o caller não passa creator_wallet E o env não define
+        BRN_TREASURY_ADDRESS. Evita criar escrows com creator
+        "BRN_TREASURY" (label) em vez de endereço brn1... real.
+  [NEW] _treasury_address() — precedência:
+          1. os.environ["BRN_TREASURY_ADDRESS"] (env)
+          2. btc_config.BRN_TREASURY_ADDRESS (arquivo)
+          3. DEFAULT_TREASURY_BRN (hardcoded neste arquivo)
+  [KEEP] Todo o resto do v1 inalterado.
 """
 from __future__ import annotations
 
 import hashlib
 import logging
 import math
+import os
 import time
 
 from .escrow_btc_brn import (
     EscrowBTCtoBRN,
     generate_escrow_id,
-    DEFAULT_BRN_ADDRESS,
     STATUS_OPEN,
     STATUS_BTC_DETECTED,
     STATUS_RELEASED,
     STATUS_EXPIRED,
     STATUS_CANCELLED,
     VALID_STATUSES,
+    is_valid_brn_address,
 )
 
 log = logging.getLogger("contracts.factory")
@@ -28,8 +44,12 @@ DEFAULT_MAX_BTC_SATS = 100_000_000
 DEFAULT_BTC_ADDRESS = ""
 DEFAULT_ESCROW_TTL_S = 24 * 3600
 
+# Fallback local (03/11/2026). Só é usado se env E btc_config não tiverem.
+DEFAULT_TREASURY_BRN = "brn176zsgk8vrn8js48npzjn8rm7cc70rwsxkxyy43"
+
 
 def _cfg(name: str, default):
+    """Lê btc_config.py com fallback seguro."""
     try:
         import btc_config
         return getattr(btc_config, name, default)
@@ -73,11 +93,33 @@ def _btc_address() -> str:
     return str(_cfg("BTC_RECEIVE_ADDRESS", DEFAULT_BTC_ADDRESS) or "").strip()
 
 
+def _treasury_address() -> str:
+    """
+    Endereço BRN do cofre (creator padrão de escrows).
+
+    Precedência:
+      1. os.environ["BRN_TREASURY_ADDRESS"] (env runtime)
+      2. btc_config.BRN_TREASURY_ADDRESS (arquivo)
+      3. DEFAULT_TREASURY_BRN (hardcoded acima)
+    """
+    env_val = (os.environ.get("BRN_TREASURY_ADDRESS", "") or "").strip()
+    if env_val and is_valid_brn_address(env_val):
+        return env_val
+
+    cfg_val = str(_cfg("BRN_TREASURY_ADDRESS", "") or "").strip()
+    if cfg_val and is_valid_brn_address(cfg_val):
+        return cfg_val
+
+    return DEFAULT_TREASURY_BRN
+
+
 def compute_brn_amounts(btc_sats: int) -> dict:
+    """Calcula BRN em unidades mínimas; 1 BTC equivale a 1e8 satoshis."""
     if isinstance(btc_sats, bool) or not isinstance(btc_sats, int) or btc_sats <= 0:
         raise ValueError("btc_sats deve ser int > 0")
     rate = _rate()
     fee_pct = _fee_pct()
+    # satoshis BTC × BRN/BTC = unidades mínimas de BRN.
     brn_gross = int(btc_sats * rate)
     fee = int(brn_gross * fee_pct / 100)
     brn_net = brn_gross - fee
@@ -91,6 +133,8 @@ def compute_brn_amounts(btc_sats: int) -> dict:
 
 
 class ContractFactory:
+    """Cria, consulta e atualiza escrows usando a interface L2 do ChainDB."""
+
     def __init__(self, db):
         if db is None:
             raise ValueError("db obrigatorio")
@@ -123,6 +167,7 @@ class ContractFactory:
         buyer_wallet: str,
         ttl_s: int = DEFAULT_ESCROW_TTL_S,
     ) -> EscrowBTCtoBRN:
+        """Cria e persiste um escrow OPEN. Não credita BRN neste estágio."""
         self._validate_buyer(buyer_wallet)
         self._validate_btc_amount(btc_amount_sats)
         if isinstance(ttl_s, bool) or not isinstance(ttl_s, int) or ttl_s <= 0:
@@ -144,17 +189,27 @@ class ContractFactory:
                 "em btc_config.py/BRN_BTC_RECEIVE_ADDRESS antes de criar ordens"
             )
 
+        # [v2] creator padrão = treasury real (brn176...), não label "BRN_TREASURY"
+        creator = (creator_wallet or "").strip()
+        if not creator:
+            creator = _treasury_address()
+            if not is_valid_brn_address(creator):
+                raise ValueError(
+                    f"treasury address invalido: {creator[:32]}… "
+                    f"(verifique BRN_TREASURY_ADDRESS)"
+                )
+
         now = int(time.time())
         escrow_id = generate_escrow_id()
         expires_at = now + ttl_s
         l2_hash = hashlib.sha256(
-            f"{escrow_id}:{creator_wallet or 'BRN_TREASURY'}:{buyer_wallet}:"
+            f"{escrow_id}:{creator}:{buyer_wallet}:"
             f"{brn_net}:{btc_amount_sats}:{btc_address}:{now}:{expires_at}".encode("utf-8")
         ).hexdigest()
 
         escrow = EscrowBTCtoBRN(
             escrow_id=escrow_id,
-            creator=creator_wallet or "BRN_TREASURY",
+            creator=creator,
             buyer=buyer_wallet,
             brn_amount=brn_net,
             btc_expected_sats=btc_amount_sats,
@@ -205,6 +260,7 @@ class ContractFactory:
             return None
 
     def cancel(self, escrow_id: str) -> dict:
+        """Cancela apenas escrows OPEN."""
         escrow = self.get(escrow_id)
         if not escrow:
             return {"ok": False, "msg": "escrow nao existe"}
@@ -254,15 +310,13 @@ class ContractFactory:
         out["rate"] = _rate()
         out["fee_pct"] = _fee_pct()
         out["btc_address"] = _btc_address()
+        out["treasury_address"] = _treasury_address()
         return out
 
 
 if __name__ == "__main__":
+    # Endereço fictício apenas para os autotestes; nunca usado em produção.
     _btc_address = lambda: "bc1qtestaddress000000000000000000000000000000"
-
-    print("Testando ContractFactory...")
-    print(f"  Endereço BRN (buyer padrão): {DEFAULT_BRN_ADDRESS}")
-    print()
 
     class FakeDB:
         def __init__(self):
@@ -280,31 +334,31 @@ if __name__ == "__main__":
                 if btc_txid:
                     self.rows[escrow_id]["btc_txid"] = btc_txid
 
+    print("Testando ContractFactory...")
     db = FakeDB()
     factory = ContractFactory(db)
-    buyer = DEFAULT_BRN_ADDRESS
-
+    buyer = "brn1qtestaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     quote = compute_brn_amounts(100_000)
     assert quote["brn_gross"] > quote["brn_net"] > 0
     assert quote["fee"] > 0
-    print(f"  [ok] cotação: 100000 sats → brn_net={quote['brn_net']} "
-          f"(fee={quote['fee']}, rate={quote['rate']})")
 
+    # Teste 1: creator explícito (label "BRN_TREASURY") — mantém compat
     escrow = factory.create_btc_to_brn("BRN_TREASURY", 100_000, buyer)
     assert escrow.status == STATUS_OPEN
-    assert escrow.buyer == DEFAULT_BRN_ADDRESS
+    assert escrow.creator == "BRN_TREASURY"
     assert factory.get(escrow.escrow_id).to_dict() == escrow.to_dict()
-    print(f"  [ok] escrow criado: {escrow.escrow_id}")
-    print(f"       buyer = {escrow.buyer}")
-
-    lst = factory.list_by_buyer(buyer, "OPEN")
-    assert len(lst) == 1
-    print(f"  [ok] list_by_buyer: 1 escrow")
-
+    assert len(factory.list_by_buyer(buyer, "OPEN")) == 1
     assert factory.cancel(escrow.escrow_id)["ok"]
     assert factory.get(escrow.escrow_id).status == STATUS_CANCELLED
     assert factory.stats()["cancelled"] == 1
-    print(f"  [ok] cancelado")
+
+    # Teste 2: creator vazio → usa treasury real (brn176...)
+    buyer2 = "brn1qtestbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    escrow2 = factory.create_btc_to_brn("", 100_000, buyer2, ttl_s=60)
+    assert escrow2.creator == DEFAULT_TREASURY_BRN, \
+        f"esperado {DEFAULT_TREASURY_BRN}, veio {escrow2.creator}"
+    assert is_valid_brn_address(escrow2.creator)
+    print(f"  [ok] treasury default: {escrow2.creator}")
 
     try:
         factory.create_btc_to_brn("BRN_TREASURY", 100_000, buyer, ttl_s=-1)
@@ -317,14 +371,12 @@ if __name__ == "__main__":
             raise AssertionError("entrada invalida deveria ser rejeitada")
         except ValueError:
             pass
-    print(f"  [ok] validações de entrada")
 
     expiring = factory.create_btc_to_brn("BRN_TREASURY", 100_000, buyer, ttl_s=1)
     db.rows[expiring.escrow_id]["created_at"] = int(time.time()) - 10
     db.rows[expiring.escrow_id]["expires_at"] = int(time.time()) - 1
     assert factory.expire_overdue() == 1
     assert factory.get(expiring.escrow_id).status == STATUS_EXPIRED
-    print(f"  [ok] expire_overdue")
 
-    print()
+    print(f"  [ok] treasury usado: {_treasury_address()}")
     print("ContractFactory OK.")
