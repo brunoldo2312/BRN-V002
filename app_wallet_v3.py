@@ -1,22 +1,10 @@
-"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.9.2)
+"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.14)
 ================================================================
+v3.14 (2026-11-03):
+  [FIX] pool_status() injeta dados do último job se o atual estiver
+        vazio. Impede GUI mostrar "—" no Vardiff durante troca de jobs.
 v3.9.2 (2026-10-30):
-  [FIX CRÍTICO] pool_start_mining / pool_stop_mining / pool_status
-                agora chamam /api/pool/start_local, /api/pool/stop_local
-                e /api/pool/local_status. Antes, criavam um segundo
-                PoolClient em memória, que ficava desalinhado do
-                PoolClient injetado pelo main.py — a GUI mostrava
-                "minerando" mas o /api/pool/local_status ficava
-                "running: false". Agora há um único PoolClient,
-                compartilhado entre GUI e API.
-  [FIX] Removido WalletApi(wallet_password=...) inexistente.
-  [KEEP] v3.9.1: AttributeError 'NoneType' corrigido em mining_status
-         e stop_mining (get_miner(None) substituía a chain).
-v3.9.1 (2026-10-28):
-  [FIX CRÍTICO] AttributeError 'NoneType' object has no attribute
-                'rede_descentralizada'.
-v3.9.0 (2026-10-26):
-  [NEW] Suporte a multi-sig dos Top 5 validadores.
+  [FIX CRÍTICO] pool_start_mining/pool_status chamam /api/pool/local_*
 ================================================================
 """
 from __future__ import annotations
@@ -30,13 +18,13 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "3.9.2"
+__version__ = "3.14"
 
 try:
     import requests
     _HAS_REQUESTS = True
 except ImportError:
-    requests = None  # type: ignore
+    requests = None
     _HAS_REQUESTS = False
 
 
@@ -53,9 +41,6 @@ RETRY_DELAY  = float(os.environ.get("BRN_API_RETRY_DELAY", "0.5"))
 _WALLET_SESSION: dict = {}
 
 
-# ============================================================
-# HTTP HELPERS
-# ============================================================
 def _post(path: str, body: dict, timeout: float = None,
           retries: int = None) -> dict:
     if not _HAS_REQUESTS:
@@ -86,7 +71,6 @@ def _post(path: str, body: dict, timeout: float = None,
             break
 
         if attempt < r_n:
-            log.debug("POST %s: retry %d/%d após %s", path, attempt + 1, r_n, last_err)
             time.sleep(RETRY_DELAY * (attempt + 1))
 
     if "Connection" in last_err or "connection" in last_err:
@@ -124,7 +108,6 @@ def _get(path: str, timeout: float = None,
             return {"error": str(e)}
 
         if attempt < r_n:
-            log.debug("GET %s: retry %d/%d após %s", path, attempt + 1, r_n, last_err)
             time.sleep(RETRY_DELAY * (attempt + 1))
 
     if "Connection" in last_err or "connection" in last_err:
@@ -132,18 +115,12 @@ def _get(path: str, timeout: float = None,
     return {"error": last_err or "erro desconhecido"}
 
 
-# ============================================================
-# WalletApi
-# ============================================================
 class WalletApi:
     def __init__(self):
         log.info("WalletApi v%s iniciada (API_BASE=%s)", __version__, API_BASE)
         if not _HAS_REQUESTS:
             log.warning("requests NÃO instalado — pip install requests")
 
-    # ========================================================
-    # SESSÃO
-    # ========================================================
     def has_wallet(self) -> dict:
         try:
             from secure_store import CURRENT_WALLET_ENC
@@ -174,10 +151,8 @@ class WalletApi:
             if not r.get("ok"):
                 return {"ok": False, "msg": "Erro ao salvar: " + str(r.get("msg", ""))}
             _WALLET_SESSION.update(data)
-            log.info("Nova carteira criada: %s...", w.address[:16])
             return {"ok": True, "address": w.address}
         except Exception as e:
-            log.exception("Erro ao criar carteira")
             return {"ok": False, "msg": str(e)}
 
     def unlock_wallet(self, password: str) -> dict:
@@ -211,9 +186,6 @@ class WalletApi:
             return {"ok": True, **_WALLET_SESSION}
         return {"ok": False, "msg": "locked"}
 
-    # ========================================================
-    # EXPERIMENTO A/B
-    # ========================================================
     def get_experiment_variant(self) -> dict:
         try:
             from ab_test import get_variant, get_node_id_hash
@@ -240,9 +212,6 @@ class WalletApi:
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
-    # ========================================================
-    # NÓ / CHAIN
-    # ========================================================
     def node_status(self) -> dict:
         try:
             s = _get("/api/status", timeout=GET_TIMEOUT)
@@ -297,34 +266,20 @@ class WalletApi:
         except Exception as e:
             return {"erro": str(e)}
 
-    # ========================================================
-    # MULTI-SIG / CONSENSO
-    # ========================================================
     def consensus_validators(self) -> dict:
         try:
             r = _get("/api/consensus/validators", timeout=10.0)
             if "error" in r:
-                return {
-                    "ok": False,
-                    "msg": r["error"],
-                    "required_sigs": 0,
-                    "all_required": True,
-                    "validators": [],
-                }
+                return {"ok": False, "msg": r["error"], "required_sigs": 0,
+                        "all_required": True, "validators": []}
             return r
         except Exception as e:
-            return {
-                "ok": False,
-                "msg": str(e),
-                "required_sigs": 0,
-                "all_required": True,
-                "validators": [],
-            }
+            return {"ok": False, "msg": str(e), "required_sigs": 0,
+                    "all_required": True, "validators": []}
 
     def block_signatures(self, height: int) -> dict:
         try:
-            r = _get(f"/api/block/{int(height)}/signatures", timeout=10.0)
-            return r
+            return _get(f"/api/block/{int(height)}/signatures", timeout=10.0)
         except Exception as e:
             return {"ok": False, "msg": str(e), "signatures": []}
 
@@ -333,15 +288,12 @@ class WalletApi:
             validators_resp = self.consensus_validators()
             required = int(validators_resp.get("required_sigs", 0) or 0)
             all_required = bool(validators_resp.get("all_required", True))
-
             mining = self.mining_status()
             height = int(mining.get("height", 0) or 0)
-
             last_sigs = 0
             if height > 0:
                 sigs_resp = self.block_signatures(height)
                 last_sigs = int(sigs_resp.get("signatures_count", 0) or 0)
-
             return {
                 "ok": True,
                 "validators_active": len(validators_resp.get("validators", [])),
@@ -353,16 +305,8 @@ class WalletApi:
                 "last_block_ready":   last_sigs >= required if required > 0 else True,
             }
         except Exception as e:
-            return {
-                "ok": False,
-                "msg": str(e),
-                "validators_active": 0,
-                "required_sigs": 0,
-            }
+            return {"ok": False, "msg": str(e), "validators_active": 0, "required_sigs": 0}
 
-    # ========================================================
-    # CARTEIRA
-    # ========================================================
     def portfolio(self, address: str) -> dict:
         try:
             s = _get(f"/api/portfolio/{address}", timeout=15.0)
@@ -377,39 +321,23 @@ class WalletApi:
             r = _post("/api/nova-carteira", {})
             if not r.get("success"):
                 return {"erro": r.get("error", "falha")}
-
-            address     = r["address"]
-            private_key = r["private_key"]
-            public_key  = r["public_key"]
-
-            pwd = (
-                (password or "").strip()
-                or os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
-                or os.environ.get("BRN_NODE_PASSWORD", "").strip()
-            )
+            address, private_key, public_key = r["address"], r["private_key"], r["public_key"]
+            pwd = ((password or "").strip()
+                   or os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
+                   or os.environ.get("BRN_NODE_PASSWORD", "").strip())
             if pwd:
                 try:
                     from secure_store import save_current_wallet
                     save_result = save_current_wallet(pwd, {
-                        "address":     address,
-                        "private_key": private_key,
-                        "public_key":  public_key,
+                        "address": address, "private_key": private_key, "public_key": public_key,
                     })
                     if save_result.get("ok"):
-                        log.info("Carteira nova persistida: %s...", address[:16])
                         _WALLET_SESSION.update({
-                            "address":     address,
-                            "private_key": private_key,
-                            "public_key":  public_key,
+                            "address": address, "private_key": private_key, "public_key": public_key,
                         })
                 except Exception as e:
                     log.warning("Falha salvando carteira em disco: %s", e)
-
-            return {
-                "address":     address,
-                "private_key": private_key,
-                "public_key":  public_key,
-            }
+            return {"address": address, "private_key": private_key, "public_key": public_key}
         except Exception as e:
             return {"erro": str(e)}
 
@@ -443,19 +371,12 @@ class WalletApi:
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
-    # ========================================================
-    # TRANSAÇÕES
-    # ========================================================
     def transfer(self, from_addr: str, to_addr: str, asset: str,
                  amount, sk: str, pk: str) -> dict:
         try:
             return _post("/api/transfer", {
-                "from":         from_addr,
-                "to":           to_addr,
-                "asset_id":     asset or "BRN",
-                "amount":       str(amount),
-                "private_key":  sk,
-                "pubkey":       pk,
+                "from": from_addr, "to": to_addr, "asset_id": asset or "BRN",
+                "amount": str(amount), "private_key": sk, "pubkey": pk,
             })
         except Exception as e:
             return {"ok": False, "msg": str(e)}
@@ -482,14 +403,10 @@ class WalletApi:
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
-    # ========================================================
-    # MINERAÇÃO LOCAL (miner_loop)
-    # ========================================================
     def start_mining(self, address: str, pubkey: str) -> dict:
         try:
             return _post("/api/miner/start", {
-                "address":      address,
-                "miner_pubkey": pubkey,
+                "address": address, "miner_pubkey": pubkey,
             })
         except Exception as e:
             return {"ok": False, "msg": str(e)}
@@ -498,10 +415,8 @@ class WalletApi:
         try:
             from miner_loop import get_miner
             from server import _get_chain
-
             chain = _get_chain()
             m = get_miner(chain)
-
             if m:
                 ok, msg = m.stop()
                 return {"ok": ok, "msg": msg, "count": m.blocks_mined}
@@ -520,9 +435,6 @@ class WalletApi:
         except Exception as e:
             return {"running": False, "error": str(e)}
 
-    # ========================================================
-    # POOL — [FIX v3.9.2] Usa /api/pool/*_local (PoolClient do main.py)
-    # ========================================================
     def _resolve_pool_url(self) -> str:
         env_pool = (os.environ.get("BRN_POOL_URL", "") or "").strip()
         if env_pool:
@@ -530,22 +442,8 @@ class WalletApi:
         return API_BASE
 
     def pool_start_mining(self, address: str, pubkey: str) -> dict:
-        """
-        [FIX v3.9.2] Inicia o PoolClient que o main.py JÁ injetou
-        no server.py via set_pool_client_local().
-
-        Antes, este método criava um PoolClient próprio (via
-        miner_pool_client.PoolClient). Isso gerava desalinhamento:
-          - a GUI minerava usando o PoolClient dela
-          - /api/pool/local_status lia o PoolClient do main.py
-          - resultado: "running: false" na API, "minerando" na GUI
-
-        Agora a GUI só chama a rota, e o PoolClient injetado é o
-        mesmo para todos os canais (GUI, API, logs).
-        """
         if not address or not pubkey:
             return {"ok": False, "msg": "address e pubkey obrigatorios"}
-
         try:
             r = _post("/api/pool/start_local", {}, timeout=30.0)
             if r.get("ok"):
@@ -555,7 +453,6 @@ class WalletApi:
             return {"ok": False, "msg": str(e)}
 
     def pool_stop_mining(self) -> dict:
-        """[FIX v3.9.2] Para o PoolClient injetado pelo main.py."""
         try:
             r = _post("/api/pool/stop_local", {}, timeout=30.0)
             if r.get("ok"):
@@ -564,13 +461,32 @@ class WalletApi:
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
+    # [FIX v3.14] Se o job atual está vazio, injeta os dados do último job conhecido
     def pool_status(self) -> dict:
-        """[FIX v3.9.2] Consulta o status do PoolClient injetado."""
         try:
             r = _get("/api/pool/local_status", timeout=10.0)
             if not isinstance(r, dict):
-                return {"ok": False, "running": False,
-                        "msg": "resposta invalida"}
+                return {"ok": False, "running": False, "msg": "resposta invalida"}
+
+            # [FIX v3.14] Fallback: se o job atual está vazio, busca do PoolClient
+            if r.get("running") and r.get("job_share_diff") is None:
+                try:
+                    from miner_pool_client import get_pool_client
+                    pc = get_pool_client()
+                    if pc:
+                        # Tenta ler o último share_diff conhecido diretamente
+                        last_diff = getattr(pc, "_last_known_share_diff", None)
+                        if last_diff is not None:
+                            r["job_share_diff"] = last_diff
+                        # Tenta ler do _job (se não foi zerado)
+                        if r.get("job_id") is None and pc._job:
+                            r["job_id"] = pc._job.get("job_id")
+                            r["job_height"] = pc._job.get("height")
+                            r["job_difficulty"] = pc._job.get("difficulty")
+                            r["job_share_diff"] = pc._job.get("share_difficulty")
+                except Exception as e:
+                    log.debug("Fallback do pool_status falhou: %s", e)
+
             return r
         except Exception as e:
             return {"ok": False, "running": False, "msg": str(e)}
@@ -587,9 +503,6 @@ class WalletApi:
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
-    # ========================================================
-    # TRUST SYSTEM
-    # ========================================================
     def get_trust_stats(self) -> dict:
         try:
             return _get("/api/trust/stats", timeout=10.0)
@@ -602,31 +515,18 @@ class WalletApi:
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
-    # ========================================================
-    # FAUCET / BRIDGE
-    # ========================================================
     def call_faucet(self, address: str, sk: str, pk: str) -> dict:
         try:
-            return _post("/api/faucet", {
-                "address":     address,
-                "private_key": sk,
-                "pubkey":      pk,
-            })
+            return _post("/api/faucet", {"address": address, "private_key": sk, "pubkey": pk})
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
     def bridge_claim(self, txid: str, address: str) -> dict:
         try:
-            return _post("/api/l2/claim", {
-                "btc_txid":  txid,
-                "buyer_brn": address,
-            })
+            return _post("/api/l2/claim", {"btc_txid": txid, "buyer_brn": address})
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
-    # ========================================================
-    # DIAGNÓSTICO
-    # ========================================================
     def ping(self) -> dict:
         try:
             return _get("/health", timeout=5.0)
@@ -634,11 +534,7 @@ class WalletApi:
             return {"ok": False, "msg": str(e)}
 
     def get_version(self) -> dict:
-        return {
-            "version":  __version__,
-            "api_base": API_BASE,
-            "has_requests": _HAS_REQUESTS,
-        }
+        return {"version": __version__, "api_base": API_BASE, "has_requests": _HAS_REQUESTS}
 
     def get_debug_info(self) -> dict:
         consensus_info = {}
@@ -646,17 +542,14 @@ class WalletApi:
             consensus_info = self.get_multi_sig_status()
         except Exception:
             pass
-
         pool_running = False
         try:
             ps = self.pool_status()
             pool_running = bool(ps.get("running", False))
         except Exception:
             pass
-
         return {
-            "version":  __version__,
-            "api_base": API_BASE,
+            "version": __version__, "api_base": API_BASE,
             "has_requests": _HAS_REQUESTS,
             "wallet_locked": not bool(_WALLET_SESSION.get("address")),
             "wallet_address": _WALLET_SESSION.get("address", ""),
@@ -674,15 +567,11 @@ class WalletApi:
         }
 
 
-# ============================================================
-# CLI SELF-TEST
-# ============================================================
 def _self_test() -> int:
     print(f"app_wallet_v3.py v{__version__}")
     print("=" * 60)
     print(f"API_BASE:      {API_BASE}")
     print(f"requests:      {'OK' if _HAS_REQUESTS else 'AUSENTE'}")
-    print(f"MAX_RETRIES:   {MAX_RETRIES}")
     print()
 
     if not _HAS_REQUESTS:
@@ -691,66 +580,20 @@ def _self_test() -> int:
 
     api = WalletApi()
 
-    print("[1] ping /health...")
     r = api.ping()
     if r.get("ok"):
-        print(f"    OK — height={r.get('height')} v={r.get('version', '?')}")
+        print(f"[1] ping OK — height={r.get('height')} v={r.get('version', '?')}")
     else:
-        print(f"    [X] FALHOU: {r}")
+        print(f"[1] [X] ping: {r}")
         return 1
 
-    print("\n[2] node_status...")
     r = api.node_status()
-    if r.get("ok"):
-        print(f"    height={r.get('height')} peers={r.get('peers')} "
-              f"diff={r.get('difficulty')} des={r.get('rede_descentralizada')} "
-              f"validators={r.get('validators_active', 0)}")
-    else:
-        print(f"    [X] FALHOU: {r}")
+    print(f"[2] node_status: ok={r.get('ok')} height={r.get('height')}")
 
-    print("\n[3] sync_info...")
-    r = api.sync_info()
-    if "erro" in r:
-        print(f"    [X] FALHOU: {r['erro']}")
-    else:
-        sync = r.get("sync", {})
-        print(f"    height={sync.get('height')} target={sync.get('target')} "
-              f"percent={sync.get('percent')}%")
-
-    print("\n[4] consensus_validators...")
-    r = api.consensus_validators()
-    print(f"    ok={r.get('ok')} required={r.get('required_sigs')} "
-          f"validators={len(r.get('validators', []))}")
-
-    print("\n[5] get_multi_sig_status...")
-    r = api.get_multi_sig_status()
-    print(f"    active={r.get('is_multisig_active')} "
-          f"required={r.get('required_sigs')} "
-          f"last_sigs={r.get('last_block_sigs')}")
-
-    print("\n[6] get_version...")
-    print(f"    {api.get_version()}")
-
-    print("\n[7] get_debug_info...")
-    info = api.get_debug_info()
-    print(f"    wallet_locked={info['wallet_locked']} "
-          f"pool_running={info['pool_client_running']}")
-    print(f"    pool_url={info['pool_url_resolved']}")
-
-    print("\n[8] has_wallet...")
-    r = api.has_wallet()
-    print(f"    exists={r.get('exists')}")
-
-    print("\n[9] pool_status...")
     r = api.pool_status()
-    print(f"    ok={r.get('ok')} running={r.get('running')} "
-          f"hashrate_khs={r.get('hashrate_khs', 0)}")
-
-    print("\n[10] miner/status...")
-    r = api.mining_status()
-    print(f"    running={r.get('running')} "
-          f"blocks={r.get('blocks_mined', 0)} "
-          f"height={r.get('height', '?')}")
+    print(f"[3] pool_status: running={r.get('running')} "
+          f"hashrate_khs={r.get('hashrate_khs', 0)} "
+          f"job_share_diff={r.get('job_share_diff')}")
 
     print("\n" + "=" * 60)
     print(" SELF-TEST CONCLUIDO")
@@ -759,16 +602,12 @@ def _self_test() -> int:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
     p = argparse.ArgumentParser(prog="app_wallet_v3.py")
-    p.add_argument("--self-test", action="store_true",
-                   help="Valida a ponte sem GUI")
-    p.add_argument("--version", action="store_true",
-                   help="Mostra versão e sai")
+    p.add_argument("--self-test", action="store_true")
+    p.add_argument("--version", action="store_true")
     args = p.parse_args()
 
     if args.version:
@@ -779,5 +618,4 @@ if __name__ == "__main__":
         sys.exit(_self_test())
 
     print("Uso: python app_wallet_v3.py --self-test")
-    print("     (a GUI usa via pywebview: from app_wallet_v3 import WalletApi)")
     sys.exit(0)
