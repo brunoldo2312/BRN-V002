@@ -1,6 +1,17 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.4.11 | Data: 03/11/2026
+Versão: 9.4.12 | Data: 03/11/2026
 ================================================================
+v9.4.12 (2026-11-03):
+  [FIX CRÍTICO] _get_active_validators() agora faz fallback para
+        get_top_validators() quando get_active_validators() retorna
+        vazio. Antes, trust_network.json com "active_validators": []
+        fazia _get_active_validators() retornar [] (ou apenas a SK
+        local), zerando o quórum multi-sig e desligando a verificação
+        de assinaturas de validador por completo.
+        Bug identificado em produção (nó travado na altura 30,
+        mensagem "Bloco #31 precisa de 2/4 assinaturas do set local,
+        tem 1").
+  [KEEP] Todas as correções de v9.4.11.
 v9.4.11 (2026-11-03):
   [NEW] BRN_ASSUME_VALID_UNTIL: até esta altura, blocos são
         aceitos SEM validação completa (só hash + prev_hash +
@@ -782,6 +793,23 @@ class Blockchain:
             except Exception as e:
                 log.warning(f"[VALIDATORS] falhou: {e}")
                 validators = []
+
+            # [v9.4.12] Fallback: active_validators vazio → usa top_validators.
+            # Sem isso, trust_network.json com "active_validators": [] fazia
+            # get_active_validators() retornar [] e required=0/0, desligando
+            # a verificação multi-sig por completo.
+            if not validators and hasattr(trust, "get_top_validators"):
+                try:
+                    validators = list(trust.get_top_validators(count=MAX_VALIDATORS) or [])
+                    if validators:
+                        log.warning(
+                            "[VALIDATORS] active_validators vazio; usando "
+                            "get_top_validators() como fallback (%d validador(es))",
+                            len(validators),
+                        )
+                except Exception as e:
+                    log.warning(f"[VALIDATORS] fallback get_top_validators falhou: {e}")
+                    validators = []
 
         local_sk = self._local_validator_sk
         if local_sk is not None:
