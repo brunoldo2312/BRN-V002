@@ -1,19 +1,15 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.7.14)
+"""main.py — Entrypoint unificado do nó BRN (v13.7.13)
 ================================================================
-v13.7.14 (2026-11-02):
-  [NEW] _auto_trust_discovery() roda em thread separada 15s após
-        o boot. Consulta /api/trust/nodes de cada peer ativo,
-        consolida o trust_network.json (remove fantasmas) e
-        recarrega em memória.
-        Modos:
-          BRN_AUTO_TRUST_RESET=auto (padrão) → limpa se trust > 10 nós
-          BRN_AUTO_TRUST_RESET=1            → sempre limpa
-          BRN_AUTO_TRUST_RESET=0            → só adiciona novos
-  [KEEP] v13.7.13: last_seen de todos os nós no boot.
-  [KEEP] v13.7.12: heartbeat do próprio nó a cada 30s.
-  [KEEP] v13.7.11: self-registration na TrustNetwork.
-v13.7.13 (2026-11-02):
-  [FIX] last_seen de todos os nós no boot.
+v13.7.13 (2026-11-03):
+  [NEW] Auto-limpeza do Trust Network no boot: chama
+        trust_net.remove_ghosts() logo após carregar, garantindo
+        que nós fantasmas (ex: travados em altura 299) não entrem
+        no cálculo de quórum.
+  [FIX] Log de inicialização do sync_manager atualizado para v9.1.
+  [KEEP] Toda a lógica de heartbeat, self-registration e multi-sig.
+v13.7.12 (2026-11-01):
+  [FIX CRÍTICO] run_status_loop agora chama trust_net.heartbeat()
+                a cada 30s.
 ================================================================
 """
 from __future__ import annotations
@@ -81,7 +77,6 @@ _HARDCODED_DEFAULTS = {
     "ANYIO_THREAD_LIMIT":      "100",
     "BRN_MULTISIG_START_HEIGHT": "",
     "BRN_CHECKPOINT_HEIGHTS":    "",
-    "BRN_AUTO_TRUST_RESET":      "auto",
 }
 
 
@@ -128,6 +123,7 @@ def _verificar_integridade_codigo() -> None:
             sys.exit(1)
 
 
+# <<< NOVO port_guard (v1.0): aborta se portas do BRN já estão em uso
 try:
     import port_guard
     _HAS_PORT_GUARD = True
@@ -412,199 +408,6 @@ def _load_validator_sk():
         return None
 
 
-# ============================================================
-# [v13.7.14] AUTO-TRUST DISCOVERY
-# ============================================================
-def _auto_trust_discovery(chain, trust_net, p2p, log):
-    """Descobre pubkeys dos peers ativos e consolida trust_network.json.
-
-    Roda em thread separada. Espera 15s (P2P conectar), consulta
-    /api/trust/nodes de cada peer, e:
-      - BRN_AUTO_TRUST_RESET=auto (padrão): limpa se trust > 10 nós
-      - BRN_AUTO_TRUST_RESET=1:            sempre limpa
-      - BRN_AUTO_TRUST_RESET=0:            só adiciona novos
-    """
-    time.sleep(15)
-
-    if _shutdown.is_set():
-        return
-
-    try:
-        MINHA = ""
-        sk = getattr(chain, "_local_validator_sk", None)
-        if sk is not None:
-            try:
-                MINHA = sk.pub_hex
-            except Exception:
-                pass
-
-        # Coleta peers (bootstrap + P2P descobertos)
-        peers = set()
-        try:
-            if p2p is not None:
-                for p in p2p.discovery.listar_peers():
-                    peers.add(p)
-        except Exception:
-            pass
-        try:
-            from p2p_unified import _carregar_bootstrap
-            peers.update(_carregar_bootstrap())
-        except Exception:
-            pass
-
-        if not peers:
-            log.info("[AutoTrust] nenhum peer para consultar — pulando")
-            return
-
-        log.info(f"[AutoTrust] consultando {len(peers)} peer(s) para descobrir pubkeys")
-
-        pubkeys = set()
-        if MINHA:
-            pubkeys.add(MINHA)
-
-        for peer in peers:
-            if _shutdown.is_set():
-                return
-            if ":" not in peer:
-                continue
-            try:
-                ip, _ = peer.rsplit(":", 1)
-            except Exception:
-                continue
-
-            # Consulta /api/trust/nodes
-            try:
-                r = urllib.request.urlopen(f"http://{ip}:5000/api/trust/nodes?limit=50", timeout=4)
-                data = json.loads(r.read())
-                if data.get("ok"):
-                    for n in data.get("nodes", []):
-                        pk = n.get("pubkey_full") or n.get("node_id") or n.get("public_key") or ""
-                        if pk and len(pk) == 66:
-                            pubkeys.add(pk)
-            except Exception:
-                pass
-
-            # Consulta /api/status como fallback (pega a pubkey do pool/servidor)
-            try:
-                r = urllib.request.urlopen(f"http://{ip}:5000/api/status", timeout=3)
-                data = json.loads(r.read())
-                # só para confirmar que peer está vivo; pubkey não vem aqui
-            except Exception:
-                pass
-
-        if not pubkeys:
-            log.info("[AutoTrust] nenhuma pubkey descoberta — trust mantido")
-            return
-
-        log.info(f"[AutoTrust] {len(pubkeys)} pubkey(s) descoberta(s) (incluindo a própria)")
-
-        # Decisão de reset
-        reset_mode = os.environ.get("BRN_AUTO_TRUST_RESET", "auto").strip().lower()
-        try:
-            max_val = int(os.environ.get("BRN_MAX_VALIDATORS", "5"))
-        except (TypeError, ValueError):
-            max_val = 5
-
-        existing_count = len(trust_net.nodes)
-        threshold = max(max_val * 2, 10)
-
-        should_reset = False
-        if reset_mode in ("1", "true", "yes"):
-            should_reset = True
-        elif reset_mode in ("0", "false", "no"):
-            should_reset = False
-        else:  # auto
-            should_reset = existing_count > threshold
-
-        if should_reset:
-            log.warning(
-                "[AutoTrust] RESET (modo=%s, trust tinha %d nós). "
-                "Mantendo só %d pubkeys ativas.",
-                reset_mode, existing_count, len(pubkeys),
-            )
-            try:
-                lock = getattr(trust_net, "_lock", None)
-                if lock is not None:
-                    with lock:
-                        trust_net.nodes.clear()
-                        for pk in pubkeys:
-                            trust_net.register_node(
-                                node_id=pk, address="", public_key=pk, peer_addr=""
-                            )
-                            if hasattr(trust_net, "mark_connected"):
-                                trust_net.mark_connected(pk)
-                else:
-                    trust_net.nodes.clear()
-                    for pk in pubkeys:
-                        trust_net.register_node(
-                            node_id=pk, address="", public_key=pk, peer_addr=""
-                        )
-                        if hasattr(trust_net, "mark_connected"):
-                            trust_net.mark_connected(pk)
-            except Exception as e:
-                log.warning("[AutoTrust] falha no reset: %s", e)
-                return
-        else:
-            adicionadas = 0
-            for pk in pubkeys:
-                if pk not in trust_net.nodes:
-                    try:
-                        trust_net.register_node(
-                            node_id=pk, address="", public_key=pk, peer_addr=""
-                        )
-                        if hasattr(trust_net, "mark_connected"):
-                            trust_net.mark_connected(pk)
-                        adicionadas += 1
-                    except Exception:
-                        pass
-            if adicionadas > 0:
-                log.info("[AutoTrust] +%d pubkey(s) adicionada(s) ao trust", adicionadas)
-
-        # Salva trust_network.json
-        try:
-            if hasattr(trust_net, "save"):
-                trust_net.save()
-            elif hasattr(trust_net, "save_data"):
-                trust_net.save_data()
-            elif hasattr(trust_net, "_save"):
-                trust_net._save()
-            else:
-                # Fallback manual: serializa nó a nó
-                path = BASE_DIR / "trust_network.json"
-                data = {"nodes": {}}
-                lock = getattr(trust_net, "_lock", None)
-                nodes_copy = {}
-                if lock is not None:
-                    with lock:
-                        nodes_copy = dict(trust_net.nodes)
-                else:
-                    nodes_copy = dict(trust_net.nodes)
-                for k, v in nodes_copy.items():
-                    if hasattr(v, "__dict__"):
-                        data["nodes"][k] = v.__dict__
-                    elif isinstance(v, dict):
-                        data["nodes"][k] = v
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=2, ensure_ascii=False)
-            log.info("[AutoTrust] trust_network.json salvo (%d nós)", len(trust_net.nodes))
-        except Exception as e:
-            log.warning("[AutoTrust] falha ao salvar trust: %s", e)
-
-        # Resumo final
-        try:
-            ativos = chain._get_active_validators()
-            req = chain._required_signatures(ativos)
-            log.info(
-                "[AutoTrust] estado final: %d nós no trust, %d ativos, required=%d/%d",
-                len(trust_net.nodes), len(ativos), req, len(ativos),
-            )
-        except Exception:
-            pass
-
-    except Exception as e:
-        log.warning("[AutoTrust] exceção: %s", e)
-
-
 def _make_sign_collector(p2p, trust_net):
     def _collect(block: dict) -> list:
         if p2p is None or trust_net is None:
@@ -868,6 +671,9 @@ def run_explorer():
     )
 
 
+# ============================================================
+# STATUS LOOP — [FIX v13.7.12] heartbeat do próprio validador
+# ============================================================
 def run_status_loop(chain, p2p, sync=None, pool=None, pool_client=None,
                     trust_net=None, node_id_short="", own_pubkey=""):
     log = get_logger("status")
@@ -878,6 +684,7 @@ def run_status_loop(chain, p2p, sync=None, pool=None, pool_client=None,
     while not _shutdown.is_set():
         time.sleep(30)
         try:
+            # [FIX v13.7.12] Renova last_seen do PRÓPRIO nó na TrustNetwork
             if trust_net is not None and own_pubkey:
                 try:
                     trust_net.heartbeat(own_pubkey)
@@ -1109,6 +916,7 @@ def _graceful_shutdown(log, trust_net=None) -> None:
 
 
 def main():
+    # <<< NOVO port_guard (v1.0): aborta se portas do BRN já estão em uso.
     if _HAS_PORT_GUARD and port_guard is not None:
         port_guard.check_brn_ports()
 
@@ -1228,6 +1036,7 @@ def main():
     chain.is_origin = is_origin
     log.info("Blockchain pronta (altura=" + str(chain.db.height()) + ")")
 
+    # ---- Trust Network ----
     trust_net = None
     if _HAS_TRUST:
         try:
@@ -1241,28 +1050,11 @@ def main():
             except AttributeError:
                 chain.trust_net = trust_net
             log.info("TrustNetwork: " + str(len(trust_net.nodes)) + " nós carregados")
-
-            # [v13.7.13] Atualiza last_seen de TODOS no boot
-            try:
-                import time as _t
-                _lock = getattr(trust_net, "_lock", None)
-                if _lock is not None:
-                    with _lock:
-                        for _n in trust_net.nodes.values():
-                            try:
-                                _n.last_seen = _t.time()
-                            except Exception:
-                                pass
-                else:
-                    for _n in trust_net.nodes.values():
-                        try:
-                            _n.last_seen = _t.time()
-                        except Exception:
-                            pass
-                log.info("[TrustNetwork] last_seen de %d nós atualizado no boot"
-                         % len(trust_net.nodes))
-            except Exception as _e:
-                log.warning("[TrustNetwork] falha atualizando last_seen: %s" % _e)
+            
+            # [FIX v13.7.13] Auto-limpeza de fantasmas no boot
+            removed = trust_net.remove_ghosts(max_age_s=300)
+            if removed > 0:
+                log.info(f"TrustNetwork: auto-limpeza removeu {removed} nós fantasmas")
 
         except Exception as e:
             log.warning("TrustNetwork desativada: " + str(e))
@@ -1289,6 +1081,7 @@ def main():
         if st == VERIFY_ERROR:
             log.warning("Verificação não conclusiva — seguindo com cautela")
 
+    # ---- P2P ----
     p2p = None
     if not args.no_p2p:
         try:
@@ -1307,6 +1100,7 @@ def main():
             log.error("Falha ao iniciar P2P: " + str(e))
             p2p = None
 
+    # ---- SK do validador local + coletor de assinaturas ----
     validator_sk = _load_validator_sk()
     if validator_sk is not None:
         try:
@@ -1322,17 +1116,7 @@ def main():
                         p2p_port_self = int(os.environ.get("BRN_P2P_PORT", "6001"))
                     except (TypeError, ValueError):
                         p2p_port_self = 6001
-                    _seu = os.environ.get("BRN_SEU_ENDERECO", "").strip()
-                    if _seu and ":" in _seu:
-                        self_addr = _seu
-                    elif WEB_HOST in ("0.0.0.0", "", "::", "127.0.0.1"):
-                        try:
-                            from p2p_unified import _get_local_ip
-                            self_addr = f"{_get_local_ip()}:{p2p_port_self}"
-                        except Exception:
-                            self_addr = f"127.0.0.1:{p2p_port_self}"
-                    else:
-                        self_addr = f"{WEB_HOST}:{p2p_port_self}"
+                    self_addr = f"{WEB_HOST}:{p2p_port_self}"
 
                     trust_net.register_node(
                         node_id=validator_sk.pub_hex,
@@ -1389,17 +1173,6 @@ def main():
     else:
         log.info("Validator SK não carregada — nó não vai assinar blocos")
 
-    # [v13.7.14] Auto-trust discovery (roda em background 15s depois)
-    if trust_net is not None and p2p is not None:
-        threading.Thread(
-            target=_thread_wrap(
-                "AutoTrust",
-                lambda: _auto_trust_discovery(chain, trust_net, p2p, log),
-            ),
-            daemon=True, name="AutoTrust",
-        ).start()
-        log.info("[AutoTrust] thread iniciada (descoberta em 15s)")
-
     if p2p is not None and trust_net is not None:
         try:
             collector = _make_sign_collector(p2p, trust_net)
@@ -1410,6 +1183,7 @@ def main():
         except Exception as e:
             log.warning(f"Falha configurando coletor: {e}")
 
+    # ---- Sync ----
     sync = None
     if not args.no_sync and p2p is not None:
         try:
@@ -1421,7 +1195,7 @@ def main():
                 pass
             sync.start_sync_loop()
             _register_service("sync", sync)
-            log.info("Sync iniciado (full mode)")
+            log.info("Sync iniciado (full mode, v9.1)")
         except ImportError as e:
             log.warning("sync_manager indisponível: " + str(e))
             sync = None
@@ -1431,6 +1205,7 @@ def main():
     elif args.no_sync:
         log.info("Sync: pulado por --no-sync")
 
+    # ---- ForkGuard ----
     fork_guard_started = False
     if sync is not None or p2p is not None:
         try:
@@ -1448,6 +1223,7 @@ def main():
     else:
         log.info("ForkGuard: pulado (sem sync nem p2p)")
 
+    # ---- Pool server ----
     pool = None
     if not args.no_pool and _pool_disponivel():
         try:
@@ -1460,32 +1236,7 @@ def main():
     elif args.no_pool:
         log.info("Pool: desativado por --no-pool")
 
-    offramp = None
-    if L2_ENABLED and btc_config is not None and getattr(btc_config, "BTC_WIF", "").strip():
-        try:
-            log.info("Iniciando OfframpManager (BRN -> BTC)...")
-            btc_sender = BTCSender(btc_config.BTC_WIF, network=btc_config.BTC_NETWORK)
-            offramp = OfframpManager(
-                db=chain.db,
-                blockchain=chain,
-                btc_sender=btc_sender,
-                rate_brn_per_btc=btc_config.BRN_PER_BTC,
-                fee_pct=btc_config.FEE_PERCENT,
-                min_brn_sats=btc_config.MIN_OFFRAMP_BRN_SATS,
-                max_brn_sats=btc_config.MAX_OFFRAMP_BRN_SATS,
-                min_btc_sats=btc_config.MIN_OFFRAMP_BTC_SATS,
-                ttl_s=btc_config.OFFRAMP_TTL_S,
-                treasury_brn=btc_config.BRN_TREASURY_ADDRESS,
-            )
-            offramp.start()
-            _register_service("offramp", offramp)
-            log.info("OfframpManager ativado. Cofre BTC: %s", btc_sender.get_address())
-        except Exception as e:
-            log.error(f"Falha ao iniciar OfframpManager: {e}")
-            offramp = None
-    else:
-        log.info("OfframpManager: desativado (BRN_BTC_WIF ausente ou L2 indisponível).")
-
+    # ---- HTTP ----
     http_app = _init_http_server(chain, log)
     if http_app is not None:
         threading.Thread(
@@ -1495,6 +1246,7 @@ def main():
     else:
         log.error("HTTP não pôde ser inicializado — seguindo sem API")
 
+    # ---- Injecoes no server.py ----
     if p2p is not None:
         _inject_into_server("p2p", p2p, log)
     else:
@@ -1515,52 +1267,26 @@ def main():
     else:
         log.info("Sem TrustNetwork — rotas /api/trust/* indisponiveis")
 
-    if offramp is not None:
-        _inject_into_server("offramp", offramp, log)
-    else:
-        log.info("Sem OfframpManager — rotas /api/l2/offramp/* indisponiveis")
+    # ---- PoolClient ----
+    disabled_pool_client = args.no_pool_client
+    if args.pool_client:
+        disabled_pool_client = False
 
     pool_client = _setup_pool_client_local(
         chain, pool, log,
+        disabled=disabled_pool_client,
         is_origin=is_origin,
     )
     if pool_client is not None:
         _register_service("pool_client", pool_client)
-        _inject_into_server("pool_client", pool_client, log)
 
-        if wants_pool_client:
-            try:
-                ok, msg = pool_client.start_mining()
-                if ok:
-                    log.info("PoolClient iniciado: " + msg)
-                    if p2p is not None and validator_sk is not None:
-                        try:
-                            if hasattr(p2p, "broadcast_validator_registration"):
-                                p2p.broadcast_validator_registration(
-                                    pubkey=validator_sk.pub_hex,
-                                    address=validator_sk.address,
-                                )
-                                log.info(
-                                    "[P2P] announce_validator enviado "
-                                    "(após start_mining)"
-                                )
-                        except Exception as e:
-                            log.warning(f"announce_validator falhou: {e}")
-                else:
-                    log.warning("PoolClient.start_mining falhou: " + msg)
-            except Exception as e:
-                log.warning("PoolClient.start_mining exceção: " + str(e))
-        else:
-            log.info("PoolClient preparado (NÃO iniciado). "
-                     "Use --pool-client ou clique em 'Minerar Pool' na GUI.")
-    else:
-        log.info("PoolClient: não preparado (carteira ausente?)")
-
+    # ---- Broadcast local -> P2P + ForkGuard ----
     _setup_local_miner_broadcast(chain, p2p, log)
 
+    # ---- Miner local ----
     quer_miner_local = bool(args.mine or AUTO_MINE)
     if quer_miner_local and (pool is not None or pool_client is not None):
-        log.warning("Miner local IGNORADO: pool/pool_client está ativo (evita forks).")
+        log.warning("Miner local IGNORADO: pool/pool_client esta ativo (evita forks).")
         quer_miner_local = False
 
     if quer_miner_local:
@@ -1594,6 +1320,7 @@ def main():
         except Exception as e:
             log.warning("Miner local falhou: " + str(e))
 
+    # ---- Status loop ----
     node_id_short = node_pub[:16]
     own_pubkey_for_hb = validator_sk.pub_hex if validator_sk is not None else ""
 
@@ -1609,6 +1336,7 @@ def main():
         daemon=True, name="StatusLoop",
     ).start()
 
+    # ---- Cliente aguarda genesis ----
     if not is_origin and chain.db.height() < 0:
         log.info("Aguardando genesis (timeout "
                  + str(CLIENT_BOOT_TIMEOUT) + "s)...")
@@ -1618,13 +1346,13 @@ def main():
                and not _shutdown.is_set()):
             time.sleep(1)
 
+    # ---- AUDIT ----
     _audit("node_start", {
         "mode":        "origin" if is_origin else "client",
         "l2":          bool(args.l2 and _l2_disponivel()),
         "mine":        bool(quer_miner_local),
         "pool":        bool(pool),
         "pool_client": bool(pool_client),
-        "pool_client_started": bool(wants_pool_client),
         "https":       os.environ.get("BRN_HTTPS") == "1",
         "height":      chain.db.height(),
         "node_id":     node_pub[:16],
@@ -1633,19 +1361,16 @@ def main():
         "trust":       bool(trust_net),
         "validator_sk": bool(validator_sk),
         "fork_guard":  bool(fork_guard_started),
-        "offramp":     bool(offramp),
+        "http_server": "waitress" if os.environ.get("BRN_USE_WAITRESS") == "1" else "flask-dev",
     })
 
     log.info("Nó pronto. Ctrl+C para encerrar.")
 
+    # ---- GUI ou headless ----
     try:
         if not cfg["headless"]:
             log.info("Abrindo carteira desktop (pywebview)...")
-            gui_ok = run_wallet_main_thread()
-            if not gui_ok:
-                log.warning("GUI falhou — caindo para headless (Ctrl+C para sair)")
-                while not _shutdown.is_set():
-                    time.sleep(1)
+            run_wallet_main_thread()
         else:
             log.info("Modo headless. Ctrl+C para encerrar.")
             while not _shutdown.is_set():
@@ -1653,6 +1378,7 @@ def main():
     except KeyboardInterrupt:
         log.info("Encerrando por Ctrl+C...")
 
+    # ---- shutdown ----
     log.info("Encerrando...")
     _shutdown.set()
     _graceful_shutdown(log, trust_net)
@@ -1667,6 +1393,9 @@ def main():
     return 0
 
 
+# ============================================================
+# SIGNAL HANDLERS
+# ============================================================
 _signal_count = 0
 
 
