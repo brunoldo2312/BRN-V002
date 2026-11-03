@@ -1,15 +1,17 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.19)
+server.py — Backend HTTP do nó BRN (v9.9.17)
 ================================================================
-v9.9.19 (2026-11-03):
-  [NEW] Rotas /api/pool/local_status, /api/pool/start_local
-        e /api/pool/stop_local. Elas controlam o PoolClient
-        injetado pelo main.py via set_pool_client_local(),
-        mantendo o mesmo estado entre GUI e API.
-v9.9.18 (2026-11-03):
-  [NEW] Rota /api/trust/download.
 v9.9.17 (2026-11-02):
-  [NEW] Endpoints miner/stop, pool/disconnect, consensus/validators.
+  [NEW] Rotas /api/pool/local_status, /api/pool/start_local e
+        /api/pool/stop_local. Compartilham o PoolClient injetado
+        pelo main.py via set_pool_client_local(). Sem essas rotas,
+        a GUI (app_wallet_v3 v3.9.2) recebia 404 e mostrava
+        "PoolClient[parado]" mesmo com o cliente minerando.
+  [NEW] set_pool_client_local() / _get_pool_client_local().
+v9.9.16 (2026-10-25):
+  [FIX CRÍTICO] Re-adicionada a rota /api/minhas-txs que havia sido
+                removida por engano na v9.9.15, causando erro 404.
+  [FIX] Mantidas as rotas /api/sync-info e /api/miner/status.
 ================================================================
 """
 from __future__ import annotations
@@ -93,14 +95,6 @@ BOOTSTRAP_HTTP_PORT   = int(
     )
 )
 
-L2_ENABLED = False
-btc_config = None
-try:
-    import btc_config
-    L2_ENABLED = True
-except ImportError:
-    pass
-
 
 def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> None:
     bootstrap_peers = os.environ.get("BRN_BOOTSTRAP_PEERS", "").split(",")
@@ -126,7 +120,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
             req = urllib.request.Request(
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
-                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.19"},
+                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.17"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -164,7 +158,7 @@ CHAIN = _LazyChain()
 
 
 # ============================================================
-# P2P / POOL / SYNC / TRUST / POOL_CLIENT MANAGERS
+# P2P / POOL / SYNC / TRUST / POOL_CLIENT LOCAIS
 # ============================================================
 _P2P_MANAGER = None
 _P2P_LOCK = threading.Lock()
@@ -174,6 +168,7 @@ def set_p2p_manager(p2p) -> None:
     log.info(f"server: P2PManager {'injetado' if p2p else 'removido'}")
 def _get_p2p_manager(): return _P2P_MANAGER
 
+
 _POOL_MANAGER = None
 _POOL_LOCK = threading.Lock()
 def set_pool_manager(pool) -> None:
@@ -181,6 +176,7 @@ def set_pool_manager(pool) -> None:
     with _POOL_LOCK: _POOL_MANAGER = pool
     log.info(f"server: PoolManager {'injetado' if pool else 'removido'}")
 def _get_pool_manager(): return _POOL_MANAGER
+
 
 _SYNC_MANAGER = None
 _SYNC_LOCK = threading.Lock()
@@ -190,6 +186,7 @@ def set_sync_manager(sync) -> None:
     log.info("server: sync_manager injetado")
 def _get_sync_manager(): return _SYNC_MANAGER
 
+
 _TRUST_NETWORK = None
 _TRUST_LOCK = threading.Lock()
 def set_trust_network(trust) -> None:
@@ -198,13 +195,19 @@ def set_trust_network(trust) -> None:
     log.info(f"server: TrustNetwork {'injetada' if trust else 'removida'}")
 def _get_trust_network(): return _TRUST_NETWORK
 
+
+# [v9.9.17] PoolClient local (compartilhado com main.py)
 _POOL_CLIENT_LOCAL = None
 _POOL_CLIENT_LOCK = threading.Lock()
+
 def set_pool_client_local(pc) -> None:
     global _POOL_CLIENT_LOCAL
-    with _POOL_CLIENT_LOCK: _POOL_CLIENT_LOCAL = pc
-    log.info(f"server: PoolClient local {'injetado' if pc else 'removido'}")
-def _get_pool_client_local(): return _POOL_CLIENT_LOCAL
+    with _POOL_CLIENT_LOCK:
+        _POOL_CLIENT_LOCAL = pc
+    log.info("server: PoolClient local %s", "injetado" if pc else "removido")
+
+def _get_pool_client_local():
+    return _POOL_CLIENT_LOCAL
 
 
 def _register_miner_in_trust(pubkey: str, address: str) -> None:
@@ -236,6 +239,9 @@ if CORS_ORIGINS:
     CORS(app, origins=CORS_ORIGINS)
 
 
+# ============================================================
+# ADMIN AUTH
+# ============================================================
 def _require_admin() -> bool:
     if not ADMIN_TOKEN: return True
     hdr = request.headers.get("Authorization", "")
@@ -253,7 +259,7 @@ def _admin_required(f):
 
 
 # ============================================================
-# CACHE
+# CACHE DE SALDOS E WALLETS
 # ============================================================
 _cache_saldos: dict = {}
 _cache_lock = threading.Lock()
@@ -368,6 +374,9 @@ def _pubkey_from_db_or_payload(addr: str, payload_pubkey: str = "", payload_sk: 
     return ""
 
 
+# ============================================================
+# CLEANUP LOOP
+# ============================================================
 def _cleanup_loop():
     while True:
         time.sleep(300)
@@ -451,7 +460,7 @@ def minhas_txs(address):
         if not WalletManager.validate_address(address): return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
         chain = _get_chain()
         current_height = chain.db.height()
-        
+
         try: _limit = int(request.args.get("limit", TXT_HISTORY_LIMIT_DEFAULT))
         except: _limit = TXT_HISTORY_LIMIT_DEFAULT
         _limit = max(1, min(_limit, TXT_HISTORY_LIMIT_MAX))
@@ -540,7 +549,7 @@ def transfer():
             inputs = [{"txid": u["txid"], "vout": u["vout"], "pubkey": w.pub_hex, "signature": ""} for u in escolhidos]
             nonce = chain.db.get_nonce_for_pubkey(w.pub_hex)
             tx = {"txid": "", "inputs": inputs, "outputs": outputs, "timestamp": int(time.time()), "locktime": 0, "nonce": nonce}
-            
+
             h = signing_hash(tx)
             for inp in tx["inputs"]: inp["signature"] = w.sign(h)
             tx["txid"] = calc_txid(tx)
@@ -603,7 +612,7 @@ def chain_info():
 def sync_info():
     result = {
         "ok": True,
-        "sync": {"percent": 100.0, "height": 0, "target": 0, "peers": 0},
+        "sync": {"percent": 100.0, "height": 0, "target": 0, "peers": 0, "work": 0},
         "miner_target": "",
         "bridge": {"onramp_ativo": False, "taxa": 0, "btc_cofre": ""},
     }
@@ -639,14 +648,6 @@ def sync_info():
 
     try:
         result["miner_target"] = chain.db.get_meta("miner_address") or ""
-    except Exception:
-        pass
-
-    try:
-        if L2_ENABLED and btc_config is not None:
-            result["bridge"]["onramp_ativo"] = True
-            result["bridge"]["taxa"] = int(getattr(btc_config, "BRN_PER_BTC", 0) or 0)
-            result["bridge"]["btc_cofre"] = getattr(btc_config, "BTC_RECEIVE_ADDRESS", "") or ""
     except Exception:
         pass
 
@@ -721,30 +722,17 @@ def miner_start():
         from miner_loop import get_miner
         m = get_miner(chain)
         is_origin_val = getattr(chain, "is_origin", (os.environ.get("BRN_IS_ORIGIN", "0") == "1"))
-        
+
         try: ok, msg = m.start(addr, pubkey, is_origin=bool(is_origin_val))
         except TypeError: ok, msg = m.start(addr, pubkey)
 
         if not ok: return jsonify({"ok": False, "msg": msg, **m.status()}), 400
-        
+
         st = m.status()
         st["rede_descentralizada"] = chain.rede_descentralizada
         st["fila_tamanho"] = len(chain.fila_mineracao)
         return jsonify({"ok": True, "msg": "Minerador iniciado.", **st})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
-
-
-@app.route("/api/miner/stop", methods=["POST"])
-@require_rate_limit("miner_stop")
-def miner_stop():
-    try:
-        from miner_loop import get_miner
-        m = get_miner(_get_chain())
-        ok, msg = m.stop()
-        audit_log("miner_stop_ok" if ok else "miner_stop_failed", {"ip": get_client_ip(), "msg": msg})
-        return jsonify({"ok": ok, "msg": msg, **m.status()})
-    except Exception as e:
-        return jsonify({"ok": False, "msg": str(e)}), 500
 
 
 @app.route("/api/miner/status", methods=["GET"])
@@ -777,7 +765,7 @@ def miner_status():
 
 
 # ============================================================
-# POOL (SERVER) — registra/submete shares no PoolManager
+# POOL (COM PROXY PARA CLIENTES)
 # ============================================================
 def _proxy_pool_request(path: str, method: str = "POST") -> tuple:
     remote_pool = os.environ.get("BRN_POOL_URL", "").strip().rstrip("/")
@@ -799,7 +787,7 @@ def _proxy_pool_request(path: str, method: str = "POST") -> tuple:
 
         with urllib.request.urlopen(req, timeout=100) as resp:
             return jsonify(json.loads(resp.read().decode("utf-8"))), resp.status
-            
+
     except urllib.error.HTTPError as e:
         try: return jsonify(json.loads(e.read().decode("utf-8"))), e.code
         except: return jsonify({"ok": False, "msg": f"HTTP {e.code} no pool remoto"}), e.code
@@ -858,17 +846,15 @@ def pool_submit():
     try:
         data = request.get_json(force=True) or {}
         miner_id = (data.get("miner_id") or "").strip()
-        job_id = (data.get("job_id") or "").strip()
         nonce = data.get("nonce")
         hash_hex = (data.get("hash") or "").strip()
 
         if not miner_id: return jsonify({"ok": False, "msg": "miner_id obrigatorio"}), 400
-        if not job_id: return jsonify({"ok": False, "msg": "job_id obrigatorio"}), 400
         if nonce is None: return jsonify({"ok": False, "msg": "nonce obrigatorio"}), 400
         try: nonce = int(nonce)
         except: return jsonify({"ok": False, "msg": "nonce invalido"}), 400
 
-        r = pool.submit_share(miner_id, job_id, nonce, hash_hex)
+        r = pool.submit_share(miner_id, nonce, hash_hex)
         return jsonify(r), (200 if r.get("ok") else 400)
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
@@ -908,62 +894,42 @@ def pool_miners():
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
 
-@app.route("/api/pool/disconnect", methods=["POST"])
-@require_rate_limit("pool_disconnect")
-def pool_disconnect():
-    pool = _get_pool_manager()
-    if pool is None: return _proxy_pool_request("/api/pool/disconnect", "POST")
-    try:
-        data = request.get_json(force=True) or {}
-        miner_id = (data.get("miner_id") or "").strip()
-        if not miner_id: return jsonify({"ok": False, "msg": "miner_id obrigatorio"}), 400
-        r = pool.disconnect(miner_id)
-        return jsonify(r)
-    except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
-
-
 # ============================================================
-# POOL CLIENT LOCAL (GUI) — [NEW v9.9.19]
+# [v9.9.17] POOL LOCAL
 # ============================================================
 @app.route("/api/pool/local_status", methods=["GET"])
-@require_rate_limit("pool_stats")
 def pool_local_status():
     pc = _get_pool_client_local()
     if pc is None:
-        return jsonify({"ok": True, "running": False, "msg": "PoolClient nao injetado pelo main.py"})
+        return jsonify({"ok": False, "running": False,
+                        "msg": "PoolClient nao injetado"}), 200
     try:
-        return jsonify(pc.status())
+        st = pc.status()
+        return jsonify({"ok": True, **st})
     except Exception as e:
-        return jsonify({"ok": False, "running": False, "msg": str(e)}), 500
+        return jsonify({"ok": False, "running": False, "msg": str(e)}), 200
 
 
 @app.route("/api/pool/start_local", methods=["POST"])
-@require_rate_limit("pool_register")
 def pool_start_local():
     pc = _get_pool_client_local()
     if pc is None:
-        return jsonify({"ok": False, "msg": "PoolClient nao injetado pelo main.py (rode com BRN_POOL_CLIENT=1)"}), 503
+        return jsonify({"ok": False, "msg": "PoolClient nao injetado"}), 503
     try:
         ok, msg = pc.start_mining()
-        return jsonify({
-            "ok": ok,
-            "msg": msg,
-            "miner_id": getattr(pc, "miner_id", ""),
-            "pool_url": getattr(pc, "pool_url", ""),
-        })
+        return jsonify({"ok": bool(ok), "msg": msg, **pc.status()})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
 @app.route("/api/pool/stop_local", methods=["POST"])
-@require_rate_limit("pool_register")
 def pool_stop_local():
     pc = _get_pool_client_local()
     if pc is None:
-        return jsonify({"ok": False, "msg": "PoolClient nao injetado pelo main.py"}), 503
+        return jsonify({"ok": False, "msg": "PoolClient nao injetado"}), 503
     try:
         ok, msg = pc.stop_mining()
-        return jsonify({"ok": ok, "msg": msg})
+        return jsonify({"ok": bool(ok), "msg": msg, **pc.status()})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
@@ -1013,23 +979,8 @@ def trust_nodes():
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
 
-@app.route("/api/trust/download", methods=["GET"])
-@require_rate_limit("trust_stats")
-def trust_download():
-    import os
-    trust_file = BASE_DIR / "trust_network.json"
-    if not trust_file.exists():
-        return jsonify({"ok": False, "msg": "trust_network.json não existe no Origin"}), 404
-    try:
-        with open(trust_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({"ok": False, "msg": str(e)}), 500
-
-
 # ============================================================
-# BLOCOS / PEERS / HEALTH / L2 / CONSENSO
+# BLOCOS / PEERS / HEALTH
 # ============================================================
 @app.route("/api/blocks", methods=["GET"])
 def api_get_blocks():
@@ -1042,18 +993,19 @@ def api_get_blocks():
     except Exception as e: return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/block/<int:height>", methods=["GET"])
-def api_get_block(height):
+@app.route("/api/latest", methods=["GET"])
+def api_latest_blocks():
     try:
-        block = _get_chain().db.get_block(height)
-        if block:
-            return jsonify(block)
-        return jsonify({"error": "Bloco não encontrado"}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        chain = _get_chain()
+        h = chain.db.height()
+        start = max(0, h - 14)
+        blocks = chain.db.get_blocks_range(start, h + 1)
+        return jsonify(list(reversed(blocks)))
+    except Exception as e: return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/peers/discovered", methods=["GET"])
+@app.route("/api/peers", methods=["GET"])
 @require_rate_limit("peers_discovered")
 def peers_discovered():
     try:
@@ -1068,8 +1020,61 @@ def peers_discovered():
             seen_ips.add(ip)
             out.append({"ip": ip, "address": addr, "height": int(p.get("height", 0) or 0), "last_seen": int(p.get("last_seen", 0) or 0)})
         out.sort(key=lambda x: x["last_seen"], reverse=True)
-        return jsonify({"ok": True, "count": len(out), "peers": out})
+        return jsonify({"ok": True, "count": len(out), "peers": out, "active": len(out)})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    try:
+        return jsonify({
+            "ok": True, "height": _get_chain().db.height(), "version": "9.9.17",
+            "chain_injected": _CHAIN is not None, "pool_injected": _POOL_MANAGER is not None,
+            "trust_injected": _TRUST_NETWORK is not None,
+            "pool_client_local": _POOL_CLIENT_LOCAL is not None,
+        })
+    except Exception as e: return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@atexit.register
+def _shutdown():
+    log.info("encerrando server…")
+    try: close_audit()
+    except: pass
+
+
+# ============================================================
+# PATCH v9.9.17
+# ============================================================
+@app.route("/api/miner/stop", methods=["POST"])
+@require_rate_limit("miner_stop")
+def miner_stop():
+    try:
+        from miner_loop import get_miner
+        m = get_miner(_get_chain())
+        ok, msg = m.stop()
+        audit_log("miner_stop_ok" if ok else "miner_stop_failed",
+                  {"ip": get_client_ip(), "msg": msg})
+        return jsonify({"ok": ok, "msg": msg, **m.status()})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/pool/disconnect", methods=["POST"])
+@require_rate_limit("pool_disconnect")
+def pool_disconnect():
+    pool = _get_pool_manager()
+    if pool is None:
+        return _proxy_pool_request("/api/pool/disconnect", "POST")
+    try:
+        data = request.get_json(force=True) or {}
+        miner_id = (data.get("miner_id") or "").strip()
+        if not miner_id:
+            return jsonify({"ok": False, "msg": "miner_id obrigatorio"}), 400
+        r = pool.disconnect(miner_id)
+        return jsonify(r)
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
 
 
 @app.route("/api/faucet", methods=["POST"])
@@ -1092,7 +1097,9 @@ def faucet():
             falta = int(FAUCET_COOLDOWN_S - (agora - hist[-1]))
             return jsonify({"ok": False, "msg": f"Aguarde {falta}s."}), 429
 
-        miner_pubkey = _pubkey_from_db_or_payload(addr, data.get("pubkey", ""), data.get("private_key", ""))
+        miner_pubkey = _pubkey_from_db_or_payload(
+            addr, data.get("pubkey", ""), data.get("private_key", ""),
+        )
         if not miner_pubkey:
             return jsonify({"ok": False, "msg": "Pubkey desconhecida."}), 400
 
@@ -1109,7 +1116,8 @@ def faucet():
         reward_sats = 0
         try:
             cb = block["transactions"][0]
-            reward_sats = sum(o.get("amount", 0) for o in cb.get("outputs", []) if o.get("address") == addr)
+            reward_sats = sum(o.get("amount", 0) for o in cb.get("outputs", [])
+                              if o.get("address") == addr)
         except Exception:
             pass
 
@@ -1133,7 +1141,8 @@ def verificar_recebimento(address, txid_str):
         chain = _get_chain()
         mem_tx = chain.db.get_mempool_tx(txid_str)
         if mem_tx:
-            valor = sum(o.get("amount", 0) for o in mem_tx.get("outputs", []) if o.get("address") == address)
+            valor = sum(o.get("amount", 0) for o in mem_tx.get("outputs", [])
+                        if o.get("address") == address)
             return jsonify({
                 "ok": True, "chegou": False, "status": "pending",
                 "valor": valor, "confirmacoes": 0, "block_height": None,
@@ -1148,7 +1157,8 @@ def verificar_recebimento(address, txid_str):
                 "msg": "TXID nao encontrado.",
             })
 
-        valor = sum(o.get("amount", 0) for o in chain_tx.get("outputs", []) if o.get("address") == address)
+        valor = sum(o.get("amount", 0) for o in chain_tx.get("outputs", [])
+                    if o.get("address") == address)
         altura = chain.db.height()
         confs = max(0, altura - block_height)
         chegou = valor > 0
@@ -1161,6 +1171,20 @@ def verificar_recebimento(address, txid_str):
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
+@app.route("/api/block/<int:height>", methods=["GET"])
+def api_get_block(height):
+    try:
+        block = _get_chain().db.get_block(height)
+        if block:
+            return jsonify(block)
+        return jsonify({"error": "Bloco não encontrado"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ============================================================
+# Multi-sig / Top 5 validadores
+# ============================================================
 @app.route("/api/consensus/validators", methods=["GET"])
 @require_rate_limit("status")
 def consensus_validators():
@@ -1227,26 +1251,42 @@ def block_signatures(height):
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
-@app.route("/health", methods=["GET"])
-def health():
+# ============================================================
+# WORK / TX STATUS
+# ============================================================
+@app.route("/api/work", methods=["GET"])
+def api_work():
     try:
+        chain = _get_chain()
         return jsonify({
-            "ok": True, "height": _get_chain().db.height(), "version": "9.9.19",
-            "chain_injected": _CHAIN is not None, "pool_injected": _POOL_MANAGER is not None,
-            "trust_injected": _TRUST_NETWORK is not None,
-            "pool_client_local_injected": _POOL_CLIENT_LOCAL is not None,
+            "ok": True,
+            "cumulative_work": chain.cumulative_work(),
+            "height": chain.db.height(),
+            "difficulty": chain.current_difficulty(),
         })
-    except Exception as e: return jsonify({"ok": False, "error": str(e)}), 500
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
 
 
-@atexit.register
-def _shutdown():
-    log.info("encerrando server…")
-    try: close_audit()
-    except: pass
+@app.route("/api/tx-status/<txid_str>", methods=["GET"])
+def api_tx_status(txid_str):
+    try:
+        if not txid_str or len(txid_str) != 64:
+            return jsonify({"ok": False, "msg": "txid invalido"}), 400
+        chain = _get_chain()
+        mem = chain.db.get_mempool_tx(txid_str)
+        if mem:
+            return jsonify({"ok": True, "status": "pending", "block_height": None, "confirmations": 0})
+        tx, bh = chain.db.get_tx_by_txid(txid_str)
+        if tx:
+            confs = max(0, chain.db.height() - (bh or 0))
+            return jsonify({"ok": True, "status": "confirmed", "block_height": bh, "confirmations": confs})
+        return jsonify({"ok": True, "status": "not_found", "block_height": None, "confirmations": 0})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.19 (Pool local + Trust + History)")
+    print(f"BRN Server v9.9.17 (Proxy + Trust + PoolClient Local)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
