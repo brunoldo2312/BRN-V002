@@ -1,23 +1,24 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.4.15 | Data: 02/11/2026
+Versão: 9.4.11 | Data: 03/11/2026
 ================================================================
-v9.4.15 (2026-11-02):
-  [FIX] Ignora checagem estrita de merkle e txid da coinbase
-        para blocos antigos (<= BRN_BOOTSTRAP_SKIP_SIGS_UNTIL).
-        Blocos da rede original foram minerados com uma serialização
-        de txid que não incluía o campo 'height', o que fazia o
-        hash local divergir. Como o hash do header já foi validado
-        pela PoW, aceitar o merkle do peer é seguro.
-  [FIX] accept_block agora retorna True se o bloco já existe com
-        o mesmo hash, evitando o erro "UNIQUE constraint failed"
-        quando dois peers enviam o mesmo bloco na mesma sessão.
-v9.4.14 (2026-11-02):
-  [FIX] Genesis (bloco #0) pula validação de merkle e txid.
-v9.4.13 (2026-11-02):
-  [FIX] Aceita o genesis do peer se o DB local estiver vazio.
-v9.4.12 (2026-11-02):
-  [FIX] Modo legado forçado até o bloco 2000.
-  [NEW] Aceleração C para compute_merkle_root.
+v9.4.11 (2026-11-03):
+  [NEW] BRN_ASSUME_VALID_UNTIL: até esta altura, blocos são
+        aceitos SEM validação completa (só hash + prev_hash +
+        altura). Sync ultra-rápido (padrão Bitcoin -assumevalid).
+        PoW, Merkle, multi-sig, txs e auth_tag são IGNORADOS no
+        intervalo. Use só em redes onde você confia nos peers.
+  [NEW] BRN_CHECKPOINT_AUTO_HEIGHT: na altura exata configurada
+        (ex: 4001), após aceitar o bloco, cria automaticamente um
+        checkpoint assinado. Isso trava o hash do bloco para
+        sempre e impede reorg abaixo daquela altura.
+        Recomendado usar junto com BRN_ASSUME_VALID_UNTIL:
+          ASSUME_VALID=4000 + CHECKPOINT_AUTO=4001
+        Assim: sync rápido até 4000, checkpoint em 4001, validação
+        estrita de 4001 em diante.
+v9.4.10 (2026-11-01):
+  [NEW] BRN_BOOTSTRAP_SKIP_SIGS_UNTIL (bypass de multi-sig).
+v9.4.9 (2026-11-01):
+  [FIX] _get_active_validators inclui SK local.
 ================================================================
 """
 from __future__ import annotations
@@ -36,11 +37,6 @@ import orjson
 from crypto import double_sha256, sha256
 from db import ChainDB
 
-try:
-    from brn_merkle import compute_merkle_root_fast
-    _HAS_MERKLE_C = True
-except ImportError:
-    _HAS_MERKLE_C = False
 
 log = logging.getLogger("blockchain")
 
@@ -77,9 +73,19 @@ BOOTSTRAP_TRUST_THRESHOLD = float(
     os.environ.get("BRN_BOOTSTRAP_TRUST_THRESHOLD", "500")
 )
 
-# [v9.4.12] Modo legado padrão até o bloco 2000 se não estiver no .env
+# [v9.4.10] Bypass de multi-sig ate uma altura.
 BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = int(
-    os.environ.get("BRN_BOOTSTRAP_SKIP_SIGS_UNTIL", "2000") or "2000"
+    os.environ.get("BRN_BOOTSTRAP_SKIP_SIGS_UNTIL", "0") or "0"
+)
+
+# [v9.4.11] Assume Valid: skip validação completa até esta altura.
+BRN_ASSUME_VALID_UNTIL = int(
+    os.environ.get("BRN_ASSUME_VALID_UNTIL", "0") or "0"
+)
+
+# [v9.4.11] Checkpoint automático na altura exata.
+BRN_CHECKPOINT_AUTO_HEIGHT = int(
+    os.environ.get("BRN_CHECKPOINT_AUTO_HEIGHT", "0") or "0"
 )
 
 if not (0.0 < VALIDATOR_QUORUM <= 1.0):
@@ -90,6 +96,23 @@ if BOOTSTRAP_TRUST_THRESHOLD < 0:
     BOOTSTRAP_TRUST_THRESHOLD = 500.0
 if BRN_BOOTSTRAP_SKIP_SIGS_UNTIL < 0:
     BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = 0
+if BRN_ASSUME_VALID_UNTIL < 0:
+    BRN_ASSUME_VALID_UNTIL = 0
+if BRN_CHECKPOINT_AUTO_HEIGHT < 0:
+    BRN_CHECKPOINT_AUTO_HEIGHT = 0
+
+if BRN_ASSUME_VALID_UNTIL > 0:
+    log.warning(
+        "[ASSUME-VALID] Ativo até altura %d — blocos nessa faixa pulam "
+        "validação completa (hash + prev_hash apenas). Rede confia nos peers.",
+        BRN_ASSUME_VALID_UNTIL,
+    )
+if BRN_CHECKPOINT_AUTO_HEIGHT > 0:
+    log.warning(
+        "[AUTO-CHECKPOINT] Checkpoint automático na altura %d "
+        "(trava hash para sempre).",
+        BRN_CHECKPOINT_AUTO_HEIGHT,
+    )
 
 GENESIS_PREV      = "0" * 64
 GENESIS_TIMESTAMP = 1700000000
@@ -138,6 +161,34 @@ def set_checkpoint_priv(priv) -> None:
 
 def get_checkpoints() -> dict:
     return dict(_checkpoints)
+
+
+def _create_auto_checkpoint(block: dict) -> None:
+    """[v9.4.11] Cria checkpoint assinado na altura BRN_CHECKPOINT_AUTO_HEIGHT."""
+    if _checkpoint_priv is None:
+        log.warning(
+            "[CHECKPOINT] #%d NÃO criado: _checkpoint_priv não configurada "
+            "(SK do validador ausente)",
+            block["height"],
+        )
+        return
+    try:
+        from checkpoints import sign_checkpoint, save_checkpoints, load_checkpoints
+        h = int(block["height"])
+        cp = sign_checkpoint(h, block["hash"], _checkpoint_priv)
+        if not cp:
+            log.warning("[CHECKPOINT] #%d sign_checkpoint retornou vazio", h)
+            return
+        cps = load_checkpoints()
+        cps[str(h)] = cp
+        save_checkpoints(cps)
+        _checkpoints[str(h)] = cp
+        log.warning(
+            "[CHECKPOINT] #%d criado automaticamente: %s...",
+            h, block["hash"][:32],
+        )
+    except Exception as e:
+        log.error("[CHECKPOINT] #%d falhou: %s", block["height"], e)
 
 
 def _verify_checkpoint_for_block(block) -> tuple:
@@ -252,12 +303,6 @@ def work_from_difficulty(difficulty) -> int:
 def compute_merkle_root(txids: list) -> str:
     if not txids:
         return "0" * 64
-    if _HAS_MERKLE_C:
-        try:
-            return compute_merkle_root_fast(txids)
-        except Exception as e:
-            log.warning(f"[MERKLE] C falhou, usando fallback Python: {e}")
-    
     layer = [bytes.fromhex(t) for t in txids]
     while len(layer) > 1:
         if len(layer) % 2:
@@ -392,11 +437,7 @@ class Blockchain:
         self.db = ChainDB(db_path)
         self.genesis_expected_hash = None
         self.network_secret = network_secret if network_secret is not None else NETWORK_SECRET
-
-        if require_auth_tag is None:
-            require_auth_tag = os.environ.get("BRN_REQUIRE_AUTH_TAG", "1") == "1"
-        self.require_auth_tag = bool(require_auth_tag) and bool(self.network_secret)
-
+        self.require_auth_tag = bool(self.network_secret) if require_auth_tag is None else bool(require_auth_tag)
         self.on_block_mined = None
         self._fork_signal = None
 
@@ -863,9 +904,7 @@ class Blockchain:
                         f"[SIG] Bloco #{block_h}: aceito em MODO "
                         f"BOOTSTRAP LOCAL ({got}/{required} sigs; "
                         f"único assinante é a própria SK local "
-                        f"{local_pk[:16]}…). Isso indica trust_network "
-                        f"incompleto ou validadores inativos — verifique "
-                        f"/api/trust/nodes."
+                        f"{local_pk[:16]}…)."
                     )
                     return True, ""
 
@@ -900,9 +939,7 @@ class Blockchain:
                         f"[SIG] Bloco #{block_h}: aceito em MODO BOOTSTRAP "
                         f"ESTENDIDO ({got}/{required} sigs; assinante "
                         f"{trusted_pubkey[:16]}… com trust_score>="
-                        f"{BOOTSTRAP_TRUST_THRESHOLD:.0f}). "
-                        f"Rede pode estar com validadores inativos — "
-                        f"verifique /api/trust/nodes no Origin."
+                        f"{BOOTSTRAP_TRUST_THRESHOLD:.0f})."
                     )
                     return True, ""
 
@@ -917,22 +954,38 @@ class Blockchain:
             f"({got_foreign} assinatura(s) estrangeira(s) ignorada(s))"
         )
 
+    # =================================================================
+    # [v9.4.11] validate_block com ASSUME-VALID até BRN_ASSUME_VALID_UNTIL
+    # =================================================================
     def validate_block(self, block: dict, prev_block=None, validators: Optional[list] = None) -> tuple:
-        is_genesis = (block["height"] == 0 and prev_block is None)
-        if is_genesis:
+        if block["height"] == 0 and prev_block is None:
             if (self.genesis_expected_hash and block["hash"] != self.genesis_expected_hash):
-                if self.db.height() < 0:
-                    log.warning(f"[Blockchain] Aceitando genesis do peer: {block['hash'][:16]}...")
-                    self.genesis_expected_hash = block["hash"]
-                else:
-                    return False, f"genesis nao corresponde ao esperado"
-
+                return False, f"genesis nao corresponde ao esperado"
         expected_prev = (prev_block["hash"] if prev_block else self.db.tip_hash())
         if block["prev_hash"] != expected_prev:
             return False, "prev_hash incorreto"
         expected_height = ((prev_block["height"] + 1) if prev_block else self.db.height() + 1)
         if block["height"] != expected_height:
             return False, "altura invalida"
+
+        # [v9.4.11] ASSUME-VALID: skip validation completa até N
+        h_int = int(block["height"])
+        if BRN_ASSUME_VALID_UNTIL > 0 and 0 < h_int <= BRN_ASSUME_VALID_UNTIL:
+            try:
+                h_calc = block_hash(
+                    block["prev_hash"], block["merkle"], block["timestamp"],
+                    block["nonce"], block["difficulty"],
+                )
+            except KeyError as e:
+                return False, f"campo ausente em #{h_int}: {e}"
+            if h_calc != block["hash"]:
+                return False, f"hash incorreto (assume_valid) em #{h_int}"
+            if h_int % 100 == 0 or h_int == 1:
+                log.info(
+                    "[ASSUME-VALID] #%d aceito (hash+prev_hash apenas; "
+                    "%d/%d)", h_int, h_int, BRN_ASSUME_VALID_UNTIL,
+                )
+            return True, "ok (assume_valid)"
 
         if block["height"] > MTP_WINDOW:
             try:
@@ -947,15 +1000,9 @@ class Blockchain:
         h = block_hash(block["prev_hash"], block["merkle"], block["timestamp"], block["nonce"], block["difficulty"])
         if h != block["hash"]:
             return False, "hash incorreto"
-
-        # [PATCH v9.4.15] Blocos legados (<= BRN_BOOTSTRAP_SKIP_SIGS_UNTIL)
-        # foram criados com serialização antiga do txid da coinbase. O hash
-        # do header já foi validado, então aceitar o merkle do peer é seguro.
-        is_legacy = (block["height"] <= BRN_BOOTSTRAP_SKIP_SIGS_UNTIL)
-        if not is_genesis and not is_legacy:
-            calc_merkle = compute_merkle_root([t["txid"] for t in block["transactions"]])
-            if calc_merkle != block["merkle"]:
-                return False, "merkle incorreto"
+        calc_merkle = compute_merkle_root([t["txid"] for t in block["transactions"]])
+        if calc_merkle != block["merkle"]:
+            return False, "merkle incorreto"
 
         ok_cp, msg_cp = _verify_checkpoint_for_block(block)
         if not ok_cp:
@@ -984,7 +1031,7 @@ class Blockchain:
         cb = block["transactions"][0]
         if cb["inputs"][0]["txid"] != "0" * 64:
             return False, "primeira tx nao e coinbase"
-        if not is_genesis and not is_legacy and cb.get("txid") != txid(cb):
+        if cb.get("txid") != txid(cb):
             return False, "coinbase txid invalido"
         if block["height"] > 0:
             for out in cb["outputs"]:
@@ -1007,6 +1054,9 @@ class Blockchain:
             return False, "coinbase acima do permitido"
         return True, "ok"
 
+    # =================================================================
+    # [v9.4.11] accept_block com auto-checkpoint em BRN_CHECKPOINT_AUTO_HEIGHT
+    # =================================================================
     def accept_block(self, block: dict, validators: Optional[list] = None) -> tuple:
         prev = self.db.get_block_by_hash(block["prev_hash"])
         ok, msg = self.validate_block(block, prev, validators=validators)
@@ -1016,9 +1066,7 @@ class Blockchain:
         try:
             existing = self.db.get_block(block["height"])
             if existing:
-                if existing.get("hash") == block.get("hash"):
-                    return True, block["hash"]
-                return False, f"Bloco #{block['height']} já existe com hash diferente"
+                return False, f"Bloco #{block['height']} já existe na blockchain"
         except Exception:
             pass
 
@@ -1026,6 +1074,10 @@ class Blockchain:
             self.db.add_block(block)
         except Exception as e:
             return False, f"Erro ao gravar bloco #{block['height']}: {e}"
+
+        # [v9.4.11] Auto-checkpoint em altura específica
+        if BRN_CHECKPOINT_AUTO_HEIGHT > 0 and int(block["height"]) == BRN_CHECKPOINT_AUTO_HEIGHT:
+            _create_auto_checkpoint(block)
 
         _maybe_sign_checkpoint(block)
         for i, t in enumerate(block["transactions"]):
@@ -1207,7 +1259,8 @@ class Blockchain:
             "validator_quorum": VALIDATOR_QUORUM,
             "bootstrap_trust_threshold": BOOTSTRAP_TRUST_THRESHOLD,
             "bootstrap_skip_sigs_until": BRN_BOOTSTRAP_SKIP_SIGS_UNTIL,
-            "require_auth_tag": self.require_auth_tag,
+            "assume_valid_until": BRN_ASSUME_VALID_UNTIL,
+            "checkpoint_auto_height": BRN_CHECKPOINT_AUTO_HEIGHT,
         }
 
 
