@@ -1,5 +1,11 @@
-"""trust_network.py — Rede de confiança e reputação do BRN (v3.7)
+"""trust_network.py — Rede de confiança e reputação do BRN (v3.8)
 ================================================================
+v3.8 (2026-11-03):
+  [NEW] remove_ghosts(max_age_s) — Auto-limpeza de nós inativos.
+        Remove da memória e dos arquivos (.json e .local.json) qualquer
+        nó que não dá sinal de vida há mais de X segundos (default 300s).
+        Chamado no boot pelo main.py para evitar que nós fantasmas
+        (ex: travados na altura 299) entrem no cálculo de quórum.
 v3.7 (2026-11-01):
   [NEW] Persistência cliente-local em trust_network.local.json.
         Clientes (is_origin=False) NÃO podem assinar o
@@ -24,7 +30,7 @@ v3.4 (2026-10-29):
 """
 from __future__ import annotations
 
-__version__ = "3.7"
+__version__ = "3.8"
 
 import json
 import logging
@@ -174,6 +180,36 @@ class TrustNetwork:
     def heartbeat_self(self, pubkey: str) -> None:
         """[v3.7] Convenience: renova last_seen do próprio nó."""
         self.heartbeat(pubkey)
+
+    def remove_ghosts(self, max_age_s: int = 300) -> int:
+        """
+        [v3.8] Remove nós fantasmas (que não dão sinal de vida há mais de X segundos).
+        Salva imediatamente os arquivos .json e .local.json limpos.
+        """
+        now = time.time()
+        to_remove = []
+        
+        with self._lock:
+            for nid, n in list(self.nodes.items()):
+                age = now - n.last_seen
+                
+                # Nunca remove o próprio Origin (a não ser que esteja realmente morto)
+                if self._origin_pubkey and n.public_key.lower() == self._origin_pubkey:
+                    continue
+                    
+                if age > max_age_s:
+                    to_remove.append((nid, age))
+            
+            for nid, age in to_remove:
+                log.info("[TrustNetwork] Auto-limpeza: removido fantasma %s… (inativo há %ds)", 
+                         nid[:12], int(age))
+                del self.nodes[nid]
+            
+            if to_remove:
+                self._mark_dirty()
+                self.flush() # Persiste as mudanças imediatamente
+                
+        return len(to_remove)
 
     def _prune_inactive(self) -> int:
         now = time.time()
