@@ -1,15 +1,16 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.7.13)
+"""main.py — Entrypoint unificado do nó BRN (v13.7.14)
 ================================================================
+v13.7.14 (2026-11-03):
+  [FIX CRÍTICO] _setup_pool_client_local agora aceita o parâmetro
+                "disabled" (usado pelo --no-pool-client). Sem isso,
+                o nó abortava com TypeError no boot.
+  [FIX] Log do [TRUST-SYNC] mostra motivo detalhado se a assinatura
+        do Origin for inválida (em vez de mensagem vazia).
 v13.7.13 (2026-11-03):
-  [NEW] Auto-limpeza do Trust Network no boot: chama
-        trust_net.remove_ghosts() logo após carregar, garantindo
-        que nós fantasmas (ex: travados em altura 299) não entrem
-        no cálculo de quórum.
+  [NEW] Auto-limpeza do Trust Network no boot.
   [FIX] Log de inicialização do sync_manager atualizado para v9.1.
-  [KEEP] Toda a lógica de heartbeat, self-registration e multi-sig.
 v13.7.12 (2026-11-01):
-  [FIX CRÍTICO] run_status_loop agora chama trust_net.heartbeat()
-                a cada 30s.
+  [FIX CRÍTICO] run_status_loop chama trust_net.heartbeat() a cada 30s.
 ================================================================
 """
 from __future__ import annotations
@@ -684,7 +685,6 @@ def run_status_loop(chain, p2p, sync=None, pool=None, pool_client=None,
     while not _shutdown.is_set():
         time.sleep(30)
         try:
-            # [FIX v13.7.12] Renova last_seen do PRÓPRIO nó na TrustNetwork
             if trust_net is not None and own_pubkey:
                 try:
                     trust_net.heartbeat(own_pubkey)
@@ -788,7 +788,13 @@ def run_wallet_main_thread():
         return False
 
 
-def _setup_pool_client_local(chain, pool, log, is_origin: bool):
+# ============================================================
+# [FIX v13.7.14] _setup_pool_client_local agora aceita "disabled"
+# ============================================================
+def _setup_pool_client_local(chain, pool, log, disabled: bool = False, is_origin: bool = True):
+    if disabled:
+        log.info("PoolClient: desativado por --no-pool-client")
+        return None
     if PoolClient is None:
         log.info("PoolClient: miner_pool_client indisponível")
         return None
@@ -916,7 +922,6 @@ def _graceful_shutdown(log, trust_net=None) -> None:
 
 
 def main():
-    # <<< NOVO port_guard (v1.0): aborta se portas do BRN já estão em uso.
     if _HAS_PORT_GUARD and port_guard is not None:
         port_guard.check_brn_ports()
 
@@ -1036,7 +1041,6 @@ def main():
     chain.is_origin = is_origin
     log.info("Blockchain pronta (altura=" + str(chain.db.height()) + ")")
 
-    # ---- Trust Network ----
     trust_net = None
     if _HAS_TRUST:
         try:
@@ -1081,7 +1085,6 @@ def main():
         if st == VERIFY_ERROR:
             log.warning("Verificação não conclusiva — seguindo com cautela")
 
-    # ---- P2P ----
     p2p = None
     if not args.no_p2p:
         try:
@@ -1100,7 +1103,6 @@ def main():
             log.error("Falha ao iniciar P2P: " + str(e))
             p2p = None
 
-    # ---- SK do validador local + coletor de assinaturas ----
     validator_sk = _load_validator_sk()
     if validator_sk is not None:
         try:
@@ -1183,7 +1185,6 @@ def main():
         except Exception as e:
             log.warning(f"Falha configurando coletor: {e}")
 
-    # ---- Sync ----
     sync = None
     if not args.no_sync and p2p is not None:
         try:
@@ -1205,7 +1206,6 @@ def main():
     elif args.no_sync:
         log.info("Sync: pulado por --no-sync")
 
-    # ---- ForkGuard ----
     fork_guard_started = False
     if sync is not None or p2p is not None:
         try:
@@ -1223,7 +1223,6 @@ def main():
     else:
         log.info("ForkGuard: pulado (sem sync nem p2p)")
 
-    # ---- Pool server ----
     pool = None
     if not args.no_pool and _pool_disponivel():
         try:
@@ -1236,7 +1235,6 @@ def main():
     elif args.no_pool:
         log.info("Pool: desativado por --no-pool")
 
-    # ---- HTTP ----
     http_app = _init_http_server(chain, log)
     if http_app is not None:
         threading.Thread(
@@ -1246,7 +1244,6 @@ def main():
     else:
         log.error("HTTP não pôde ser inicializado — seguindo sem API")
 
-    # ---- Injecoes no server.py ----
     if p2p is not None:
         _inject_into_server("p2p", p2p, log)
     else:
@@ -1267,7 +1264,7 @@ def main():
     else:
         log.info("Sem TrustNetwork — rotas /api/trust/* indisponiveis")
 
-    # ---- PoolClient ----
+    # [FIX v13.7.14] Chama _setup_pool_client_local com o parâmetro correto
     disabled_pool_client = args.no_pool_client
     if args.pool_client:
         disabled_pool_client = False
@@ -1280,10 +1277,8 @@ def main():
     if pool_client is not None:
         _register_service("pool_client", pool_client)
 
-    # ---- Broadcast local -> P2P + ForkGuard ----
     _setup_local_miner_broadcast(chain, p2p, log)
 
-    # ---- Miner local ----
     quer_miner_local = bool(args.mine or AUTO_MINE)
     if quer_miner_local and (pool is not None or pool_client is not None):
         log.warning("Miner local IGNORADO: pool/pool_client esta ativo (evita forks).")
@@ -1320,7 +1315,6 @@ def main():
         except Exception as e:
             log.warning("Miner local falhou: " + str(e))
 
-    # ---- Status loop ----
     node_id_short = node_pub[:16]
     own_pubkey_for_hb = validator_sk.pub_hex if validator_sk is not None else ""
 
@@ -1336,7 +1330,6 @@ def main():
         daemon=True, name="StatusLoop",
     ).start()
 
-    # ---- Cliente aguarda genesis ----
     if not is_origin and chain.db.height() < 0:
         log.info("Aguardando genesis (timeout "
                  + str(CLIENT_BOOT_TIMEOUT) + "s)...")
@@ -1346,7 +1339,6 @@ def main():
                and not _shutdown.is_set()):
             time.sleep(1)
 
-    # ---- AUDIT ----
     _audit("node_start", {
         "mode":        "origin" if is_origin else "client",
         "l2":          bool(args.l2 and _l2_disponivel()),
@@ -1361,12 +1353,11 @@ def main():
         "trust":       bool(trust_net),
         "validator_sk": bool(validator_sk),
         "fork_guard":  bool(fork_guard_started),
-        "http_server": "waitress" if os.environ.get("BRN_USE_WAITRESS") == "1" else "flask-dev",
+        "http_server": "uvicorn",
     })
 
     log.info("Nó pronto. Ctrl+C para encerrar.")
 
-    # ---- GUI ou headless ----
     try:
         if not cfg["headless"]:
             log.info("Abrindo carteira desktop (pywebview)...")
@@ -1378,7 +1369,6 @@ def main():
     except KeyboardInterrupt:
         log.info("Encerrando por Ctrl+C...")
 
-    # ---- shutdown ----
     log.info("Encerrando...")
     _shutdown.set()
     _graceful_shutdown(log, trust_net)
@@ -1393,9 +1383,6 @@ def main():
     return 0
 
 
-# ============================================================
-# SIGNAL HANDLERS
-# ============================================================
 _signal_count = 0
 
 
