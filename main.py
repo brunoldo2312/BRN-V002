@@ -1,16 +1,30 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.7.14)
+"""main.py — Entrypoint unificado do nó BRN (v13.7.13)
 ================================================================
-v13.7.14 (2026-11-03):
-  [FIX CRÍTICO] _setup_pool_client_local agora aceita o parâmetro
-                "disabled" (usado pelo --no-pool-client). Sem isso,
-                o nó abortava com TypeError no boot.
-  [FIX] Log do [TRUST-SYNC] mostra motivo detalhado se a assinatura
-        do Origin for inválida (em vez de mensagem vazia).
-v13.7.13 (2026-11-03):
-  [NEW] Auto-limpeza do Trust Network no boot.
-  [FIX] Log de inicialização do sync_manager atualizado para v9.1.
+v13.7.13 (2026-11-02):
+  [FIX CRÍTICO] No boot, atualiza last_seen de TODOS os nós do
+                trust_network.json. Sem isso, get_active_validators()
+                retornava [] após 5min (ACTIVE_TTL_SECONDS=300),
+                pois apenas a própria SK recebia heartbeat.
+  [NEW] Log explícito em _setup_pool_client_local:
+          - qual dos 5 motivos fez retornar None
+          - addr/pubkey lidos da carteira
+          - confirmação do PoolClient criado
+  [NEW] Log explícito em _inject_into_server:
+          - "[inject] <tipo>: OK (setter=<fn>)"
+          - "[inject] <tipo>: FALHOU — <motivo>"
 v13.7.12 (2026-11-01):
-  [FIX CRÍTICO] run_status_loop chama trust_net.heartbeat() a cada 30s.
+  [FIX CRÍTICO] run_status_loop agora chama trust_net.heartbeat()
+                a cada 30s.
+v13.7.11 (2026-11-01):
+  [FIX] Self-registration na TrustNetwork para TODOS os nós.
+  [FIX] register_node passa peer_addr.
+v13.7.10 (2026-10-30):
+  [FIX] Origin registrado na TrustNetwork.
+  [NEW] set_checkpoint_priv() chamado com Validator SK.
+  [FIX] PoolClient sempre injetado em server.py.
+  [FIX] Log duplicado "PoolClient preparado" consolidado.
+v13.7.9 (2026-10-30):
+  [PERF] run_http() otimizado.
 ================================================================
 """
 from __future__ import annotations
@@ -124,7 +138,6 @@ def _verificar_integridade_codigo() -> None:
             sys.exit(1)
 
 
-# <<< NOVO port_guard (v1.0): aborta se portas do BRN já estão em uso
 try:
     import port_guard
     _HAS_PORT_GUARD = True
@@ -565,16 +578,16 @@ def _inject_into_server(what: str, obj, log) -> bool:
         import server as _srv
         setter = getattr(_srv, setter_name, None)
         if setter is None:
-            log.warning(f"[inject] server.py NAO tem {setter_name}()")
+            log.warning(f"[inject] {what}: FALHOU — server.py NAO tem {setter_name}()")
             return False
         setter(obj)
-        log.info(f"[inject] {what} injetado em server.py")
+        log.info(f"[inject] {what}: OK (setter={setter_name}, obj={'None' if obj is None else type(obj).__name__})")
         return True
     except ImportError as e:
-        log.warning(f"[inject] server.py indisponível ({what}): {e}")
+        log.warning(f"[inject] {what}: FALHOU — server.py indisponível: {e}")
         return False
     except Exception as e:
-        log.warning(f"[inject] {what} falhou: {e}")
+        log.warning(f"[inject] {what}: FALHOU — exceção: {e}")
         return False
 
 
@@ -788,20 +801,15 @@ def run_wallet_main_thread():
         return False
 
 
-# ============================================================
-# [FIX v13.7.14] _setup_pool_client_local agora aceita "disabled"
-# ============================================================
-def _setup_pool_client_local(chain, pool, log, disabled: bool = False, is_origin: bool = True):
-    if disabled:
-        log.info("PoolClient: desativado por --no-pool-client")
-        return None
+def _setup_pool_client_local(chain, pool, log, is_origin: bool):
+    """[FIX v13.7.13] Cada motivo de retornar None é logado explicitamente."""
     if PoolClient is None:
-        log.info("PoolClient: miner_pool_client indisponível")
+        log.warning("PoolClient: RETORNANDO None — miner_pool_client indisponível (PoolClient is None)")
         return None
 
     wallet_pass = _resolve_wallet_password()
     if not wallet_pass:
-        log.warning("PoolClient: BRN_WALLET_SESSION_PASS/BRN_NODE_PASSWORD vazias")
+        log.warning("PoolClient: RETORNANDO None — BRN_WALLET_SESSION_PASS/BRN_NODE_PASSWORD vazias")
         return None
 
     addr = ""
@@ -813,14 +821,21 @@ def _setup_pool_client_local(chain, pool, log, disabled: bool = False, is_origin
             addr = (w.get("address") or "").strip()
             pub = (w.get("public_key") or w.get("pub_hex")
                    or w.get("pubkey") or "").strip()
+            log.info("PoolClient: carteira lida — address=%s... pub=%s... (len=%d)",
+                     addr[:20], pub[:24], len(pub))
         else:
-            log.info("PoolClient: current_wallet.enc não decifrou ("
-                     + str((w or {}).get("msg", "?")) + ")")
+            log.warning("PoolClient: RETORNANDO None — current_wallet.enc não decifrou: %s",
+                        (w or {}).get("msg", "?"))
+            return None
     except Exception as e:
-        log.warning("PoolClient: falha lendo current_wallet: " + str(e))
+        log.warning("PoolClient: RETORNANDO None — falha lendo current_wallet: %s", e)
+        return None
 
-    if not addr.startswith("brn1") or not pub:
-        log.warning("PoolClient: current_wallet.enc sem address/public_key")
+    if not addr.startswith("brn1"):
+        log.warning("PoolClient: RETORNANDO None — address não começa com 'brn1': %r", addr)
+        return None
+    if not pub:
+        log.warning("PoolClient: RETORNANDO None — pubkey vazia")
         return None
 
     if is_origin:
@@ -830,10 +845,11 @@ def _setup_pool_client_local(chain, pool, log, disabled: bool = False, is_origin
 
     try:
         pc = PoolClient(addr, pub, pool_url=pool_url)
-        log.debug("PoolClient instanciado: addr=" + addr[:16] + "...")
+        log.info("PoolClient: criado com sucesso — miner_id=%s pool_url=%s",
+                 getattr(pc, "miner_id", "?"), pool_url)
         return pc
     except Exception as e:
-        log.warning("PoolClient: exceção: " + str(e))
+        log.warning("PoolClient: RETORNANDO None — exceção no construtor: %s", e)
         return None
 
 
@@ -1054,11 +1070,28 @@ def main():
             except AttributeError:
                 chain.trust_net = trust_net
             log.info("TrustNetwork: " + str(len(trust_net.nodes)) + " nós carregados")
-            
-            # [FIX v13.7.13] Auto-limpeza de fantasmas no boot
-            removed = trust_net.remove_ghosts(max_age_s=300)
-            if removed > 0:
-                log.info(f"TrustNetwork: auto-limpeza removeu {removed} nós fantasmas")
+
+            # [FIX v13.7.13] Atualiza last_seen de TODOS os nós no boot.
+            try:
+                import time as _t
+                _lock = getattr(trust_net, "_lock", None)
+                if _lock is not None:
+                    with _lock:
+                        for _n in trust_net.nodes.values():
+                            try:
+                                _n.last_seen = _t.time()
+                            except Exception:
+                                pass
+                else:
+                    for _n in trust_net.nodes.values():
+                        try:
+                            _n.last_seen = _t.time()
+                        except Exception:
+                            pass
+                log.info("[TrustNetwork] last_seen de %d nós atualizado no boot"
+                         % len(trust_net.nodes))
+            except Exception as _e:
+                log.warning("[TrustNetwork] falha atualizando last_seen: %s" % _e)
 
         except Exception as e:
             log.warning("TrustNetwork desativada: " + str(e))
@@ -1118,7 +1151,17 @@ def main():
                         p2p_port_self = int(os.environ.get("BRN_P2P_PORT", "6001"))
                     except (TypeError, ValueError):
                         p2p_port_self = 6001
-                    self_addr = f"{WEB_HOST}:{p2p_port_self}"
+                    _seu = os.environ.get("BRN_SEU_ENDERECO", "").strip()
+                    if _seu and ":" in _seu:
+                        self_addr = _seu
+                    elif WEB_HOST in ("0.0.0.0", "", "::", "127.0.0.1"):
+                        try:
+                            from p2p_unified import _get_local_ip
+                            self_addr = f"{_get_local_ip()}:{p2p_port_self}"
+                        except Exception:
+                            self_addr = f"127.0.0.1:{p2p_port_self}"
+                    else:
+                        self_addr = f"{WEB_HOST}:{p2p_port_self}"
 
                     trust_net.register_node(
                         node_id=validator_sk.pub_hex,
@@ -1196,7 +1239,7 @@ def main():
                 pass
             sync.start_sync_loop()
             _register_service("sync", sync)
-            log.info("Sync iniciado (full mode, v9.1)")
+            log.info("Sync iniciado (full mode)")
         except ImportError as e:
             log.warning("sync_manager indisponível: " + str(e))
             sync = None
@@ -1235,6 +1278,32 @@ def main():
     elif args.no_pool:
         log.info("Pool: desativado por --no-pool")
 
+    offramp = None
+    if L2_ENABLED and btc_config is not None and getattr(btc_config, "BTC_WIF", "").strip():
+        try:
+            log.info("Iniciando OfframpManager (BRN -> BTC)...")
+            btc_sender = BTCSender(btc_config.BTC_WIF, network=btc_config.BTC_NETWORK)
+            offramp = OfframpManager(
+                db=chain.db,
+                blockchain=chain,
+                btc_sender=btc_sender,
+                rate_brn_per_btc=btc_config.BRN_PER_BTC,
+                fee_pct=btc_config.FEE_PERCENT,
+                min_brn_sats=btc_config.MIN_OFFRAMP_BRN_SATS,
+                max_brn_sats=btc_config.MAX_OFFRAMP_BRN_SATS,
+                min_btc_sats=btc_config.MIN_OFFRAMP_BTC_SATS,
+                ttl_s=btc_config.OFFRAMP_TTL_S,
+                treasury_brn=btc_config.BRN_TREASURY_ADDRESS,
+            )
+            offramp.start()
+            _register_service("offramp", offramp)
+            log.info("OfframpManager ativado. Cofre BTC: %s", btc_sender.get_address())
+        except Exception as e:
+            log.error(f"Falha ao iniciar OfframpManager: {e}")
+            offramp = None
+    else:
+        log.info("OfframpManager: desativado (BRN_BTC_WIF ausente ou L2 indisponível).")
+
     http_app = _init_http_server(chain, log)
     if http_app is not None:
         threading.Thread(
@@ -1264,24 +1333,52 @@ def main():
     else:
         log.info("Sem TrustNetwork — rotas /api/trust/* indisponiveis")
 
-    # [FIX v13.7.14] Chama _setup_pool_client_local com o parâmetro correto
-    disabled_pool_client = args.no_pool_client
-    if args.pool_client:
-        disabled_pool_client = False
+    if offramp is not None:
+        _inject_into_server("offramp", offramp, log)
+    else:
+        log.info("Sem OfframpManager — rotas /api/l2/offramp/* indisponiveis")
 
     pool_client = _setup_pool_client_local(
         chain, pool, log,
-        disabled=disabled_pool_client,
         is_origin=is_origin,
     )
     if pool_client is not None:
         _register_service("pool_client", pool_client)
+        _inject_into_server("pool_client", pool_client, log)
+
+        if wants_pool_client:
+            try:
+                ok, msg = pool_client.start_mining()
+                if ok:
+                    log.info("PoolClient iniciado: " + msg)
+                    if p2p is not None and validator_sk is not None:
+                        try:
+                            if hasattr(p2p, "broadcast_validator_registration"):
+                                p2p.broadcast_validator_registration(
+                                    pubkey=validator_sk.pub_hex,
+                                    address=validator_sk.address,
+                                )
+                                log.info(
+                                    "[P2P] announce_validator enviado "
+                                    "(após start_mining)"
+                                )
+                        except Exception as e:
+                            log.warning(f"announce_validator falhou: {e}")
+                else:
+                    log.warning("PoolClient.start_mining falhou: " + msg)
+            except Exception as e:
+                log.warning("PoolClient.start_mining exceção: " + str(e))
+        else:
+            log.info("PoolClient preparado (NÃO iniciado). "
+                     "Use --pool-client ou clique em 'Minerar Pool' na GUI.")
+    else:
+        log.warning("PoolClient: NAO INJETADO no server.py (ver logs '[PoolClient: RETORNANDO None' acima)")
 
     _setup_local_miner_broadcast(chain, p2p, log)
 
     quer_miner_local = bool(args.mine or AUTO_MINE)
     if quer_miner_local and (pool is not None or pool_client is not None):
-        log.warning("Miner local IGNORADO: pool/pool_client esta ativo (evita forks).")
+        log.warning("Miner local IGNORADO: pool/pool_client está ativo (evita forks).")
         quer_miner_local = False
 
     if quer_miner_local:
@@ -1345,6 +1442,7 @@ def main():
         "mine":        bool(quer_miner_local),
         "pool":        bool(pool),
         "pool_client": bool(pool_client),
+        "pool_client_started": bool(wants_pool_client),
         "https":       os.environ.get("BRN_HTTPS") == "1",
         "height":      chain.db.height(),
         "node_id":     node_pub[:16],
@@ -1353,7 +1451,7 @@ def main():
         "trust":       bool(trust_net),
         "validator_sk": bool(validator_sk),
         "fork_guard":  bool(fork_guard_started),
-        "http_server": "uvicorn",
+        "offramp":     bool(offramp),
     })
 
     log.info("Nó pronto. Ctrl+C para encerrar.")
@@ -1361,7 +1459,11 @@ def main():
     try:
         if not cfg["headless"]:
             log.info("Abrindo carteira desktop (pywebview)...")
-            run_wallet_main_thread()
+            gui_ok = run_wallet_main_thread()
+            if not gui_ok:
+                log.warning("GUI falhou — caindo para headless (Ctrl+C para sair)")
+                while not _shutdown.is_set():
+                    time.sleep(1)
         else:
             log.info("Modo headless. Ctrl+C para encerrar.")
             while not _shutdown.is_set():
