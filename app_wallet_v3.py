@@ -1,5 +1,12 @@
-"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.14)
+"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.15)
 ================================================================
+v3.15 (2026-11-03):
+  [NEW] _sync_sk_to_chain() — propaga a SK da carteira ativa para
+        chain._local_validator_sk e trust_net via endpoint
+        /api/wallet/set_validator_sk (server.py v1.1+).
+        Chamado em create_and_unlock, unlock_wallet e load_wallet.
+        Resolve o gap em que abrir a GUI não atualizava a chain
+        sem reiniciar o nó.
 v3.14 (2026-11-03):
   [FIX] pool_status() injeta dados do último job se o atual estiver
         vazio. Impede GUI mostrar "—" no Vardiff durante troca de jobs.
@@ -18,7 +25,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "3.14"
+__version__ = "3.15"
 
 try:
     import requests
@@ -39,6 +46,35 @@ RETRY_DELAY  = float(os.environ.get("BRN_API_RETRY_DELAY", "0.5"))
 
 
 _WALLET_SESSION: dict = {}
+
+
+def _sync_sk_to_chain(sk_hex: str, address: str = "", pubkey: str = "") -> dict:
+    """
+    [v3.15] Propaga a SK ativa para o nó em runtime:
+      - atualiza chain._local_validator_sk (sem restart)
+      - registra/atualiza nó na TrustNetwork (last_seen, pubkey)
+    Chamado quando a carteira muda via GUI.
+    """
+    if not sk_hex:
+        return {"ok": False, "msg": "sk vazio"}
+    try:
+        r = _post("/api/wallet/set_validator_sk", {
+            "sk_hex": sk_hex,
+            "address": address or "",
+            "pubkey":  pubkey or "",
+        }, timeout=10.0)
+        if not r.get("ok"):
+            log.warning("_sync_sk_to_chain falhou: %s", r.get("msg"))
+        else:
+            log.info(
+                "_sync_sk_to_chain ok — pk=%s… trust_synced=%s",
+                (r.get("pubkey") or "")[:16],
+                r.get("trust_synced"),
+            )
+        return r
+    except Exception as e:
+        log.warning("_sync_sk_to_chain exception: %s", e)
+        return {"ok": False, "msg": str(e)}
 
 
 def _post(path: str, body: dict, timeout: float = None,
@@ -151,6 +187,8 @@ class WalletApi:
             if not r.get("ok"):
                 return {"ok": False, "msg": "Erro ao salvar: " + str(r.get("msg", ""))}
             _WALLET_SESSION.update(data)
+            # [v3.15] sincroniza SK com chain + trust em runtime
+            _sync_sk_to_chain(w.priv_hex, w.address, w.pub_hex)
             return {"ok": True, "address": w.address}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
@@ -166,6 +204,13 @@ class WalletApi:
                 _WALLET_SESSION["public_key"]  = (
                     r.get("public_key") or r.get("pubkey") or r.get("pub_hex") or ""
                 )
+                # [v3.15] sincroniza SK com chain + trust em runtime
+                if _WALLET_SESSION.get("private_key"):
+                    _sync_sk_to_chain(
+                        _WALLET_SESSION["private_key"],
+                        _WALLET_SESSION.get("address", ""),
+                        _WALLET_SESSION.get("public_key", ""),
+                    )
                 return {"ok": True, "address": _WALLET_SESSION["address"]}
             return {"ok": False, "msg": r.get("msg", "Senha incorreta")}
         except Exception as e:
@@ -367,6 +412,13 @@ class WalletApi:
                 _WALLET_SESSION["public_key"]  = (
                     r.get("public_key") or r.get("pubkey") or r.get("pub_hex") or ""
                 )
+                # [v3.15] sincroniza SK com chain + trust em runtime
+                if _WALLET_SESSION["private_key"]:
+                    _sync_sk_to_chain(
+                        _WALLET_SESSION["private_key"],
+                        _WALLET_SESSION["address"],
+                        _WALLET_SESSION["public_key"],
+                    )
             return r or {"ok": False, "msg": "resposta vazia"}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
