@@ -9,7 +9,7 @@ echo   INICIANDO BRN NODE - CLIENTE
 echo ============================================================
 echo.
 
-echo [0/5] Carregando configuracoes de rede e senhas...
+echo [0/6] Carregando configuracoes de rede e senhas...
 set "BRN_NETWORK_SECRET=088641fd110a36bcb3a1bd3d497d8cd68287bf10e49eedfc52d1fc0329ef8d12"
 set "BRN_NODE_PASSWORD=senha-forte-windows-2026"
 set "BRN_WALLET_SESSION_PASS=carteira-windows-2026"
@@ -39,24 +39,31 @@ set "BRN_SKIP_VERIFY=1"
 set "BRN_TCP_TIMEOUT=30.0"
 set "BRN_ASSUME_VALID_UNTIL=4001"
 set "BRN_CHECKPOINT_AUTO_HEIGHT=4001"
+
+REM ─── [NOVO] PBFT ───────────────────────────────────────────
+set "BRN_PBFT_ENABLED=1"
+set "BRN_PBFT_ENFORCE=0"
+set "BRN_PBFT_TIMEOUT=15"
+set "BRN_PBFT_MAX_STATES=100"
+REM ───────────────────────────────────────────────────────────
 echo OK.
 echo.
 
-echo [1/5] Verificando Python...
+echo [1/6] Verificando Python...
 where python >nul 2>&1
 if errorlevel 1 (
     echo ERRO: Python nao encontrado no PATH.
     pause
-    exit /b
+    exit /b 1
 )
 python --version
 echo OK.
 echo.
 
-echo [2/5] Verificando dependencias (isso pode demorar)...
+echo [2/6] Verificando dependencias (isso pode demorar)...
 python -m pip install --upgrade pip --quiet
 
-REM Corrige o erro do anyio 4.15 que quebra a interface grafica
+REM Corrige o bug do anyio 4.15 que quebra a GUI
 python -c "import anyio; print(anyio.__version__)" 2>nul | findstr "4.15" >nul
 if not errorlevel 1 (
     echo Corrigindo versao do anyio...
@@ -64,8 +71,6 @@ if not errorlevel 1 (
     python -m pip install "starlette<0.40.0" --quiet
 )
 
-REM Instala os pacotes baseados no seu requirements.txt + os necessarios pro Windows
-REM Nota: Corrigido "p2webview" para "pywebview"
 set "PKGS=cryptography argon2-cffi orjson requests fastapi flask flask-cors waitress mnemonic pymongo pywebview pythonnet bitcoinlib zeroconf"
 
 for %%P in (!PKGS!) do (
@@ -78,24 +83,15 @@ for %%P in (!PKGS!) do (
     )
 )
 
-REM Uvicorn com os extras "standard" (do requirements.txt)
 python -c "import uvicorn" >nul 2>&1
 if errorlevel 1 (
     echo Instalando uvicorn[standard]...
     python -m pip install --quiet "uvicorn[standard]"
 )
-
-REM Instala o minerador C (se o arquivo existir)
-if exist "brn_miner.c" (
-    python -c "import brn_miner" >nul 2>&1
-    if errorlevel 1 (
-        echo [AVISO] Minerador C nao compilado. Usando Python puro.
-    )
-)
 echo OK.
 echo.
 
-echo [3/5] Verificando Tailscale...
+echo [3/6] Verificando Tailscale...
 set "TS_PATH=C:\Program Files\Tailscale\tailscale.exe"
 if not exist "%TS_PATH%" set "TS_PATH=tailscale"
 "%TS_PATH%" status >nul 2>&1
@@ -107,7 +103,7 @@ if errorlevel 1 (
 echo OK.
 echo.
 
-echo [4/5] Verificando blockchain e carteira...
+echo [4/6] Verificando blockchain e carteira...
 python -c "from db import ChainDB; d=ChainDB('brn_v2_chain.db'); print('Altura local:', d.height()); d.close()"
 
 if not exist "current_wallet.enc" (
@@ -117,14 +113,54 @@ if not exist "current_wallet.enc" (
 echo OK.
 echo.
 
-echo [5/5] Iniciando o no...
+echo [5/6] Verificando suporte a PBFT...
+set "HAS_PBFT=0"
+if exist "pbft_consensus.py" (
+    python -c "import pbft_consensus" >nul 2>&1
+    if not errorlevel 1 (
+        findstr /C:"_setup_pbft" main.py >nul 2>&1
+        if not errorlevel 1 (
+            set "HAS_PBFT=1"
+            echo [ok] pbft_consensus.py presente e main.py integrado
+        ) else (
+            echo [AVISO] main.py NAO tem _setup_pbft^(^) - PBFT sera desativado
+        )
+    ) else (
+        echo [AVISO] pbft_consensus.py nao importavel - PBFT desativado
+    )
+) else (
+    echo [AVISO] pbft_consensus.py ausente - PBFT desativado
+)
+
+if "!HAS_PBFT!"=="0" (
+    set "BRN_PBFT_ENABLED=0"
+    echo [INFO] BRN_PBFT_ENABLED forcado para 0 ^(multi-sig antigo continua^)
+) else (
+    echo [ok] PBFT ligado ^(ENABLED=1 ENFORCE=0^)
+)
+echo OK.
+echo.
+
+echo [6/6] Iniciando o no...
 echo ============================================================
 echo   MODO: GUI (Carteira Grafica)
 echo   STATUS: AGUARDANDO CLIQUE NO BOTAO "MINERAR POOL"
+if "!HAS_PBFT!"=="1" (
+    echo   PBFT: ATIVO ^(quorum 2f+1^)
+) else (
+    echo   PBFT: desligado
+)
 echo ============================================================
 echo.
 
-python main.py --skip-verify
+REM [FIX] So passa --skip-verify se o main.py aceitar esse argumento
+set "MAIN_ARGS="
+python main.py --help 2>&1 | findstr /C:"--skip-verify" >nul
+if not errorlevel 1 set "MAIN_ARGS=--skip-verify"
+
+echo [bat] python main.py !MAIN_ARGS!
+echo.
+python main.py !MAIN_ARGS!
 
 echo.
 echo ============================================================
