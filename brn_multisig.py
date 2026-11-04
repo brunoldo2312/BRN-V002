@@ -1,18 +1,32 @@
-"""brn_multisig.py — Multi-sig drop-in para o BRN (v2)
+"""brn_multisig.py — Multi-sig drop-in para o BRN (v2.1)
+================================================================
+v2.1 (2026-11-04):
+  [FIX CRÍTICO] install_multisig() agora checa chain.is_origin antes
+                de chamar trust.set_origin_pubkey(). Antes, o cliente
+                (Windows/Mayra) sobrescrevia o _origin_pubkey correto
+                (do trust_network.json, assinado pelo Origin Ubuntu)
+                com a própria pubkey local. Resultado:
+                  - get_active_validators() do cliente tratava ele
+                    mesmo como "origin ativo" indevidamente
+                  - Log dizia "trust._origin_pubkey = 020a23cc..."
+                    (Mayra) em vez de 021de63b... (Ubuntu)
+                Agora:
+                  - Origin: set_origin_pubkey(sk.pub_hex)  (correto)
+                  - Cliente: preserva o origin_pubkey do arquivo
+v2.0 (2026-11-04):
+  - Coletor paralelo com ThreadPoolExecutor (6 peers em ~1s)
+  - accept_block autosign para o pool (só no origin)
+  - set_origin_pubkey sem check is_origin  ← BUG
+v1.0:
+  - Versão inicial sequencial
+================================================================
 
-Instala, numa única chamada, todos os componentes de co-assinatura:
-
-  1. chain.set_sign_collector(...)          — para mine_block() (minerador local)
-  2. chain.accept_block = auto-sign wrapper — para o pool (accept_block direto)
-  3. trust.set_origin_pubkey(...)           — corrige "Origin ausente"
-  4. chain.set_trust_net(trust)             — se ainda não estiver injetado
-
-Uso no main.py (2 linhas, após p2p.start() e set_local_validator_sk):
+Uso no main.py (após p2p.start() e set_local_validator_sk):
 
     from brn_multisig import ensure_multisig
     ensure_multisig(chain, sk, p2p, trust=trust, logger=log)
 
-Idempotente: rodar 2× não duplica wrapper nem collector.
+Idempotente: rodar 2x não duplica wrapper nem collector.
 """
 from __future__ import annotations
 
@@ -23,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 log = logging.getLogger("multisig")
 
-__version__ = "2.0"
+__version__ = "2.1"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -31,7 +45,7 @@ __version__ = "2.0"
 # ═══════════════════════════════════════════════════════════════
 def build_collector(chain, sk, p2p, timeout: float = 5.0,
                     max_workers: int = 8, logger=None):
-    """Retorna uma função collector(block) → list[{pubkey, signature}].
+    """Retorna uma função collector(block) -> list[{pubkey, signature}].
 
     A função:
       - assina localmente (1 sig imediata)
@@ -82,7 +96,7 @@ def build_collector(chain, sk, p2p, timeout: float = 5.0,
                     except Exception:
                         pass
 
-        # 3) dedup por pubkey (mantém a primeira ocorrência)
+        # 3) dedup por pubkey
         seen = set()
         out = []
         for s in sigs:
@@ -195,14 +209,15 @@ def install_multisig(chain, sk, p2p, trust=None,
                      timeout: float = 5.0,
                      install_accept_patch: bool = True,
                      logger=None):
-    """Instala o sign_collector + (opcional) accept_block autosign +
-    origin_pubkey. Retorna o collector.
+    """Instala sign_collector + (opcional) accept_block autosign +
+    origin_pubkey (só se for origin).
 
     Pré-requisitos:
       - chain: Blockchain já aberta
       - sk:    Wallet com a SK local já carregada
       - p2p:   P2PManager já startado (discovery ativo)
-      - trust: TrustNetwork (opcional — se dado, set_origin_pubkey)
+      - trust: TrustNetwork (opcional — se dado, set_origin_pubkey
+               só se chain.is_origin)
     """
     L = logger or log
 
@@ -215,7 +230,7 @@ def install_multisig(chain, sk, p2p, trust=None,
         L.error("[multisig] atualize blockchain.py — sem isso multi-sig nunca funciona")
         return None
 
-    # 1) collector
+    # 1) collector PARALELO
     collector = build_collector(chain, sk, p2p, timeout=timeout, logger=L)
     chain.set_sign_collector(collector)
 
@@ -226,20 +241,31 @@ def install_multisig(chain, sk, p2p, trust=None,
         pass
     L.info("[multisig] sign_collector instalado (%d peer(s) alvo)", n_peers)
 
-    # 2) origin_pubkey
+    # 2) origin_pubkey — [FIX v2.1] SÓ se for origin
+    is_origin = bool(getattr(chain, "is_origin", False))
     if trust is not None and hasattr(trust, "set_origin_pubkey"):
-        try:
-            trust.set_origin_pubkey(sk.pub_hex)
-            L.info("[multisig] trust._origin_pubkey = %s...", sk.pub_hex[:16])
-        except Exception as e:
-            L.warning("[multisig] set_origin_pubkey: %s", e)
+        if is_origin:
+            try:
+                trust.set_origin_pubkey(sk.pub_hex)
+                L.info("[multisig] trust._origin_pubkey = %s... (origin)",
+                       sk.pub_hex[:16])
+            except Exception as e:
+                L.warning("[multisig] set_origin_pubkey: %s", e)
+        else:
+            # Cliente: respeita o origin_pubkey que veio do trust_network.json
+            cur = getattr(trust, "_origin_pubkey", "") or ""
+            L.info("[multisig] cliente — preservando trust._origin_pubkey=%s...",
+                   cur[:16] if cur else "(vazio)")
 
-    # 3) patch do accept_block (para o pool)
-    if install_accept_patch:
+    # 3) patch do accept_block (só se origin)
+    if install_accept_patch and is_origin:
         try:
             install_accept_block_autosign(chain, logger=L)
         except Exception as e:
             L.warning("[multisig] accept_block auto-sign: %s", e)
+    elif not is_origin:
+        L.info("[multisig] cliente — accept_block autosign NÃO instalado "
+               "(é só para origin)")
 
     # 4) teste rápido com o tip local (não bloqueia se falhar)
     try:
@@ -254,11 +280,17 @@ def install_multisig(chain, sk, p2p, trust=None,
                     "[multisig] teste com bloco #%d: %d assinatura(s) em %.0fms",
                     h, len(sigs), dt_ms,
                 )
-                if len(sigs) < 2:
+                if len(sigs) < 2 and is_origin:
                     L.warning(
-                        "[multisig] ATENÇÃO: só %d assinatura(s) no teste. "
-                        "Se for 1, o tip local não está no top-5 do trust. "
-                        "Rode: python3 populate_trust.py (ou fix_all.py)",
+                        "[multisig] ATENÇÃO: só %d assinatura(s) no teste "
+                        "(origin). Se for 1, o tip não está no top-5 do trust "
+                        "ou os peers estão em altura diferente.",
+                        len(sigs),
+                    )
+                elif len(sigs) < 2 and not is_origin:
+                    L.info(
+                        "[multisig] cliente — %d assinatura(s) no teste "
+                        "(normal se peers estão em altura diferente)",
                         len(sigs),
                     )
     except Exception as e:
@@ -293,6 +325,7 @@ def status(chain) -> dict:
         "accept_block_autosign": False,
         "trust_net_installed": False,
         "local_sk_installed": False,
+        "is_origin": False,
         "origin_pubkey": "",
         "top_validators": 0,
     }
@@ -306,6 +339,7 @@ def status(chain) -> dict:
     out["accept_block_autosign"] = bool(
         getattr(chain, "_accept_block_autosign_installed", False)
     )
+    out["is_origin"] = bool(getattr(chain, "is_origin", False))
 
     trust = getattr(chain, "trust_net", None)
     if trust is not None:
