@@ -1,5 +1,15 @@
-"""main.py — Entrypoint unificado do nó BRN (v13.7.13)
+"""main.py — Entrypoint unificado do nó BRN (v13.7.14)
 ================================================================
+v13.7.14 (2026-11-04):
+  [FIX CRÍTICO] Substituído _make_sign_collector (sequencial, 6s,
+                sem accept_block autosign) por ensure_multisig() do
+                brn_multisig v2 (paralelo, ~1s, com accept_block
+                autosign para o pool). Resolve:
+                  - pool em loop "sem assinaturas válidas"
+                  - blocos minerados com 1 sig em vez de 4
+                  - tempo de coleta 6s → 1s
+  [NEW] Fallback: se brn_multisig indisponível, mantém o collector
+        antigo + tenta install_accept_block_autosign isolado.
 v13.7.13 (2026-11-02):
   [FIX CRÍTICO] No boot, atualiza last_seen de TODOS os nós do
                 trust_network.json. Sem isso, get_active_validators()
@@ -1218,15 +1228,37 @@ def main():
     else:
         log.info("Validator SK não carregada — nó não vai assinar blocos")
 
+    # ── Multi-sig: instala collector paralelo + accept_block autosign ──
+    # [v13.7.14] Substitui o _make_sign_collector (sequencial, sem
+    # accept_block autosign) pelo ensure_multisig() do brn_multisig v2.
     if p2p is not None and trust_net is not None:
-        try:
-            collector = _make_sign_collector(p2p, trust_net)
-            chain.set_sign_collector(collector)
-            log.info("Coletor de assinaturas P2P configurado")
-        except AttributeError:
-            chain._sign_collector = _make_sign_collector(p2p, trust_net)
-        except Exception as e:
-            log.warning(f"Falha configurando coletor: {e}")
+        if validator_sk is not None:
+            try:
+                from brn_multisig import ensure_multisig
+                ensure_multisig(chain, validator_sk, p2p,
+                                trust=trust_net, logger=log)
+            except Exception as e:
+                log.warning(f"[multisig] falhou, usando fallback: {e}")
+                try:
+                    collector = _make_sign_collector(p2p, trust_net)
+                    chain.set_sign_collector(collector)
+                    try:
+                        from brn_multisig import install_accept_block_autosign
+                        install_accept_block_autosign(chain, logger=log)
+                    except Exception as _e2:
+                        log.warning(f"[multisig] autosign fallback falhou: {_e2}")
+                    log.info("Coletor fallback + accept_block autosign instalados")
+                except Exception as e2:
+                    log.warning(f"[multisig] fallback também falhou: {e2}")
+        else:
+            # Sem SK local: coleciona apenas dos peers (modo cliente passivo)
+            try:
+                collector = _make_sign_collector(p2p, trust_net)
+                chain.set_sign_collector(collector)
+                log.info("Coletor de assinaturas P2P configurado (sem SK local)")
+            except Exception as e:
+                log.warning(f"Falha configurando coletor: {e}")
+    # ─────────────────────────────────────────────────────────────
 
     sync = None
     if not args.no_sync and p2p is not None:
