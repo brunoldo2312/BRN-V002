@@ -1,9 +1,19 @@
-"""port_guard.py — aborta o boot se portas do BRN já estão em uso (v1.0)
+"""port_guard.py — aborta o boot se portas do BRN já estão em uso (v1.1)
 
-Motivo: main.py v13.7.12 engolia o erro de "Address already in use"
-no P2P e continuava como se tivesse subido — resultado: HTTP, P2P e
-Explorer caíam em silêncio, e PoolClient minerava para o processo
-antigo sem o operador perceber.
+v1.1 (2026-11-04):
+  [FIX CRÍTICO] print com '✓' (U+2713) crashava em Windows pt-BR
+                (cp1252). Substituído por 'OK' e adicionado
+                sys.stdout.reconfigure(encoding="utf-8") no topo.
+  [FIX] Windows: SO_REUSEADDR deixava bind() passar mesmo com porta
+        ocupada (comportamento do Winsock). Agora usa
+        SO_EXCLUSIVEADDRUSE quando os.name == "nt", que detecta
+        corretamente.
+  [NEW] _diagnostico_porta() ganhou fallback com psutil (mais
+        confiável que netstat quando a porta é IPv6 ou o PID tem
+        nome longo).
+  [KEEP] Mesma API pública (check_brn_ports, check_only) e CLI.
+v1.0:
+  Versão inicial.
 
 Uso no main.py (2 linhas):
 
@@ -12,41 +22,119 @@ Uso no main.py (2 linhas):
     def main():
         port_guard.check_brn_ports()   # <-- primeira linha do main()
         _verificar_integridade_codigo()
-        args = parse_args()
         ...
 
 Env respeitadas:
-    BRN_P2P_PORT    (default 6001)
-    BRN_WEB_PORT    (default 5000)
-    BRN_EXPLORER_PORT (default 8080, opcional checar)
+    BRN_P2P_PORT        (default 6001)
+    BRN_WEB_PORT        (default 5000)
+    BRN_EXPLORER_PORT   (default 8080, opcional checar)
     BRN_PORT_GUARD_SKIP=1 → desativa o guard (só para testes)
 """
 from __future__ import annotations
 
 import os
+import sys
 import socket
 import subprocess
-import sys
 
 
+# ============================================================
+# [FIX v1.1] Força UTF-8 no stdout/stderr ANTES de qualquer print
+# ============================================================
+for _stream_name in ("stdout", "stderr"):
+    _stream = getattr(sys, _stream_name, None)
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+# psutil é opcional — melhora o diagnóstico se estiver instalado
+_HAS_PSUTIL = False
+try:
+    import psutil  # type: ignore
+    _HAS_PSUTIL = True
+except ImportError:
+    pass
+
+
+# ============================================================
+# DETECÇÃO DE PORTA
+# ============================================================
 def _port_em_uso(port: int, host: str = "0.0.0.0") -> bool:
-    """Tenta bind; se falhar com OSError, porta está ocupada."""
+    """Tenta bind; se falhar com OSError, porta está ocupada.
+
+    [FIX v1.1] No Windows, SO_REUSEADDR faz o bind() SUCEDER mesmo
+    quando outro processo está escutando na mesma porta (comportamento
+    do Winsock). Trocamos por SO_EXCLUSIVEADDRUSE, que falha nesse
+    caso — que é o que queremos detectar.
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
-        s.bind((host, int(port)))
-        s.close()
-        return False
-    except OSError:
-        s.close()
-        return True
+        if os.name == "nt":
+            # Windows: SO_EXCLUSIVEADDRUSE impede bind compartilhado
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except (AttributeError, OSError):
+                # Fallback: sem a flag, usa SO_REUSEADDR (raro)
+                try:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                except Exception:
+                    pass
+        else:
+            # POSIX: SO_REUSEADDR permite reaproveitar TIME_WAIT
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        try:
+            s.bind((host, int(port)))
+            return False
+        except OSError:
+            return True
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def _who_uses_port_psutil(port: int):
+    """Retorna [(pid, nome), ...] para LISTEN na porta. Usa psutil."""
+    if not _HAS_PSUTIL:
+        return []
+    out = []
+    try:
+        for conn in psutil.net_connections(kind="inet"):
+            try:
+                if (conn.status == "LISTEN"
+                        and conn.laddr
+                        and conn.laddr.port == port):
+                    pid = conn.pid
+                    try:
+                        proc = psutil.Process(pid)
+                        out.append((pid, proc.name()))
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        out.append((pid, "<desconhecido>"))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
 
 
 def _diagnostico_porta(port: int) -> None:
     """Mostra quem está usando a porta (best-effort, Linux/macOS/Windows)."""
     print(f"\n[port_guard] Processo(s) na porta {port}:", file=sys.stderr)
 
-    # Linux: ss
+    # 1) psutil (mais confiável, se disponível)
+    if _HAS_PSUTIL:
+        ps = _who_uses_port_psutil(port)
+        if ps:
+            for pid, pname in ps:
+                print(f"  PID {pid} ({pname})", file=sys.stderr)
+            return
+
+    # 2) Linux: ss
     try:
         r = subprocess.run(
             ["ss", "-tlnp", f"sport = :{port}"],
@@ -59,7 +147,7 @@ def _diagnostico_porta(port: int) -> None:
     except Exception:
         pass
 
-    # macOS/Linux: lsof
+    # 3) macOS/Linux: lsof
     try:
         r = subprocess.run(
             ["lsof", "-nP", f"-i:{port}"],
@@ -72,7 +160,7 @@ def _diagnostico_porta(port: int) -> None:
     except Exception:
         pass
 
-    # Windows: netstat
+    # 4) Windows: netstat
     try:
         r = subprocess.run(
             ["netstat", "-ano"],
@@ -92,6 +180,9 @@ def _sugerir_acao() -> None:
     print("    3. python3 main.py --headless  (sobe o nó novo)", file=sys.stderr)
 
 
+# ============================================================
+# API PÚBLICA
+# ============================================================
 def check_brn_ports(checar_explorer: bool = False) -> None:
     """Aborta o processo se portas do BRN estiverem em uso.
 
@@ -115,7 +206,8 @@ def check_brn_ports(checar_explorer: bool = False) -> None:
             ocupadas.append((nome, porta))
 
     if not ocupadas:
-        print(f"[port_guard] portas {p2p} (P2P) e {web} (HTTP) livres \u2713")
+        # [FIX v1.1] ASCII-safe — sem U+2713, sem crash em cp1252.
+        print(f"[port_guard] portas {p2p} (P2P) e {web} (HTTP) livres OK")
         return
 
     # Pelo menos uma porta ocupada — aborta com diagnóstico
@@ -138,10 +230,16 @@ def check_brn_ports(checar_explorer: bool = False) -> None:
 
 
 def check_only(ports: list) -> dict:
-    """Diagnóstico sem abortar — útil para CLI. Retorna {porta: bool_em_uso}."""
+    """Diagnóstico sem abortar — útil para CLI.
+
+    Retorna {porta: bool_em_uso}.
+    """
     return {int(p): _port_em_uso(int(p)) for p in ports}
 
 
+# ============================================================
+# CLI
+# ============================================================
 if __name__ == "__main__":
     import argparse
     import json
