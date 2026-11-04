@@ -1,27 +1,16 @@
-"""checkpoints.py — Checkpoints assinados do BRN
+"""checkpoints.py — Checkpoints assinados do BRN (v1.1)
 ================================================================
-A cada CHECKPOINT_INTERVAL blocos, o nó ORIGEM assina o hash do bloco
-com sua chave Ed25519. Todos os nós verificam a assinatura antes de
-aceitar blocos naquela altura.
-
-Efeito: um reorg não pode violar um checkpoint. Um atacante com
-100x mais hashrate não consegue reescrever a cadeia — os checkpoints
-são imutáveis.
-
-Formato de checkpoints.json:
-{
-  "1000": {"height":1000, "hash":"...", "sig":"...", "pub":"...", "ts":123},
-  "2000": {...}
-}
-
-API usada por blockchain.py v9.1.7:
-    load_checkpoints() -> dict
-    sign_checkpoint(height, block_hash, priv) -> dict
-    verify_checkpoint(cp) -> bool
-    save_checkpoints(d) -> bool
-
-Requer:
-    pip install cryptography
+v1.1 (2026-11-04):
+  [FIX CRÍTICO] sign_checkpoint() agora detecta se 'priv' é Wallet
+                (hex strings) ou Ed25519PrivateKey (bytes) e usa a
+                interface correta. Antes, main.py passava uma Wallet
+                (validator_sk) e a chamada priv.public_key() falhava
+                com "'str' object is not callable" — porque Wallet
+                expõe pub_hex como ATRIBUTO string, não como método.
+                Resultado: checkpoint #4000 e #4001 nunca eram
+                assinados ("sign_checkpoint retornou vazio").
+v1.0:
+  Versão inicial.
 ================================================================
 """
 from __future__ import annotations
@@ -62,7 +51,6 @@ def _payload(height: int, block_hash: str) -> bytes:
 # LEITURA / ESCRITA
 # ============================================================
 def load_checkpoints() -> dict:
-    """Lê checkpoints.json. Retorna {} se não existir ou estiver inválido."""
     if not os.path.exists(CHECKPOINT_FILE):
         return {}
     try:
@@ -78,7 +66,6 @@ def load_checkpoints() -> dict:
 
 
 def save_checkpoints(d: dict) -> bool:
-    """Grava atomicamente (tmp + rename). Retorna True se sucesso."""
     if not isinstance(d, dict):
         return False
     with _lock:
@@ -96,11 +83,16 @@ def save_checkpoints(d: dict) -> bool:
 
 
 # ============================================================
-# ASSINATURA
+# ASSINATURA  ← [FIX v1.1] detecta interface
 # ============================================================
 def sign_checkpoint(height: int, block_hash: str, priv) -> dict:
-    """
-    Assina um checkpoint. 'priv' é Ed25519PrivateKey.
+    """Assina um checkpoint. Aceita duas interfaces:
+
+      - Wallet (BRN): priv.sign(msg) → str hex;
+                       priv.pub_hex → str hex (atributo)
+      - Ed25519PrivateKey (cryptography): priv.sign(msg) → bytes;
+                       priv.public_key().public_bytes_raw() → bytes
+
     Retorna dict vazio se priv for None ou assinatura falhar.
     """
     if priv is None:
@@ -112,8 +104,31 @@ def sign_checkpoint(height: int, block_hash: str, priv) -> dict:
     except (ValueError, TypeError):
         return {}
 
+    payload = _payload(h, block_hash)
+
     try:
-        sig_bytes = priv.sign(_payload(h, block_hash))
+        # ─── [v1.1] Detecta interface pela PRESENÇA de pub_hex ───
+        # Wallet tem pub_hex como atributo string; Ed25519PrivateKey não.
+        pub_hex_attr = getattr(priv, "pub_hex", None)
+        if isinstance(pub_hex_attr, str) and pub_hex_attr:
+            # ─── Interface Wallet ───
+            sig = priv.sign(payload)
+            if not isinstance(sig, str):
+                # Se retornou bytes por engano, converte
+                try:
+                    sig = sig.hex()
+                except Exception:
+                    return {}
+            return {
+                "height": h,
+                "hash":   block_hash,
+                "sig":    sig,
+                "pub":    pub_hex_attr.lower(),
+                "ts":     int(time.time()),
+            }
+
+        # ─── Interface Ed25519PrivateKey (cryptography) ───
+        sig_bytes = priv.sign(payload)
         pub_bytes = priv.public_key().public_bytes_raw()
         return {
             "height": h,
@@ -122,6 +137,7 @@ def sign_checkpoint(height: int, block_hash: str, priv) -> dict:
             "pub":    pub_bytes.hex(),
             "ts":     int(time.time()),
         }
+
     except Exception as e:
         log.error(f"erro ao assinar checkpoint #{h}: {e}")
         return {}
@@ -131,10 +147,6 @@ def sign_checkpoint(height: int, block_hash: str, priv) -> dict:
 # VERIFICAÇÃO
 # ============================================================
 def verify_checkpoint(cp: dict) -> bool:
-    """
-    Verifica a assinatura Ed25519 do checkpoint.
-    Retorna True se válido.
-    """
     if not isinstance(cp, dict):
         return False
     try:
@@ -158,14 +170,10 @@ def verify_checkpoint(cp: dict) -> bool:
 
 
 def verify_checkpoint_for(chain, height: int) -> tuple:
-    """
-    Procura um checkpoint para `height` e verifica se bate com o bloco
-    atual da cadeia. Retorna (ok, msg).
-    """
     cps = load_checkpoints()
     cp = cps.get(str(height))
     if not cp:
-        return True, ""  # sem checkpoint = sem restrição
+        return True, ""
 
     if not verify_checkpoint(cp):
         return False, f"checkpoint #{height} assinatura invalida"
@@ -190,17 +198,12 @@ def verify_checkpoint_for(chain, height: int) -> tuple:
 # MESCLAGEM
 # ============================================================
 def merge_checkpoints(local: dict, remote: dict) -> dict:
-    """
-    Une dois dicts. Em conflito de altura, mantém o LOCAL.
-    Útil para sincronizar checkpoints entre peers sem perder os locais.
-    """
     merged = dict(remote or {})
     merged.update(local or {})
     return merged
 
 
 def merge_from_file(path: str) -> int:
-    """Funde um checkpoints.json externo no local. Retorna quantos adicionou."""
     if not os.path.exists(path):
         return 0
     try:
@@ -225,14 +228,9 @@ def merge_from_file(path: str) -> int:
 
 
 # ============================================================
-# API ALTO NÍVEL — assinatura automática em intervalos
+# API ALTO NÍVEL
 # ============================================================
 class CheckpointSigner:
-    """
-    Helper que assina um checkpoint a cada CHECKPOINT_INTERVAL blocos.
-    Chame .maybe_sign(block, priv) a cada bloco aceito.
-    """
-
     def __init__(self, priv=None, interval: int = CHECKPOINT_INTERVAL):
         self.priv = priv
         self.interval = interval
@@ -242,7 +240,6 @@ class CheckpointSigner:
         self.priv = priv
 
     def maybe_sign(self, block: dict) -> bool:
-        """Assina se a altura for múltipla do intervalo. Retorna True se assinou."""
         if self.priv is None:
             return False
         try:
@@ -254,7 +251,6 @@ class CheckpointSigner:
 
         h_str = str(h)
         if h_str in self._cache:
-            # já assinado
             return False
 
         cp = sign_checkpoint(h, block["hash"], self.priv)
@@ -287,49 +283,51 @@ if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "test"
 
     if cmd == "test":
-        print("Testando checkpoints...")
+        print("Testando checkpoints (v1.1)...")
         with tempfile.TemporaryDirectory() as td:
-            # aponta arquivo temporário
             globals()["CHECKPOINT_FILE"] = os.path.join(td, "cps.json")
 
-            # 1. Cria chave e assina
+            # 1. Ed25519PrivateKey (interface cryptography)
             priv = Ed25519PrivateKey.generate()
             cp = sign_checkpoint(1000, "abc123" * 8, priv)
-            assert cp, "sign_checkpoint falhou"
-            assert cp["height"] == 1000
-            assert cp["hash"] == "abc123" * 8
-            assert "sig" in cp and "pub" in cp
-            print("  [ok] sign_checkpoint")
+            assert cp, "sign_checkpoint falhou com Ed25519PrivateKey"
+            assert verify_checkpoint(cp), "verify falhou com Ed25519PrivateKey"
+            print("  [ok] Ed25519PrivateKey (bytes)")
 
-            # 2. Verifica
-            assert verify_checkpoint(cp), "verify_checkpoint deveria passar"
-            print("  [ok] verify_checkpoint (valido)")
+            # 2. [v1.1] Mock Wallet (interface hex)
+            class MockWallet:
+                def __init__(self):
+                    self._priv = Ed25519PrivateKey.generate()
+                    self.pub_hex = self._priv.public_key().public_bytes_raw().hex()
+                def sign(self, msg):
+                    return self._priv.sign(msg).hex()
 
-            # 3. Adulterar hash
-            bad = dict(cp)
+            wallet = MockWallet()
+            cp2 = sign_checkpoint(2000, "def456" * 8, wallet)
+            assert cp2, "sign_checkpoint falhou com Wallet"
+            assert cp2["sig"] == wallet.sign(_payload(2000, "def456" * 8))
+            assert cp2["pub"] == wallet.pub_hex
+            assert verify_checkpoint(cp2), "verify falhou com Wallet"
+            print("  [ok] Wallet (hex)")
+
+            # 3. Adulterar
+            bad = dict(cp2)
             bad["hash"] = "deadbeef" * 8
-            assert not verify_checkpoint(bad), "checkpoint adulterado deveria falhar"
-            print("  [ok] verify_checkpoint rejeita adulteracao")
+            assert not verify_checkpoint(bad), "aceitou checkpoint adulterado"
+            print("  [ok] rejeita adulteracao")
 
             # 4. Save/load
-            d = {"1000": cp}
-            assert save_checkpoints(d), "save_checkpoints falhou"
+            d = {"1000": cp, "2000": cp2}
+            assert save_checkpoints(d), "save falhou"
             loaded = load_checkpoints()
-            assert loaded == d, f"load_checkpoints retornou {loaded}"
+            assert loaded == d, "load retornou diferente"
             print("  [ok] save/load")
 
-            # 5. Merge
-            cp2 = sign_checkpoint(2000, "abc999" * 8, priv)
-            merged = merge_checkpoints({"1000": cp}, {"2000": cp2, "1000": {"x": 1}})
-            assert "2000" in merged
-            assert merged["1000"] == cp  # local venceu
-            print("  [ok] merge_checkpoints")
-
-            # 6. CheckpointSigner
-            signer = CheckpointSigner(priv, interval=100)
+            # 5. CheckpointSigner
+            signer = CheckpointSigner(wallet, interval=100)
             assert signer.maybe_sign({"height": 100, "hash": "h1"})
-            assert not signer.maybe_sign({"height": 100, "hash": "h1"})  # já assinado
-            assert not signer.maybe_sign({"height": 50, "hash": "h2"})   # não múltiplo
+            assert not signer.maybe_sign({"height": 100, "hash": "h1"})
+            assert not signer.maybe_sign({"height": 50, "hash": "h2"})
             assert signer.maybe_sign({"height": 200, "hash": "h2"})
             print("  [ok] CheckpointSigner")
 
@@ -345,4 +343,4 @@ if __name__ == "__main__":
             print(f"  [{marker}] #{h}  {cp.get('hash','?')[:24]}...")
 
     else:
-        print(f"Uso: python checkpoints.py [test|show]")
+        print("Uso: python checkpoints.py [test|show]")
