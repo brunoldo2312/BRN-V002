@@ -1,6 +1,18 @@
 """
-p2p_unified.py — BRN P2P Network v6.7.7
+p2p_unified.py — BRN P2P Network v6.7.8
 ================================================================
+v6.7.8 (2026-11-04):
+  [FIX CRÍTICO] _handle_sign_block agora aceita TRÊS cenários:
+                a) block_h == local_h + 1 (normal)
+                b) block_h == local_h     (RACE RECOVERY)
+                c) block_h < local_h      (RACE RECOVERY REVERSA)
+                O cenário (c) acontece quando o peer está 1-2 blocos
+                À FRENTE do Origin, mas o bloco pedido JÁ ESTÁ na
+                chain do peer (recebeu via new_block antes do
+                sign_block). Antes, era recusado com "altura_fora",
+                resultando em blocos com apenas 1 assinatura.
+                Fix identificado em produção (Origin travado com
+                blocos 1-sig porque peers recusavam assinar).
 v6.7.7 (2026-11-02):
   [FIX CRÍTICO] _handle_sign_block agora aceita DOIS cenários:
                 a) block_h == local_h + 1 (normal)
@@ -474,9 +486,11 @@ class P2PServer(threading.Thread):
 
     def _handle_sign_block(self, msg: dict, addr, peer_id) -> dict:
         """
-        [v6.7.7] Valida o bloco antes de assinar. Aceita 2 cenários:
+        [v6.7.8] Valida o bloco antes de assinar. Aceita 3 cenários:
           a) block_h == local_h + 1 (normal)
           b) block_h == local_h     (RACE RECOVERY — bloco já é o tip)
+          c) block_h < local_h      (RACE RECOVERY REVERSA — peer à frente,
+                                     mas bloco já está na chain com hash bate)
         Todos os retornos de recusa incluem "error" com o motivo.
         """
         block = msg.get("block")
@@ -545,7 +559,7 @@ class P2PServer(threading.Thread):
                 return {"type": "sign_block_response", "pubkey": "", "signature": "",
                         "error": "excecao_pow %s" % e}
 
-            # ---- 3+4. Altura e prev_hash (race recovery + motivo) ----
+            # ---- 3+4. Altura e prev_hash (race recovery + race recovery reversa) ----
             try:
                 local_h = int(self.bc.db.height())
                 local_tip = self.bc.db.tip_hash()
@@ -578,6 +592,36 @@ class P2PServer(threading.Thread):
                                     (block.get("hash") or "")[:16])}
                     prev_block = self.bc.db.get_block(block_h - 1) if block_h > 0 else None
                     log.info("[SIG] assinando bloco #%d em RACE RECOVERY (já é o tip local)", block_h)
+                elif block_h < local_h:
+                    # [PATCH v6.7.8] RACE RECOVERY REVERSA
+                    # Peer à frente, mas bloco já existe na chain local
+                    # com mesmo hash. Pode assinar.
+                    try:
+                        _existing = self.bc.db.get_block(block_h)
+                    except Exception:
+                        _existing = None
+                    if not _existing:
+                        log.info(
+                            "[SIG] bloco #%d nao existe localmente "
+                            "(peer em #%d) - recusando",
+                            block_h, local_h,
+                        )
+                        return {"type": "sign_block_response", "pubkey": "", "signature": "",
+                                "error": "altura_fora local_h=%d block_h=%d (sem bloco local)" % (local_h, block_h)}
+                    if _existing.get("hash") != block.get("hash"):
+                        log.info(
+                            "[SIG] bloco #%d existe mas hash diverge "
+                            "(peer em #%d) - recusando",
+                            block_h, local_h,
+                        )
+                        return {"type": "sign_block_response", "pubkey": "", "signature": "",
+                                "error": "altura_fora local_h=%d block_h=%d (hash divergente)" % (local_h, block_h)}
+                    prev_block = self.bc.db.get_block(block_h - 1) if block_h > 0 else None
+                    log.info(
+                        "[SIG] assinando bloco #%d em RACE RECOVERY REVERSA "
+                        "(peer em #%d, hash bate)",
+                        block_h, local_h,
+                    )
                 else:
                     log.info(
                         "[SIG] altura %d fora da janela [%d, %d]",
