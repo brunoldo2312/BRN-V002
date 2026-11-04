@@ -3,25 +3,16 @@
 v13.7.14 (2026-11-04):
   [FIX CRÍTICO] Substituído _make_sign_collector (sequencial, 6s,
                 sem accept_block autosign) por ensure_multisig() do
-                brn_multisig v2 (paralelo, ~1s, com accept_block
-                autosign para o pool). Resolve:
-                  - pool em loop "sem assinaturas válidas"
-                  - blocos minerados com 1 sig em vez de 4
-                  - tempo de coleta 6s → 1s
+                brn_multisig v2.1 (paralelo, ~1s, com accept_block
+                autosign para o pool, e com check de is_origin para
+                não sobrescrever origin_pubkey no cliente).
   [NEW] Fallback: se brn_multisig indisponível, mantém o collector
         antigo + tenta install_accept_block_autosign isolado.
 v13.7.13 (2026-11-02):
   [FIX CRÍTICO] No boot, atualiza last_seen de TODOS os nós do
-                trust_network.json. Sem isso, get_active_validators()
-                retornava [] após 5min (ACTIVE_TTL_SECONDS=300),
-                pois apenas a própria SK recebia heartbeat.
-  [NEW] Log explícito em _setup_pool_client_local:
-          - qual dos 5 motivos fez retornar None
-          - addr/pubkey lidos da carteira
-          - confirmação do PoolClient criado
-  [NEW] Log explícito em _inject_into_server:
-          - "[inject] <tipo>: OK (setter=<fn>)"
-          - "[inject] <tipo>: FALHOU — <motivo>"
+                trust_network.json.
+  [NEW] Log explícito em _setup_pool_client_local.
+  [NEW] Log explícito em _inject_into_server.
 v13.7.12 (2026-11-01):
   [FIX CRÍTICO] run_status_loop agora chama trust_net.heartbeat()
                 a cada 30s.
@@ -32,7 +23,6 @@ v13.7.10 (2026-10-30):
   [FIX] Origin registrado na TrustNetwork.
   [NEW] set_checkpoint_priv() chamado com Validator SK.
   [FIX] PoolClient sempre injetado em server.py.
-  [FIX] Log duplicado "PoolClient preparado" consolidado.
 v13.7.9 (2026-10-30):
   [PERF] run_http() otimizado.
 ================================================================
@@ -433,6 +423,11 @@ def _load_validator_sk():
 
 
 def _make_sign_collector(p2p, trust_net):
+    """Coletor SEQUENCIAL (fallback quando brn_multisig não está disponível).
+
+    O brn_multisig.py v2.1 tem um coletor PARALELO com ThreadPoolExecutor,
+    que é ~6x mais rápido. Este é só para o caso de import fail.
+    """
     def _collect(block: dict) -> list:
         if p2p is None or trust_net is None:
             return []
@@ -696,7 +691,7 @@ def run_explorer():
 
 
 # ============================================================
-# STATUS LOOP — [FIX v13.7.12] heartbeat do próprio validador
+# STATUS LOOP — heartbeat do próprio validador
 # ============================================================
 def run_status_loop(chain, p2p, sync=None, pool=None, pool_client=None,
                     trust_net=None, node_id_short="", own_pubkey=""):
@@ -812,7 +807,7 @@ def run_wallet_main_thread():
 
 
 def _setup_pool_client_local(chain, pool, log, is_origin: bool):
-    """[FIX v13.7.13] Cada motivo de retornar None é logado explicitamente."""
+    """Cada motivo de retornar None é logado explicitamente."""
     if PoolClient is None:
         log.warning("PoolClient: RETORNANDO None — miner_pool_client indisponível (PoolClient is None)")
         return None
@@ -1081,7 +1076,7 @@ def main():
                 chain.trust_net = trust_net
             log.info("TrustNetwork: " + str(len(trust_net.nodes)) + " nós carregados")
 
-            # [FIX v13.7.13] Atualiza last_seen de TODOS os nós no boot.
+            # Atualiza last_seen de TODOS os nós no boot.
             try:
                 import time as _t
                 _lock = getattr(trust_net, "_lock", None)
@@ -1228,17 +1223,19 @@ def main():
     else:
         log.info("Validator SK não carregada — nó não vai assinar blocos")
 
-    # ── Multi-sig: instala collector paralelo + accept_block autosign ──
-    # [v13.7.14] Substitui o _make_sign_collector (sequencial, sem
-    # accept_block autosign) pelo ensure_multisig() do brn_multisig v2.
+    # ── Multi-sig: coletor PARALELO via brn_multisig v2.1 ──
     if p2p is not None and trust_net is not None:
         if validator_sk is not None:
+            _multisig_ok = False
             try:
                 from brn_multisig import ensure_multisig
                 ensure_multisig(chain, validator_sk, p2p,
                                 trust=trust_net, logger=log)
+                _multisig_ok = True
             except Exception as e:
-                log.warning(f"[multisig] falhou, usando fallback: {e}")
+                log.warning(f"[multisig] falhou, usando fallback sequencial: {e}")
+
+            if not _multisig_ok:
                 try:
                     collector = _make_sign_collector(p2p, trust_net)
                     chain.set_sign_collector(collector)
@@ -1247,18 +1244,16 @@ def main():
                         install_accept_block_autosign(chain, logger=log)
                     except Exception as _e2:
                         log.warning(f"[multisig] autosign fallback falhou: {_e2}")
-                    log.info("Coletor fallback + accept_block autosign instalados")
+                    log.info("Coletor fallback (sequencial) + accept_block autosign instalados")
                 except Exception as e2:
                     log.warning(f"[multisig] fallback também falhou: {e2}")
         else:
-            # Sem SK local: coleciona apenas dos peers (modo cliente passivo)
             try:
                 collector = _make_sign_collector(p2p, trust_net)
                 chain.set_sign_collector(collector)
                 log.info("Coletor de assinaturas P2P configurado (sem SK local)")
             except Exception as e:
                 log.warning(f"Falha configurando coletor: {e}")
-    # ─────────────────────────────────────────────────────────────
 
     sync = None
     if not args.no_sync and p2p is not None:
