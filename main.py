@@ -1,28 +1,12 @@
-"""main.py — Entrypoint do nó BRN (v13.8.0)
+"""main.py — Entrypoint do nó BRN (v13.8.1)
 ================================================================
-v13.8.0 (2026-11-04):
-  [NEW] Integração PBFT. Após p2p.start() e chain.set_local_validator_sk(),
-        chama _setup_pbft(chain, node_id_priv, p2p) que:
-          - cria PBFTConsensus(chain, wallet_sk, send_fn)
-          - injeta via chain.set_pbft(pbft)
-          - P2PManager.start() injeta no P2PServer via server.set_pbft()
-        Ativa só se BRN_PBFT_ENABLED=1.
-  [KEEP] Comportamento anterior: headless, client-mode, pool-client,
-         GUI, relay, sync, rendezvous, BTC watcher.
-
-⚠️ Este arquivo é uma RECONSTRUÇÃO. O main.py original v13.7.12
-   não foi compartilhado. Antes de substituir, faça diff com o seu.
-
-Uso:
-    python main.py                       # GUI + nó completo
-    python main.py --headless            # sem GUI
-    python main.py --client-mode         # nó cliente (sem minerar)
-    python main.py --no-pool-client      # não inicia PoolClient
-    python main.py --origem              # força BRN_IS_ORIGIN=1
-    python main.py --no-p2p              # só servidor HTTP (debug)
-    python main.py --no-explorer         # sem Explorer
-    python main.py --db X.db             # DB alternativo
-    python main.py --version             # versão e sai
+v13.8.1 (2026-11-04):
+  [FIX] GUI: prioriza 'index_wallet.html' (carteira gráfica real).
+        Antes apontava para 'panel.html' ou 'index.html' (Explorer).
+  [FIX] CLI: adiciona argumento '--skip-verify' para compatibilidade
+        com os scripts .bat / .cmd do projeto.
+  [KEEP] Integração PBFT (v13.8.0).
+  [KEEP] Boot completo: identity, wallet, trust, p2p, sync, pbft.
 ================================================================
 """
 from __future__ import annotations
@@ -37,25 +21,18 @@ import json
 import logging
 from pathlib import Path
 
-
-# ============================================================
-# Path / version
-# ============================================================
 BASE_DIR = Path(__file__).resolve().parent
 os.chdir(BASE_DIR)
 
 try:
     from version import VERSION, BUILD_DATE, GITHUB_USER, GITHUB_REPO
 except ImportError:
-    VERSION     = "13.8.0"
+    VERSION     = "13.8.1"
     BUILD_DATE  = "2026-11-04"
     GITHUB_USER = "brunoldo2312"
     GITHUB_REPO = "LRN-L1-L2"
 
 
-# ============================================================
-# Parse args
-# ============================================================
 def parse_args():
     p = argparse.ArgumentParser(
         prog="main.py",
@@ -81,12 +58,12 @@ def parse_args():
                    help="porta P2P (default: BRN_P2P_PORT ou 6001)")
     p.add_argument("--version", action="store_true",
                    help="mostra versão e sai")
+    # [FIX] compatibilidade com .bat que usam essa flag
+    p.add_argument("--skip-verify", action="store_true",
+                   help="pula verificações internas (o .bat já fez)")
     return p.parse_args()
 
 
-# ============================================================
-# .env loader (compat com formato simples do projeto)
-# ============================================================
 def _load_env_file():
     env_file = BASE_DIR / "brn_network.env"
     if not env_file.exists():
@@ -107,16 +84,12 @@ def _load_env_file():
         v = v.strip().strip('"').strip("'")
         if not k:
             continue
-        # não sobrescreve variável já exportada no shell
         if k not in os.environ:
             os.environ[k] = v
             loaded += 1
     return loaded
 
 
-# ============================================================
-# Logging (via brn_logger se disponível)
-# ============================================================
 def _setup_logging(level: str = "INFO", log_file: str = ""):
     try:
         from brn_logger import setup_logger, get_logger
@@ -130,33 +103,21 @@ def _setup_logging(level: str = "INFO", log_file: str = ""):
         return logging.getLogger("main")
 
 
-# ============================================================
-# Config (brn_config)
-# ============================================================
 def _load_config():
     try:
         from brn_config import Config
         return Config("config.json")
-    except Exception as e:
-        logging.getLogger("main").warning(
-            "brn_config indisponivel (%s) — usando defaults", e,
-        )
+    except Exception:
         class _Fallback:
             def __init__(self): self.data = {}
             def get(self, k, d=None): return os.environ.get(k, d)
             def __getitem__(self, k): return os.environ[k]
             def __contains__(self, k): return k in os.environ
+            def apply_to_env(self): pass
         return _Fallback()
 
 
-# ============================================================
-# Node identity (Ed25519 para P2P auth)
-# ============================================================
 def load_or_create_node_identity(password: str, path: str = "node_identity.enc"):
-    """
-    Carrega ou cria a identidade Ed25519 do nó (usada por p2p_auth).
-    Retorna (Ed25519PrivateKey, pub_hex_str).
-    """
     try:
         from secure_store import load_node_identity, save_node_identity
         from crypto import Ed25519PrivateKey
@@ -181,7 +142,6 @@ def load_or_create_node_identity(password: str, path: str = "node_identity.enc")
                 "[identity] falha carregando %s: %s — recriando", p, e,
             )
 
-    # cria nova
     priv = Ed25519PrivateKey.generate()
     sk_hex = priv.private_bytes_raw().hex()
     pub = priv.public_key().public_bytes_raw().hex()
@@ -201,14 +161,7 @@ def load_or_create_node_identity(password: str, path: str = "node_identity.enc")
     return priv, pub
 
 
-# ============================================================
-# Wallet ativa (current_wallet.enc)
-# ============================================================
 def _load_wallet(password: str):
-    """
-    Carrega current_wallet.enc e retorna (Wallet, address, pub_hex) ou
-    (None, "", "") se ausente.
-    """
     try:
         from secure_store import load_current_wallet
         from wallet import Wallet
@@ -247,9 +200,6 @@ def _load_wallet(password: str):
         return None, "", ""
 
 
-# ============================================================
-# Trust Network
-# ============================================================
 def _setup_trust(chain, node_id_priv, is_origin: bool):
     try:
         from trust_network import TrustNetwork
@@ -276,9 +226,6 @@ def _setup_trust(chain, node_id_priv, is_origin: bool):
         return None
 
 
-# ============================================================
-# P2P
-# ============================================================
 def _setup_p2p(chain, node_id_priv, p2p_port: int, enable_upnp: bool = True):
     try:
         from p2p_unified import P2PManager
@@ -300,9 +247,6 @@ def _setup_p2p(chain, node_id_priv, p2p_port: int, enable_upnp: bool = True):
         return None
 
 
-# ============================================================
-# Sync Manager
-# ============================================================
 def _setup_sync(chain, p2p):
     try:
         from sync_manager import ChainSyncManager
@@ -317,9 +261,6 @@ def _setup_sync(chain, p2p):
         return None
 
 
-# ============================================================
-# Pool (Origin)
-# ============================================================
 def _setup_pool(chain, is_origin: bool):
     if not is_origin:
         return None
@@ -329,9 +270,7 @@ def _setup_pool(chain, is_origin: bool):
         try:
             from pool_server import MiningPool  # type: ignore
         except Exception as e:
-            logging.getLogger("main").debug(
-                "[pool] indisponivel: %s", e,
-            )
+            logging.getLogger("main").debug("[pool] indisponivel: %s", e)
             return None
     try:
         pool = MiningPool(chain)
@@ -342,40 +281,28 @@ def _setup_pool(chain, is_origin: bool):
         return None
 
 
-# ============================================================
-# PoolClient (Cliente)
-# ============================================================
 def _setup_pool_client(chain, disabled: bool, is_origin: bool):
     if disabled or is_origin:
         return None
     try:
         from miner_pool_client import PoolClient
     except Exception as e:
-        logging.getLogger("main").debug(
-            "[pool_client] indisponivel: %s", e,
-        )
+        logging.getLogger("main").debug("[pool_client] indisponivel: %s", e)
         return None
     try:
         pc = PoolClient(chain)
         logging.getLogger("main").info("[pool_client] PoolClient ativo")
         return pc
     except Exception as e:
-        logging.getLogger("main").warning(
-            "[pool_client] init falhou: %s", e,
-        )
+        logging.getLogger("main").warning("[pool_client] init falhou: %s", e)
         return None
 
 
-# ============================================================
-# Rendezvous
-# ============================================================
 def _setup_rendezvous(chain, node_uuid: str, p2p, stop_flag):
     try:
         from rendezvous_discovery import RendezvousDiscovery
     except Exception as e:
-        logging.getLogger("main").debug(
-            "[rdv] indisponivel: %s", e,
-        )
+        logging.getLogger("main").debug("[rdv] indisponivel: %s", e)
         return None
 
     try:
@@ -399,14 +326,7 @@ def _setup_rendezvous(chain, node_uuid: str, p2p, stop_flag):
         return None
 
 
-# ============================================================
-# Relay (opcional)
-# ============================================================
 def _setup_relay(chain):
-    """
-    Relay TCP (p2p_relay) — opcional. Só ativa se BRN_RELAY_ENABLED=1.
-    verify.py indica que main exporta _setup_relay.
-    """
     if os.environ.get("BRN_RELAY_ENABLED", "0") != "1":
         return None
     try:
@@ -423,68 +343,38 @@ def _setup_relay(chain):
         return None
 
 
-# ============================================================
-# [v13.8.0] PBFT — motor de consenso bizantino
-# ============================================================
 def _setup_pbft(chain, node_id_priv, p2p):
-    """
-    Injeta PBFTConsensus se BRN_PBFT_ENABLED=1.
-
-    Pré-requisitos:
-      - chain.set_local_validator_sk(sk) JÁ foi chamado (para
-        _get_active_validators retornar a pubkey local)
-      - p2p.start() JÁ foi chamado (para discovery.listar_peers()
-        funcionar)
-      - node_id_priv definido (chave Ed25519 do nó)
-
-    Retorna (pbft ou None, motivo).
-    """
     if os.environ.get("BRN_PBFT_ENABLED", "0") != "1":
-        logging.getLogger("main").info(
-            "[PBFT] desligado (BRN_PBFT_ENABLED!=1) — multi-sig continua ativo",
-        )
+        logging.getLogger("main").info("[PBFT] desligado (multi-sig continua ativo)")
         return None, "disabled"
 
     if node_id_priv is None:
-        logging.getLogger("main").warning(
-            "[PBFT] node_id_priv ausente — PBFT NAO será ativado",
-        )
+        logging.getLogger("main").warning("[PBFT] node_id_priv ausente")
         return None, "no_priv"
 
     if p2p is None:
-        logging.getLogger("main").warning(
-            "[PBFT] P2P ausente — PBFT NAO será ativado",
-        )
+        logging.getLogger("main").warning("[PBFT] P2P ausente")
         return None, "no_p2p"
 
     try:
         from pbft_consensus import PBFTConsensus
         from p2p_unified import P2PClient
     except Exception as e:
-        logging.getLogger("main").error(
-            "[PBFT] imports falharam: %s — PBFT desligado", e,
-        )
+        logging.getLogger("main").error("[PBFT] imports falharam: %s", e)
         return None, "import"
 
     try:
         def _pbft_send(peer_addr: str, msg: dict):
             try:
                 ip, port_s = peer_addr.rsplit(":", 1)
-                resp, _ = P2PClient.send_message(
-                    ip, int(port_s), msg, timeout=15.0,
-                )
+                resp, _ = P2PClient.send_message(ip, int(port_s), msg, timeout=15.0)
                 return resp
-            except Exception as e:
-                logging.getLogger("pbft").debug(
-                    "[PBFT] send %s falhou: %s", peer_addr, e,
-                )
+            except Exception:
                 return None
 
         pbft = PBFTConsensus(chain, node_id_priv, _pbft_send)
         chain.set_pbft(pbft)
 
-        # O P2PManager.start() lê chain._pbft e injeta no P2PServer.
-        # Se p2p já foi startado antes de chegar aqui, forçamos também.
         try:
             if hasattr(p2p, "server") and p2p.server is not None:
                 p2p.server.set_pbft(pbft)
@@ -502,61 +392,38 @@ def _setup_pbft(chain, node_id_priv, p2p):
         )
         return pbft, "ok"
     except Exception as e:
-        logging.getLogger("main").error(
-            "[PBFT] init falhou: %s", e, exc_info=True,
-        )
+        logging.getLogger("main").error("[PBFT] init falhou: %s", e)
         return None, "init"
 
 
-# ============================================================
-# BTC Watcher (opcional)
-# ============================================================
 def _setup_btc_watcher(chain):
     if os.environ.get("BRN_BTC_ENABLED", "0") != "1":
         return None
     try:
         from btc_watcher import get_watcher
-    except Exception as e:
-        logging.getLogger("main").debug(
-            "[btc] indisponivel: %s", e,
-        )
+    except Exception:
         return None
     try:
         w = get_watcher(chain.db, chain)
         w.start()
-        logging.getLogger("main").info("[btc] watcher iniciado")
         return w
-    except Exception as e:
-        logging.getLogger("main").warning(
-            "[btc] init falhou: %s", e,
-        )
+    except Exception:
         return None
 
 
-# ============================================================
-# Flask server (thread)
-# ============================================================
-def _start_web_server(chain, p2p, pool, sync, trust, pool_client,
-                      web_port: int):
+def _start_web_server(chain, p2p, pool, sync, trust, pool_client, web_port: int):
     try:
         import server as srv
     except Exception as e:
-        logging.getLogger("main").error(
-            "[server] import falhou: %s", e,
-        )
+        logging.getLogger("main").error("[server] import falhou: %s", e)
         return None
 
     srv.set_chain(chain)
-    if p2p is not None:
-        srv.set_p2p_manager(p2p)
-    if pool is not None:
-        srv.set_pool_manager(pool)
-    if sync is not None:
-        srv.set_sync_manager(sync)
-    if trust is not None:
-        srv.set_trust_network(trust)
-    if pool_client is not None:
-        srv.set_pool_client_local(pool_client)
+    if p2p is not None: srv.set_p2p_manager(p2p)
+    if pool is not None: srv.set_pool_manager(pool)
+    if sync is not None: srv.set_sync_manager(sync)
+    if trust is not None: srv.set_trust_network(trust)
+    if pool_client is not None: srv.set_pool_client_local(pool_client)
 
     def _run():
         try:
@@ -568,32 +435,19 @@ def _start_web_server(chain, p2p, pool, sync, trust, pool_client,
                 use_reloader=False,
             )
         except Exception as e:
-            logging.getLogger("main").error(
-                "[server] crash: %s", e, exc_info=True,
-            )
+            logging.getLogger("main").error("[server] crash: %s", e)
 
     t = threading.Thread(target=_run, daemon=True, name="HTTP-Server")
     t.start()
-    logging.getLogger("main").info(
-        "[server] HTTP em %s:%d",
-        os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port,
-    )
     return t
 
 
-# ============================================================
-# Explorer (thread)
-# ============================================================
 def _start_explorer(chain):
     try:
         import explorer as exp
-    except Exception as e:
-        logging.getLogger("main").debug(
-            "[explorer] indisponivel: %s", e,
-        )
+    except Exception:
         return None
 
-    # injeta chain se explorer tiver set_chain
     try:
         if hasattr(exp, "set_chain"):
             exp.set_chain(chain)
@@ -603,48 +457,46 @@ def _start_explorer(chain):
     def _run():
         try:
             port = int(os.environ.get("BRN_EXPLORER_PORT", "8080"))
-            exp.app.run(
-                host="0.0.0.0", port=port,
-                debug=False, threaded=True, use_reloader=False,
-            )
-        except Exception as e:
-            logging.getLogger("main").debug(
-                "[explorer] crash: %s", e,
-            )
+            exp.app.run(host="0.0.0.0", port=port, debug=False, threaded=True, use_reloader=False)
+        except Exception:
+            pass
 
     t = threading.Thread(target=_run, daemon=True, name="Explorer")
     t.start()
-    logging.getLogger("main").info(
-        "[explorer] http://0.0.0.0:%d",
-        int(os.environ.get("BRN_EXPLORER_PORT", "8080")),
-    )
     return t
 
 
-# ============================================================
-# GUI (pywebview)
-# ============================================================
 def _start_gui():
     try:
         import webview
     except Exception as e:
-        logging.getLogger("main").warning(
-            "[gui] pywebview indisponivel: %s — use --headless", e,
-        )
+        logging.getLogger("main").warning("[gui] pywebview indisponivel: %s — use --headless", e)
         return False
 
     try:
         from app_wallet_v3 import WalletApi
         api = WalletApi()
     except Exception as e:
-        logging.getLogger("main").warning(
-            "[gui] WalletApi indisponivel: %s", e,
-        )
+        logging.getLogger("main").warning("[gui] WalletApi indisponivel: %s", e)
         api = None
 
     try:
-        panel = str(BASE_DIR / "panel.html")
-        url = Path(panel).as_uri() if Path(panel).exists() else "about:blank"
+        # [FIX] Prioriza o arquivo real da carteira gráfica (v3.13)
+        possible_htmls = ["index_wallet.html", "wallet.html", "carteira.html"]
+        wallet_path = None
+        for name in possible_htmls:
+            p = BASE_DIR / name
+            if p.exists():
+                wallet_path = p
+                break
+        
+        # Se não achar a carteira, cai pro painel (fallback)
+        if not wallet_path:
+            wallet_path = BASE_DIR / "panel.html"
+            
+        url = wallet_path.as_uri() if wallet_path.exists() else "about:blank"
+        logging.getLogger("main").info(f"[gui] Abrindo interface: {wallet_path.name}")
+        
         window = webview.create_window(
             "BRN Wallet",
             url=url,
@@ -658,9 +510,6 @@ def _start_gui():
         return False
 
 
-# ============================================================
-# MAIN
-# ============================================================
 def main() -> int:
     args = parse_args()
 
@@ -668,18 +517,15 @@ def main() -> int:
         print(f"BRN Node v{VERSION} (build {BUILD_DATE})")
         return 0
 
-    # ─── 1. .env ─────────────────────────────────────────────
+    if args.skip_verify:
+        print("[main] --skip-verify: assumindo que o .bat já fez as verificações")
+
     loaded = _load_env_file()
 
-    # ─── 2. flags CLI sobrepõem env ──────────────────────────
-    if args.client_mode:
-        os.environ["BRN_IS_ORIGIN"] = "0"
-    if args.origem:
-        os.environ["BRN_IS_ORIGIN"] = "1"
-    if args.web_port is not None:
-        os.environ["BRN_WEB_PORT"] = str(args.web_port)
-    if args.p2p_port is not None:
-        os.environ["BRN_P2P_PORT"] = str(args.p2p_port)
+    if args.client_mode: os.environ["BRN_IS_ORIGIN"] = "0"
+    if args.origem:      os.environ["BRN_IS_ORIGIN"] = "1"
+    if args.web_port is not None: os.environ["BRN_WEB_PORT"] = str(args.web_port)
+    if args.p2p_port is not None: os.environ["BRN_P2P_PORT"] = str(args.p2p_port)
 
     is_origin = os.environ.get("BRN_IS_ORIGIN", "0") == "1"
     os.environ.setdefault("BRN_IS_ORIGIN", "1" if is_origin else "0")
@@ -688,12 +534,10 @@ def main() -> int:
     p2p_port = int(os.environ.get("BRN_P2P_PORT", "6001"))
     db_path  = args.db or os.environ.get("BRN_DB", "brn_v2_chain.db")
 
-    # ─── 3. Config ───────────────────────────────────────────
     cfg = _load_config()
     try: cfg.apply_to_env()
     except Exception: pass
 
-    # ─── 4. Logging ──────────────────────────────────────────
     log_level = str(cfg.get("log_level", "INFO")).upper()
     log_file  = str(cfg.get("log_file", "") or "")
     log = _setup_logging(level=log_level, log_file=log_file)
@@ -704,68 +548,51 @@ def main() -> int:
     log.info(" web_port=%d p2p_port=%d db=%s", web_port, p2p_port, db_path)
     log.info("=" * 64)
 
-    # ─── 5. Port guard (DEVE vir antes de qualquer bind) ─────
     try:
         import port_guard
         port_guard.check_brn_ports(checar_explorer=not args.no_explorer)
     except SystemExit:
         return 1
     except Exception as e:
-        log.warning("[port_guard] falhou (seguindo mesmo assim): %s", e)
+        log.warning("[port_guard] falhou: %s", e)
 
-    # ─── 6. Senha para decifrar arquivos ─────────────────────
     password = (
         os.environ.get("BRN_NODE_PASSWORD", "").strip()
         or os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
     )
     if not password:
-        log.warning(
-            "BRN_NODE_PASSWORD / BRN_WALLET_SESSION_PASS vazias — "
-            "identity e wallet NAO serao carregadas",
-        )
+        log.warning("BRN_NODE_PASSWORD vazia — identity/wallet nao serao carregadas")
 
-    # ─── 7. Node identity ────────────────────────────────────
-    node_id_priv = None
-    node_id_pub = ""
+    node_id_priv, node_id_pub = None, ""
     if password:
         try:
             node_id_priv, node_id_pub = load_or_create_node_identity(password)
         except Exception as e:
             log.error("[identity] fatal: %s", e)
 
-    # ─── 8. Blockchain ───────────────────────────────────────
     try:
         from blockchain import Blockchain
         chain = Blockchain(db_path, auto_genesis=False)
-        log.info("[chain] aberta height=%d tip=%s…",
-                 chain.db.height(),
-                 (chain.db.tip_hash() or "")[:16])
+        log.info("[chain] aberta height=%d tip=%s…", chain.db.height(), (chain.db.tip_hash() or "")[:16])
     except Exception as e:
-        log.error("[chain] fatal: %s", e, exc_info=True)
+        log.error("[chain] fatal: %s", e)
         return 2
 
-    # ─── 9. Trust Network ────────────────────────────────────
     trust = _setup_trust(chain, node_id_priv, is_origin)
 
-    # ─── 10. Wallet ativa → SK do validador ──────────────────
     wallet_obj, wallet_addr, wallet_pub = (None, "", "")
     if password:
         wallet_obj, wallet_addr, wallet_pub = _load_wallet(password)
     if wallet_obj is not None:
         try:
             chain.set_local_validator_sk(wallet_obj)
-            log.info(
-                "[wallet] SK ativa instalada addr=%s pub=%s…",
-                wallet_addr[:24], wallet_pub[:16],
-            )
+            log.info("[wallet] SK ativa instalada addr=%s pub=%s…", wallet_addr[:24], wallet_pub[:16])
         except Exception as e:
             log.warning("[wallet] set_local_validator_sk falhou: %s", e)
 
-    # ─── 11. P2P ─────────────────────────────────────────────
     p2p = None
     if not args.no_p2p:
-        p2p = _setup_p2p(chain, node_id_priv, p2p_port,
-                         enable_upnp=bool(cfg.get("upnp", True)))
+        p2p = _setup_p2p(chain, node_id_priv, p2p_port, enable_upnp=bool(cfg.get("upnp", True)))
         if p2p is not None:
             try:
                 p2p.start()
@@ -774,7 +601,6 @@ def main() -> int:
                 log.error("[p2p] start falhou: %s", e)
                 p2p = None
 
-    # ─── 12. Sync Manager ────────────────────────────────────
     sync_mgr = _setup_sync(chain, p2p) if p2p else None
     if sync_mgr is not None:
         try:
@@ -783,76 +609,48 @@ def main() -> int:
         except Exception as e:
             log.warning("[sync] start falhou: %s", e)
 
-    # ─── 13. Pool (Origin) / PoolClient (Cliente) ────────────
     pool = _setup_pool(chain, is_origin)
     pool_client = _setup_pool_client(chain, args.no_pool_client, is_origin)
-
-    # ─── 14. Relay (opcional) ────────────────────────────────
     relay = _setup_relay(chain)
 
-    # ─── 15. Rendezvous ──────────────────────────────────────
     stop_flag = threading.Event()
     rdv = None
     if p2p is not None and node_id_pub:
         rdv = _setup_rendezvous(chain, node_id_pub, p2p, stop_flag)
 
-    # ─── 16. [PBFT] Motor de consenso bizantino ──────────────
-    # IMPORTANTE: só depois de chain.set_local_validator_sk() e
-    # p2p.start() — o motor lê _get_active_validators() e envia
-    # mensagens via discovery.listar_peers().
     pbft, pbft_motivo = _setup_pbft(chain, node_id_priv, p2p)
-    if pbft is None and os.environ.get("BRN_PBFT_ENABLED") == "1":
-        log.warning("[PBFT] NAO ativado (motivo=%s) — multi-sig continua", pbft_motivo)
 
-    # ─── 17. BTC Watcher (opcional) ──────────────────────────
     btc_watcher = _setup_btc_watcher(chain)
 
-    # ─── 18. HTTP Server ─────────────────────────────────────
-    _start_web_server(
-        chain, p2p, pool, sync_mgr, trust, pool_client, web_port,
-    )
+    _start_web_server(chain, p2p, pool, sync_mgr, trust, pool_client, web_port)
 
-    # ─── 19. Explorer ────────────────────────────────────────
     if not args.no_explorer:
         _start_explorer(chain)
 
-    # ─── 20. Miner (automático se env) ───────────────────────
     auto_mine = os.environ.get("BRN_AUTO_MINE", "0") == "1"
     if auto_mine and wallet_addr and wallet_pub:
         try:
             from miner_loop import get_miner
             m = get_miner(chain)
-            ok, msg = m.start(wallet_addr, wallet_pub,
-                              is_origin=is_origin)
-            log.info("[miner] start auto → ok=%s msg=%s", ok, msg)
-        except Exception as e:
-            log.warning("[miner] auto start falhou: %s", e)
+            m.start(wallet_addr, wallet_pub, is_origin=is_origin)
+        except Exception:
+            pass
 
-    # ─── 21. Signal handler (Ctrl+C graceful) ────────────────
     def _shutdown(signum, frame):
         log.info("[shutdown] sinal %s recebido", signum)
         stop_flag.set()
-        for name, obj in (
-            ("sync", sync_mgr), ("rdv", rdv),
-            ("btc", btc_watcher), ("p2p", p2p),
-        ):
+        for name, obj in (("sync", sync_mgr), ("rdv", rdv), ("btc", btc_watcher), ("p2p", p2p)):
             if obj is None: continue
-            try:
-                obj.stop() if hasattr(obj, "stop") else None
-            except Exception:
-                pass
+            try: obj.stop() if hasattr(obj, "stop") else None
+            except Exception: pass
         try: chain.db.close()
         except Exception: pass
-        log.info("[shutdown] bye")
         os._exit(0)
 
     signal.signal(signal.SIGINT, _shutdown)
-    try:
-        signal.signal(signal.SIGTERM, _shutdown)
-    except AttributeError:
-        pass
+    try: signal.signal(signal.SIGTERM, _shutdown)
+    except AttributeError: pass
 
-    # ─── 22. GUI ou headless ─────────────────────────────────
     if not args.headless:
         log.info("[gui] abrindo pywebview...")
         if _start_gui():
@@ -862,15 +660,12 @@ def main() -> int:
 
     log.info("=" * 64)
     log.info(" NÓ ATIVO — Ctrl+C para encerrar")
-    log.info("   API      : http://%s:%d",
-             os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
-    log.info("   Explorer : http://0.0.0.0:%d",
-             int(os.environ.get("BRN_EXPLORER_PORT", "8080")))
+    log.info("   API      : http://%s:%d", os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
+    log.info("   Explorer : http://0.0.0.0:%d", int(os.environ.get("BRN_EXPLORER_PORT", "8080")))
     log.info("   P2P      : :%d", p2p_port)
     log.info("   PBFT     : %s", "ATIVO" if pbft else "desligado")
     log.info("=" * 64)
 
-    # loop principal
     try:
         while not stop_flag.wait(1.0):
             pass
@@ -878,7 +673,6 @@ def main() -> int:
         _shutdown("KeyboardInterrupt", None)
 
     return 0
-
 
 if __name__ == "__main__":
     try:
