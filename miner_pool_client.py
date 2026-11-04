@@ -1,4 +1,11 @@
-"""miner_pool_client.py — Pool client BRN (v6.9)"""
+"""miner_pool_client.py — Pool client BRN (v7.0)
+================================================================
+v7.0 (2026-11-03):
+  [FIX] Envia 'share_difficulty' e 'active_share_difficulty' no
+        status() para a GUI mostrar o Vardiff corretamente.
+  [FIX] Normaliza 'share_diff' para 'share_difficulty' no _fetch_work.
+================================================================
+"""
 from __future__ import annotations
 import os
 import time
@@ -12,7 +19,7 @@ import urllib.error
 from blockchain import block_hash, target_from_difficulty
 
 log = logging.getLogger("pool.client")
-__version__ = "6.9"
+__version__ = "7.0"
 
 _INSTANCE = None
 _INSTANCE_LOCK = threading.RLock()
@@ -190,6 +197,11 @@ class PoolClient(threading.Thread):
             self.last_error = r.get("msg", "work falhou")
             return
         job = r.get("job") or {}
+        
+        # [FIX] Normaliza a dificuldade para a interface gráfica ler
+        if "share_difficulty" not in job:
+            job["share_difficulty"] = job.get("share_diff", 4)
+            
         with self._job_lock:
             if self._job is None or self._job.get("job_id") != job.get("job_id"):
                 self._job = job
@@ -275,6 +287,8 @@ class PoolClient(threading.Thread):
 
     def status(self) -> dict:
         with self._lock:
+            job = self._job or {}
+            sdiff = job.get("share_difficulty", 4)
             return {
                 "ok": True,
                 "running": self._running,
@@ -289,9 +303,13 @@ class PoolClient(threading.Thread):
                 "blocks_found": self.blocks_found,
                 "uptime_s": (int(time.time() - self.started_at) if self.started_at else 0),
                 "last_error": self.last_error,
-                "job_id": (self._job.get("job_id") if self._job else None),
-                "job_height": (self._job.get("height") if self._job else None),
+                "job_id": job.get("job_id"),
+                "job_height": job.get("height"),
                 "pool_url": self.pool_url,
+                # [FIX] Envia todos os nomes para a GUI conseguir ler
+                "share_difficulty": sdiff,
+                "active_share_difficulty": sdiff,
+                "job_share_diff": sdiff,
             }
 
 try:
