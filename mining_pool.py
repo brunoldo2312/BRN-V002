@@ -1,1316 +1,1034 @@
-"""blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.4.12 | Data: 03/11/2026
+"""mining_pool.py — Pool de mineração BRN (v6.3)
 ================================================================
-v9.4.12 (2026-11-03):
-  [FIX CRÍTICO] _get_active_validators() agora faz fallback para
-        get_top_validators() quando get_active_validators() retorna
-        vazio. Antes, trust_network.json com "active_validators": []
-        fazia _get_active_validators() retornar [] (ou apenas a SK
-        local), zerando o quórum multi-sig e desligando a verificação
-        de assinaturas de validador por completo.
-        Bug identificado em produção (nó travado na altura 30,
-        mensagem "Bloco #31 precisa de 2/4 assinaturas do set local,
-        tem 1").
-  [KEEP] Todas as correções de v9.4.11.
-v9.4.11 (2026-11-03):
-  [NEW] BRN_ASSUME_VALID_UNTIL: até esta altura, blocos são
-        aceitos SEM validação completa (só hash + prev_hash +
-        altura). Sync ultra-rápido (padrão Bitcoin -assumevalid).
-        PoW, Merkle, multi-sig, txs e auth_tag são IGNORADOS no
-        intervalo. Use só em redes onde você confia nos peers.
-  [NEW] BRN_CHECKPOINT_AUTO_HEIGHT: na altura exata configurada
-        (ex: 4001), após aceitar o bloco, cria automaticamente um
-        checkpoint assinado. Isso trava o hash do bloco para
-        sempre e impede reorg abaixo daquela altura.
-        Recomendado usar junto com BRN_ASSUME_VALID_UNTIL:
-          ASSUME_VALID=4000 + CHECKPOINT_AUTO=4001
-        Assim: sync rápido até 4000, checkpoint em 4001, validação
-        estrita de 4001 em diante.
-v9.4.10 (2026-11-01):
-  [NEW] BRN_BOOTSTRAP_SKIP_SIGS_UNTIL (bypass de multi-sig).
-v9.4.9 (2026-11-01):
-  [FIX] _get_active_validators inclui SK local.
+v6.3 (2026-11-04):
+  [FIX CRÍTICO] _assemble_and_accept_block agora coleta assinaturas
+                via chain._collect_signatures(block) ANTES de chamar
+                chain.accept_block(block). Sem isso, o bloco saía
+                com validators_sig=[] e era rejeitado por
+                _validate_validators_sig com "sem assinaturas
+                válidas" — pool em loop infinito (bloco achado mas
+                nunca aceito, altura travada).
+                chain._collect_signatures já faz: assina localmente
+                + chama _sign_collector (peers) + dedup por pubkey
+                + filtra por valid_set. Mesma função usada por
+                mine_block_interruptible, então comportamento é
+                idêntico entre miner local e pool.
+                Fallback: se _collect_signatures não existir
+                (blockchain.py antigo), chama _sign_collector puro.
+v6.2 (2026-11-03):
+  [NEW] PoolClient — cliente de mineração que faltava. Roda em
+        thread daemon, minera jobs do PoolManager local (modo
+        local) ou de um pool remoto (modo HTTP, se BRN_POOL_URL
+        setado), e expõe os atributos que app_wallet_v3.py espera:
+          _job: dict do último job (job_id, height, difficulty,
+                share_difficulty)
+          _last_known_share_diff: int
+          running: bool
+          hashrate_khs: float
+        Métodos: start(), stop(), status().
+        Singleton: get_pool_client() / reset_pool_client().
+        Fecha o gap em que server.py chamava "/api/pool/start_local"
+        e recebia "PoolClient nao injetado".
+  [NEW] Suporte a BRN_POOL_URL para mineração remota (HTTP).
+        Se vazio, usa o PoolManager local (mesmo processo).
+v6.1 (2026-10-27):
+  [FIX CRÍTICO] Unifica a fonte de reputação no consenso.
+                Antes:
+                  - pool usava trust_system.py      (peer_trust_data.json)
+                  - consenso usava trust_network.py (trust_network.json)
+                Resultado: pool pontuava em uma fonte que o consenso
+                NÃO lia → multi-sig sempre em modo bootstrap, e
+                reputação de mineradores do pool nunca afetava a
+                lista de validadores.
+                Agora:
+                  - register(): registra o minerador em chain.trust_net
+                  - _assemble_and_accept_block(): credita o bloco via
+                    chain.trust_net.record_block_validated()
+v6 (2026-10-25):
+  [FIX CRÍTICO] Proteção contra UNIQUE constraint failed.
+v5 (2026-10-23):
+  [NEW] Vardiff: dificuldade variável por minerador.
 ================================================================
 """
 from __future__ import annotations
 
-import os
-import time
-import math
-import hmac
-import json
 import hashlib
+import json as _json
 import logging
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
 from typing import Optional
 
-import orjson
+from blockchain import block_hash, compute_merkle_root, meets_difficulty, txid as calc_txid
 
-from crypto import double_sha256, sha256
-from db import ChainDB
+log = logging.getLogger("pool")
+
+SHARE_DIFF_OFFSET   = 1
+MINER_TIMEOUT_S     = 60
+JOB_REFRESH_S       = 20
+MAX_MINERS          = 50
+MAX_RECENT_JOBS     = 5
+
+# ============================================================
+# VARDIFF — Dificuldade variável por minerador
+# ============================================================
+VARDIFF_TARGET_S        = 15.0
+VARDIFF_MIN_DIFF        = 2
+VARDIFF_WINDOW_S        = 120.0
+VARDIFF_FAST_RATIO      = 0.5
+VARDIFF_SLOW_RATIO      = 2.0
+VARDIFF_MAX_STEP        = 1
+VARDIFF_MAX_SAMPLES     = 100
+VARDIFF_MIN_SAMPLES     = 3
+
+# ============================================================
+# POOLCLIENT — parâmetros do cliente de mineração (v6.2)
+# ============================================================
+POOLCLIENT_JOB_MAX_S        = 30.0
+POOLCLIENT_HEARTBEAT_S      = 10.0
+POOLCLIENT_RETRY_S          = 5.0
+POOLCLIENT_HASH_BATCH       = 2000
 
 
-log = logging.getLogger("blockchain")
-
-COIN_NAME       = "BrunoCoin"
-TICKER          = "BRN"
-DECIMALS        = 8
-UNIT            = 10 ** DECIMALS
-MAX_SUPPLY      = 21_000_000 * UNIT
-INITIAL_REWARD  = 50 * UNIT
-HALVING_INTERVAL = 210_000
-
-BLOCK_TIME          = int(os.environ.get("BRN_BLOCK_TIME",       "30"))
-DIFFICULTY_INTERVAL = int(os.environ.get("BRN_DIFF_INTERVAL",    "50"))
-MAX_DIFFICULTY      = int(os.environ.get("BRN_MAX_DIFFICULTY",   "7"))
-INITIAL_DIFFICULTY  = int(os.environ.get("BRN_MIN_DIFFICULTY",   "5"))
-FORCE_DIFFICULTY    = os.environ.get("BRN_FORCE_DIFFICULTY", "").strip()
-
-MAX_TX_PER_BLOCK   = 500
-MIN_RELAY_FEE      = 1000
-MAX_REORG_DEPTH    = 2000
-HASH_BATCH_SIZE    = 5000
-AUTH_TAG_START_HEIGHT = 6000
-CHECKPOINT_INTERVAL   = 1000
-MTP_WINDOW            = 50
-FILA_MAX_MINERADORES  = 20
-
-MAX_VALIDATORS       = int(os.environ.get("BRN_MAX_VALIDATORS", "5"))
-REQUIRE_ALL_SIGS     = os.environ.get("BRN_REQUIRE_ALL_SIGS", "1") == "1"
-VALIDATOR_QUORUM     = float(os.environ.get("BRN_VALIDATOR_QUORUM", "0.67"))
-SIG_COLLECT_TIMEOUT  = float(os.environ.get("BRN_SIG_COLLECT_TIMEOUT", "10"))
-MAX_MEMPOOL_SIZE     = int(os.environ.get("BRN_MAX_MEMPOOL_SIZE", "5000"))
-
-BOOTSTRAP_TRUST_THRESHOLD = float(
-    os.environ.get("BRN_BOOTSTRAP_TRUST_THRESHOLD", "500")
-)
-
-# [v9.4.10] Bypass de multi-sig ate uma altura.
-BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = int(
-    os.environ.get("BRN_BOOTSTRAP_SKIP_SIGS_UNTIL", "0") or "0"
-)
-
-# [v9.4.11] Assume Valid: skip validação completa até esta altura.
-BRN_ASSUME_VALID_UNTIL = int(
-    os.environ.get("BRN_ASSUME_VALID_UNTIL", "0") or "0"
-)
-
-# [v9.4.11] Checkpoint automático na altura exata.
-BRN_CHECKPOINT_AUTO_HEIGHT = int(
-    os.environ.get("BRN_CHECKPOINT_AUTO_HEIGHT", "0") or "0"
-)
-
-if not (0.0 < VALIDATOR_QUORUM <= 1.0):
-    VALIDATOR_QUORUM = 0.67
-if SIG_COLLECT_TIMEOUT <= 0:
-    SIG_COLLECT_TIMEOUT = 10.0
-if BOOTSTRAP_TRUST_THRESHOLD < 0:
-    BOOTSTRAP_TRUST_THRESHOLD = 500.0
-if BRN_BOOTSTRAP_SKIP_SIGS_UNTIL < 0:
-    BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = 0
-if BRN_ASSUME_VALID_UNTIL < 0:
-    BRN_ASSUME_VALID_UNTIL = 0
-if BRN_CHECKPOINT_AUTO_HEIGHT < 0:
-    BRN_CHECKPOINT_AUTO_HEIGHT = 0
-
-if BRN_ASSUME_VALID_UNTIL > 0:
-    log.warning(
-        "[ASSUME-VALID] Ativo até altura %d — blocos nessa faixa pulam "
-        "validação completa (hash + prev_hash apenas). Rede confia nos peers.",
-        BRN_ASSUME_VALID_UNTIL,
+class MinerState:
+    __slots__ = (
+        "miner_id", "address", "pubkey",
+        "shares_period", "shares_total",
+        "hashes_total", "hashrate",
+        "last_seen", "connected_at", "mining",
+        "share_difficulty", "active_share_difficulty", "share_times",
     )
-if BRN_CHECKPOINT_AUTO_HEIGHT > 0:
-    log.warning(
-        "[AUTO-CHECKPOINT] Checkpoint automático na altura %d "
-        "(trava hash para sempre).",
-        BRN_CHECKPOINT_AUTO_HEIGHT,
-    )
-
-GENESIS_PREV      = "0" * 64
-GENESIS_TIMESTAMP = 1700000000
-GENESIS_REWARD    = INITIAL_REWARD
-GENESIS_ADDRESS   = "brn1qxyzk7y0v2j4g0a8d9n5t2k7h4s6w8c9p2e"
-GENESIS_PUBKEY    = ""
-
-SIGNING_DOMAIN   = b"BRN-TX-v1|"
-AUTH_TAG_DOMAIN  = b"BRN-BLOCK-AUTH-v1|"
-BLOCK_SIG_DOMAIN = b"BRN-BLOCK-SIG-v1|"
-_CORE_V          = 1
-NETWORK_SECRET = os.environ.get("BRN_NETWORK_SECRET", "").strip()
-
-try:
-    import brn_miner as _brn_miner_c
-    _HAS_C_MINER = _brn_miner_c.is_available()
-    if _HAS_C_MINER:
-        log.info("PoW C acceleration ATIVA (%s)", _brn_miner_c.library_path())
-    else:
-        log.info("PoW C acceleration indisponível — usando Python puro")
-except Exception as _e:
-    _brn_miner_c = None
-    _HAS_C_MINER = False
-    log.debug("brn_miner.py nao disponivel: %s", _e)
+    def __init__(self, miner_id, address, pubkey):
+        self.miner_id = miner_id
+        self.address = address
+        self.pubkey = pubkey
+        self.shares_period = 0
+        self.shares_total = 0
+        self.hashes_total = 0
+        self.hashrate = 0.0
+        self.last_seen = time.time()
+        self.connected_at = time.time()
+        self.mining = False
+        self.share_difficulty = VARDIFF_MIN_DIFF
+        self.active_share_difficulty = VARDIFF_MIN_DIFF
+        self.share_times = []
 
 
-def miner_info() -> dict:
-    if _HAS_C_MINER and _brn_miner_c is not None:
-        return {"c_available": True, "path": str(_brn_miner_c.library_path()), "python_fallback": True}
-    return {"c_available": False, "path": None, "python_fallback": True}
+class Job:
+    __slots__ = ("job_id", "height", "prev_hash", "merkle", "timestamp", "difficulty",
+                 "share_difficulty", "transactions", "distribution", "created_at")
+    def __init__(self, height, prev_hash, merkle, timestamp, difficulty, share_difficulty, transactions, distribution):
+        self.job_id = uuid.uuid4().hex[:16]
+        self.height = height
+        self.prev_hash = prev_hash
+        self.merkle = merkle
+        self.timestamp = timestamp
+        self.difficulty = difficulty
+        self.share_difficulty = share_difficulty
+        self.transactions = transactions
+        self.distribution = distribution
+        self.created_at = time.time()
 
 
-_checkpoints: dict = {}
-_checkpoint_priv = None
+def _target(diff: int) -> int:
+    return int("0" * int(diff) + "f" * (64 - int(diff)), 16)
 
 
-def set_checkpoints(d: dict) -> None:
-    global _checkpoints
-    _checkpoints = {str(k): v for k, v in (d or {}).items()}
-
-
-def set_checkpoint_priv(priv) -> None:
-    global _checkpoint_priv
-    _checkpoint_priv = priv
-
-
-def get_checkpoints() -> dict:
-    return dict(_checkpoints)
-
-
-def _create_auto_checkpoint(block: dict) -> None:
-    """[v9.4.11] Cria checkpoint assinado na altura BRN_CHECKPOINT_AUTO_HEIGHT."""
-    if _checkpoint_priv is None:
-        log.warning(
-            "[CHECKPOINT] #%d NÃO criado: _checkpoint_priv não configurada "
-            "(SK do validador ausente)",
-            block["height"],
-        )
-        return
+def _meets(h_hex: str, diff: int) -> bool:
     try:
-        from checkpoints import sign_checkpoint, save_checkpoints, load_checkpoints
-        h = int(block["height"])
-        cp = sign_checkpoint(h, block["hash"], _checkpoint_priv)
-        if not cp:
-            log.warning("[CHECKPOINT] #%d sign_checkpoint retornou vazio", h)
-            return
-        cps = load_checkpoints()
-        cps[str(h)] = cp
-        save_checkpoints(cps)
-        _checkpoints[str(h)] = cp
-        log.warning(
-            "[CHECKPOINT] #%d criado automaticamente: %s...",
-            h, block["hash"][:32],
-        )
-    except Exception as e:
-        log.error("[CHECKPOINT] #%d falhou: %s", block["height"], e)
-
-
-def _verify_checkpoint_for_block(block) -> tuple:
-    cp = _checkpoints.get(str(block["height"]))
-    if not cp:
-        return True, ""
-    if cp.get("hash") != block["hash"]:
-        return False, f"checkpoint mismatch em #{block['height']}"
-    try:
-        from checkpoints import verify_checkpoint
-        if not verify_checkpoint(cp):
-            return False, f"checkpoint invalido em #{block['height']}"
-    except ImportError:
-        pass
-    except Exception as e:
-        return False, f"checkpoint verify erro: {e}"
-    return True, ""
-
-
-def _maybe_sign_checkpoint(block) -> None:
-    if _checkpoint_priv is None:
-        return
-    try:
-        h = int(block["height"])
-        if h == 0 or h % CHECKPOINT_INTERVAL != 0:
-            return
-        from checkpoints import sign_checkpoint, save_checkpoints
-        from wallet import Wallet
-        priv = _checkpoint_priv
-        if isinstance(priv, str):
-            priv = Wallet(private_key_hex=priv.strip())
-        cp = sign_checkpoint(h, block["hash"], priv)
-        if not cp:
-            return
-        _checkpoints[str(h)] = cp
-        save_checkpoints(_checkpoints)
-        print(f"[CHECKPOINT] #{h} assinado e salvo")
+        return int(h_hex, 16) <= _target(diff)
     except Exception:
-        pass
+        return False
 
 
-def signing_hash_block(block: dict) -> bytes:
-    raw_msg = BLOCK_SIG_DOMAIN + block["hash"].encode()
-    return sha256(raw_msg)
-
-
-def sign_block_as_validator(block: dict, priv) -> dict:
-    if priv is None:
-        return {}
-    try:
-        from wallet import Wallet
-        if not isinstance(priv, Wallet):
-            if isinstance(priv, str):
-                priv = Wallet(private_key_hex=priv.strip())
-            else:
-                return {}
-        h = signing_hash_block(block)
-        sig = priv.sign(h)
+def _make_pool_coinbase(height: int, reward: int, distribution: dict) -> dict:
+    if not distribution:
         return {
-            "pubkey": priv.pub_hex,
-            "signature": sig,
+            "txid": "",
+            "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}],
+            "outputs": [{"address": "brn1poolfallbackxxxxxxxxxxxxxxxxxxx", "amount": reward,
+                         "pubkey": "00" * 33}],
+            "timestamp": int(time.time()), "locktime": 0, "height": height, "nonce": 0,
         }
-    except Exception as e:
-        log.debug(f"sign_block falhou: {e}")
-        return {}
-
-
-def verify_block_signature(pubkey_hex: str, block: dict, sig_hex: str) -> bool:
-    try:
-        from wallet import Wallet
-        h = signing_hash_block(block)
-        return Wallet.verify(h, sig_hex, pubkey_hex)
-    except Exception:
-        return False
-
-
-def compute_auth_tag(height: int, block_hash_hex: str, secret: str = None) -> str:
-    sec = secret if secret is not None else NETWORK_SECRET
-    if not sec:
-        return ""
-    msg = AUTH_TAG_DOMAIN + f"{int(height)}:{block_hash_hex}".encode()
-    return hmac.new(sec.encode(), msg, hashlib.sha256).hexdigest()
-
-
-def verify_auth_tag(height: int, block_hash_hex: str, tag: str, secret: str = None) -> bool:
-    expected = compute_auth_tag(height, block_hash_hex, secret)
-    if not expected or not tag:
-        return False
-    return hmac.compare_digest(expected, tag)
-
-
-def block_hash(prev_hash, merkle, timestamp, nonce, difficulty) -> str:
-    header = f"{prev_hash}{merkle}{timestamp}{nonce}{difficulty}"
-    return double_sha256(header.encode()).hex()
-
-
-def target_from_difficulty(difficulty: int) -> int:
-    return int("0" * int(difficulty) + "f" * (64 - int(difficulty)), 16)
-
-
-def meets_difficulty(h_hex: str, difficulty: int) -> bool:
-    try:
-        return int(h_hex, 16) <= target_from_difficulty(difficulty)
-    except Exception:
-        return False
-
-
-def work_from_difficulty(difficulty) -> int:
-    return 16 ** int(difficulty)
-
-
-def compute_merkle_root(txids: list) -> str:
-    if not txids:
-        return "0" * 64
-    layer = [bytes.fromhex(t) for t in txids]
-    while len(layer) > 1:
-        if len(layer) % 2:
-            layer.append(layer[-1])
-        layer = [sha256(layer[i] + layer[i + 1]) for i in range(0, len(layer), 2)]
-    return layer[0].hex()
-
-
-def _tx_core(tx: dict) -> dict:
-    inputs = [{"txid": i["txid"], "vout": i["vout"], "pubkey": i.get("pubkey", "")} for i in tx["inputs"]]
-    outputs = [{"address": o["address"], "amount": o["amount"], "pubkey": o.get("pubkey", "")} for o in tx["outputs"]]
-    core = {"v": _CORE_V, "inputs": inputs, "outputs": outputs, "timestamp": tx["timestamp"], "locktime": tx.get("locktime", 0), "nonce": tx.get("nonce", 0)}
-    if "data" in tx and tx["data"] is not None:
-        core["data"] = tx["data"]
-    if "height" in tx:
-        core["height"] = tx["height"]
-    return core
-
-
-def _serialize_core(tx: dict) -> bytes:
-    return orjson.dumps(_tx_core(tx), option=orjson.OPT_SORT_KEYS)
-
-
-def txid(tx: dict) -> str:
-    return double_sha256(_serialize_core(tx)).hex()
-
-
-def signing_hash(tx: dict) -> bytes:
-    return double_sha256(SIGNING_DOMAIN + _serialize_core(tx))
-
-
-def _pow_search_py(prev_hash, merkle, ts, diff, nonce_start=0, should_continue=None, progress_cb=None):
-    prefix = f"{prev_hash}{merkle}{ts}".encode()
-    diff_bytes = str(diff).encode()
-    target_int = int("0" * int(diff) + "f" * (64 - int(diff)), 16)
-    sha = hashlib.sha256
-    nonce = nonce_start
-    hashes_done = 0
-    while True:
-        for _ in range(HASH_BATCH_SIZE):
-            data = prefix + str(nonce).encode() + diff_bytes
-            h = sha(sha(data).digest()).digest()
-            if int.from_bytes(h, "big") <= target_int:
-                return nonce, h.hex(), hashes_done + 1
-            nonce += 1
-        hashes_done += HASH_BATCH_SIZE
-        time.sleep(0)
-        if should_continue is not None and not should_continue():
-            return None, None, hashes_done
-        if progress_cb is not None:
-            try:
-                progress_cb(nonce, hashes_done)
-            except Exception:
-                pass
-
-
-def _pow_search_c(prev_hash, merkle, ts, diff, nonce_start, should_continue, progress_cb):
-    prefix = f"{prev_hash}{merkle}{ts}"
-    diff_str = str(int(diff))
-    nonce = nonce_start
-    hashes_done = 0
-    while True:
-        try:
-            result = _brn_miner_c.pow_search(prefix, diff_str, int(diff), nonce_start=nonce, max_iters=HASH_BATCH_SIZE)
-        except Exception:
-            return _pow_search_py(prev_hash, merkle, ts, diff, nonce, should_continue, progress_cb)
-        if result is None:
-            return _pow_search_py(prev_hash, merkle, ts, diff, nonce, should_continue, progress_cb)
-        found_nonce, found_hash, batch_hashes = result
-        hashes_done += batch_hashes
-        if found_nonce is not None:
-            return found_nonce, found_hash, hashes_done
-        nonce += batch_hashes
-        if should_continue is not None and not should_continue():
-            return None, None, hashes_done
-        if progress_cb is not None:
-            try:
-                progress_cb(nonce, hashes_done)
-            except Exception:
-                pass
-
-
-def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0, should_continue=None, progress_cb=None):
-    if _HAS_C_MINER and _brn_miner_c is not None:
-        return _pow_search_c(prev_hash, merkle, ts, diff, nonce_start, should_continue, progress_cb)
-    return _pow_search_py(prev_hash, merkle, ts, diff, nonce_start, should_continue, progress_cb)
-
-
-def make_coinbase(address: str, pubkey_hex: str, height: int, reward: int, fila_mineracao: dict = None) -> dict:
-    if not pubkey_hex:
-        raise ValueError("make_coinbase: pubkey_hex é obrigatória")
+    total_weight = sum(d["weight"] for d in distribution.values()) or 1.0
     outputs = []
-    if fila_mineracao and len(fila_mineracao) > 0:
-        valor_validador = int(reward * 0.5)
-        valor_restante = reward - valor_validador
-        valor_por_cliente = valor_restante // len(fila_mineracao)
-        outputs.append({"address": address, "amount": valor_validador, "pubkey": pubkey_hex})
-        for cliente_addr, cliente_pub in fila_mineracao.items():
-            outputs.append({"address": cliente_addr, "amount": valor_por_cliente, "pubkey": cliente_pub})
-        total_pago = sum(o["amount"] for o in outputs)
-        if total_pago < reward:
-            outputs[0]["amount"] += (reward - total_pago)
-    else:
-        outputs.append({"address": address, "amount": int(reward), "pubkey": pubkey_hex})
-    cb = {"txid": "", "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}], "outputs": outputs, "timestamp": int(time.time()), "locktime": 0, "height": int(height), "nonce": 0}
-    cb["txid"] = txid(cb)
+    for addr, info in distribution.items():
+        amt = int(reward * (info["weight"] / total_weight))
+        if amt <= 0:
+            continue
+        outputs.append({"address": addr, "amount": amt,
+                        "pubkey": info["pubkey"] or ("00" * 33)})
+    if not outputs:
+        first = max(distribution.items(), key=lambda kv: kv[1]["weight"])
+        outputs = [{"address": first[0], "amount": reward, "pubkey": first[1]["pubkey"]}]
+    dif = reward - sum(o["amount"] for o in outputs)
+    if dif > 0:
+        outputs[0]["amount"] += dif
+    cb = {
+        "txid": "",
+        "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}],
+        "outputs": outputs,
+        "timestamp": int(time.time()),
+        "locktime": 0,
+        "height": int(height),
+        "nonce": 0,
+    }
+    cb["txid"] = calc_txid(cb)
     return cb
 
 
-def build_genesis() -> dict:
-    cb = {"txid": "", "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}], "outputs": [{"address": GENESIS_ADDRESS, "amount": GENESIS_REWARD, "pubkey": GENESIS_PUBKEY}], "timestamp": GENESIS_TIMESTAMP, "locktime": 0, "height": 0, "nonce": 0}
-    cb["txid"] = txid(cb)
-    merkle = compute_merkle_root([cb["txid"]])
-    nonce = 0
-    while True:
-        h = block_hash(GENESIS_PREV, merkle, GENESIS_TIMESTAMP, nonce, 1)
-        if h.startswith("0"):
-            break
-        nonce += 1
-    g = {"height": 0, "hash": h, "prev_hash": GENESIS_PREV, "timestamp": GENESIS_TIMESTAMP, "nonce": nonce, "merkle": merkle, "difficulty": 1, "transactions": [cb], "cumulative_work": work_from_difficulty(1), "validators_sig": []}
-    tag = compute_auth_tag(0, h)
-    if tag:
-        g["auth_tag"] = tag
-    return g
+class PoolManager:
+    def __init__(self, chain):
+        self.chain = chain
+        self.lock = threading.RLock()
+        self.miners = {}
+        self.current_job = None
+        self.recent_jobs = {}
+        self.started_at = time.time()
+        self.blocks_found = 0
+        self.total_reward_paid = 0
+        self.last_block_at = 0.0
+        self.last_block_height = -1
+        self.rejected_shares = 0
+        self.accepted_shares = 0
 
+        self.phase = 2 if self.chain.rede_descentralizada else 1
+        self.phase2_threshold = 20
+        self.miner_queue = list(self.chain.fila_mineracao.keys())
 
-GENESIS_BLOCK = build_genesis()
-
-
-class Blockchain:
-    def __init__(self, db_path="brn_v2_chain.db", genesis_address=None, genesis_pubkey=None, auto_genesis=True, network_secret=None, require_auth_tag=None):
-        self.db = ChainDB(db_path)
-        self.genesis_expected_hash = None
-        self.network_secret = network_secret if network_secret is not None else NETWORK_SECRET
-        self.require_auth_tag = bool(self.network_secret) if require_auth_tag is None else bool(require_auth_tag)
-        self.on_block_mined = None
-        self._fork_signal = None
-
-        self.trust_net = None
-        self.p2p = None
-        self._sign_collector = None
-        self._local_validator_sk = None
-
-        fila_salva = self.db.get_meta("fila_mineracao")
-        self.fila_mineracao = json.loads(fila_salva) if fila_salva else {}
-        rede_desc = self.db.get_meta("rede_descentralizada")
-        self.rede_descentralizada = (rede_desc == "1")
-
-        if not auto_genesis:
-            self.genesis_expected_hash = GENESIS_BLOCK["hash"]
-            return
-        if self.db.height() < 0:
-            g = GENESIS_BLOCK
-            if genesis_address:
-                g = self._genesis_with_address(genesis_address, genesis_pubkey if genesis_pubkey is not None else GENESIS_PUBKEY)
-            self.db.add_block(g)
-            self.db.apply_tx(g["transactions"][0], 0, coinbase=True)
-            self.db.set_meta("genesis_hash", g["hash"])
-
-    def set_trust_net(self, trust):
-        self.trust_net = trust
-        log.info(f"[Blockchain] trust_net injetado ({len(getattr(trust, 'nodes', {}))} nós)")
-
-    def set_p2p(self, p2p):
-        self.p2p = p2p
-
-    def set_local_validator_sk(self, sk) -> None:
-        if sk is None:
-            self._local_validator_sk = None
-            return
-        try:
-            from wallet import Wallet
-            if isinstance(sk, Wallet):
-                self._local_validator_sk = sk
-                log.info("[SIG] chave local de validador configurada (Wallet)")
-                return
-            if isinstance(sk, str):
-                h = sk.strip()
-                if len(h) != 64 or any(c not in "0123456789abcdefABCDEF" for c in h):
-                    log.warning("[SIG] set_local_validator_sk: hex inválido")
-                    self._local_validator_sk = None
-                    return
-                self._local_validator_sk = Wallet(private_key_hex=h)
-                log.info("[SIG] chave local de validador configurada (hex)")
-                return
-            log.warning(f"[SIG] set_local_validator_sk: tipo não suportado ({type(sk).__name__}); ignorando")
-            self._local_validator_sk = None
-        except Exception as e:
-            log.warning(f"[SIG] set_local_validator_sk falhou: {e}")
-            self._local_validator_sk = None
-
-    def set_sign_collector(self, cb):
-        self._sign_collector = cb
-
-    def adicionar_na_fila(self, address: str, pubkey: str) -> None:
-        if self.rede_descentralizada:
-            return
-        if not address or not pubkey:
-            return
-        if address in self.fila_mineracao:
-            return
-        self.fila_mineracao[address] = pubkey
-        print(f"[BOOTSTRAP] Novo minerador na fila: {address[:12]}... ({len(self.fila_mineracao)}/{FILA_MAX_MINERADORES})")
-        self.db.set_meta("fila_mineracao", json.dumps(self.fila_mineracao))
-        if len(self.fila_mineracao) >= FILA_MAX_MINERADORES:
-            self.rede_descentralizada = True
-            self.db.set_meta("rede_descentralizada", "1")
-            print("\n[BOOTSTRAP] 20 MINERADORES ATINGIDOS! REDE DESCENTRALIZADA.\n")
-
-    @staticmethod
-    def _genesis_with_address(address: str, pubkey_hex: str = "") -> dict:
-        cb = {"txid": "", "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}], "outputs": [{"address": address, "amount": GENESIS_REWARD, "pubkey": pubkey_hex}], "timestamp": GENESIS_TIMESTAMP, "locktime": 0, "height": 0, "nonce": 0}
-        cb["txid"] = txid(cb)
-        merkle = compute_merkle_root([cb["txid"]])
-        nonce = 0
-        while True:
-            h = block_hash(GENESIS_PREV, merkle, GENESIS_TIMESTAMP, nonce, 1)
-            if h.startswith("0"):
-                break
-            nonce += 1
-        g = {"height": 0, "hash": h, "prev_hash": GENESIS_PREV, "timestamp": GENESIS_TIMESTAMP, "nonce": nonce, "merkle": merkle, "difficulty": 1, "transactions": [cb], "cumulative_work": work_from_difficulty(1), "validators_sig": []}
-        tag = compute_auth_tag(0, h)
-        if tag:
-            g["auth_tag"] = tag
-        return g
-
-    def set_network_secret(self, secret: str) -> None:
-        self.network_secret = (secret or "").strip()
-        if os.environ.get("BRN_REQUIRE_AUTH_TAG", "1") == "1":
-            if self.require_auth_tag is False:
-                self.require_auth_tag = bool(self.network_secret)
-
-    def current_reward(self, height: int) -> int:
-        halvings = height // HALVING_INTERVAL
-        if halvings >= 64:
-            return 0
-        return INITIAL_REWARD >> halvings
-
-    def current_difficulty(self) -> int:
-        if FORCE_DIFFICULTY:
-            try:
-                return max(1, min(20, int(FORCE_DIFFICULTY)))
-            except ValueError:
-                pass
-        h = self.db.height()
-        if h < DIFFICULTY_INTERVAL:
-            return INITIAL_DIFFICULTY
-        start = self.db.get_block(h - DIFFICULTY_INTERVAL + 1)
-        end = self.db.get_block(h)
-        if not start or not end:
-            return INITIAL_DIFFICULTY
-        if end["difficulty"] > MAX_DIFFICULTY:
-            return MAX_DIFFICULTY
-        actual = max(1, end["timestamp"] - start["timestamp"])
-        expected = BLOCK_TIME * DIFFICULTY_INTERVAL
-        prev = end["difficulty"]
-        new = int(prev * expected / actual)
-        new = max(prev // 4, min(prev * 4, new))
-        return max(1, min(MAX_DIFFICULTY, new))
-
-    def cumulative_work(self) -> int:
-        total = 0
-        with self.db.lock:
-            rows = self.db.conn.execute("SELECT difficulty FROM blocks").fetchall()
-            for r in rows:
-                try:
-                    total += work_from_difficulty(r["difficulty"])
-                except Exception:
-                    continue
-        return total
-
-    def get_latest_height(self) -> int:
-        return self.db.height()
-
-    def get_transaction_block_height(self, txid_str: str) -> int:
-        return self.db.get_tx_block_height(txid_str)
-
-    def count_confirmations(self, txid_str: str) -> int:
-        tx_height = self.get_transaction_block_height(txid_str)
-        if tx_height == -1:
-            return 0
-        return self.get_latest_height() - tx_height
-
-    def estimate_fee(self, priority: str = "medium") -> int:
-        try:
-            stats = self.db.mempool_stats()
-        except Exception:
-            return MIN_RELAY_FEE
-        count = stats.get("count", 0)
-        fees = stats.get("fees", [])
-        if count == 0 or not fees:
-            return MIN_RELAY_FEE
-        fees_sorted = sorted(fees, reverse=True)
-        n = len(fees_sorted)
-        if priority == "high":
-            idx = max(0, n // 10)
-            return max(MIN_RELAY_FEE, fees_sorted[idx] * 2)
-        elif priority == "low":
-            idx = min(n - 1, (n * 9) // 10)
-            return max(MIN_RELAY_FEE, fees_sorted[idx])
+        # [v6.1] Informa qual fonte de trust está ativa
+        _trust = getattr(self.chain, "trust_net", None)
+        if _trust is not None:
+            log.info("PoolManager: usando chain.trust_net (unificado com consenso)")
         else:
-            idx = n // 2
-            return max(MIN_RELAY_FEE, fees_sorted[idx])
-
-    def tx_fee(self, tx: dict) -> int:
-        in_sum = 0
-        for inp in tx["inputs"]:
-            u = self.db.get_utxo(inp["txid"], inp["vout"])
-            if u:
-                in_sum += u["amount"]
-        return in_sum - sum(o["amount"] for o in tx["outputs"])
-
-    def _validate_contract_tx(self, tx: dict) -> tuple:
-        tx_data = tx.get("data") or {}
-        t = tx_data.get("type")
-        if t == "deploy":
-            code = tx_data.get("code")
-            if not isinstance(code, dict):
-                return False, "deploy sem 'code' (dict)"
             try:
-                from contracts import ContractVM
-                return ContractVM.validate(code)
-            except ImportError:
-                return False, "modulo contracts.py nao encontrado"
-            except Exception as e:
-                return False, f"erro validando contrato: {e}"
-        if t == "call":
-            cid = tx_data.get("contract_id")
-            if not cid or not isinstance(cid, str):
-                return False, "call sem 'contract_id'"
-            if not cid.startswith("ctr1"):
-                return False, "contract_id deve começar com 'ctr1'"
-            if not self.db.contract_get(cid):
-                return False, f"contrato {cid[:16]}... nao existe"
-            return True, "ok"
-        return False, f"tipo de contrato desconhecido: {t}"
-
-    def _contract_sender_address(self, tx: dict) -> str:
-        inputs = tx.get("inputs") or []
-        if not inputs or not isinstance(inputs[0], dict):
-            raise ValueError("transacao de contrato sem input valido")
-        pubkey_hex = inputs[0].get("pubkey", "")
-        if not isinstance(pubkey_hex, str) or not pubkey_hex:
-            raise ValueError("transacao de contrato sem pubkey do remetente")
-        try:
-            from bech32 import address_from_pubkey
-            pubkey = bytes.fromhex(pubkey_hex)
-            address = address_from_pubkey(pubkey)
-        except Exception as exc:
-            raise ValueError("pubkey do remetente invalida") from exc
-        if not address:
-            raise ValueError("nao foi possivel derivar endereco do remetente")
-        return address
-
-    def _apply_contract_tx(self, tx: dict) -> dict:
-        tx_data = tx.get("data") or {}
-        t = tx_data.get("type")
-        from contracts import deploy as _deploy, call as _call
-        sender = self._contract_sender_address(tx)
-        if t == "deploy":
-            r = _deploy(self, sender, tx_data.get("code") or {}, metadata=tx_data.get("metadata"))
-            if not r.get("ok"):
-                raise ValueError(f"deploy falhou: {r.get('msg')}")
-            return r
-        if t == "call":
-            r = _call(self, tx_data.get("contract_id", ""), sender, tx_data.get("args"))
-            if not r.get("ok"):
-                raise ValueError(f"call falhou: {r.get('msg')}")
-            return r
-        raise ValueError(f"tipo de contrato desconhecido: {t}")
-
-    def validate_tx(self, tx: dict, from_mempool: bool = False) -> tuple:
-        from wallet import Wallet
-        if not tx.get("inputs") or not tx.get("outputs"):
-            return False, "tx sem inputs/outputs"
-        if tx["inputs"][0]["txid"] == "0" * 64:
-            return False, "coinbase invalida"
-        if tx.get("txid") != txid(tx):
-            return False, "txid invalido"
-        tx_data = tx.get("data") or {}
-        if isinstance(tx_data, dict) and tx_data.get("type") in ("deploy", "call"):
-            ok_ctr, msg_ctr = self._validate_contract_tx(tx)
-            if not ok_ctr:
-                return False, f"contrato: {msg_ctr}"
-        if not from_mempool:
-            try:
-                gastos_mem = self.db.utxos_gastos_na_mempool()
-            except AttributeError:
-                gastos_mem = set()
+                from trust_system import trust_system as _legacy  # noqa: F401
+                log.warning("PoolManager: chain.trust_net ausente — usando "
+                            "trust_system LEGADO (repare: main.py deve criar "
+                            "TrustNetwork e chamar chain.set_trust_net)")
             except Exception:
-                gastos_mem = set()
-            for inp in tx["inputs"]:
-                key = (inp["txid"], int(inp["vout"]))
-                if key in gastos_mem:
-                    return False, f"UTXO {inp['txid'][:16]}...:{inp['vout']} ja esta sendo gasta por outra tx na mempool"
-        for inp in tx["inputs"]:
-            if not inp.get("pubkey"):
-                return False, "input sem pubkey"
-        tx_nonce = tx.get("nonce", 0)
-        for inp in tx["inputs"]:
-            pk = inp["pubkey"]
-            expected = self.db.get_nonce_for_pubkey(pk)
-            if tx_nonce != expected:
-                return False, f"nonce invalido para {pk[:16]}... (esperado {expected}, recebido {tx_nonce})"
-        in_sum = 0
-        seen = set()
-        for inp in tx["inputs"]:
-            key = (inp["txid"], inp["vout"])
-            if key in seen:
-                return False, "input duplicado"
-            seen.add(key)
-            u = self.db.get_utxo(inp["txid"], inp["vout"])
-            if not u:
-                return False, "UTXO inexistente"
-            stored_pk = (u["pubkey"] or "").strip()
-            if stored_pk and set(stored_pk) != {"0"}:
-                if inp["pubkey"] != stored_pk:
-                    return False, f"pubkey mismatch: input={inp['pubkey'][:16]}... utxo={stored_pk[:16]}"
-            else:
-                try:
-                    from bech32 import address_from_pubkey
-                    derived = address_from_pubkey(bytes.fromhex(inp["pubkey"]))
-                except Exception:
-                    return False, "input pubkey invalida"
-                if derived != u["address"]:
-                    return False, f"address mismatch: deriva {derived[:16]}... utxo {u['address'][:16]}..."
-            in_sum += u["amount"]
-        out_sum = sum(o["amount"] for o in tx["outputs"])
-        if out_sum > in_sum:
-            return False, "outputs > inputs"
-        if in_sum - out_sum < MIN_RELAY_FEE:
-            return False, "fee abaixo do minimo"
-        sig_hash = signing_hash(tx)
-        for inp in tx["inputs"]:
-            if not Wallet.verify(sig_hash, inp.get("signature", ""), inp["pubkey"]):
-                return False, "assinatura invalida"
-        return True, "ok"
+                log.warning("PoolManager: sem trust network — reputação de "
+                            "mineradores desabilitada neste pool")
 
-    def submit_tx(self, tx: dict) -> tuple:
-        if self.db.mempool_count() >= MAX_MEMPOOL_SIZE:
-            return False, "Mempool cheia. Tente novamente mais tarde."
-        if self.db.has_mempool(tx["txid"]):
-            return False, "ja na mempool"
-        ok, msg = self.validate_tx(tx)
-        if not ok:
-            return False, msg
-        fee = self.tx_fee(tx)
-        if fee < 0:
-            return False, "fee negativa"
-        if not self.db.add_mempool(tx, fee):
-            return False, "falha na mempool"
-        return True, tx["txid"]
+        self._stop = threading.Event()
+        threading.Thread(target=self._maintenance_loop, daemon=True, name="Pool-Maint").start()
+        log.info("PoolManager iniciado — Blockchain + Vardiff + Trust unificado + Multi-sig")
 
-    def median_time_past(self, height: int) -> int:
-        timestamps = []
-        for i in range(max(0, height - MTP_WINDOW), height):
-            try:
-                b = self.db.get_block(i)
-                if b:
-                    timestamps.append(b["timestamp"])
-            except Exception:
-                continue
-        if not timestamps:
-            return 0
-        timestamps.sort()
-        return timestamps[len(timestamps) // 2]
-
-    def _get_active_validators(self) -> list:
-        validators: list = []
-        trust = self.trust_net
+    # ============================================================
+    # [v6.1] Helpers de integração com o trust network
+    # ============================================================
+    def _register_in_trust(self, miner_id: str, address: str, pubkey: str) -> None:
+        trust = getattr(self.chain, "trust_net", None)
         if trust is not None:
             try:
-                if hasattr(trust, "get_active_validators"):
-                    validators = list(trust.get_active_validators(count=MAX_VALIDATORS) or [])
-                else:
-                    validators = list(trust.get_top_validators(count=MAX_VALIDATORS) or [])
+                trust.register_node(miner_id, address, pubkey)
+                return
             except Exception as e:
-                log.warning(f"[VALIDATORS] falhou: {e}")
-                validators = []
-
-            # [v9.4.12] Fallback: active_validators vazio → usa top_validators.
-            # Sem isso, trust_network.json com "active_validators": [] fazia
-            # get_active_validators() retornar [] e required=0/0, desligando
-            # a verificação multi-sig por completo.
-            if not validators and hasattr(trust, "get_top_validators"):
-                try:
-                    validators = list(trust.get_top_validators(count=MAX_VALIDATORS) or [])
-                    if validators:
-                        log.warning(
-                            "[VALIDATORS] active_validators vazio; usando "
-                            "get_top_validators() como fallback (%d validador(es))",
-                            len(validators),
-                        )
-                except Exception as e:
-                    log.warning(f"[VALIDATORS] fallback get_top_validators falhou: {e}")
-                    validators = []
-
-        local_sk = self._local_validator_sk
-        if local_sk is not None:
-            try:
-                local_pk = local_sk.pub_hex
-            except Exception:
-                local_pk = ""
-            if local_pk and local_pk not in validators:
-                validators.append(local_pk)
-                log.info(
-                    f"[VALIDATORS] bootstrap: incluindo local "
-                    f"{local_pk[:16]}… no set"
-                )
-
-        return sorted({p for p in validators if p})
-
-    def _required_signatures(self, validators: list) -> int:
-        n = len(validators)
-        if n == 0:
-            return 0
-        if REQUIRE_ALL_SIGS:
-            log.info(f"[SIG] quorum=ALL ({n}/{n})")
-            return n
-        need = max(1, math.ceil(n * VALIDATOR_QUORUM))
-        need = min(need, n)
-        log.info(f"[SIG] quorum={VALIDATOR_QUORUM} → {need}/{n} assinaturas")
-        return need
-
-    def _validate_validators_sig(self, block: dict, validators: Optional[list] = None) -> tuple:
-        if BRN_BOOTSTRAP_SKIP_SIGS_UNTIL > 0:
-            try:
-                _bh = int(block.get("height", -1))
-            except Exception:
-                _bh = -1
-            if 0 < _bh <= BRN_BOOTSTRAP_SKIP_SIGS_UNTIL:
-                log.warning(
-                    f"[SIG] EMERGENCIA: bloco #{_bh} aceito SEM multi-sig "
-                    f"(BRN_BOOTSTRAP_SKIP_SIGS_UNTIL={BRN_BOOTSTRAP_SKIP_SIGS_UNTIL}). "
-                    f"REMOVA essa env e reinicie apos altura > {BRN_BOOTSTRAP_SKIP_SIGS_UNTIL}."
-                )
-                return True, ""
-
-        if validators is None:
-            validators = self._get_active_validators()
-        if not validators:
-            return True, ""
-
-        required = self._required_signatures(validators)
-
-        sigs = block.get("validators_sig", [])
-        if sigs is None:
-            sigs = []
-        if not isinstance(sigs, list):
-            return False, "validators_sig inválido"
-
-        valid_set = set(validators)
-        verified_pubkeys: set = set()
-        foreign_pubkeys: set = set()
-
-        for entry in sigs:
-            if not isinstance(entry, dict):
-                continue
-            pubkey = (entry.get("pubkey") or "").strip()
-            signature = (entry.get("signature") or "").strip()
-            if not pubkey or not signature:
-                continue
-            if pubkey in verified_pubkeys or pubkey in foreign_pubkeys:
-                continue
-            if not verify_block_signature(pubkey, block, signature):
-                log.warning(f"[SIG] assinatura inválida de {pubkey[:16]}")
-                continue
-            if pubkey in valid_set:
-                verified_pubkeys.add(pubkey)
-            else:
-                foreign_pubkeys.add(pubkey)
-
-        got = len(verified_pubkeys)
-        got_foreign = len(foreign_pubkeys)
-
-        if got >= required:
-            return True, ""
-
-        if len(validators) < 2 and got == 0 and got_foreign >= 1:
-            try:
-                block_h = int(block.get("height", -1))
-                my_height = self.db.height()
-            except Exception:
-                block_h = -1
-                my_height = -1
-            if block_h > my_height + 1:
-                return False, (
-                    f"Bloco #{block_h}: salto de altura "
-                    f"(tip local #{my_height}); rejeitado para evitar fork"
-                )
-            log.warning(
-                f"[SIG] Bloco #{block_h}: aceito em MODO BOOTSTRAP "
-                f"(set local tem {len(validators)} validador(es), "
-                f"{got_foreign} assinatura(s) estrangeira(s) válida(s)). "
-                f"Para multi-sig real, sincronize trust_network.json "
-                f"entre os nós (GET /api/trust/download no Origin)."
-            )
-            return True, ""
-
-        if got >= 1 and got_foreign == 0:
-            local_pk = ""
-            if self._local_validator_sk is not None:
-                try:
-                    local_pk = self._local_validator_sk.pub_hex
-                except Exception:
-                    pass
-            if local_pk and local_pk in verified_pubkeys:
-                try:
-                    block_h = int(block.get("height", -1))
-                    my_height = self.db.height()
-                except Exception:
-                    block_h = -1
-                    my_height = -1
-                if block_h <= my_height + 1:
-                    log.warning(
-                        f"[SIG] Bloco #{block_h}: aceito em MODO "
-                        f"BOOTSTRAP LOCAL ({got}/{required} sigs; "
-                        f"único assinante é a própria SK local "
-                        f"{local_pk[:16]}…)."
-                    )
-                    return True, ""
-
-        if got >= 1 and got_foreign == 0:
-            trusted = False
-            trusted_pubkey = ""
-            if self.trust_net is not None:
-                try:
-                    for pk in verified_pubkeys:
-                        for node in self.trust_net.nodes.values():
-                            node_pk = (node.public_key or "").lower()
-                            if node_pk and node_pk == pk.lower():
-                                score = float(getattr(node, "trust_score", 0) or 0)
-                                if score >= BOOTSTRAP_TRUST_THRESHOLD:
-                                    trusted = True
-                                    trusted_pubkey = pk
-                                    break
-                        if trusted:
-                            break
-                except Exception as e:
-                    log.debug(f"[SIG] trust_score lookup falhou: {e}")
-
-            if trusted:
-                try:
-                    block_h = int(block.get("height", -1))
-                    my_height = self.db.height()
-                except Exception:
-                    block_h = -1
-                    my_height = -1
-                if block_h <= my_height + 1:
-                    log.warning(
-                        f"[SIG] Bloco #{block_h}: aceito em MODO BOOTSTRAP "
-                        f"ESTENDIDO ({got}/{required} sigs; assinante "
-                        f"{trusted_pubkey[:16]}… com trust_score>="
-                        f"{BOOTSTRAP_TRUST_THRESHOLD:.0f})."
-                    )
-                    return True, ""
-
-        if got == 0 and got_foreign == 0:
-            return False, f"Bloco #{block.get('height')}: sem assinaturas válidas"
-
-        missing = [p[:12] + "…" for p in validators if p not in verified_pubkeys]
-        return False, (
-            f"Bloco #{block['height']} precisa de {required}/{len(validators)} "
-            f"assinaturas do set local, tem {got}. "
-            f"Faltam: {', '.join(missing[:5])}. "
-            f"({got_foreign} assinatura(s) estrangeira(s) ignorada(s))"
-        )
-
-    # =================================================================
-    # [v9.4.11] validate_block com ASSUME-VALID até BRN_ASSUME_VALID_UNTIL
-    # =================================================================
-    def validate_block(self, block: dict, prev_block=None, validators: Optional[list] = None) -> tuple:
-        if block["height"] == 0 and prev_block is None:
-            if (self.genesis_expected_hash and block["hash"] != self.genesis_expected_hash):
-                return False, f"genesis nao corresponde ao esperado"
-        expected_prev = (prev_block["hash"] if prev_block else self.db.tip_hash())
-        if block["prev_hash"] != expected_prev:
-            return False, "prev_hash incorreto"
-        expected_height = ((prev_block["height"] + 1) if prev_block else self.db.height() + 1)
-        if block["height"] != expected_height:
-            return False, "altura invalida"
-
-        # [v9.4.11] ASSUME-VALID: skip validation completa até N
-        h_int = int(block["height"])
-        if BRN_ASSUME_VALID_UNTIL > 0 and 0 < h_int <= BRN_ASSUME_VALID_UNTIL:
-            try:
-                h_calc = block_hash(
-                    block["prev_hash"], block["merkle"], block["timestamp"],
-                    block["nonce"], block["difficulty"],
-                )
-            except KeyError as e:
-                return False, f"campo ausente em #{h_int}: {e}"
-            if h_calc != block["hash"]:
-                return False, f"hash incorreto (assume_valid) em #{h_int}"
-            if h_int % 100 == 0 or h_int == 1:
-                log.info(
-                    "[ASSUME-VALID] #%d aceito (hash+prev_hash apenas; "
-                    "%d/%d)", h_int, h_int, BRN_ASSUME_VALID_UNTIL,
-                )
-            return True, "ok (assume_valid)"
-
-        if block["height"] > MTP_WINDOW:
-            try:
-                mtp = self.median_time_past(block["height"])
-                if block["timestamp"] < mtp:
-                    return False, f"timestamp ({block['timestamp']}) < MTP ({mtp})"
-            except Exception as e:
-                log.warning(f"[validate_block] Falha no MTP (tolerado): {e}")
-
-        if not meets_difficulty(block["hash"], block["difficulty"]):
-            return False, "PoW invalido"
-        h = block_hash(block["prev_hash"], block["merkle"], block["timestamp"], block["nonce"], block["difficulty"])
-        if h != block["hash"]:
-            return False, "hash incorreto"
-        calc_merkle = compute_merkle_root([t["txid"] for t in block["transactions"]])
-        if calc_merkle != block["merkle"]:
-            return False, "merkle incorreto"
-
-        ok_cp, msg_cp = _verify_checkpoint_for_block(block)
-        if not ok_cp:
-            return False, msg_cp
-
-        if block["height"] > 0:
-            ok_sig, msg_sig = self._validate_validators_sig(block, validators=validators)
-            if not ok_sig:
-                return False, msg_sig
-
-        if block["height"] > 0 and self.require_auth_tag:
-            if not self.network_secret:
-                return False, "no exige auth_tag mas sem BRN_NETWORK_SECRET"
-            if block["height"] > AUTH_TAG_START_HEIGHT:
-                tag = block.get("auth_tag")
-                if not tag:
-                    return False, "bloco sem auth_tag"
-                if not verify_auth_tag(block["height"], block["hash"], tag, self.network_secret):
-                    return False, "auth_tag invalido (segredo errado?)"
-            else:
-                tag = block.get("auth_tag")
-                if tag:
-                    if not verify_auth_tag(block["height"], block["hash"], tag, self.network_secret):
-                        return False, "auth_tag invalido em bloco legado"
-
-        cb = block["transactions"][0]
-        if cb["inputs"][0]["txid"] != "0" * 64:
-            return False, "primeira tx nao e coinbase"
-        if cb.get("txid") != txid(cb):
-            return False, "coinbase txid invalido"
-        if block["height"] > 0:
-            for out in cb["outputs"]:
-                if not out.get("pubkey"):
-                    return False, "coinbase output sem pubkey"
-        for inp in cb["inputs"]:
-            if inp.get("signature"):
-                return False, "coinbase input com assinatura"
-        reward = self.current_reward(block["height"])
-        fees = 0
-        for i, t in enumerate(block["transactions"][1:], 1):
-            if t["txid"] != txid(t):
-                return False, "txid invalido"
-            ok_tx, msg_tx = self.validate_tx(t, from_mempool=True)
-            if not ok_tx:
-                return False, f"tx #{i}: {msg_tx}"
-            fees += self.tx_fee(t)
-        total_cb = sum(o["amount"] for o in cb["outputs"])
-        if total_cb > reward + fees:
-            return False, "coinbase acima do permitido"
-        return True, "ok"
-
-    # =================================================================
-    # [v9.4.11] accept_block com auto-checkpoint em BRN_CHECKPOINT_AUTO_HEIGHT
-    # =================================================================
-    def accept_block(self, block: dict, validators: Optional[list] = None) -> tuple:
-        prev = self.db.get_block_by_hash(block["prev_hash"])
-        ok, msg = self.validate_block(block, prev, validators=validators)
-        if not ok:
-            return False, msg
-
+                log.warning("[Pool] register_node falhou em trust_net: %s", e)
+                return
         try:
-            existing = self.db.get_block(block["height"])
-            if existing:
-                return False, f"Bloco #{block['height']} já existe na blockchain"
+            from trust_system import trust_system as _legacy
+            _legacy.ensure_peer_entry(pubkey)
         except Exception:
             pass
 
-        try:
-            self.db.add_block(block)
-        except Exception as e:
-            return False, f"Erro ao gravar bloco #{block['height']}: {e}"
-
-        # [v9.4.11] Auto-checkpoint em altura específica
-        if BRN_CHECKPOINT_AUTO_HEIGHT > 0 and int(block["height"]) == BRN_CHECKPOINT_AUTO_HEIGHT:
-            _create_auto_checkpoint(block)
-
-        _maybe_sign_checkpoint(block)
-        for i, t in enumerate(block["transactions"]):
-            coinbase = (i == 0)
-            self.db.apply_tx(t, block["height"], coinbase=coinbase)
-            if i > 0:
-                self.db.remove_mempool(t["txid"])
-            if not coinbase:
-                tx_data = t.get("data") or {}
-                if (isinstance(tx_data, dict) and tx_data.get("type") in ("deploy", "call")):
-                    try:
-                        self._apply_contract_tx(t)
-                    except Exception as e:
-                        print(f"[CONTRACT] tx {t['txid'][:16]}... falhou: {e}")
-        return True, block["hash"]
-
-    def _attach_auth_tag(self, block: dict) -> dict:
-        tag = compute_auth_tag(block["height"], block["hash"], self.network_secret)
-        if tag:
-            block["auth_tag"] = tag
-        return block
-
-    def _fire_block_mined(self, block: dict) -> None:
-        cb = self.on_block_mined
-        if cb is None:
+    def _credit_miner_in_trust(self, cb: dict, height: int) -> None:
+        output_pubkeys = {o.get("pubkey") for o in cb.get("outputs", []) if o.get("pubkey")}
+        if not output_pubkeys:
             return
-        try:
-            cb(block)
-        except Exception as e:
-            print(f"[on_block_mined] callback falhou: {e}")
 
-    def _collect_signatures(self, block: dict, validators: Optional[list] = None) -> list:
-        if validators is None:
-            validators = self._get_active_validators()
-        if not validators:
-            return []
-
-        valid_set = set(validators)
-        sigs: list = []
-        seen: set = set()
-
-        local_sk = self._local_validator_sk
-        if local_sk is not None:
-            entry = sign_block_as_validator(block, local_sk)
-            if not entry:
-                log.warning("[SIG] assinatura local falhou (chave inválida?)")
-            else:
-                pk = entry.get("pubkey", "")
-                if pk in valid_set:
-                    if verify_block_signature(pk, block, entry.get("signature", "")):
-                        sigs.append(entry)
-                        seen.add(pk)
-                    else:
-                        log.warning(f"[SIG] assinatura local inválida ({pk[:16]})")
-                elif pk:
-                    log.info(f"[SIG] pubkey local {pk[:16]} não é validador ativo — assinatura descartada")
-
-        if self._sign_collector is not None:
-            extra: list = []
-            try:
-                from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
-                with ThreadPoolExecutor(max_workers=1, thread_name_prefix="sig-collect") as pool:
-                    fut = pool.submit(self._sign_collector, block)
+        trust = getattr(self.chain, "trust_net", None)
+        if trust is not None:
+            for mid, m in self.miners.items():
+                if m.pubkey in output_pubkeys:
                     try:
-                        extra = fut.result(timeout=SIG_COLLECT_TIMEOUT) or []
-                    except FutTimeout:
-                        log.warning(f"[SIG] _sign_collector timeout após {SIG_COLLECT_TIMEOUT:.1f}s")
-            except Exception as e:
-                log.warning(f"[SIG] _sign_collector falhou: {e}")
+                        trust.record_block_validated(mid, height)
+                        log.info("[Trust] %s creditado por bloco #%d",
+                                 m.pubkey[:8], height)
+                    except Exception as e:
+                        log.warning("[Trust] record_block_validated falhou "
+                                    "para %s: %s", mid, e)
+                    return
+            return
 
-            for entry in extra:
-                if not isinstance(entry, dict):
-                    continue
-                pk = (entry.get("pubkey") or "").strip()
-                sg = (entry.get("signature") or "").strip()
-                if not pk or not sg:
-                    continue
-                if pk not in valid_set:
-                    log.warning(f"[SIG] coletor devolveu pubkey desconhecida: {pk[:16]}")
-                    continue
-                if pk in seen:
-                    continue
-                if verify_block_signature(pk, block, sg):
-                    sigs.append(entry)
-                    seen.add(pk)
-                else:
-                    log.warning(f"[SIG] coletor devolveu assinatura inválida: {pk[:16]}")
+        try:
+            from trust_system import trust_system as _legacy
+            for mid, m in self.miners.items():
+                if m.pubkey in output_pubkeys:
+                    _legacy.update_score(m.pubkey, "valid_block")
+                    log.info("[Trust-legacy] %s creditado por bloco #%d",
+                             m.pubkey[:8], height)
+                    return
+        except Exception:
+            pass
 
-        return sigs
+    # ============================================================
+    # Registro de mineradores
+    # ============================================================
+    def register(self, address: str, pubkey: str, miner_id: Optional[str] = None) -> dict:
+        if not address or not address.startswith("brn1"):
+            return {"ok": False, "msg": "address invalido"}
+        if not pubkey:
+            return {"ok": False, "msg": "pubkey obrigatoria"}
+        with self.lock:
+            if len(self.miners) >= MAX_MINERS and miner_id not in self.miners:
+                return {"ok": False, "msg": "pool cheio"}
+            if not miner_id:
+                miner_id = uuid.uuid4().hex[:12]
+            m = self.miners.get(miner_id)
+            if m is None:
+                m = MinerState(miner_id, address, pubkey)
+                self.miners[miner_id] = m
+                log.info("pool: %s registado (addr=%s)", miner_id, address[:16])
+            else:
+                m.address = address
+                m.pubkey = pubkey
+                m.last_seen = time.time()
 
-    def mine_block(self, miner_address: str, miner_pubkey: str) -> dict:
-        if not miner_pubkey:
-            raise ValueError("mine_block: miner_pubkey é obrigatória")
-        return self.mine_block_interruptible(miner_address, miner_pubkey, None)
+            self.phase = 2 if self.chain.rede_descentralizada else 1
+            self.miner_queue = list(self.chain.fila_mineracao.keys())
 
-    def mine_block_interruptible(self, miner_address: str, miner_pubkey: str, should_continue=None, progress_cb=None) -> dict:
-        if not miner_pubkey:
-            raise ValueError("mine_block_interruptible: miner_pubkey é obrigatória")
+            self._register_in_trust(miner_id, address, pubkey)
 
-        validators = self._get_active_validators()
+        return {"ok": True, "miner_id": miner_id}
 
-        height = self.db.height() + 1
-        reward = self.current_reward(height)
-        diff = self.current_difficulty()
+    def heartbeat(self, miner_id: str, hashrate: float = 0.0, hashes_total: int = 0) -> dict:
+        with self.lock:
+            m = self.miners.get(miner_id)
+            if m is None:
+                return {"ok": False, "msg": "miner desconhecido"}
+            m.last_seen = time.time()
+            m.hashrate = float(hashrate or 0.0)
+            if hashes_total > m.hashes_total:
+                m.hashes_total = int(hashes_total)
+        return {"ok": True}
 
-        fila_para_pagar = None
-        if (not self.rede_descentralizada and len(self.fila_mineracao) > 0):
-            fila_para_pagar = self.fila_mineracao
-        cb = make_coinbase(miner_address, miner_pubkey, height, reward, fila_mineracao=fila_para_pagar)
+    def disconnect(self, miner_id: str) -> dict:
+        with self.lock:
+            self.miners.pop(miner_id, None)
+        return {"ok": True}
 
-        candidatas = self.db.all_mempool(limit=MAX_TX_PER_BLOCK - 1)
-        selected = []
-        gastos_neste_bloco = set()
-        for t in candidatas:
-            try:
-                ok_tx, msg_tx = self.validate_tx(t, from_mempool=True)
-                if not ok_tx:
-                    continue
-                conflito = False
-                for inp in t.get("inputs", []):
-                    key = (inp["txid"], int(inp["vout"]))
-                    if key in gastos_neste_bloco:
-                        conflito = True
-                        break
-                if conflito:
-                    continue
-                for inp in t.get("inputs", []):
-                    gastos_neste_bloco.add((inp["txid"], int(inp["vout"])))
-                selected.append(t)
-            except Exception:
+    # ============================================================
+    # VARDIFF
+    # ============================================================
+    def _apply_vardiff(self, m: MinerState, job: Job) -> None:
+        now = time.time()
+        cutoff = now - VARDIFF_WINDOW_S
+        m.share_times = [t for t in m.share_times if t >= cutoff]
+
+        if len(m.share_times) < VARDIFF_MIN_SAMPLES:
+            return
+
+        intervals = [m.share_times[i + 1] - m.share_times[i]
+                     for i in range(len(m.share_times) - 1)]
+        if not intervals:
+            return
+        avg_interval = sum(intervals) / len(intervals)
+
+        max_diff = max(VARDIFF_MIN_DIFF, int(job.difficulty) - 1)
+        changed = False
+
+        if avg_interval < VARDIFF_TARGET_S * VARDIFF_FAST_RATIO:
+            new_diff = min(m.share_difficulty + VARDIFF_MAX_STEP, max_diff)
+            if new_diff > m.share_difficulty:
+                m.share_difficulty = new_diff
+                changed = True
+                log.info("vardiff: %s diff -> %d (rápido avg=%.1fs n=%d)",
+                         m.miner_id, new_diff, avg_interval, len(m.share_times))
+        elif avg_interval > VARDIFF_TARGET_S * VARDIFF_SLOW_RATIO:
+            new_diff = max(m.share_difficulty - VARDIFF_MAX_STEP, VARDIFF_MIN_DIFF)
+            if new_diff < m.share_difficulty:
+                m.share_difficulty = new_diff
+                changed = True
+                log.info("vardiff: %s diff -> %d (lento avg=%.1fs n=%d)",
+                         m.miner_id, new_diff, avg_interval, len(m.share_times))
+
+        if changed:
+            m.share_times = []
+
+    def get_work(self, miner_id: str) -> dict:
+        with self.lock:
+            m = self.miners.get(miner_id)
+            if m is None:
+                return {"ok": False, "msg": "miner desconhecido"}
+            m.last_seen = time.time()
+            m.mining = True
+            job = self.current_job
+            if job is None or self._job_is_stale(job):
+                job = self._build_job_locked()
+
+            self._apply_vardiff(m, job)
+            effective_diff = min(
+                m.share_difficulty,
+                max(VARDIFF_MIN_DIFF, int(job.difficulty) - 1),
+            )
+            m.share_difficulty = effective_diff
+            m.active_share_difficulty = effective_diff
+
+        return {"ok": True, "job": {
+            "job_id": job.job_id,
+            "height": job.height,
+            "prev_hash": job.prev_hash,
+            "merkle": job.merkle,
+            "timestamp": job.timestamp,
+            "difficulty": job.difficulty,
+            "share_difficulty": effective_diff,
+            "coinbase_txid": job.transactions[0]["txid"],
+            "n_txs": len(job.transactions),
+            "created_at": job.created_at,
+        }}
+
+    def _job_is_stale(self, job: Job) -> bool:
+        if time.time() - job.created_at > JOB_REFRESH_S:
+            return True
+        try:
+            tip = self.chain.db.tip_hash()
+            if tip != job.prev_hash:
+                return True
+        except Exception:
+            return True
+        return False
+
+    def _build_job_locked(self) -> Job:
+        h = self.chain.db.height() + 1
+        reward = self.chain.current_reward(h)
+        diff = self.chain.current_difficulty()
+        share_diff = max(2, diff - SHARE_DIFF_OFFSET)
+        prev_hash = self.chain.db.tip_hash()
+
+        distribution = {}
+        for mid, m in self.miners.items():
+            if (time.time() - m.last_seen) > MINER_TIMEOUT_S:
                 continue
-        txs = [cb] + selected
-        merkle = compute_merkle_root([t["txid"] for t in txs])
-        prev_hash = self.db.tip_hash()
-        ts = int(time.time())
-        nonce, h_hex, _ = _pow_search(prev_hash, merkle, ts, diff, should_continue=should_continue, progress_cb=progress_cb)
-        if nonce is None:
-            return None
+            if not m.address or not m.pubkey:
+                continue
+            w = float(m.shares_period) + 1.0
+            distribution[m.address] = {"pubkey": m.pubkey, "weight": w}
+
+        cb = _make_pool_coinbase(h, reward, distribution)
+
+        try:
+            mempool_txs = self.chain.db.all_mempool(limit=200)
+        except Exception:
+            mempool_txs = []
+        transactions = [cb] + mempool_txs
+        merkle = compute_merkle_root([t["txid"] for t in transactions])
+
+        job = Job(
+            height=h, prev_hash=prev_hash, merkle=merkle,
+            timestamp=int(time.time()), difficulty=diff,
+            share_difficulty=share_diff,
+            transactions=transactions, distribution=distribution,
+        )
+        self.current_job = job
+        self.recent_jobs[job.job_id] = job
+        if len(self.recent_jobs) > MAX_RECENT_JOBS:
+            oldest = sorted(self.recent_jobs.items(), key=lambda kv: kv[1].created_at)[:1]
+            for k, _ in oldest:
+                self.recent_jobs.pop(k, None)
+        log.info("pool: novo job %s (h=%d diff=%d share_diff=%d miners=%d)",
+                 job.job_id, h, diff, share_diff, len(distribution))
+        return job
+
+    def submit_share(self, miner_id: str, nonce: int, hash_hex: str = "") -> dict:
+        with self.lock:
+            m = self.miners.get(miner_id)
+            if m is None:
+                return {"ok": False, "msg": "miner desconhecido"}
+            m.last_seen = time.time()
+            job = self.current_job
+            if job is None:
+                return {"ok": False, "msg": "sem job ativo"}
+
+            miner_share_diff = max(
+                int(m.active_share_difficulty or VARDIFF_MIN_DIFF),
+                VARDIFF_MIN_DIFF,
+            )
+
+            candidates = [job]
+            for j in self.recent_jobs.values():
+                if j.job_id != job.job_id:
+                    candidates.append(j)
+
+            h = None
+            matched_job = None
+            for cand in candidates:
+                try:
+                    h2 = block_hash(cand.prev_hash, cand.merkle,
+                                    cand.timestamp, int(nonce), cand.difficulty)
+                except Exception:
+                    continue
+                if _meets(h2, miner_share_diff):
+                    h = h2
+                    matched_job = cand
+                    break
+
+            if matched_job is None:
+                self.rejected_shares += 1
+                return {"ok": False, "msg": "share nao bate share_difficulty"}
+
+            job = matched_job
+            if hash_hex and hash_hex != h:
+                self.rejected_shares += 1
+                return {"ok": False, "msg": "hash nao corresponde ao nonce"}
+
+            m.shares_period += 1
+            m.shares_total += 1
+            self.accepted_shares += 1
+
+            m.share_times.append(time.time())
+            if len(m.share_times) > VARDIFF_MAX_SAMPLES:
+                m.share_times = m.share_times[-VARDIFF_MAX_SAMPLES:]
+
+            block_found = False
+            new_height = None
+
+            if _meets(h, job.difficulty):
+                log.warning("pool: FULL BLOCK encontrado por %s (nonce=%s, h=%d)",
+                            miner_id, nonce, job.height)
+                try:
+                    ok = self._assemble_and_accept_block(job, int(nonce), h)
+                    if ok:
+                        block_found = True
+                        new_height = job.height
+                        self.blocks_found += 1
+                        self.last_block_at = time.time()
+                        self.last_block_height = job.height
+                        for mm in self.miners.values():
+                            mm.shares_period = 0
+                            mm.share_times = []
+                        self.current_job = None
+                    else:
+                        log.warning("pool: accept_block falhou — forcando novo job")
+                        self.current_job = None
+                except Exception as e:
+                    log.exception("pool: erro aceitando bloco: %s", e)
+
+        return {
+            "ok": True,
+            "share_id": uuid.uuid4().hex[:12],
+            "block_found": block_found,
+            "height": new_height,
+            "job_id": job.job_id,
+            "share_difficulty": miner_share_diff,
+        }
+
+    def _assemble_and_accept_block(self, job: Job, nonce: int, hash_hex: str) -> bool:
+        cb = job.transactions[0]
+        for out in cb["outputs"]:
+            if out["address"] not in job.distribution:
+                log.error("[POOL] Bloco rejeitado: endereço suspeito no coinbase: %s",
+                          out["address"])
+                return False
+
+        try:
+            existing = self.chain.db.get_block(job.height)
+            if existing:
+                log.warning("[POOL] Bloco #%d já existe. Ignorando duplicata.", job.height)
+                return False
+        except Exception:
+            pass
 
         block = {
-            "height": height, "hash": h_hex, "prev_hash": prev_hash,
-            "timestamp": ts, "nonce": nonce, "merkle": merkle,
-            "difficulty": diff, "transactions": txs,
+            "height": int(job.height),
+            "hash": str(hash_hex),
+            "prev_hash": str(job.prev_hash),
+            "timestamp": int(job.timestamp),
+            "nonce": int(nonce),
+            "merkle": str(job.merkle),
+            "difficulty": int(job.difficulty),
+            "transactions": job.transactions,
             "validators_sig": [],
         }
-        self._attach_auth_tag(block)
-
-        sigs = self._collect_signatures(block, validators=validators)
-        block["validators_sig"] = sigs
-
-        ok_sig, msg_sig = self._validate_validators_sig(block, validators=validators)
-        if not ok_sig:
-            log.warning(f"[MINER] bloco #{height} REJEITADO (multi-sig): {msg_sig}")
-            return None
-
-        ok, msg = self.accept_block(block, validators=validators)
-        if ok:
-            self._fire_block_mined(block)
-            return block
-        log.warning(f"[MINER] bloco #{height} minerado mas REJEITADO: {msg}")
-        return None
-
-    def state_snapshot(self) -> dict:
         try:
-            n_validators = len(self._get_active_validators())
+            self.chain._attach_auth_tag(block)
         except Exception:
-            n_validators = -1
+            pass
+
+        # ═══════════════════════════════════════════════════════════
+        # [v6.3] FIX CRÍTICO: coletar assinaturas ANTES do accept_block
+        # ═══════════════════════════════════════════════════════════
+        # blockchain.accept_block NÃO preenche validators_sig — ele
+        # apenas VALIDA. Sem essa coleta, o bloco do pool sai com 0
+        # sigs e é rejeitado por _validate_validators_sig com
+        # "sem assinaturas válidas", causando loop infinito (bloco
+        # achado, aceito, altura travada).
+        #
+        # chain._collect_signatures é a MESMA função usada por
+        # mine_block_interruptible. Ela faz:
+        #   1. Assina localmente com chain._local_validator_sk
+        #   2. Chama chain._sign_collector (que pede aos peers)
+        #   3. Deduplica por pubkey
+        #   4. Filtra por valid_set (só aceita sigs de validadores
+        #      ativos no trust_network local)
+        # Então o comportamento é idêntico ao miner local — sem
+        # divergência.
+        _collector = getattr(self.chain, "_collect_signatures", None)
+        if callable(_collector):
+            try:
+                log.info("[POOL] coletando sigs para bloco #%d",
+                         block.get("height", -1))
+                _t0 = time.time()
+                _sigs = _collector(block)
+                _dt_ms = (time.time() - _t0) * 1000
+                if _sigs:
+                    block["validators_sig"] = _sigs
+                    log.info("[POOL] %d sig(s) coletada(s) em %.0fms",
+                             len(_sigs), _dt_ms)
+                else:
+                    log.warning("[POOL] _collect_signatures retornou 0 sig(s) "
+                                "em %.0fms para #%d",
+                                _dt_ms, block.get("height", -1))
+            except Exception as _e:
+                log.exception("[POOL] _collect_signatures falhou: %s", _e)
+        else:
+            # Fallback: blockchain.py muito antigo — tenta _sign_collector puro
+            # (perde a assinatura local do origin, mas ao menos pega dos peers)
+            _sc = getattr(self.chain, "_sign_collector", None)
+            if _sc is not None:
+                try:
+                    log.info("[POOL] fallback: usando _sign_collector puro")
+                    _sigs = _sc(block)
+                    if _sigs:
+                        block["validators_sig"] = _sigs
+                        log.info("[POOL] fallback: %d sig(s) via _sign_collector",
+                                 len(_sigs))
+                    else:
+                        log.warning("[POOL] fallback _sign_collector retornou 0 sig(s)")
+                except Exception as _e:
+                    log.exception("[POOL] fallback _sign_collector falhou: %s", _e)
+            else:
+                log.warning("[POOL] chain._collect_signatures E _sign_collector "
+                            "ausentes — bloco sairá SEM assinaturas e será "
+                            "rejeitado. Atualize blockchain.py ou instale "
+                            "brn_multisig.")
+        # ═══════════════════════════════════════════════════════════
+
+        ok, msg = self.chain.accept_block(block)
+        if not ok:
+            log.warning("pool: accept_block: %s", msg)
+            return False
+
+        self._credit_miner_in_trust(cb, job.height)
+
+        try:
+            cb = block["transactions"][0]
+            reward = sum(int(o["amount"]) for o in cb.get("outputs", []))
+            self.total_reward_paid += int(reward)
+        except Exception:
+            pass
+        return True
+
+    def stats(self) -> dict:
+        with self.lock:
+            self.phase = 2 if self.chain.rede_descentralizada else 1
+            self.miner_queue = list(self.chain.fila_mineracao.keys())
+
+            now = time.time()
+            active = [m for m in self.miners.values()
+                      if now - m.last_seen < MINER_TIMEOUT_S]
+            total_hashrate = sum(m.hashrate for m in active)
+            total_shares = sum(m.shares_period for m in active)
+            current_job = self.current_job
+            return {
+                "ok": True,
+                "uptime_s": int(now - self.started_at),
+                "miners_active": len(active),
+                "miners_total": len(self.miners),
+                "hashrate_total": round(total_hashrate, 2),
+                "shares_period": int(total_shares),
+                "shares_accepted": self.accepted_shares,
+                "shares_rejected": self.rejected_shares,
+                "blocks_found": self.blocks_found,
+                "total_reward_paid": self.total_reward_paid,
+                "last_block_height": self.last_block_height,
+                "last_block_ago_s": (int(now - self.last_block_at) if self.last_block_at else None),
+                "job_active": current_job is not None,
+                "job_id": (current_job.job_id if current_job else None),
+                "job_height": (current_job.height if current_job else None),
+                "job_difficulty": (current_job.difficulty if current_job else None),
+                "job_share_difficulty": (current_job.share_difficulty if current_job else None),
+                "job_created_ago_s": (int(now - current_job.created_at) if current_job else None),
+                "recent_jobs_cached": len(self.recent_jobs),
+                "phase": self.phase,
+                "miner_queue_len": len(self.miner_queue),
+                "vardiff_target_s": VARDIFF_TARGET_S,
+                "vardiff_miners": sum(1 for m in active if m.share_difficulty > VARDIFF_MIN_DIFF),
+            }
+
+    def miners_list(self) -> list:
+        with self.lock:
+            now = time.time()
+            out = []
+            for m in self.miners.values():
+                out.append({
+                    "miner_id": m.miner_id,
+                    "address": m.address,
+                    "shares_period": m.shares_period,
+                    "shares_total": m.shares_total,
+                    "hashrate": round(m.hashrate, 2),
+                    "connected_s": int(now - m.connected_at),
+                    "last_seen_s": int(now - m.last_seen),
+                    "mining": m.mining,
+                    "active": (now - m.last_seen) < MINER_TIMEOUT_S,
+                    "share_difficulty": int(m.share_difficulty),
+                    "active_share_difficulty": int(m.active_share_difficulty),
+                })
+            out.sort(key=lambda x: x["hashrate"], reverse=True)
+            return out
+
+    def miner_status(self, miner_id: str) -> dict:
+        with self.lock:
+            m = self.miners.get(miner_id)
+            if m is None:
+                return {"ok": False, "msg": "miner desconhecido"}
+            total_shares = sum(x.shares_period for x in self.miners.values())
+            reward = self.chain.current_reward(self.chain.db.height() + 1)
+            est_reward = 0
+            if total_shares > 0:
+                est_reward = int(reward * (m.shares_period / total_shares))
+            return {
+                "ok": True,
+                "miner_id": m.miner_id,
+                "address": m.address,
+                "hashrate": round(m.hashrate, 2),
+                "shares_period": m.shares_period,
+                "shares_total": m.shares_total,
+                "hashes_total": m.hashes_total,
+                "connected_s": int(time.time() - m.connected_at),
+                "last_seen_s": int(time.time() - m.last_seen),
+                "mining": m.mining,
+                "est_reward_sats": est_reward,
+                "pool_total_shares": int(total_shares),
+                "share_difficulty": int(m.share_difficulty),
+                "active_share_difficulty": int(m.active_share_difficulty),
+                "share_rate_n": len(m.share_times),
+            }
+
+    def _maintenance_loop(self):
+        while not self._stop.is_set():
+            try:
+                time.sleep(5)
+                with self.lock:
+                    now = time.time()
+                    gone = [mid for mid, m in self.miners.items()
+                            if now - m.last_seen > MINER_TIMEOUT_S * 3]
+                    for mid in gone:
+                        self.miners.pop(mid, None)
+                        log.info("pool: miner %s removido (timeout)", mid)
+                    if (self.current_job is None or self._job_is_stale(self.current_job)):
+                        if self.miners:
+                            self._build_job_locked()
+            except Exception as e:
+                log.warning("pool maint: %s", e)
+
+    def stop(self):
+        self._stop.set()
+
+
+# ══════════════════════════════════════════════════════════════
+# PoolClient — cliente de mineração (v6.2, inalterado em v6.3)
+# ══════════════════════════════════════════════════════════════
+class PoolClient:
+    def __init__(self, address: str, pubkey: str,
+                 pool_manager: Optional[PoolManager] = None,
+                 pool_url: str = ""):
+        self.address = (address or "").strip()
+        self.pubkey = (pubkey or "").strip()
+        self.pm = pool_manager
+        self.pool_url = (pool_url or "").strip().rstrip("/")
+
+        self.running = False
+        self._stop_evt = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+        self._miner_id: Optional[str] = None
+        self._job: dict = {}
+        self._last_known_share_diff: Optional[int] = None
+        self._hashes_total: int = 0
+        self._hashrate: float = 0.0
+        self._shares_submitted: int = 0
+        self._shares_accepted: int = 0
+        self._blocks_found: int = 0
+        self._last_error: str = ""
+        self._last_heartbeat: float = 0.0
+        self._hashes_at_last_hb: int = 0
+
+    def start(self) -> tuple:
+        if self.running:
+            return False, "PoolClient já está rodando"
+        if not self.address or not self.pubkey:
+            return False, "address e pubkey obrigatórios"
+        if self.pm is None and not self.pool_url:
+            return False, "sem PoolManager local e BRN_POOL_URL vazio"
+
+        self._stop_evt.clear()
+        self.running = True
+        self._thread = threading.Thread(
+            target=self._mining_loop, name="PoolClient", daemon=True,
+        )
+        self._thread.start()
+        log.info("PoolClient: iniciado (addr=%s, mode=%s)",
+                 self.address[:16],
+                 "local" if self.pm else f"remoto {self.pool_url}")
+        return True, "iniciado"
+
+    def stop(self) -> tuple:
+        if not self.running and (self._thread is None or not self._thread.is_alive()):
+            return False, "PoolClient não está rodando"
+        self._stop_evt.set()
+        self.running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=10)
+        try:
+            if self._miner_id and self.pm:
+                self.pm.disconnect(self._miner_id)
+        except Exception:
+            pass
+        log.info("PoolClient: parado (%d shares, %d blocos)",
+                 self._shares_accepted, self._blocks_found)
+        return True, "parado"
+
+    def status(self) -> dict:
         return {
-            "height": self.get_latest_height(),
-            "tip_hash": self.db.tip_hash(),
-            "difficulty": self.current_difficulty(),
-            "cumulative_work": self.cumulative_work(),
-            "mempool": self.db.mempool_count(),
-            "checkpoints": len(_checkpoints),
-            "rede_descentralizada": self.rede_descentralizada,
-            "fila_tamanho": len(self.fila_mineracao),
-            "validators_active": n_validators,
-            "require_all_sigs": REQUIRE_ALL_SIGS,
-            "validator_quorum": VALIDATOR_QUORUM,
-            "bootstrap_trust_threshold": BOOTSTRAP_TRUST_THRESHOLD,
-            "bootstrap_skip_sigs_until": BRN_BOOTSTRAP_SKIP_SIGS_UNTIL,
-            "assume_valid_until": BRN_ASSUME_VALID_UNTIL,
-            "checkpoint_auto_height": BRN_CHECKPOINT_AUTO_HEIGHT,
+            "ok": True,
+            "running": self.running,
+            "mode": "local" if self.pm else "remoto",
+            "pool_url": self.pool_url,
+            "miner_id": self._miner_id,
+            "address": self.address,
+            "hashrate_khs": round(self._hashrate / 1000.0, 2),
+            "hashrate_hs": round(self._hashrate, 1),
+            "hashes_total": self._hashes_total,
+            "shares_submitted": self._shares_submitted,
+            "shares_accepted": self._shares_accepted,
+            "blocks_found": self._blocks_found,
+            "job_id": self._job.get("job_id"),
+            "job_height": self._job.get("height"),
+            "job_difficulty": self._job.get("difficulty"),
+            "job_share_diff": self._last_known_share_diff,
+            "last_error": self._last_error,
         }
 
+    def _mining_loop(self):
+        try:
+            if not self._register():
+                log.error("PoolClient: register falhou, encerrando")
+                return
+            while self.running and not self._stop_evt.is_set():
+                try:
+                    job = self._get_work()
+                    if not job:
+                        self._sleep_retry()
+                        continue
 
-try:
-    from reorg import reorg_to as _reorg_to, find_fork_point as _find_fork
-    def _reorg_to_method(self, new_blocks, max_depth=MAX_REORG_DEPTH, allow_genesis_reorg=False):
-        res = _reorg_to(self, new_blocks, max_depth, allow_genesis_reorg)
-        return res.to_tuple()
-    def _find_fork_method(self, remote_blocks, max_depth=1000):
-        return _find_fork(self, remote_blocks, max_depth)
-    Blockchain.reorg_to = _reorg_to_method
-    Blockchain.find_fork_point = _find_fork_method
-    print("reorg.py plugado em Blockchain")
-except ImportError:
-    print("reorg.py nao encontrado (reorg desabilitado)")
+                    nonce, hash_hex, hashes = self._mine(job)
+                    if nonce is None:
+                        continue
 
-try:
-    from chain_validator import verify_chain as _verify_ext
-    def _verify_chain_method(self, full=True):
-        return _verify_ext(self)
-    Blockchain.verify_chain = _verify_chain_method
-    Blockchain.verify_chain_dict = lambda self: _verify_ext(self).to_dict()
-    print("chain_validator.py plugado em Blockchain")
-except ImportError:
-    print("chain_validator.py nao encontrado")
+                    self._submit(nonce, hash_hex)
+                    self._maybe_heartbeat()
+
+                except Exception as e:
+                    self._last_error = str(e)
+                    log.exception("PoolClient: erro no loop: %s", e)
+                    self._sleep_retry()
+        finally:
+            self.running = False
+            if self._miner_id and self.pm:
+                try:
+                    self.pm.disconnect(self._miner_id)
+                except Exception:
+                    pass
+            log.info("PoolClient: thread encerrada")
+
+    def _sleep_retry(self):
+        if self._stop_evt.wait(POOLCLIENT_RETRY_S):
+            pass
+
+    def _register(self) -> bool:
+        try:
+            if self.pm is not None:
+                r = self.pm.register(self.address, self.pubkey)
+            else:
+                r = self._http_post("/api/pool/register", {
+                    "address": self.address, "pubkey": self.pubkey,
+                })
+            if not r.get("ok"):
+                self._last_error = r.get("msg", "register falhou")
+                return False
+            self._miner_id = r.get("miner_id")
+            log.info("PoolClient: registrado como %s", self._miner_id)
+            return True
+        except Exception as e:
+            self._last_error = str(e)
+            log.warning("PoolClient: register exception: %s", e)
+            return False
+
+    def _get_work(self) -> Optional[dict]:
+        try:
+            if self.pm is not None:
+                r = self.pm.get_work(self._miner_id)
+            else:
+                r = self._http_post("/api/pool/getwork", {"miner_id": self._miner_id})
+            if not r.get("ok"):
+                self._last_error = r.get("msg", "get_work falhou")
+                return None
+            job = r.get("job") or {}
+            if not job or not job.get("job_id"):
+                return None
+            self._job = dict(job)
+            self._last_known_share_diff = int(job.get("share_difficulty") or 2)
+            return self._job
+        except Exception as e:
+            self._last_error = str(e)
+            log.warning("PoolClient: get_work exception: %s", e)
+            return None
+
+    def _submit(self, nonce: int, hash_hex: str) -> None:
+        try:
+            self._shares_submitted += 1
+            if self.pm is not None:
+                r = self.pm.submit_share(self._miner_id, nonce, hash_hex)
+            else:
+                r = self._http_post("/api/pool/submit", {
+                    "miner_id": self._miner_id,
+                    "nonce": int(nonce),
+                    "hash": hash_hex,
+                })
+            if r.get("ok"):
+                self._shares_accepted += 1
+                if r.get("block_found"):
+                    self._blocks_found += 1
+                    log.warning("PoolClient: BLOCO encontrado! h=%s", r.get("height"))
+            else:
+                log.debug("PoolClient: share rejeitada: %s", r.get("msg"))
+        except Exception as e:
+            self._last_error = str(e)
+            log.warning("PoolClient: submit exception: %s", e)
+
+    def _maybe_heartbeat(self) -> None:
+        now = time.time()
+        if now - self._last_heartbeat < POOLCLIENT_HEARTBEAT_S:
+            return
+        try:
+            if self.pm is not None:
+                self.pm.heartbeat(self._miner_id, self._hashrate, self._hashes_total)
+            else:
+                self._http_post("/api/pool/heartbeat", {
+                    "miner_id": self._miner_id,
+                    "hashrate": float(self._hashrate),
+                    "hashes_total": int(self._hashes_total),
+                })
+            self._last_heartbeat = now
+            self._hashes_at_last_hb = self._hashes_total
+        except Exception as e:
+            log.debug("PoolClient: heartbeat exception: %s", e)
+
+    def _mine(self, job: dict) -> tuple:
+        try:
+            prev = job["prev_hash"]
+            merkle = job["merkle"]
+            ts = int(job["timestamp"])
+            diff = int(job.get("share_difficulty") or 2)
+            target = _target(diff)
+            prefix = f"{prev}{merkle}{ts}".encode()
+            diff_bytes = str(int(job["difficulty"])).encode()
+
+            nonce = 0
+            hashes = 0
+            t0 = time.time()
+
+            while self.running and not self._stop_evt.is_set():
+                for _ in range(POOLCLIENT_HASH_BATCH):
+                    data = prefix + str(nonce).encode() + diff_bytes
+                    h = hashlib.sha256(hashlib.sha256(data).digest()).digest()
+                    hashes += 1
+                    if int.from_bytes(h, "big") <= target:
+                        dt = time.time() - t0
+                        self._hashes_total += hashes
+                        if dt > 0:
+                            self._hashrate = hashes / dt
+                        return nonce, h.hex(), hashes
+                    nonce += 1
+
+                dt = time.time() - t0
+                if dt > 0:
+                    self._hashrate = hashes / dt
+
+                if dt > POOLCLIENT_JOB_MAX_S:
+                    self._hashes_total += hashes
+                    log.debug("PoolClient: job expirou (%.1fs, %d hashes) — renovando",
+                              dt, hashes)
+                    return None, None, hashes
+
+            self._hashes_total += hashes
+            return None, None, hashes
+        except Exception as e:
+            self._last_error = str(e)
+            log.warning("PoolClient: mine exception: %s", e)
+            return None, None, 0
+
+    def _http_post(self, path: str, body: dict, timeout: float = 10.0) -> dict:
+        if not self.pool_url:
+            return {"ok": False, "msg": "pool_url vazio"}
+        url = self.pool_url + path
+        try:
+            req = urllib.request.Request(
+                url,
+                data=_json.dumps(body).encode(),
+                headers={"Content-Type": "application/json",
+                         "User-Agent": "brn-poolclient/6.3"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return _json.loads(resp.read().decode() or "{}")
+        except urllib.error.HTTPError as e:
+            return {"ok": False, "msg": f"HTTP {e.code}"}
+        except urllib.error.URLError as e:
+            return {"ok": False, "msg": f"conn: {e.reason}"}
+        except Exception as e:
+            return {"ok": False, "msg": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════
+# Singleton
+# ══════════════════════════════════════════════════════════════
+_pool_client: Optional[PoolClient] = None
+_pool_client_lock = threading.Lock()
+
+
+def get_pool_client(
+    pool_manager: Optional[PoolManager] = None,
+    address: str = "",
+    pubkey: str = "",
+    pool_url: str = "",
+) -> Optional[PoolClient]:
+    global _pool_client
+    with _pool_client_lock:
+        if _pool_client is None:
+            if not address or not pubkey:
+                return None
+            if pool_manager is None and not pool_url:
+                return None
+            _pool_client = PoolClient(
+                address=address,
+                pubkey=pubkey,
+                pool_manager=pool_manager,
+                pool_url=pool_url,
+            )
+        return _pool_client
+
+
+def reset_pool_client() -> None:
+    global _pool_client
+    with _pool_client_lock:
+        if _pool_client is not None and _pool_client.running:
+            try:
+                _pool_client.stop()
+            except Exception:
+                pass
+        _pool_client = None
