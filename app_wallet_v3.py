@@ -1,17 +1,11 @@
-"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.15)
+"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.16)
 ================================================================
+v3.16 (2026-11-04):
+  [FIX CRÍTICO] pool_start_mining() agora envia o endereço e a pubkey
+        da carteira para o servidor. Antes enviava um dict vazio {},
+        fazendo o PoolClient minerar sem saber para quem pagar.
 v3.15 (2026-11-03):
-  [NEW] _sync_sk_to_chain() — propaga a SK da carteira ativa para
-        chain._local_validator_sk e trust_net via endpoint
-        /api/wallet/set_validator_sk (server.py v1.1+).
-        Chamado em create_and_unlock, unlock_wallet e load_wallet.
-        Resolve o gap em que abrir a GUI não atualizava a chain
-        sem reiniciar o nó.
-v3.14 (2026-11-03):
-  [FIX] pool_status() injeta dados do último job se o atual estiver
-        vazio. Impede GUI mostrar "—" no Vardiff durante troca de jobs.
-v3.9.2 (2026-10-30):
-  [FIX CRÍTICO] pool_start_mining/pool_status chamam /api/pool/local_*
+  [NEW] _sync_sk_to_chain() — propaga a SK da carteira ativa.
 ================================================================
 """
 from __future__ import annotations
@@ -25,7 +19,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "3.15"
+__version__ = "3.16"
 
 try:
     import requests
@@ -49,12 +43,6 @@ _WALLET_SESSION: dict = {}
 
 
 def _sync_sk_to_chain(sk_hex: str, address: str = "", pubkey: str = "") -> dict:
-    """
-    [v3.15] Propaga a SK ativa para o nó em runtime:
-      - atualiza chain._local_validator_sk (sem restart)
-      - registra/atualiza nó na TrustNetwork (last_seen, pubkey)
-    Chamado quando a carteira muda via GUI.
-    """
     if not sk_hex:
         return {"ok": False, "msg": "sk vazio"}
     try:
@@ -187,7 +175,6 @@ class WalletApi:
             if not r.get("ok"):
                 return {"ok": False, "msg": "Erro ao salvar: " + str(r.get("msg", ""))}
             _WALLET_SESSION.update(data)
-            # [v3.15] sincroniza SK com chain + trust em runtime
             _sync_sk_to_chain(w.priv_hex, w.address, w.pub_hex)
             return {"ok": True, "address": w.address}
         except Exception as e:
@@ -204,7 +191,6 @@ class WalletApi:
                 _WALLET_SESSION["public_key"]  = (
                     r.get("public_key") or r.get("pubkey") or r.get("pub_hex") or ""
                 )
-                # [v3.15] sincroniza SK com chain + trust em runtime
                 if _WALLET_SESSION.get("private_key"):
                     _sync_sk_to_chain(
                         _WALLET_SESSION["private_key"],
@@ -412,7 +398,6 @@ class WalletApi:
                 _WALLET_SESSION["public_key"]  = (
                     r.get("public_key") or r.get("pubkey") or r.get("pub_hex") or ""
                 )
-                # [v3.15] sincroniza SK com chain + trust em runtime
                 if _WALLET_SESSION["private_key"]:
                     _sync_sk_to_chain(
                         _WALLET_SESSION["private_key"],
@@ -493,11 +478,17 @@ class WalletApi:
             return env_pool.rstrip("/")
         return API_BASE
 
+    # =================================================================
+    # [FIX v3.16] Envia address e pubkey para o servidor
+    # =================================================================
     def pool_start_mining(self, address: str, pubkey: str) -> dict:
         if not address or not pubkey:
             return {"ok": False, "msg": "address e pubkey obrigatorios"}
         try:
-            r = _post("/api/pool/start_local", {}, timeout=30.0)
+            r = _post("/api/pool/start_local", {
+                "address": address,
+                "pubkey": pubkey
+            }, timeout=30.0)
             if r.get("ok"):
                 return r
             return {"ok": False, "msg": r.get("msg", "start_local falhou")}
@@ -513,24 +504,20 @@ class WalletApi:
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
-    # [FIX v3.14] Se o job atual está vazio, injeta os dados do último job conhecido
     def pool_status(self) -> dict:
         try:
             r = _get("/api/pool/local_status", timeout=10.0)
             if not isinstance(r, dict):
                 return {"ok": False, "running": False, "msg": "resposta invalida"}
 
-            # [FIX v3.14] Fallback: se o job atual está vazio, busca do PoolClient
             if r.get("running") and r.get("job_share_diff") is None:
                 try:
                     from miner_pool_client import get_pool_client
                     pc = get_pool_client()
                     if pc:
-                        # Tenta ler o último share_diff conhecido diretamente
                         last_diff = getattr(pc, "_last_known_share_diff", None)
                         if last_diff is not None:
                             r["job_share_diff"] = last_diff
-                        # Tenta ler do _job (se não foi zerado)
                         if r.get("job_id") is None and pc._job:
                             r["job_id"] = pc._job.get("job_id")
                             r["job_height"] = pc._job.get("height")
