@@ -1,12 +1,24 @@
-"""main.py — Entrypoint do nó BRN (v13.8.4)
+"""main.py — Entrypoint do nó BRN (v13.8.5)
 ================================================================
-v13.8.4 (2026-11-04):
-  [FIX] PoolClient e PBFT agora são inicializados dinamicamente 
+v13.8.5 (2026-11-04):
+  [FIX] Reinjetada a TrustNetwork no server.py (corrige erro 503).
+  [FIX] PoolClient e PBFT agora são inicializados dinamicamente
         pelo server.py quando a carteira é desbloqueada.
+  [FIX] GUI abre o index_wallet.html.
+v13.8.0 (2026-11-04):
+  [NEW] Integração PBFT.
 ================================================================
 """
 from __future__ import annotations
-import argparse, os, signal, sys, threading, time, json, logging
+
+import argparse
+import os
+import signal
+import sys
+import threading
+import time
+import json
+import logging
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -15,30 +27,36 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.8.4"
+    VERSION = "13.8.5"
     BUILD_DATE = "2026-11-04"
 
 def parse_args():
-    p = argparse.ArgumentParser(prog="main.py")
-    p.add_argument("--headless", action="store_true")
-    p.add_argument("--client-mode", action="store_true")
-    p.add_argument("--origem", action="store_true")
-    p.add_argument("--no-pool-client", action="store_true")
-    p.add_argument("--no-p2p", action="store_true")
-    p.add_argument("--no-explorer", action="store_true")
-    p.add_argument("--db", metavar="PATH", default=None)
-    p.add_argument("--web-port", type=int, default=None)
-    p.add_argument("--p2p-port", type=int, default=None)
-    p.add_argument("--version", action="store_true")
-    p.add_argument("--skip-verify", action="store_true")
+    p = argparse.ArgumentParser(
+        prog="main.py",
+        description=f"BRN Node v{VERSION} (build {BUILD_DATE})",
+    )
+    p.add_argument("--headless", action="store_true", help="sem GUI")
+    p.add_argument("--client-mode", action="store_true", help="nó cliente")
+    p.add_argument("--origem", action="store_true", help="força BRN_IS_ORIGIN=1")
+    p.add_argument("--no-pool-client", action="store_true", help="não inicia PoolClient")
+    p.add_argument("--no-p2p", action="store_true", help="desliga P2P")
+    p.add_argument("--no-explorer", action="store_true", help="não inicia Explorer")
+    p.add_argument("--db", metavar="PATH", default=None, help="caminho do DB")
+    p.add_argument("--web-port", type=int, default=None, help="porta HTTP")
+    p.add_argument("--p2p-port", type=int, default=None, help="porta P2P")
+    p.add_argument("--version", action="store_true", help="mostra versão")
+    p.add_argument("--skip-verify", action="store_true", help="pula verificações")
     return p.parse_args()
 
 def _load_env_file():
     env_file = BASE_DIR / "brn_network.env"
     if not env_file.exists(): return 0
     loaded = 0
-    try: text = env_file.read_text(encoding="utf-8", errors="ignore")
-    except Exception: return 0
+    try: 
+        text = env_file.read_text(encoding="utf-8", errors="ignore")
+    except Exception: 
+        return 0
+        
     for raw in text.splitlines():
         s = raw.strip()
         if not s or s.startswith("#") or "=" not in s: continue
@@ -80,13 +98,16 @@ def main() -> int:
     db_path  = args.db or os.environ.get("BRN_DB", "brn_v2_chain.db")
 
     log = _setup_logging()
+    log.info("=" * 64)
     log.info(" BRN Node v%s (build %s) is_origin=%s", VERSION, BUILD_DATE, is_origin)
+    log.info("=" * 64)
 
     try:
         import port_guard
         port_guard.check_brn_ports(checar_explorer=not args.no_explorer)
     except Exception: pass
 
+    # 1. Blockchain
     try:
         from blockchain import Blockchain
         chain = Blockchain(db_path, auto_genesis=False)
@@ -95,7 +116,17 @@ def main() -> int:
         log.error("[chain] fatal: %s", e)
         return 2
 
-    # P2P
+    # 2. Trust Network
+    trust = None
+    try:
+        from trust_network import TrustNetwork
+        trust = TrustNetwork("trust_network.json", is_origin=is_origin)
+        chain.set_trust_net(trust)
+        log.info("[trust] carregado")
+    except Exception as e:
+        log.warning("[trust] init falhou: %s", e)
+
+    # 3. P2P
     p2p = None
     if not args.no_p2p:
         try:
@@ -107,7 +138,7 @@ def main() -> int:
         except Exception as e:
             log.error("[p2p] init falhou: %s", e)
 
-    # Sync
+    # 4. Sync Manager
     sync_mgr = None
     if p2p:
         try:
@@ -116,7 +147,7 @@ def main() -> int:
             sync_mgr.start_sync_loop()
         except Exception: pass
 
-    # Pool (somente Origem)
+    # 5. Pool Manager (somente Origem)
     pool = None
     if is_origin:
         try:
@@ -126,13 +157,14 @@ def main() -> int:
         except Exception as e:
             log.warning("[pool] init falhou: %s", e)
 
-    # Web Server
+    # 6. Web Server
     try:
         import server as srv
         srv.set_chain(chain)
         if p2p: srv.set_p2p_manager(p2p)
         if pool: srv.set_pool_manager(pool)
         if sync_mgr: srv.set_sync_manager(sync_mgr)
+        if trust: srv.set_trust_network(trust)
         
         def _run_web():
             srv.app.run(host=os.environ.get("BRN_WEB_HOST", "127.0.0.1"), port=web_port, threaded=True, use_reloader=False)
@@ -141,7 +173,7 @@ def main() -> int:
     except Exception as e:
         log.error("[server] falhou: %s", e)
 
-    # Explorer
+    # 7. Explorer
     if not args.no_explorer:
         try:
             import explorer as exp
@@ -151,7 +183,7 @@ def main() -> int:
             threading.Thread(target=_run_exp, daemon=True, name="EXP").start()
         except Exception: pass
 
-    # GUI
+    # 8. GUI
     if not args.headless:
         try:
             import webview
@@ -167,6 +199,7 @@ def main() -> int:
             log.warning("[gui] falha: %s", e)
 
     def _shutdown(*_):
+        log.info("[shutdown] encerrando...")
         try: chain.db.close()
         except Exception: pass
         os._exit(0)
