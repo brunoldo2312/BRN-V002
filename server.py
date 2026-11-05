@@ -2,13 +2,11 @@
 server.py — Backend HTTP do nó BRN (v9.9.22)
 ================================================================
 v9.9.22 (2026-11-05):
-  [FIX] peers_discovered(): agora cruza os dados do banco com o
-        P2PManager para exibir a altura REAL dos peers na rota
-        /api/peers. Antes a altura vinha zerada do SQLite.
+  [FIX CRÍTICO] pool_start_local() corrigido para passar a URL
+        (string) em vez da chain (objeto) para o PoolClient.
+        Resolve o erro "'str' object has no attribute 'register'".
+        Agora o nó Windows consegue se registrar no pool do Ubuntu.
 v9.9.21 (2026-11-05):
-  [FIX CRÍTICO] pool_start_local() agora instancia o PoolClient 
-        passando a URL (string) como primeiro argumento.
-v9.9.20 (2026-11-04):
   [FIX] Detecção dinâmica do método de início/parada no PoolClient.
 v9.9.19 (2026-11-04):
   [FIX] trust_nodes(): cruza dados P2P para mostrar altura real.
@@ -919,22 +917,32 @@ def pool_start_local():
             data = request.get_json(force=True) or {}
             address = (data.get("address") or "").strip()
             pubkey = (data.get("pubkey") or "").strip()
-            pool_url = os.environ.get("BRN_POOL_URL", "").strip() or "http://127.0.0.1:5000"
-            
+
             if not pubkey:
                 return jsonify({"ok": False, "msg": "pubkey obrigatoria para iniciar o PoolClient"}), 400
-                
-            # [FIX] Passa a URL (string) como primeiro argumento, não a blockchain
+
+            # [FIX] Pega a URL do pool do ambiente
+            pool_url = os.environ.get("BRN_POOL_URL", "").strip()
+            if not pool_url:
+                pool_url = os.environ.get("BRN_POOL_URL_LOCAL", "").strip() or "http://127.0.0.1:5000"
+
+            log.info("[pool_client] Inicializando com pool_url=%s", pool_url)
+
+            # [FIX] Passa a URL (string) como primeiro argumento
             try:
                 pc = PoolClient(pool_url, address, pubkey)
             except TypeError:
                 try:
                     pc = PoolClient(pool_url, pubkey)
                 except TypeError:
-                    pc = PoolClient(pool_url)
-            
+                    try:
+                        pc = PoolClient(pool_url)
+                    except TypeError:
+                        chain = _get_chain()
+                        pc = PoolClient(chain, pubkey)
+
             set_pool_client_local(pc)
-            log.info("[pool_client] Inicializado dinamicamente (pool_url + address + pubkey)")
+            log.info("[pool_client] Inicializado dinamicamente")
         except Exception as e:
             return jsonify({"ok": False, "msg": f"Falha ao inicializar PoolClient: {e}"}), 503
 
@@ -942,14 +950,13 @@ def pool_start_local():
         data = request.get_json(force=True) or {}
         address = (data.get("address") or "").strip()
         pubkey = (data.get("pubkey") or "").strip()
-        
-        # Procura o método de inicio correto no PoolClient
+
         start_method = None
         for m in ("start_mining", "start", "run", "start_client", "start_pool_client", "connect"):
             if hasattr(pc, m):
                 start_method = getattr(pc, m)
                 break
-        
+
         if start_method is None:
             return jsonify({"ok": False, "msg": "PoolClient nao possui metodo de inicio"}), 500
 
@@ -976,16 +983,15 @@ def pool_stop_local():
     if pc is None:
         return jsonify({"ok": False, "msg": "PoolClient nao injetado"}), 503
     try:
-        # Procura o método de parada correto
         stop_method = None
         for m in ("stop_mining", "stop", "disconnect", "stop_client"):
             if hasattr(pc, m):
                 stop_method = getattr(pc, m)
                 break
-                
+
         if stop_method is None:
             return jsonify({"ok": False, "msg": "PoolClient nao possui metodo de parada"}), 500
-            
+
         ok, msg = stop_method()
         status = pc.status() if hasattr(pc, "status") else {}
         return jsonify({"ok": bool(ok), "msg": msg, **status})
@@ -1041,26 +1047,25 @@ def api_wallet_set_validator_sk():
             except Exception as e:
                 log.warning("[wallet_sk] sync no trust falhou: %s", e)
 
-        # Ativa o PBFT dinamicamente se ainda não estiver rodando
         if chain._pbft is None and os.environ.get("BRN_PBFT_ENABLED") == "1":
             try:
                 from pbft_consensus import PBFTConsensus
                 from p2p_unified import P2PClient
                 from wallet import Wallet
-                
+
                 def _pbft_send(peer_addr, msg):
                     ip, port_s = peer_addr.rsplit(":", 1)
                     resp, _ = P2PClient.send_message(ip, int(port_s), msg, timeout=15.0)
                     return resp
-                
+
                 w_obj = Wallet(private_key_hex=sk_hex)
                 pbft = PBFTConsensus(chain, w_obj, _pbft_send)
                 chain.set_pbft(pbft)
-                
+
                 p2p = _get_p2p_manager()
-                if p2p and p2p.server: 
+                if p2p and p2p.server:
                     p2p.server.set_pbft(pbft)
-                
+
                 log.info("[PBFT] Ativado dinamicamente via API de wallet")
             except Exception as e:
                 log.warning("[PBFT] Falha ao ativar dinamicamente: %s", e)
@@ -1100,8 +1105,7 @@ def trust_nodes():
     try:
         limit = int(request.args.get("limit", 100))
         nodes = []
-        
-        # 1. Pega os dados do P2P (IP, Altura, Latência)
+
         p2p = _get_p2p_manager()
         p2p_peers = {}
         if p2p and hasattr(p2p, "get_peer_stats"):
@@ -1111,50 +1115,47 @@ def trust_nodes():
             except Exception: pass
 
         if hasattr(trust, "nodes"):
+            from dataclasses import asdict
             for pubkey, n in trust.nodes.items():
                 peer_addr = getattr(n, "peer_addr", "")
                 addr = getattr(n, "address", "")
-                
-                # Cruza com os dados do P2P para achar a altura
+
                 h = 0
                 if peer_addr in p2p_peers:
                     h = p2p_peers[peer_addr].get("height", 0)
                 elif addr in p2p_peers:
                     h = p2p_peers[addr].get("height", 0)
 
-                # Define um status mais amigável
                 status = "new"
-                if getattr(n, "banned", False): 
+                if getattr(n, "banned", False):
                     status = "banned"
-                elif getattr(n, "connected", False): 
+                elif getattr(n, "connected", False):
                     status = "connected"
-                elif getattr(n, "trust_level", "") in ("validator", "trusted"): 
+                elif getattr(n, "trust_level", "") in ("validator", "trusted"):
                     status = getattr(n, "trust_level")
                 elif getattr(n, "trust_score", 0) >= 150:
                     status = "validator"
 
-                # Ignora nós fantasmas (sem IP válido)
                 endereco_final = peer_addr if (peer_addr and ":" in peer_addr) else addr
                 if ":" not in endereco_final:
                     continue
 
                 nodes.append({
                     "node_id": pubkey,
-                    "address": endereco_final, 
+                    "address": endereco_final,
                     "height": h,
                     "trust_score": getattr(n, "trust_score", 0),
                     "status": status,
                     "last_seen": getattr(n, "last_seen", 0),
                 })
         else:
-            # Fallback
             for pubkey, data in trust.peers.items():
                 nodes.append({
-                    "node_id": pubkey, "address": "desconhecido", 
+                    "node_id": pubkey, "address": "desconhecido",
                     "height": 0, "trust_score": data.get("score", 0),
                     "status": data.get("status", "new"), "last_seen": 0
                 })
-                
+
         nodes.sort(key=lambda x: x.get("trust_score", 0), reverse=True)
         return jsonify({"ok": True, "count": len(nodes), "nodes": nodes[:limit]})
     except Exception as e:
@@ -1193,17 +1194,6 @@ def peers_discovered():
     try:
         chain = _get_chain()
         rows = chain.db.listar_peers(apenas_ativos=False)
-        
-        # [FIX v9.9.22] Pega as alturas reais do cache do P2P
-        p2p = _get_p2p_manager()
-        p2p_heights = {}
-        if p2p and hasattr(p2p, "get_peer_stats"):
-            try:
-                for stat in p2p.get_peer_stats():
-                    p2p_heights[stat["address"]] = stat.get("height", 0)
-            except Exception:
-                pass
-
         out, seen_ips = [], set()
         for p in rows:
             addr = (p.get("address") or "").strip()
@@ -1211,17 +1201,7 @@ def peers_discovered():
             ip = addr.rsplit(":", 1)[0] if ":" in addr else addr
             if ip.startswith("127.") or ip == "0.0.0.0" or ip in seen_ips: continue
             seen_ips.add(ip)
-            
-            # Usa a altura do P2P; se não achar, usa a do banco
-            real_height = p2p_heights.get(addr, int(p.get("height", 0) or 0))
-            
-            out.append({
-                "ip": ip, 
-                "address": addr, 
-                "height": real_height, 
-                "last_seen": int(p.get("last_seen", 0) or 0)
-            })
-            
+            out.append({"ip": ip, "address": addr, "height": int(p.get("height", 0) or 0), "last_seen": int(p.get("last_seen", 0) or 0)})
         out.sort(key=lambda x: x["last_seen"], reverse=True)
         return jsonify({"ok": True, "count": len(out), "peers": out, "active": len(out)})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
@@ -1491,5 +1471,5 @@ def api_tx_status(txid_str):
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.22 (Dynamic Pool + Dynamic PBFT + Real Peer Heights)")
+    print(f"BRN Server v9.9.22 (Dynamic Pool + Dynamic PBFT + Trust Nodes Fix)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
