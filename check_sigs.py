@@ -1,59 +1,77 @@
 import urllib.request, json
 
-try:
-    url = 'http://127.0.0.1:5000/api/blocks?start=0&limit=500'
-    d = json.loads(urllib.request.urlopen(url, timeout=5).read())
-    blocks = d.get('blocks', [])
+LOCAL_API = "http://127.0.0.1:5000"
 
-    if not blocks:
-        print("Nenhum bloco retornado.")
-        raise SystemExit(1)
-
-    ultimo = max(blocks, key=lambda b: b.get('height', 0))
-    h = ultimo.get('height')
-    hash_ = ultimo.get('hash', '')
-    sigs = ultimo.get('validators_sig', []) or []
-
-    print("=" * 60)
-    print(f"ULTIMO BLOCO: #{h}")
-    print("=" * 60)
-    print(f"Hash       : {hash_}")
-    print(f"Prev hash  : {ultimo.get('prev_hash','')[:64]}")
-    print(f"Timestamp  : {ultimo.get('timestamp')}")
-    print(f"Difficulty : {ultimo.get('difficulty')}")
-    print(f"Nonce      : {ultimo.get('nonce')}")
-    print(f"Txs        : {len(ultimo.get('transactions', []))}")
-    print()
-    print(f"ASSINATURAS: {len(sigs)}")
-    print("-" * 60)
-
-    if not sigs:
-        print("  (nenhuma - bloco aceito em BOOTSTRAP ou genesis)")
-    else:
-        for i, s in enumerate(sigs, 1):
-            pk = s.get('pubkey', '')
-            sig = s.get('signature', '')
-            print(f"  [{i}] pubkey : {pk}")
-            print(f"      sig    : {sig[:64]}...")
-            print()
-
-    # Quorum info
+def get_json(path):
     try:
-        info = json.loads(urllib.request.urlopen(
-            'http://127.0.0.1:5000/api/consensus/validators', timeout=5).read())
-        print(f"VALIDATORS ATIVOS: {len(info.get('validators', []))}")
-        print(f"REQUIRED_SIGS    : {info.get('required_sigs', '?')}")
-    except Exception:
-        pass
+        with urllib.request.urlopen(LOCAL_API + path, timeout=5) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        return {"error": str(e)}
 
-    print("=" * 60)
-    if len(sigs) >= 2:
-        print(" STATUS: MULTI-SIG REAL (quorum atingido)")
-    elif len(sigs) == 1:
-        print(" STATUS: BOOTSTRAP LOCAL (1 assinante)")
-    else:
-        print(" STATUS: SEM ASSINATURA")
-    print("=" * 60)
+print("=" * 60)
+print(" VERIFICADOR DE ASSINATURAS E QUÓRUM")
+print("=" * 60)
 
-except Exception as e:
-    print(f"ERRO: {e}")
+# 1. Pega os validadores ativos e o quórum exigido
+val_info = get_json('/api/consensus/validators')
+required_sigs = 0
+if "error" not in val_info:
+    required_sigs = val_info.get('required_sigs', 0)
+    validators = val_info.get('validators', [])
+    print(f"Validadores Ativos : {len(validators)}")
+    print(f"Assinaturas Exigidas (Quórum): {required_sigs}")
+else:
+    print(f"Erro ao consultar validadores: {val_info['error']}")
+
+# 2. Pega o ÚLTIMO bloco minerado (usando /api/latest)
+latest_blocks = get_json('/api/latest')
+if "error" in latest_blocks or not isinstance(latest_blocks, list) or not latest_blocks:
+    print(f"Erro ao consultar último bloco: {latest_blocks.get('error', 'vazio')}")
+    exit()
+
+ultimo = latest_blocks[0]  # O /api/latest já retorna do mais novo pro mais antigo
+h = ultimo.get('height')
+hash_ = ultimo.get('hash', '')
+sigs = ultimo.get('validators_sig', []) or []
+pbft = ultimo.get('pbft_commits', []) or []
+
+print("-" * 60)
+print(f"ÚLTIMO BLOCO   : #{h}")
+print(f"Hash           : {hash_[:32]}...")
+print(f"Prev Hash      : {ultimo.get('prev_hash','')[:32]}...")
+print(f"Timestamp      : {ultimo.get('timestamp')}")
+print(f"Dificuldade    : {ultimo.get('difficulty')}")
+print(f"Transações     : {len(ultimo.get('transactions', []))}")
+print("-" * 60)
+
+# 3. Mostra as assinaturas
+print(f"ASSINATURAS (validators_sig): {len(sigs)}")
+if not sigs:
+    print("  (nenhuma)")
+else:
+    for i, s in enumerate(sigs, 1):
+        pk = s.get('pubkey', '')
+        print(f"  [{i}] pubkey : {pk[:48]}...")
+
+# 4. Mostra os commits do PBFT
+print(f"COMMITS (PBFT): {len(pbft)}")
+if pbft:
+    for i, s in enumerate(pbft, 1):
+        pk = s.get('pubkey', '')
+        print(f"  [{i}] pubkey : {pk[:48]}...")
+
+# 5. Veredito
+print("=" * 60)
+if len(sigs) == 0:
+    print(" STATUS: FALHOU (Sem assinaturas)")
+elif len(sigs) >= required_sigs and required_sigs > 0:
+    print(f" STATUS: OK (Multi-sig atingiu o quórum de {required_sigs})")
+else:
+    print(f" STATUS: FALHOU (Tem {len(sigs)} assinaturas, mas precisa de {required_sigs})")
+
+if len(pbft) > 0:
+    print(" PBFT: ATIVO (O bloco tem prova de consenso bizantino)")
+else:
+    print(" PBFT: Vazio (Pode ser um bloco antigo ou PBFT desligado)")
+print("=" * 60)
