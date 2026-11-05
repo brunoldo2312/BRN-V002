@@ -1,5 +1,12 @@
-"""chain_validator.py — Auditoria completa da cadeia BRN (v2.4)
+"""chain_validator.py — Auditoria completa da cadeia BRN (v2.5)
 ================================================================
+v2.5 (2026-11-05):
+  [NEW] --network: Audita os peers, verificando quem está sincronizado,
+        atrasado ou em fork (comparando a altura local e tip).
+  [NEW] --clean: Limpa o bootstrap_peers.json mantendo apenas os
+        peers saudáveis (excluindo os atrasados além da tolerância).
+  [NEW] --consensus: Mostra os validadores ativos e quem assinou
+        o último bloco.
 v2.4 (2026-10-28):
   [FIX CRÍTICO] _verify_tx_signature agora usa Wallet.verify (que
                 aceita Schnorr BIP-340 E ECDSA como fallback). Antes
@@ -17,12 +24,21 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+from pathlib import Path
 
 from crypto import sha256, double_sha256
 
 log = logging.getLogger("chain_validator")
 
-__version__ = "2.4"
+__version__ = "2.5"
+BASE_DIR = Path(__file__).resolve().parent
+BOOTSTRAP_FILE = BASE_DIR / "bootstrap_peers.json"
+PEERS_FILE = BASE_DIR / "peers_discovered.json"
 
 
 # ============================================================
@@ -173,7 +189,7 @@ def _verify_coinbase(cb: dict, height: int, chain) -> tuple:
 
 
 # ============================================================
-# Assinatura de tx (v2.4 — usa Wallet.verify: Schnorr ou ECDSA)
+# Assinatura de tx
 # ============================================================
 def _verify_tx_signature(tx: dict, chain=None) -> bool:
     if _is_coinbase(tx):
@@ -189,12 +205,9 @@ def _verify_tx_signature(tx: dict, chain=None) -> bool:
     except Exception:
         return False
 
-    # Import tardio para evitar circular import (wallet importa blockchain)
     try:
         from wallet import Wallet
     except Exception:
-        # Fallback: usa ECDSA direto (compatibilidade com ambientes
-        # onde wallet.py ainda não foi migrado para Schnorr)
         try:
             from crypto import verify_ecdsa
             for inp in inputs:
@@ -215,7 +228,6 @@ def _verify_tx_signature(tx: dict, chain=None) -> bool:
         if not sig_hex or not pub_hex:
             return False
         try:
-            # Wallet.verify (v2+) aceita Schnorr BIP-340 e ECDSA
             if not Wallet.verify(h, sig_hex, pub_hex):
                 return False
         except Exception:
@@ -276,7 +288,6 @@ def _required_sigs_for(chain, validators: list) -> int:
             return int(fn(validators))
         except Exception:
             pass
-    import os
     if os.environ.get("BRN_REQUIRE_ALL_SIGS", "1") == "1":
         return len(validators)
     try:
@@ -295,18 +306,13 @@ def _verify_block_sig(pubkey_hex: str, block: dict, sig_hex: str) -> bool:
         return False
 
 
-def _verify_validator_sigs(
-    block: dict, chain, strict: bool = False
-) -> tuple:
+def _verify_validator_sigs(block: dict, chain, strict: bool = False) -> tuple:
     sigs = block.get("validators_sig")
-
-    # [FIX v2.3] Corrige o erro "validators_sig nao e lista" em blocos antigos
     if sigs is None:
         sigs = []
 
     if not isinstance(sigs, list):
         return False, "validators_sig nao e lista", 0
-
     if not sigs:
         return True, "", 0
 
@@ -356,7 +362,125 @@ def _verify_validator_sigs(
 
 
 # ============================================================
-# AUDITORIA COMPLETA
+# AUDITORIA DE REDE E CONSENSO (NOVO v2.5)
+# ============================================================
+def _fetch_peer_info(ip, port=5000, timeout=3.0):
+    """Consulta /api/chain-info para saber a altura e o tip do peer."""
+    try:
+        url = f"http://{ip}:{port}/api/chain-info"
+        req = urllib.request.Request(url, headers={"User-Agent": "brn-validator/2.5"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode())
+            return {
+                "height": int(data.get("height", -1)),
+                "tip": data.get("tip_hash", ""),
+                "error": None
+            }
+    except Exception as e:
+        return {"height": -1, "tip": "", "error": str(e)}
+
+def _load_all_peers():
+    peers = set()
+    for file in (BOOTSTRAP_FILE, PEERS_FILE):
+        if file.exists():
+            try:
+                data = json.loads(file.read_text())
+                if isinstance(data, list):
+                    peers.update(data)
+            except Exception:
+                pass
+    env_peers = os.environ.get("BRN_BOOTSTRAP_PEERS", "")
+    for p in env_peers.split(","):
+        if p.strip():
+            peers.add(p.strip())
+    return list(peers)
+
+def audit_network(local_height, local_tip, tolerance=5):
+    print("\n" + "="*60)
+    print(f" AUDITORIA DE REDE (Tolerância: {tolerance} blocos)")
+    print("="*60)
+    
+    peers = _load_all_peers()
+    if not peers:
+        print("[!] Nenhum peer encontrado para auditar.")
+        return []
+
+    print(f"[*] Testando {len(peers)} peer(s) na porta 5000...")
+    
+    healthy_peers = []
+    max_net_height = local_height
+    
+    results = []
+    for p in peers:
+        ip = p.split(":")[0] if ":" in p else p
+        info = _fetch_peer_info(ip)
+        
+        if info["error"]:
+            print(f"  [X] {ip:<15} OFFLINE ({info['error'][:30]})")
+        else:
+            h = info["height"]
+            tip = info["tip"]
+            if h > max_net_height:
+                max_net_height = h
+            results.append({"peer": p, "ip": ip, "height": h, "tip": tip})
+            
+    min_acceptable = max(0, max_net_height - tolerance)
+    
+    for r in results:
+        h = r["height"]
+        status = "OK"
+        color = "\033[92m" # Verde
+        if h < min_acceptable:
+            status = f"ATRASADO (Max: {max_net_height})"
+            color = "\033[93m" # Amarelo
+        elif h == local_height and r["tip"] != local_tip:
+            status = "FORK (Mesmo height, tip difere)"
+            color = "\033[91m" # Vermelho
+        elif h > local_height:
+            status = "MAIOR QUE LOCAL (Precisa sincronizar)"
+            color = "\033[96m" # Ciano
+            
+        print(f"  {color}[{status}]\033[0m {r['ip']:<15} H: {h} Tip: {r['tip'][:16]}...")
+        
+        if status == "OK" or status.startswith("MAIOR"):
+            healthy_peers.append(r["peer"])
+
+    return healthy_peers
+
+def audit_consensus(chain):
+    print("\n" + "="*60)
+    print(" AUDITORIA DE CONSENSO (Validadores)")
+    print("="*60)
+    
+    validators = chain._get_active_validators()
+    if not validators:
+        print("[!] Nenhum validador ativo no Trust Network.")
+        return
+        
+    required = chain._required_signatures(validators)
+    print(f"[*] Validadores ativos: {len(validators)}")
+    print(f"[*] Quórum exigido: {required}")
+    
+    h = chain.db.height()
+    if h < 0:
+        print("[!] Cadeia vazia.")
+        return
+        
+    last_block = chain.db.get_block(h)
+    sigs = last_block.get("validators_sig", []) if last_block else []
+    signed_pks = set((s.get("pubkey") or "").lower() for s in sigs)
+    
+    print(f"\n[*] Assinaturas no último bloco (#{h}): {len(signed_pks)}")
+    print("-" * 60)
+    for pk in validators:
+        pk_lower = pk.lower()
+        signed = pk_lower in signed_pks
+        status = "\033[92m[ASSINOU]\033[0m" if signed else "\033[91m[NÃO ASSINOU]\033[0m"
+        print(f"  {status} {pk}")
+
+
+# ============================================================
+# AUDITORIA COMPLETA DA CADEIA
 # ============================================================
 def verify_chain(chain, strict_validators: bool = False) -> VerifyResult:
     t0 = time.time()
@@ -498,10 +622,7 @@ def verify_chain(chain, strict_validators: bool = False) -> VerifyResult:
 def verify_chain_dict(chain, strict_validators: bool = False) -> dict:
     return verify_chain(chain, strict_validators=strict_validators).to_dict()
 
-
-def verify_range(
-    chain, start: int, end: int, strict_validators: bool = False
-) -> dict:
+def verify_range(chain, start: int, end: int, strict_validators: bool = False) -> dict:
     r = VerifyResult()
     r.strict_validators = strict_validators
     prev = chain.db.get_block(start - 1) if start > 0 else None
@@ -517,27 +638,21 @@ def verify_range(
         if prev is not None and b["prev_hash"] != prev["hash"]:
             r.valid = False
             r.errors.append(f"bloco {i}: prev_hash nao bate")
-
         if i > 0 and not _verify_pow(b):
             r.valid = False
             r.errors.append(f"bloco {i}: PoW invalido")
-
         if not _verify_merkle(b):
             r.valid = False
             r.errors.append(f"bloco {i}: merkle root nao bate")
 
-        ok_vs, msg_vs, count_vs = _verify_validator_sigs(
-            b, chain, strict=strict_validators
-        )
+        ok_vs, msg_vs, count_vs = _verify_validator_sigs(b, chain, strict=strict_validators)
         if count_vs > 0:
             r.validators_checked += 1
         if not ok_vs:
             r.valid = False
             r.errors.append(f"bloco {i}: {msg_vs}")
-
         prev = b
     return r.to_dict()
-
 
 def find_fork_point(chain_a, chain_b, max_depth: int = 1000) -> int:
     h = min(chain_a.db.height(), chain_b.db.height())
@@ -550,39 +665,74 @@ def find_fork_point(chain_a, chain_b, max_depth: int = 1000) -> int:
 
 
 # ============================================================
-# AUTO-TESTE
+# AUTO-TESTE / CLI
 # ============================================================
 if __name__ == "__main__":
-    import sys
+    import argparse
+    logging.basicConfig(level=logging.WARNING)
+    
+    parser = argparse.ArgumentParser(description="BRN Chain Validator & Network Auditor")
+    parser.add_argument("db", nargs="?", default="brn_v2_chain.db", help="Caminho do DB (default: brn_v2_chain.db)")
+    parser.add_argument("--strict", action="store_true", help="Exige validação estrita de multi-sig")
+    parser.add_argument("--network", action="store_true", help="Audita a sincronização dos peers")
+    parser.add_argument("--consensus", action="store_true", help="Mostra quem assinou o último bloco")
+    parser.add_argument("--clean-peers", action="store_true", help="Limpa o bootstrap_peers.json (requer --network)")
+    parser.add_argument("--tolerance", type=int, default=5, help="Tolerância de blocos atrasados (default: 5)")
+    args = parser.parse_args()
 
-    path = sys.argv[1] if len(sys.argv) > 1 else "brn_v2_chain.db"
-    strict = "--strict" in sys.argv
-
-    print(f"Auditando {path}... (strict_validators={strict})")
+    print("=" * 60)
+    print(f" BRN CHAIN VALIDATOR v{__version__}")
+    print("=" * 60)
+    print(f"[*] Auditando banco local: {args.db} (strict_validators={args.strict})")
 
     try:
         from blockchain import Blockchain
-        bc = Blockchain(path, auto_genesis=False)
+        bc = Blockchain(args.db, auto_genesis=False)
+        # Tenta carregar Trust Network para validação estrita
+        try:
+            from trust_network import TrustNetwork
+            bc.set_trust_net(TrustNetwork("trust_network.json"))
+        except Exception:
+            pass
     except Exception as e:
-        print(f"Erro ao abrir blockchain: {e}")
+        print(f"\n[X] Erro ao abrir blockchain: {e}")
         sys.exit(1)
 
-    r = verify_chain(bc, strict_validators=strict)
-    print(f"  height              : {r.height}")
-    print(f"  blocks_checked      : {r.blocks_checked}")
-    print(f"  checkpoints_checked : {r.checkpoints_checked}")
-    print(f"  validators_checked  : {r.validators_checked}")
-    print(f"  strict_validators   : {r.strict_validators}")
-    print(f"  duration            : {r.duration:.2f}s")
-    print(f"  valid               : {r.valid}")
-    print(f"  summary             : {r.summary()}")
-    if r.warnings:
-        print(f"  warnings ({len(r.warnings)}):")
-        for w in r.warnings[:5]:
-            print(f"    - {w}")
+    local_h = bc.db.height()
+    local_tip = bc.db.tip_hash()
+
+    # 1. Validação da Cadeia Local
+    r = verify_chain(bc, strict_validators=args.strict)
+    print(f"\n{'='*60}")
+    print(f" RESULTADO DA CADEIA LOCAL")
+    print(f"{'='*60}")
+    print(f"  Altura              : {r.height}")
+    print(f"  Blocos verificados  : {r.blocks_checked}")
+    print(f"  Assinaturas válidas : {r.validators_checked}")
+    print(f"  Status              : {'\033[92mSALDAVEL\033[0m' if r.valid else '\033[91mINVALIDA\033[0m'}")
+    
     if r.errors:
-        print(f"  errors ({len(r.errors)}):")
+        print(f"\n  Erros ({len(r.errors)}):")
         for e in r.errors[:10]:
             print(f"    - {e}")
 
+    # 2. Consenso
+    if args.consensus:
+        audit_consensus(bc)
+
+    # 3. Rede
+    if args.network or args.clean_peers:
+        healthy = audit_network(local_h, local_tip, args.tolerance)
+        
+        if args.clean_peers:
+            if healthy:
+                # Preserva o localhost se estiver lá
+                local_peers = [p for p in healthy if "127.0.0.1" in p or "localhost" in p]
+                
+                BOOTSTRAP_FILE.write_text(json.dumps(healthy, indent=2), encoding="utf-8")
+                print(f"\n\033[92m[OK]\033[0m bootstrap_peers.json atualizado com {len(healthy)} peer(s) saudáveis!")
+            else:
+                print("\n\033[93m[!]\033[0m Nenhum peer saudável encontrado. Arquivo não alterado.")
+
+    print("\n" + "=" * 60)
     sys.exit(0 if r.valid else 2)
