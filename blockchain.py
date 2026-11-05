@@ -1,49 +1,22 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.5.0 | Data: 04/11/2026
+Versão: 9.5.2 | Data: 05/11/2026
 ================================================================
+v9.5.2 (2026-11-05):
+  [NEW] BRN_STRICT_MULTISIG: variável mestre que, quando =1,
+        DESATIVA todos os bypasses de multi-sig:
+          - BRN_BOOTSTRAP_SKIP_SIGS_UNTIL
+          - BRN_ASSUME_VALID_UNTIL (só para validação de bloco, sync continua funcionando abaixo da altura)
+          - bootstrap estrangeiro
+          - bootstrap local
+          - bootstrap estendido (trust_score >= 500)
+        Uso: produção multi-nó onde a rede deve travar se peers
+        não assinarem. Para bootstrap (rede em formação), use =0.
+  [NEW] Log explícito com "[STRICT]" quando a variável está ativa.
+  [KEEP] Todos os bypasses continuam disponíveis quando =0.
+v9.5.1 (2026-11-05):
+  [FIX] mine_block_interruptible respeita BRN_PBFT_ENFORCE.
 v9.5.0 (2026-11-04):
-  [NEW] Integração PBFT (Practical Byzantine Fault Tolerance).
-        O motor PBFT é injetado via `chain.set_pbft(pbft)` pelo
-        main.py. Quando ativo (BRN_PBFT_ENABLED=1):
-          1. `mine_block_interruptible` chama `pbft.propose(block)`
-             ANTES de `accept_block`. Se o quórum 2f+1 não for
-             atingido, o bloco é descartado.
-          2. `validate_block` verifica `block["pbft_commits"]` se
-             `BRN_PBFT_ENFORCE=1`. Blocos sem prova válida são
-             rejeitados.
-        Fornece FINALIDADE IMEDIATA: um bloco aceito não pode ser
-        revertido por reorg (a menos que >f nós sejam bizantinos).
-        Ver `pbft_consensus.py` para o motor.
-  [KEEP] Todas as correções de v9.4.12 (fallback get_active_validators).
-v9.4.12 (2026-11-03):
-  [FIX CRÍTICO] _get_active_validators() agora faz fallback para
-        get_top_validators() quando get_active_validators() retorna
-        vazio. Antes, trust_network.json com "active_validators": []
-        fazia _get_active_validators() retornar [] (ou apenas a SK
-        local), zerando o quórum multi-sig e desligando a verificação
-        de assinaturas de validador por completo.
-        Bug identificado em produção (nó travado na altura 30,
-        mensagem "Bloco #31 precisa de 2/4 assinaturas do set local,
-        tem 1").
-  [KEEP] Todas as correções de v9.4.11.
-v9.4.11 (2026-11-03):
-  [NEW] BRN_ASSUME_VALID_UNTIL: até esta altura, blocos são
-        aceitos SEM validação completa (só hash + prev_hash +
-        altura). Sync ultra-rápido (padrão Bitcoin -assumevalid).
-        PoW, Merkle, multi-sig, txs e auth_tag são IGNORADOS no
-        intervalo. Use só em redes onde você confia nos peers.
-  [NEW] BRN_CHECKPOINT_AUTO_HEIGHT: na altura exata configurada
-        (ex: 4001), após aceitar o bloco, cria automaticamente um
-        checkpoint assinado. Isso trava o hash do bloco para
-        sempre e impede reorg abaixo daquela altura.
-        Recomendado usar junto com BRN_ASSUME_VALID_UNTIL:
-          ASSUME_VALID=4000 + CHECKPOINT_AUTO=4001
-        Assim: sync rápido até 4000, checkpoint em 4001, validação
-        estrita de 4001 em diante.
-v9.4.10 (2026-11-01):
-  [NEW] BRN_BOOTSTRAP_SKIP_SIGS_UNTIL (bypass de multi-sig).
-v9.4.9 (2026-11-01):
-  [FIX] _get_active_validators inclui SK local.
+  [NEW] Integração PBFT.
 ================================================================
 """
 from __future__ import annotations
@@ -103,19 +76,33 @@ BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = int(
     os.environ.get("BRN_BOOTSTRAP_SKIP_SIGS_UNTIL", "0") or "0"
 )
 
-# [v9.4.11] Assume Valid: skip validação completa até esta altura.
+# [v9.4.11] Assume Valid
 BRN_ASSUME_VALID_UNTIL = int(
     os.environ.get("BRN_ASSUME_VALID_UNTIL", "0") or "0"
 )
 
-# [v9.4.11] Checkpoint automático na altura exata.
+# [v9.4.11] Checkpoint automático
 BRN_CHECKPOINT_AUTO_HEIGHT = int(
     os.environ.get("BRN_CHECKPOINT_AUTO_HEIGHT", "0") or "0"
 )
 
-# [PBFT v9.5.0] flag de enforcement — espelha pbft_consensus.PBFT_ENFORCE
-# mas é lida aqui também para permitir desligar sem reinjetar o motor.
+# [PBFT] flag de enforcement
 BRN_PBFT_ENFORCE = os.environ.get("BRN_PBFT_ENFORCE", "0") == "1"
+
+# [v9.5.2] STRICT MULTISIG: desativa TODOS os bypasses de multi-sig.
+BRN_STRICT_MULTISIG = os.environ.get("BRN_STRICT_MULTISIG", "0") == "1"
+
+if BRN_STRICT_MULTISIG:
+    # Em modo estrito, ignoramos qualquer bypass configurado
+    BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = 0
+    BRN_ASSUME_VALID_UNTIL = 0
+    log.warning(
+        "[STRICT] BRN_STRICT_MULTISIG=1 — TODOS os bypasses de "
+        "multi-sig foram desativados. A rede vai travar se os "
+        "validadores não assinarem. Bypasses ignorados: "
+        "BRN_BOOTSTRAP_SKIP_SIGS_UNTIL, BRN_ASSUME_VALID_UNTIL, "
+        "bootstrap local/estrangeiro/estendido."
+    )
 
 if not (0.0 < VALIDATOR_QUORUM <= 1.0):
     VALIDATOR_QUORUM = 0.67
@@ -197,7 +184,6 @@ def get_checkpoints() -> dict:
 
 
 def _create_auto_checkpoint(block: dict) -> None:
-    """[v9.4.11] Cria checkpoint assinado na altura BRN_CHECKPOINT_AUTO_HEIGHT."""
     if _checkpoint_priv is None:
         log.warning(
             "[CHECKPOINT] #%d NÃO criado: _checkpoint_priv não configurada "
@@ -478,7 +464,7 @@ class Blockchain:
         self.p2p = None
         self._sign_collector = None
         self._local_validator_sk = None
-        self._pbft = None  # [PBFT v9.5.0] motor PBFT (injetado via set_pbft)
+        self._pbft = None
 
         fila_salva = self.db.get_meta("fila_mineracao")
         self.fila_mineracao = json.loads(fila_salva) if fila_salva else {}
@@ -531,18 +517,7 @@ class Blockchain:
     def set_sign_collector(self, cb):
         self._sign_collector = cb
 
-    # ================================================================
-    # [PBFT v9.5.0] Injeção do motor de consenso PBFT
-    # ================================================================
     def set_pbft(self, pbft) -> None:
-        """
-        Injeta o motor PBFT (pbft_consensus.PBFTConsensus).
-
-        Chamado pelo main.py após criar o P2PManager e o chain.
-        Com PBFT ativo:
-          - `mine_block_interruptible` chama pbft.propose() antes de aceitar
-          - `validate_block` verifica pbft_commits se ENFORCE=1
-        """
         self._pbft = pbft
         if pbft is not None:
             enabled = getattr(pbft, "PBFT_ENABLED", "?")
@@ -554,9 +529,6 @@ class Blockchain:
         else:
             log.info("[PBFT] motor removido da Blockchain")
 
-    # ================================================================
-    # Fila de mineradores (bootstrap)
-    # ================================================================
     def adicionar_na_fila(self, address: str, pubkey: str) -> None:
         if self.rede_descentralizada:
             return
@@ -843,10 +815,6 @@ class Blockchain:
                 log.warning(f"[VALIDATORS] falhou: {e}")
                 validators = []
 
-            # [v9.4.12] Fallback: active_validators vazio → usa top_validators.
-            # Sem isso, trust_network.json com "active_validators": []
-            # fazia get_active_validators() retornar [] e required=0/0,
-            # desligando a verificação multi-sig por completo.
             if not validators and hasattr(trust, "get_top_validators"):
                 try:
                     validators = list(trust.get_top_validators(count=MAX_VALIDATORS) or [])
@@ -888,7 +856,8 @@ class Blockchain:
         return need
 
     def _validate_validators_sig(self, block: dict, validators: Optional[list] = None) -> tuple:
-        if BRN_BOOTSTRAP_SKIP_SIGS_UNTIL > 0:
+        # [v9.4.10] Bypass por altura (só se STRICT_MULTISIG=0)
+        if not BRN_STRICT_MULTISIG and BRN_BOOTSTRAP_SKIP_SIGS_UNTIL > 0:
             try:
                 _bh = int(block.get("height", -1))
             except Exception:
@@ -941,7 +910,12 @@ class Blockchain:
         if got >= required:
             return True, ""
 
-        if len(validators) < 2 and got == 0 and got_foreign >= 1:
+        # ═══════════════════════════════════════════════════════════
+        # BYPASSES (só ativos quando STRICT_MULTISIG=0)
+        # ═══════════════════════════════════════════════════════════
+
+        # Bypass 1: bootstrap estrangeiro (1 validador local, 1 assinatura estrangeira)
+        if not BRN_STRICT_MULTISIG and len(validators) < 2 and got == 0 and got_foreign >= 1:
             try:
                 block_h = int(block.get("height", -1))
                 my_height = self.db.height()
@@ -956,13 +930,12 @@ class Blockchain:
             log.warning(
                 f"[SIG] Bloco #{block_h}: aceito em MODO BOOTSTRAP "
                 f"(set local tem {len(validators)} validador(es), "
-                f"{got_foreign} assinatura(s) estrangeira(s) válida(s)). "
-                f"Para multi-sig real, sincronize trust_network.json "
-                f"entre os nós (GET /api/trust/download no Origin)."
+                f"{got_foreign} assinatura(s) estrangeira(s) válida(s))."
             )
             return True, ""
 
-        if got >= 1 and got_foreign == 0:
+        # Bypass 2: bootstrap local (só a própria SK assinou)
+        if not BRN_STRICT_MULTISIG and got >= 1 and got_foreign == 0:
             local_pk = ""
             if self._local_validator_sk is not None:
                 try:
@@ -985,7 +958,8 @@ class Blockchain:
                     )
                     return True, ""
 
-        if got >= 1 and got_foreign == 0:
+        # Bypass 3: bootstrap estendido (trust_score >= BOOTSTRAP_TRUST_THRESHOLD)
+        if not BRN_STRICT_MULTISIG and got >= 1 and got_foreign == 0:
             trusted = False
             trusted_pubkey = ""
             if self.trust_net is not None:
@@ -1024,16 +998,14 @@ class Blockchain:
             return False, f"Bloco #{block.get('height')}: sem assinaturas válidas"
 
         missing = [p[:12] + "…" for p in validators if p not in verified_pubkeys]
+        prefix = "[STRICT] " if BRN_STRICT_MULTISIG else ""
         return False, (
-            f"Bloco #{block['height']} precisa de {required}/{len(validators)} "
+            f"{prefix}Bloco #{block['height']} precisa de {required}/{len(validators)} "
             f"assinaturas do set local, tem {got}. "
             f"Faltam: {', '.join(missing[:5])}. "
             f"({got_foreign} assinatura(s) estrangeira(s) ignorada(s))"
         )
 
-    # =================================================================
-    # validate_block com ASSUME-VALID + PBFT
-    # =================================================================
     def validate_block(self, block: dict, prev_block=None, validators: Optional[list] = None) -> tuple:
         if block["height"] == 0 and prev_block is None:
             if (self.genesis_expected_hash and block["hash"] != self.genesis_expected_hash):
@@ -1045,9 +1017,9 @@ class Blockchain:
         if block["height"] != expected_height:
             return False, "altura invalida"
 
-        # [v9.4.11] ASSUME-VALID: skip validation completa até N
+        # [v9.4.11] ASSUME-VALID (só se STRICT_MULTISIG=0)
         h_int = int(block["height"])
-        if BRN_ASSUME_VALID_UNTIL > 0 and 0 < h_int <= BRN_ASSUME_VALID_UNTIL:
+        if not BRN_STRICT_MULTISIG and BRN_ASSUME_VALID_UNTIL > 0 and 0 < h_int <= BRN_ASSUME_VALID_UNTIL:
             try:
                 h_calc = block_hash(
                     block["prev_hash"], block["merkle"], block["timestamp"],
@@ -1130,17 +1102,11 @@ class Blockchain:
         if total_cb > reward + fees:
             return False, "coinbase acima do permitido"
 
-        # ─── [PBFT v9.5.0] Verifica prova PBFT se o bloco trouxer ────
-        # Só exige se ENFORCE=1 (para permitir rollout gradual).
         if self._pbft is not None and "pbft_commits" in block:
             try:
                 ok_pbft, why_pbft = self._pbft.validate_proof(block)
                 if not ok_pbft:
                     return False, f"pbft: {why_pbft}"
-                log.debug(
-                    "[PBFT] bloco #%d com prova válida (%d commits)",
-                    block.get("height"), len(block.get("pbft_commits", [])),
-                )
             except Exception as e:
                 log.warning("[PBFT] validate_proof exceção: %s", e)
                 if BRN_PBFT_ENFORCE:
@@ -1148,9 +1114,6 @@ class Blockchain:
 
         return True, "ok"
 
-    # =================================================================
-    # accept_block com auto-checkpoint em BRN_CHECKPOINT_AUTO_HEIGHT
-    # =================================================================
     def accept_block(self, block: dict, validators: Optional[list] = None) -> tuple:
         prev = self.db.get_block_by_hash(block["prev_hash"])
         ok, msg = self.validate_block(block, prev, validators=validators)
@@ -1169,7 +1132,6 @@ class Blockchain:
         except Exception as e:
             return False, f"Erro ao gravar bloco #{block['height']}: {e}"
 
-        # [v9.4.11] Auto-checkpoint em altura específica
         if BRN_CHECKPOINT_AUTO_HEIGHT > 0 and int(block["height"]) == BRN_CHECKPOINT_AUTO_HEIGHT:
             _create_auto_checkpoint(block)
 
@@ -1267,14 +1229,17 @@ class Blockchain:
             raise ValueError("mine_block: miner_pubkey é obrigatória")
         return self.mine_block_interruptible(miner_address, miner_pubkey, None)
 
-    # =================================================================
-    # mine_block_interruptible com PBFT
-    # =================================================================
     def mine_block_interruptible(self, miner_address: str, miner_pubkey: str, should_continue=None, progress_cb=None) -> dict:
         if not miner_pubkey:
             raise ValueError("mine_block_interruptible: miner_pubkey é obrigatória")
 
         validators = self._get_active_validators()
+        if BRN_STRICT_MULTISIG:
+            log.info(
+                "[STRICT] minerando com %d validador(es), quórum=%s",
+                len(validators),
+                "ALL" if REQUIRE_ALL_SIGS else VALIDATOR_QUORUM,
+            )
 
         height = self.db.height() + 1
         reward = self.current_reward(height)
@@ -1330,36 +1295,26 @@ class Blockchain:
             log.warning(f"[MINER] bloco #{height} REJEITADO (multi-sig): {msg_sig}")
             return None
 
-        # ─── [PBFT v9.5.0] Proposta PBFT ANTES de accept_block ──────
-        # Se o quórum 2f+1 não for atingido, descarta o bloco.
-        # A prova (view/seq/commits) é anexada ao bloco antes do accept.
         if self._pbft is not None:
             try:
                 decided = self._pbft.propose(block)
-                if not decided:
-                    log.warning(
-                        f"[PBFT] bloco #{height} NÃO decidido — descartando "
-                        f"(peers não atingiram 2f+1)"
-                    )
-                    return None
-                if not self._pbft.attach_proof(block):
-                    log.warning(
-                        f"[PBFT] bloco #{height} decidiu mas attach_proof "
-                        f"falhou — descartando"
-                    )
-                    return None
-                n_commits = len(block.get("pbft_commits", []))
-                log.info(
-                    "[PBFT] bloco #%d decidido com %d commit(s) "
-                    "(view=%d seq=%d)",
-                    height, n_commits,
-                    block.get("pbft_view"), block.get("pbft_seq"),
-                )
+                if decided:
+                    if not self._pbft.attach_proof(block):
+                        log.warning(f"[PBFT] bloco #{height} decidiu mas attach_proof falhou")
+                        if BRN_PBFT_ENFORCE:
+                            return None
+                    else:
+                        log.info("[PBFT] bloco #%d decidido com %d commit(s)", height, len(block.get("pbft_commits", [])))
+                else:
+                    if BRN_PBFT_ENFORCE:
+                        log.warning(f"[PBFT] bloco #{height} NÃO decidido — descartando (ENFORCE=1)")
+                        return None
+                    else:
+                        log.warning(f"[PBFT] bloco #{height} sem quórum PBFT — continuando via multi-sig (ENFORCE=0)")
             except Exception as e:
                 log.error("[PBFT] propose falhou para #%d: %s", height, e)
                 if BRN_PBFT_ENFORCE:
                     return None
-        # ────────────────────────────────────────────────────────────
 
         ok, msg = self.accept_block(block, validators=validators)
         if ok:
@@ -1389,8 +1344,8 @@ class Blockchain:
             "bootstrap_skip_sigs_until": BRN_BOOTSTRAP_SKIP_SIGS_UNTIL,
             "assume_valid_until": BRN_ASSUME_VALID_UNTIL,
             "checkpoint_auto_height": BRN_CHECKPOINT_AUTO_HEIGHT,
+            "strict_multisig": BRN_STRICT_MULTISIG,
         }
-        # [PBFT v9.5.0] status do motor
         if self._pbft is not None:
             try:
                 snap["pbft"] = self._pbft.status()
