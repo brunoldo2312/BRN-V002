@@ -47,7 +47,6 @@ h1 span { color: var(--accent); }
 .btn:hover { background: var(--border); }
 .btn.p { background: #238636; border-color: #2ea043; color: white; }
 .btn.p:hover { background: #2ea043; }
-.btn.danger { background: var(--red); border-color: var(--red); color: white; }
 select {
     background: var(--bg-card); color: var(--text);
     border: 1px solid var(--border); padding: 6px 10px;
@@ -68,8 +67,6 @@ select {
 .card .value {
     font-size: 1.4rem; font-weight: 600; color: var(--accent); margin-top: 4px;
 }
-.card.warn .value { color: var(--yellow); }
-.card.crit .value { color: var(--red); }
 .section {
     background: var(--bg-card); border: 1px solid var(--border);
     border-radius: 8px; padding: 16px; margin-bottom: 12px;
@@ -83,23 +80,16 @@ th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--bor
 th { color: var(--text-muted); font-weight: 500; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; }
 tr.clickable { cursor: pointer; }
 tr.clickable:hover { background: var(--bg-hover); }
-tr.behind td { color: var(--yellow); }
 code {
     font-family: ui-monospace, "SF Mono", Menlo, monospace;
     font-size: 0.78rem; background: var(--bg);
     padding: 2px 6px; border-radius: 4px; color: #79c0ff; word-break: break-all;
 }
-.sync-card { display: none; }
-.sync-card.show { display: block; }
-.sync-bar { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; margin: 10px 0; }
-.sync-bar > div { height: 100%; width: 0%; background: var(--accent); transition: width 0.4s; }
 .sync-stats { display: flex; gap: 16px; flex-wrap: wrap; font-size: 0.85rem; color: var(--text-muted); }
 .sync-stats b { color: var(--text); }
 .alert { padding: 10px 14px; border-radius: 6px; margin-bottom: 12px; font-size: 0.88rem; }
 .alert.warn { background: #2d2200; border: 1px solid #9e6a03; color: #e3b341; }
 .alert.err { background: #2d1416; border: 1px solid #8b2424; color: #ffa198; }
-.alert.ok { background: #0d2818; border: 1px solid #238636; color: #7ee787; }
-.alert.info { background: #0d1d2f; border: 1px solid #1f6feb; color: #79c0ff; }
 .modal {
     display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
     background: rgba(0, 0, 0, 0.75); z-index: 1000; padding: 20px; overflow-y: auto;
@@ -129,17 +119,14 @@ code {
 .tx-item .coinbase { color: var(--yellow); font-weight: bold; }
 .tx-item .outputs { color: var(--text-muted); font-size: 0.75rem; }
 .footer { text-align: center; margin-top: 24px; padding-top: 12px; border-top: 1px solid var(--border); color: var(--text-muted); font-size: 0.78rem; }
-.footer a { color: var(--accent); text-decoration: none; }
-.footer a:hover { text-decoration: underline; }
 .loading { color: var(--text-muted); font-style: italic; text-align: center; padding: 20px; }
 .empty { color: var(--text-muted); text-align: center; padding: 20px; }
-.tag { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 0.7rem; font-weight: 600; }
+.tag { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.7rem; font-weight: 600; white-space: nowrap;}
 .tag.green { background: #0d2818; color: var(--green); }
 .tag.yellow { background: #2d2200; color: var(--yellow); }
 .tag.red { background: #2d1416; color: var(--red); }
 .tag.blue { background: #0d1d2f; color: var(--accent); }
-.tag.trusted { background: #1f2d1f; color: #7ee787; border: 1px solid #238636; }
-.tag.banned { background: #2d1416; color: #ffa198; border: 1px solid #8b2424; }
+.tag.purple { background: #2d1f3a; color: var(--purple); }
 @media (max-width: 640px) { .hide-sm { display: none; } h1 { font-size: 1.2rem; } .card .value { font-size: 1.15rem; } }
 </style>
 </head>
@@ -157,14 +144,12 @@ code {
                 <option value="5" selected>Auto: 5s</option>
                 <option value="10">Auto: 10s</option>
                 <option value="30">Auto: 30s</option>
-                <option value="60">Auto: 60s</option>
             </select>
             <button class="btn p" onclick="carregarTudo(true)">🔄 Atualizar</button>
         </div>
     </header>
 
     <div id="alertFork" class="alert err" style="display:none;">⚠️ <b>FORK DETECTADO</b> — a rede está dividida. Aguardando reorg.</div>
-    <div id="alertOffline" class="alert warn" style="display:none;">🔌 Servidor principal offline — mostrando apenas dados locais do SQLite.</div>
 
     <div class="grid">
         <div class="card"><div class="label">Altura</div><div class="value" id="height">—</div></div>
@@ -175,46 +160,54 @@ code {
         <div class="card"><div class="label">Recompensa</div><div class="value" id="reward">—</div></div>
     </div>
 
-    <div class="section sync-card" id="syncCard">
-        <h2><span>🔄 Sincronização</span><span id="syncStatus" class="tag blue">—</span></h2>
-        <div class="sync-bar"><div id="syncBar"></div></div>
-        <div class="sync-stats">
-            <span>Local: <b id="syncLocal">—</b></span>
-            <span>Alvo: <b id="syncTarget">—</b></span>
-            <span>Progresso: <b id="syncPct">—</b></span>
-            <span id="syncPeer">—</span>
+    <!-- NOVA SEÇÃO: CONSENSO E VALIDADORES -->
+    <div class="section" id="consensusSection">
+        <h2>
+            <span>🛡️ Consenso e Assinaturas</span>
+            <span id="consensusStatus" class="tag blue">Carregando…</span>
+        </h2>
+        <div class="sync-stats" style="margin-bottom: 12px;">
+            <span>Quórum Exigido: <b id="reqSigs">—</b></span>
+            <span>Assinaturas no Último Bloco: <b id="lastSigs" style="color:var(--accent);">—</b></span>
+            <span>Validadores Ativos: <b id="totalValidators">—</b></span>
         </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Validador (Pubkey / Endereço)</th>
+                    <th class="hide-sm">Trust Score</th>
+                    <th>Status</th>
+                    <th>Assinou o Último Bloco?</th>
+                </tr>
+            </thead>
+            <tbody id="validatorsBody">
+                <tr><td colspan="4" class="loading">Consultando validadores…</td></tr>
+            </tbody>
+        </table>
     </div>
 
     <div class="section" id="peersSection" style="display:none;">
-        <h2><span>👥 Peers (<span id="peersCount">0</span>)</span></h2>
+        <h2><span>👥 Peers Conectados (<span id="peersCount">0</span>)</span></h2>
         <table>
-            <thead><tr><th>Endereço</th><th>Altura</th><th>Reputação (Trust)</th><th class="hide-sm">Última vez</th></tr></thead>
-            <tbody id="peersBody"><tr><td colspan="4" class="loading">Carregando…</td></tr></tbody>
+            <thead><tr><th>Endereço</th><th>Altura</th><th>Status</th><th class="hide-sm">Última vez</th></tr></thead>
+            <tbody id="peersBody"></tbody>
         </table>
     </div>
 
     <div class="section">
-        <h2><span>📦 Últimos Blocos</span><span style="font-size:0.75rem;color:var(--text-muted);font-weight:400;">clique para ver detalhes</span></h2>
+        <h2><span>📦 Últimos Blocos</span></h2>
         <table>
             <thead><tr><th>#</th><th>Hash</th><th class="hide-sm">Timestamp</th><th>Txs</th><th class="hide-sm">Dificuldade</th></tr></thead>
             <tbody id="blocksBody"><tr><td colspan="5" class="loading">Carregando…</td></tr></tbody>
         </table>
     </div>
 
-    <div class="section">
-        <h2>🔗 Tip Hash (bloco atual)</h2>
-        <code id="tipHash" style="display:block;padding:10px;">—</code>
-    </div>
-
     <div class="footer">
-        BRN Explorer v2.2 · <span id="lastUpdate">aguardando…</span>
-        · <a href="/api/status">/api/status</a>
-        · <a href="/health">/health</a>
-        · <a href="javascript:carregarTudo(true)">reload</a>
+        BRN Explorer v2.3 · <span id="lastUpdate">aguardando…</span>
     </div>
 </div>
 
+<!-- Modal de Bloco (mantido igual) -->
 <div class="modal" id="blockModal">
     <div class="modal-content">
         <button class="modal-close" onclick="closeModal()">×</button>
@@ -234,8 +227,17 @@ code {
 
 <script>
 "use strict";
-const REFRESH_KEY = "brn_explorer_refresh_s";
-const state = { blocks: [], byHeight: new Map(), status: null, sync: null, peers: null, autoTimer: null, refreshing: false, serverOnline: true };
+const state = { 
+    blocks: [], 
+    status: null, 
+    sync: null, 
+    peers: [], 
+    activeValidators: [],
+    requiredSigs: 0,
+    latestBlockSigs: new Set(),
+    autoTimer: null, 
+    refreshing: false 
+};
 
 function $(id) { return document.getElementById(id); }
 
@@ -254,149 +256,189 @@ function fmtBRN(sats) { const v = Number(sats || 0) / 1e8; return v.toFixed(8).r
 function fmtTs(ts) { if (!ts) return "—"; return new Date(ts * 1000).toLocaleString("pt-BR"); }
 function fmtAgo(ts) { if (!ts) return "—"; const diff = Math.max(0, Date.now() / 1000 - ts); if (diff < 60) return `${Math.floor(diff)}s`; if (diff < 3600) return `${Math.floor(diff / 60)}min`; if (diff < 86400) return `${Math.floor(diff / 3600)}h`; return `${Math.floor(diff / 86400)}d`; }
 
+// ==========================================
+// 1. STATUS DO NÓ
+// ==========================================
 async function refreshStatus() {
     try {
         const s = await fetchJSON("/api/status");
-        if (s.error || s.success === false) throw new Error(s.error || "error");
         state.status = s;
-        state.serverOnline = true;
         $("height").textContent = s.height ?? "—";
         $("peers").textContent = s.peers ?? "—";
         $("utxos").textContent = s.utxos ?? "—";
         $("mempool").textContent = s.mempool ?? "—";
         $("difficulty").textContent = s.difficulty ?? "—";
         $("reward").textContent = s.reward ? fmtBRN(s.reward) : "—";
-        $("tipHash").textContent = s.tip_hash || "—";
-        $("alertOffline").style.display = "none";
-        setStatusBadge("online");
     } catch (e) {
-        state.serverOnline = false;
-        $("alertOffline").style.display = "block";
-        setStatusBadge("offline");
-        try {
-            const blocks = await fetchJSON("/api/latest");
-            if (Array.isArray(blocks) && blocks.length > 0) {
-                const latest = blocks.reduce((a, b) => (b.height > a.height ? b : a));
-                $("height").textContent = latest.height;
-                $("tipHash").textContent = latest.hash || "—";
-            }
-        } catch (_) {}
+        $("height").textContent = "Offline";
     }
 }
 
-function setStatusBadge(kind) {
-    const dot = $("statusDot"); const txt = $("statusText");
-    if (kind === "online") { dot.style.background = "var(--green)"; txt.textContent = "Online"; txt.style.color = "var(--green)"; }
-    else if (kind === "syncing") { dot.style.background = "var(--yellow)"; txt.textContent = "Sincronizando"; txt.style.color = "var(--yellow)"; }
-    else if (kind === "forking") { dot.style.background = "var(--red)"; txt.textContent = "FORK"; txt.style.color = "var(--red)"; }
-    else { dot.style.background = "var(--red)"; txt.textContent = "Offline"; txt.style.color = "var(--red)"; }
-}
-
-async function refreshSync() {
+// ==========================================
+// 2. CONSENSO E VALIDADORES (NOVO)
+// ==========================================
+async function refreshConsensus() {
     try {
-        const s = await fetchJSON("/api/sync/status");
-        if (s.error) throw new Error(s.error);
-        state.sync = s;
-        const forking = !!s.forking;
-        const syncing = !!s.syncing;
-        $("alertFork").style.display = forking ? "block" : "none";
-        if (forking) setStatusBadge("forking");
-        else if (syncing) setStatusBadge("syncing");
-        else if (state.serverOnline) setStatusBadge("online");
-        const progress = Number(s.progress ?? 100);
-        const showSync = syncing || forking || progress < 99.9;
-        const card = $("syncCard");
-        if (showSync) {
-            card.classList.add("show");
-            $("syncBar").style.width = progress + "%";
-            $("syncLocal").textContent = s.local_height ?? "—";
-            $("syncTarget").textContent = s.target_height ?? "—";
-            $("syncPct").textContent = progress.toFixed(1) + "%";
-            const st = $("syncStatus");
-            if (forking) { st.textContent = "FORK"; st.className = "tag red"; }
-            else if (syncing) { st.textContent = "Sincronizando"; st.className = "tag yellow"; }
-            else { st.textContent = "OK"; st.className = "tag green"; }
-            $("syncPeer").innerHTML = s.active_peer ? `Peer ativo: <b>${shortHash(s.active_peer, 24)}</b>` : "";
-            $("syncBar").style.background = forking ? "var(--red)" : (syncing ? "var(--yellow)" : "var(--green)");
-        } else { card.classList.remove("show"); }
-    } catch (e) { $("syncCard").classList.remove("show"); }
+        // Pega lista de validadores ativos no Trust Network
+        const cons = await fetchJSON("/api/consensus/validators");
+        if (!cons.ok) throw new Error(cons.msg || "Erro na API");
+
+        state.activeValidators = cons.validators || [];
+        state.requiredSigs = cons.required_sigs || 0;
+
+        $("reqSigs").textContent = state.requiredSigs;
+        $("totalValidators").textContent = state.activeValidators.length;
+
+        // Atualiza as assinaturas do último bloco baseado no que já foi carregado
+        if (state.blocks && state.blocks.length > 0) {
+            const latestBlock = state.blocks[0]; // Assumindo ordenação decrescente
+            const sigs = latestBlock.validators_sig || [];
+            state.latestBlockSigs = new Set(sigs.map(s => s.pubkey.toLowerCase()));
+            $("lastSigs").textContent = state.latestBlockSigs.size;
+        }
+
+        renderValidatorsTable();
+    } catch (e) {
+        $("validatorsBody").innerHTML = `<tr><td colspan="4" class="empty">Erro ao carregar consenso: ${e.message}</td></tr>`;
+        $("consensusStatus").textContent = "Falha";
+        $("consensusStatus").className = "tag red";
+    }
 }
 
+function renderValidatorsTable() {
+    const tbody = $("validatorsBody");
+    tbody.innerHTML = "";
+    
+    if (state.activeValidators.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4" class="empty">Nenhum validador ativo no Trust Network.</td></tr>';
+        $("consensusStatus").textContent = "Sem Validadores";
+        $("consensusStatus").className = "tag yellow";
+        return;
+    }
+
+    // Atualiza a tag de status geral
+    const statusTag = $("consensusStatus");
+    if (state.requiredSigs > 0 && state.latestBlockSigs.size >= state.requiredSigs) {
+        statusTag.textContent = "Consenso Atingido";
+        statusTag.className = "tag green";
+    } else if (state.requiredSigs > 0) {
+        statusTag.textContent = "Aguardando Assinaturas";
+        statusTag.className = "tag red";
+    } else {
+        statusTag.textContent = "Modo Bootstrap";
+        statusTag.className = "tag blue";
+    }
+
+    for (const v of state.activeValidators) {
+        const pk = (v.pubkey_full || v.pubkey || "").toLowerCase();
+        const signed = state.latestBlockSigs.has(pk);
+        
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+            <td>
+                <code>${shortHash(pk, 20)}</code><br>
+                <small style="color:var(--text-muted)">${v.address || 'Endereço desconhecido'}</small>
+            </td>
+            <td class="hide-sm"><b>${v.trust_score}</b></td>
+            <td>${v.connected ? '<span class="tag green">Online</span>' : '<span class="tag red">Offline</span>'}</td>
+            <td>
+                ${signed 
+                    ? '<span class="tag green">✓ Assinou</span>' 
+                    : '<span class="tag yellow">✗ Não Assinou</span>'}
+            </td>
+        `;
+        tbody.appendChild(tr);
+    }
+}
+
+// ==========================================
+// 3. PEERS CONECTADOS
+// ==========================================
 async function refreshPeers() {
     try {
         const s = await fetchJSON("/api/trust/nodes");
-        if (s.error || !s.ok) throw new Error(s.error || "error");
-        state.peers = s.nodes || [];
-        renderPeers(state.peers);
-    } catch (e) {
-        try {
-            const s = await fetchJSON("/api/peers");
-            state.peers = s.peers || [];
+        if (s.ok && s.nodes) {
+            state.peers = s.nodes;
             renderPeers(state.peers);
-        } catch (_) { $("peersSection").style.display = "none"; }
+        }
+    } catch (e) {
+        $("peersSection").style.display = "none";
     }
 }
 
 function renderPeers(peers) {
-    const section = $("peersSection"); const tbody = $("peersBody");
+    const section = $("peersSection"); 
+    const tbody = $("peersBody");
     $("peersCount").textContent = peers.length;
-    if (peers.length === 0) { tbody.innerHTML = '<tr><td colspan="4" class="empty">Nenhum peer descoberto</td></tr>'; section.style.display = "block"; return; }
+    
+    if (peers.length === 0) { 
+        tbody.innerHTML = '<tr><td colspan="4" class="empty">Nenhum peer descoberto</td></tr>'; 
+        section.style.display = "block"; 
+        return; 
+    }
+    
     const localH = state.status?.height ?? 0;
     tbody.innerHTML = "";
+    
     for (const p of peers.slice(0, 50)) {
         const tr = document.createElement("tr");
         const behind = p.height < localH - 5;
-        if (behind) tr.className = "behind";
-        const status = p.status || "new";
-        let statusTag = `<span class="tag blue">${status.toUpperCase()}</span>`;
-        if (status === "trusted") statusTag = `<span class="tag trusted">✓ CONFIÁVEL</span>`;
-        else if (status === "banned") statusTag = `<span class="tag banned">✗ BANIDO</span>`;
-        else if (status === "candidate") statusTag = `<span class="tag yellow">CANDIDATO</span>`;
+        if (behind) tr.style.color = "var(--yellow)";
+        
+        // Verifica se este peer é um dos validadores ativos
+        const isValidator = state.activeValidators.some(v => 
+            (v.pubkey_full && v.pubkey_full === p.node_id) || 
+            (v.address && v.address === p.address)
+        );
+        
+        let statusHtml = `<span class="tag blue">${(p.status || "new").toUpperCase()}</span>`;
+        if (isValidator) {
+            statusHtml += ` <span class="tag purple">🛡️ VALIDADOR</span>`;
+        }
+
         tr.innerHTML = `
             <td><code>${p.address || "?"}</code></td>
             <td>${p.height ?? "—"}</td>
-            <td>${statusTag}</td>
+            <td>${statusHtml}</td>
             <td class="hide-sm">${fmtAgo(p.last_seen)}</td>
         `;
-        tbody.appendChild(tr);
-    }
-    if (peers.length > 50) {
-        const tr = document.createElement("tr");
-        tr.innerHTML = `<td colspan="4" class="empty">… e mais ${peers.length - 50} peers</td>`;
         tbody.appendChild(tr);
     }
     section.style.display = "block";
 }
 
+// ==========================================
+// 4. BLOCOS
+// ==========================================
 async function refreshBlocks() {
     const tbody = $("blocksBody");
     try {
         const blocks = await fetchJSON("/api/latest");
         if (!Array.isArray(blocks)) throw new Error("resposta inválida");
-        state.blocks = blocks.slice().sort((a, b) => b.height - a.height);
-        state.byHeight.clear();
-        for (const b of state.blocks) { state.byHeight.set(b.height, b); }
-        if (state.blocks.length === 0) { tbody.innerHTML = '<tr><td colspan="5" class="empty">Nenhum bloco ainda</td></tr>'; return; }
-        renderBlocks();
-    } catch (e) { tbody.innerHTML = `<tr><td colspan="5" class="empty">Erro: ${e.message}</td></tr>`; }
-}
-
-function renderBlocks() {
-    const tbody = $("blocksBody");
-    tbody.innerHTML = "";
-    for (const b of state.blocks) {
-        const tr = document.createElement("tr");
-        tr.className = "clickable";
-        const txs = b.transactions ? b.transactions.length : 0;
-        tr.innerHTML = `
-            <td><b>${b.height}</b></td>
-            <td><code>${shortHash(b.hash, 20)}</code></td>
-            <td class="hide-sm">${fmtTs(b.timestamp)}</td>
-            <td>${txs}</td>
-            <td class="hide-sm">${b.difficulty ?? "—"}</td>
-        `;
-        tr.onclick = () => showBlockDetail(b);
-        tbody.appendChild(tr);
+        state.blocks = blocks.sort((a, b) => b.height - a.height);
+        
+        if (state.blocks.length === 0) { 
+            tbody.innerHTML = '<tr><td colspan="5" class="empty">Nenhum bloco ainda</td></tr>'; 
+            return; 
+        }
+        
+        tbody.innerHTML = "";
+        for (const b of state.blocks) {
+            const tr = document.createElement("tr");
+            tr.className = "clickable";
+            const txs = b.transactions ? b.transactions.length : 0;
+            tr.innerHTML = `
+                <td><b>${b.height}</b></td>
+                <td><code>${shortHash(b.hash, 20)}</code></td>
+                <td class="hide-sm">${fmtTs(b.timestamp)}</td>
+                <td>${txs}</td>
+                <td class="hide-sm">${b.difficulty ?? "—"}</td>
+            `;
+            tr.onclick = () => showBlockDetail(b);
+            tbody.appendChild(tr);
+        }
+    } catch (e) { 
+        tbody.innerHTML = `<tr><td colspan="5" class="empty">Erro: ${e.message}</td></tr>`; 
     }
 }
 
@@ -408,10 +450,27 @@ function showBlockDetail(b) {
     $("mNonce").textContent = b.nonce ?? "—";
     $("mDiff").textContent = b.difficulty ?? "—";
     $("mTs").textContent = fmtTs(b.timestamp);
+    
+    // Mostrar assinaturas no modal
+    const sigs = b.validators_sig || [];
+    let sigHtml = `<div style="margin-top: 15px; padding: 10px; background: var(--bg); border-radius: 6px;">
+        <b style="color: var(--accent);">Assinaturas deste Bloco (${sigs.length}):</b><br>`;
+    if (sigs.length === 0) {
+        sigHtml += `<span style="color: var(--yellow);">Nenhuma assinatura (modo bootstrap).</span>`;
+    } else {
+        sigHtml += `<ul style="margin-left: 20px; font-size: 0.8rem; font-family: monospace;">`;
+        for (let s of sigs) {
+            sigHtml += `<li>${s.pubkey}</li>`;
+        }
+        sigHtml += `</ul>`;
+    }
+    sigHtml += `</div>`;
+    
     const txs = b.transactions || [];
     $("mTxCount").textContent = txs.length;
     const box = $("mTxs");
-    box.innerHTML = "";
+    box.innerHTML = sigHtml;
+    
     for (let i = 0; i < txs.length; i++) {
         const tx = txs[i];
         const isCoinbase = tx.inputs && tx.inputs.length > 0 && tx.inputs[0].txid === "0".repeat(64);
@@ -424,19 +483,22 @@ function showBlockDetail(b) {
         `;
         box.appendChild(div);
     }
-    if (txs.length === 0) { box.innerHTML = '<div class="empty">Sem transações</div>'; }
     $("blockModal").classList.add("show");
 }
 
 function closeModal() { $("blockModal").classList.remove("show"); }
-document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeModal(); });
-$("blockModal").addEventListener("click", (e) => { if (e.target.id === "blockModal") closeModal(); });
 
+// ==========================================
+// 5. ORQUESTRAÇÃO E AUTO-REFRESH
+// ==========================================
 async function carregarTudo(manual = false) {
     if (state.refreshing) return;
     state.refreshing = true;
     try {
-        await Promise.all([refreshStatus(), refreshSync(), refreshPeers(), refreshBlocks()]);
+        await refreshStatus();
+        await refreshBlocks();
+        await refreshConsensus(); // Executa após blocks para checar quem assinou
+        await refreshPeers();
         $("lastUpdate").textContent = "atualizado " + new Date().toLocaleTimeString("pt-BR");
     } finally {
         state.refreshing = false;
@@ -445,25 +507,23 @@ async function carregarTudo(manual = false) {
 }
 
 function scheduleAuto() {
-    if (state.autoTimer) { clearInterval(state.autoTimer); state.autoTimer = null; }
+    if (state.autoTimer) clearInterval(state.autoTimer);
     const secs = parseInt($("refreshSelect").value, 10);
     if (secs > 0) {
         state.autoTimer = setInterval(async () => {
-            await Promise.all([refreshStatus(), refreshSync(), refreshPeers()]);
+            await refreshStatus();
+            await refreshBlocks();
+            await refreshConsensus();
             $("lastUpdate").textContent = "atualizado " + new Date().toLocaleTimeString("pt-BR");
         }, secs * 1000);
     }
 }
 
-(function initRefreshSelect() {
-    const saved = localStorage.getItem(REFRESH_KEY);
-    const sel = $("refreshSelect");
-    if (saved !== null) {
-        for (const opt of sel.options) { if (opt.value === saved) { sel.value = saved; break; } }
-    }
-    sel.addEventListener("change", () => { localStorage.setItem(REFRESH_KEY, sel.value); scheduleAuto(); });
-})();
+$("refreshSelect").addEventListener("change", scheduleAuto);
+$("blockModal").addEventListener("click", (e) => { if (e.target.id === "blockModal") closeModal(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeModal(); });
 
+// Inicialização
 carregarTudo(false);
 scheduleAuto();
 </script>
