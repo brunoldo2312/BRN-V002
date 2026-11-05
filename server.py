@@ -1,11 +1,13 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.22)
+server.py — Backend HTTP do nó BRN (v9.9.23)
 ================================================================
+v9.9.23 (2026-11-05):
+  [FIX CRÍTICO] Adicionada rota /api/trust/download que estava
+        faltando. Sem ela, os clientes recebiam erro 404 ao tentar
+        sincronizar a Trust Network do Origem.
 v9.9.22 (2026-11-05):
   [FIX CRÍTICO] pool_start_local() corrigido para passar a URL
-        (string) em vez da chain (objeto) para o PoolClient.
-        Resolve o erro "'str' object has no attribute 'register'".
-        Agora o nó Windows consegue se registrar no pool do Ubuntu.
+        em vez da chain para o PoolClient.
 v9.9.21 (2026-11-05):
   [FIX] Detecção dinâmica do método de início/parada no PoolClient.
 v9.9.19 (2026-11-04):
@@ -119,7 +121,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
             req = urllib.request.Request(
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
-                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.22"},
+                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.23"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -893,7 +895,7 @@ def pool_miners():
 
 
 # ============================================================
-# POOL LOCAL DINÂMICO E DETECÇÃO DE MÉTODOS [FIX v9.9.22]
+# POOL LOCAL DINÂMICO E DETECÇÃO DE MÉTODOS
 # ============================================================
 @app.route("/api/pool/local_status", methods=["GET"])
 def pool_local_status():
@@ -921,14 +923,12 @@ def pool_start_local():
             if not pubkey:
                 return jsonify({"ok": False, "msg": "pubkey obrigatoria para iniciar o PoolClient"}), 400
 
-            # [FIX] Pega a URL do pool do ambiente
             pool_url = os.environ.get("BRN_POOL_URL", "").strip()
             if not pool_url:
                 pool_url = os.environ.get("BRN_POOL_URL_LOCAL", "").strip() or "http://127.0.0.1:5000"
 
             log.info("[pool_client] Inicializando com pool_url=%s", pool_url)
 
-            # [FIX] Passa a URL (string) como primeiro argumento
             try:
                 pc = PoolClient(pool_url, address, pubkey)
             except TypeError:
@@ -1078,7 +1078,7 @@ def api_wallet_set_validator_sk():
 
 
 # ============================================================
-# TRUST NETWORK (Altura e Status Reais)
+# TRUST NETWORK
 # ============================================================
 @app.route("/api/trust/stats", methods=["GET"])
 @require_rate_limit("trust_stats")
@@ -1095,6 +1095,32 @@ def trust_stats():
         else:
             return jsonify({"ok": True, **trust.get_network_stats()})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/trust/download", methods=["GET"])
+def trust_download():
+    """[v9.9.23] Serve o arquivo trust_network.json assinado para clientes."""
+    trust = _get_trust_network()
+    if trust is None:
+        return jsonify({"ok": False, "msg": "TrustNetwork indisponivel"}), 503
+    try:
+        # Garante que o arquivo está atualizado e assinado
+        trust.flush()
+        
+        data_file = getattr(trust, "data_file", Path("trust_network.json"))
+        if not data_file.is_absolute():
+            data_file = BASE_DIR / data_file
+            
+        if not data_file.exists():
+            return jsonify({"ok": False, "msg": "Arquivo de trust nao encontrado"}), 404
+            
+        with open(data_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            
+        return jsonify(data)
+    except Exception as e:
+        log.error(f"[trust_download] Erro: {e}")
+        return jsonify({"ok": False, "msg": str(e)}), 500
 
 
 @app.route("/api/trust/nodes", methods=["GET"])
@@ -1211,7 +1237,7 @@ def peers_discovered():
 def health():
     try:
         return jsonify({
-            "ok": True, "height": _get_chain().db.height(), "version": "9.9.22",
+            "ok": True, "height": _get_chain().db.height(), "version": "9.9.23",
             "chain_injected": _CHAIN is not None, "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
             "pool_client_local": _POOL_CLIENT_LOCAL is not None,
@@ -1471,5 +1497,5 @@ def api_tx_status(txid_str):
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.22 (Dynamic Pool + Dynamic PBFT + Trust Nodes Fix)")
+    print(f"BRN Server v9.9.23 (Dynamic Pool + Dynamic PBFT + Trust Download Fix)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
