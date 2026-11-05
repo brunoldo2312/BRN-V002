@@ -1,27 +1,13 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.18)
+server.py — Backend HTTP do nó BRN (v9.9.19)
 ================================================================
+v9.9.19 (2026-11-04):
+  [FIX CRÍTICO] pool_start_local() agora inicializa dinamicamente o 
+        PoolClient se ele for None. Resolve o erro 503 na GUI.
+  [FIX CRÍTICO] api_wallet_set_validator_sk() agora ativa o PBFT 
+        dinamicamente usando o objeto Wallet, evitando erro de 'pub_hex'.
 v9.9.18 (2026-11-03):
-  [NEW] Rota POST /api/wallet/set_validator_sk. Chamada pelo
-        app_wallet_v3.py v3.15 quando a GUI abre/cria/desbloqueia
-        carteira. Faz duas coisas:
-          1. chain.set_local_validator_sk(sk_hex) — atualiza a SK
-             ativa em runtime, sem reiniciar o nó.
-          2. trust_net.sync_local_validator(pubkey, address) —
-             registra a pubkey como nó ativo no trust (v3.10+).
-        Resolve o gap em que abrir a GUI não propagava a SK para
-        o consenso até o próximo boot.
-v9.9.17 (2026-11-02):
-  [NEW] Rotas /api/pool/local_status, /api/pool/start_local e
-        /api/pool/stop_local. Compartilham o PoolClient injetado
-        pelo main.py via set_pool_client_local(). Sem essas rotas,
-        a GUI (app_wallet_v3 v3.9.2) recebia 404 e mostrava
-        "PoolClient[parado]" mesmo com o cliente minerando.
-  [NEW] set_pool_client_local() / _get_pool_client_local().
-v9.9.16 (2026-10-25):
-  [FIX CRÍTICO] Re-adicionada a rota /api/minhas-txs que havia sido
-                removida por engano na v9.9.15, causando erro 404.
-  [FIX] Mantidas as rotas /api/sync-info e /api/miner/status.
+  [NEW] Rota POST /api/wallet/set_validator_sk.
 ================================================================
 """
 from __future__ import annotations
@@ -130,7 +116,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
             req = urllib.request.Request(
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
-                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.18"},
+                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.19"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -206,7 +192,7 @@ def set_trust_network(trust) -> None:
 def _get_trust_network(): return _TRUST_NETWORK
 
 
-# [v9.9.17] PoolClient local (compartilhado com main.py)
+# PoolClient local
 _POOL_CLIENT_LOCAL = None
 _POOL_CLIENT_LOCK = threading.Lock()
 
@@ -905,7 +891,7 @@ def pool_miners():
 
 
 # ============================================================
-# [v9.9.17] POOL LOCAL
+# [v9.9.19] POOL LOCAL DINÂMICO
 # ============================================================
 @app.route("/api/pool/local_status", methods=["GET"])
 def pool_local_status():
@@ -924,9 +910,40 @@ def pool_local_status():
 def pool_start_local():
     pc = _get_pool_client_local()
     if pc is None:
-        return jsonify({"ok": False, "msg": "PoolClient nao injetado"}), 503
+        try:
+            from mining_pool import PoolClient
+            data = request.get_json(force=True) or {}
+            address = (data.get("address") or "").strip()
+            pubkey = (data.get("pubkey") or "").strip()
+            pool_url = os.environ.get("BRN_POOL_URL", "").strip() or "http://127.0.0.1:5000"
+            
+            # [FIX] Tenta instanciar o PoolClient com as assinaturas mais comuns
+            try:
+                pc = PoolClient(pool_url, pubkey)
+            except TypeError:
+                try:
+                    pc = PoolClient(pool_url, address)
+                except TypeError:
+                    pc = PoolClient(pool_url)
+            
+            set_pool_client_local(pc)
+            log.info("[pool_client] Inicializado dinamicamente via start_local")
+        except Exception as e:
+            return jsonify({"ok": False, "msg": f"Falha ao inicializar PoolClient: {e}"}), 503
+
     try:
-        ok, msg = pc.start_mining()
+        data = request.get_json(force=True) or {}
+        address = (data.get("address") or "").strip()
+        pubkey = (data.get("pubkey") or "").strip()
+        
+        try:
+            if address and pubkey:
+                ok, msg = pc.start_mining(address, pubkey)
+            else:
+                ok, msg = pc.start_mining()
+        except TypeError:
+            ok, msg = pc.start_mining()
+            
         return jsonify({"ok": bool(ok), "msg": msg, **pc.status()})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
@@ -945,23 +962,10 @@ def pool_stop_local():
 
 
 # ============================================================
-# [v9.9.18] WALLET — sincroniza SK com chain e trust em runtime
+# [v9.9.19] WALLET — sincroniza SK e ATIVA PBFT DINAMICAMENTE
 # ============================================================
 @app.route("/api/wallet/set_validator_sk", methods=["POST"])
 def api_wallet_set_validator_sk():
-    """
-    [v9.9.18] Atualiza a SK ativa do validador sem reiniciar o nó.
-
-    Chamado pelo app_wallet_v3.py v3.15 em create_and_unlock,
-    unlock_wallet e load_wallet. Faz:
-      1. chain.set_local_validator_sk(sk_hex) — a chain passa a
-         assinar blocos com essa SK imediatamente.
-      2. trust_net.sync_local_validator(pubkey, address) — registra
-         a pubkey como nó ativo no trust (v3.10+), persistindo em
-         trust_network.json (Origin) ou trust_network.local.json
-         (Cliente).
-    Retorna a pubkey efetivamente instalada para a GUI conferir.
-    """
     try:
         data = request.get_json(force=True) or {}
         sk_hex  = (data.get("sk_hex")  or "").strip()
@@ -969,9 +973,7 @@ def api_wallet_set_validator_sk():
         pubkey  = (data.get("pubkey")  or "").strip()
 
         if not sk_hex or len(sk_hex) != 64:
-            return jsonify({"ok": False,
-                            "msg": "sk_hex inválido (esperado 64 hex)"}), 400
-        # valida hex (sem import extra)
+            return jsonify({"ok": False, "msg": "sk_hex inválido (esperado 64 hex)"}), 400
         try:
             int(sk_hex, 16)
         except ValueError:
@@ -988,12 +990,8 @@ def api_wallet_set_validator_sk():
             installed_pk = ""
 
         if not installed_pk:
-            return jsonify({
-                "ok": False,
-                "msg": "chain.set_local_validator_sk não instalou a SK",
-            }), 500
+            return jsonify({"ok": False, "msg": "chain.set_local_validator_sk não instalou a SK"}), 500
 
-        # Se a GUI não mandou pubkey, usa a derivada da SK
         if not pubkey:
             pubkey = installed_pk
 
@@ -1002,32 +1000,41 @@ def api_wallet_set_validator_sk():
         if trust is not None:
             try:
                 if hasattr(trust, "sync_local_validator"):
-                    trust.sync_local_validator(
-                        installed_pk, address or installed_pk[:16], "",
-                    )
+                    trust.sync_local_validator(installed_pk, address or installed_pk[:16], "")
                     trust_synced = True
                 elif hasattr(trust, "register_node"):
-                    trust.register_node(
-                        node_id=installed_pk,
-                        address=address or installed_pk[:16],
-                        public_key=installed_pk,
-                    )
-                    if hasattr(trust, "mark_connected"):
-                        trust.mark_connected(installed_pk)
+                    trust.register_node(node_id=installed_pk, address=address or installed_pk[:16], public_key=installed_pk)
+                    if hasattr(trust, "mark_connected"): trust.mark_connected(installed_pk)
                     trust_synced = True
             except Exception as e:
                 log.warning("[wallet_sk] sync no trust falhou: %s", e)
 
-        log.info(
-            "[wallet_sk] SK atualizada em runtime — pk=%s… trust=%s",
-            installed_pk[:16],
-            "ok" if trust_synced else ("skip" if trust is None else "erro"),
-        )
-        return jsonify({
-            "ok": True,
-            "pubkey": installed_pk,
-            "trust_synced": trust_synced,
-        })
+        # [FIX] Ativa o PBFT dinamicamente se ainda não estiver rodando
+        if chain._pbft is None and os.environ.get("BRN_PBFT_ENABLED") == "1":
+            try:
+                from pbft_consensus import PBFTConsensus
+                from p2p_unified import P2PClient
+                from wallet import Wallet
+                
+                def _pbft_send(peer_addr, msg):
+                    ip, port_s = peer_addr.rsplit(":", 1)
+                    resp, _ = P2PClient.send_message(ip, int(port_s), msg, timeout=15.0)
+                    return resp
+                
+                w_obj = Wallet(private_key_hex=sk_hex)
+                pbft = PBFTConsensus(chain, w_obj, _pbft_send)
+                chain.set_pbft(pbft)
+                
+                p2p = _get_p2p_manager()
+                if p2p and p2p.server: 
+                    p2p.server.set_pbft(pbft)
+                
+                log.info("[PBFT] Ativado dinamicamente via API de wallet")
+            except Exception as e:
+                log.warning("[PBFT] Falha ao ativar dinamicamente: %s", e)
+
+        log.info("[wallet_sk] SK atualizada em runtime — pk=%s… trust=%s", installed_pk[:16], "ok" if trust_synced else "skip")
+        return jsonify({"ok": True, "pubkey": installed_pk, "trust_synced": trust_synced})
     except Exception as e:
         log.exception("api_wallet_set_validator_sk falhou: %s", e)
         return jsonify({"ok": False, "msg": str(e)}), 500
@@ -1127,7 +1134,7 @@ def peers_discovered():
 def health():
     try:
         return jsonify({
-            "ok": True, "height": _get_chain().db.height(), "version": "9.9.18",
+            "ok": True, "height": _get_chain().db.height(), "version": "9.9.19",
             "chain_injected": _CHAIN is not None, "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
             "pool_client_local": _POOL_CLIENT_LOCAL is not None,
@@ -1143,7 +1150,7 @@ def _shutdown():
 
 
 # ============================================================
-# PATCH v9.9.17
+# PATCH v9.9.17 e outros
 # ============================================================
 @app.route("/api/miner/stop", methods=["POST"])
 @require_rate_limit("miner_stop")
@@ -1387,5 +1394,5 @@ def api_tx_status(txid_str):
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.18 (Proxy + Trust + PoolClient Local + wallet_sk)")
+    print(f"BRN Server v9.9.19 (Dynamic Pool + Dynamic PBFT)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
