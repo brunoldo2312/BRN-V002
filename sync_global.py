@@ -1,48 +1,5 @@
 #!/usr/bin/env python3
 """sync_global.py v2.1 — Sincroniza com filtro de altura e peer explícito.
-
-================================================================
-v2.1 (2026-10-27):
-  [FIX CRÍTICO] import_chain agora usa Blockchain.accept_block()
-                em vez de db.add_block() + db.apply_tx() direto.
-                Isso ativa TODA a validação de consenso:
-                  - PoW (meets_difficulty)
-                  - merkle root
-                  - auth_tag HMAC
-                  - coinbase <= reward + fees
-                  - checkpoint (se presente)
-                  - validators_sig (se trust injetado)
-                  - assinaturas Ed25519 das txs
-                Antes, blocos forjados/corrompidos de qualquer peer
-                entravam no DB local sem verificação.
-  [FIX] Falha em accept_block para o loop imediatamente (evita
-        buraco na cadeia). Próximo sync continua do ponto correto.
-  [NEW] --strict: injeta trust_network.json na chain de import
-        para FORÇAR validação multi-sig. Sem isso, blocos com
-        validators_sig passam em modo bootstrap (compatível com
-        peers que ainda não assinam).
-  [NEW] --db PATH: sincroniza um DB alternativo (testes/restore).
-  [NEW] Log claro de motivo de rejeição (msg do validate_block).
-  [KEEP] Toda a lógica de descoberta/teste/download inalterada.
-  [KEEP] --only, --peer, --target-height, --dry-run, --batch, --timeout.
-  [KEEP] DEFAULT_BOOTSTRAP_PEERS mantido como fallback legado de dev.
-================================================================
-
-Exemplos:
-  # Sincronizar SÓ do 61LTR37, exigindo altura 5026:
-  python sync_global.py --only --peer http://100.70.107.15:5000 --target-height 5026
-
-  # Testar sem baixar:
-  python sync_global.py --only --peer http://100.70.107.15:5000 --dry-run
-
-  # Sincronizar com validação multi-sig estrita:
-  python sync_global.py --strict
-
-  # Sincronizar um DB alternativo (ex: restore):
-  python sync_global.py --db backups/chain_20261027_120000.db
-
-  # Modo antigo (maior altura, auto-descoberta):
-  python sync_global.py
 """
 from __future__ import annotations
 import argparse
@@ -62,16 +19,14 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / 'brn_v2_chain.db'
 ENV_FILE = BASE_DIR / 'brn_network.env'
 
-# Legado de desenvolvimento — substitua por bootstrap via env em produção.
 DEFAULT_BOOTSTRAP_PEERS = [
-    'http://100.70.107.15:5000',  # desktop-61ltr37 (ORIGEM)
-    'http://100.64.151.67:5000',  # Filipe
+    'http://100.70.107.15:5000',
+    'http://100.64.151.67:5000',
 ]
 
-
-def log(msg: str):
-    print(msg, flush=True)
-
+# [FIX] Função log corrigida para aceitar parâmetros extras (ex: end=' ')
+def log(msg: str, *args, **kwargs):
+    print(msg, *args, flush=True, **kwargs)
 
 def load_env() -> dict:
     env = {}
@@ -84,7 +39,6 @@ def load_env() -> dict:
             env[k.strip()] = v.strip().strip('"').strip("'")
     return env
 
-
 def normalize_url(url: str) -> Optional[str]:
     url = url.strip()
     if not url:
@@ -92,7 +46,6 @@ def normalize_url(url: str) -> Optional[str]:
     if not url.startswith(('http://', 'https://')):
         url = 'http://' + url
     return url.rstrip('/')
-
 
 def discover_from_env(env: dict) -> list[str]:
     urls = []
@@ -105,7 +58,6 @@ def discover_from_env(env: dict) -> list[str]:
         if ip:
             urls.append(f'http://{ip}:5000')
     return urls
-
 
 def discover_from_tailscale() -> list[str]:
     import subprocess
@@ -127,11 +79,9 @@ def discover_from_tailscale() -> list[str]:
     except Exception:
         return []
 
-
 def dedupe(urls: list[str]) -> list[str]:
     seen = set()
     return [u for u in urls if u and not (u in seen or seen.add(u))]
-
 
 def fetch_status(url: str, timeout: float = 30.0) -> Optional[dict]:
     try:
@@ -143,7 +93,6 @@ def fetch_status(url: str, timeout: float = 30.0) -> Optional[dict]:
     except Exception:
         pass
     return None
-
 
 def probe_peer(url: str, timeout: float = 30.0) -> dict:
     result = {'url': url, 'reachable': False, 'height': -1,
@@ -158,7 +107,6 @@ def probe_peer(url: str, timeout: float = 30.0) -> dict:
     result['utxos'] = int(status.get('utxos', 0) or 0)
     result['version'] = status.get('version', '?')
     return result
-
 
 def fetch_blocks(url: str, start: int, batch: int = 100,
                  timeout: float = 120.0, retries: int = 3) -> Optional[list]:
@@ -175,7 +123,6 @@ def fetch_blocks(url: str, start: int, batch: int = 100,
         if attempt < retries - 1:
             time.sleep(3)
     return None
-
 
 def download_chain(url: str, remote_height: int, local_height: int,
                    batch: int = 100, timeout: float = 120.0) -> list[dict]:
@@ -205,24 +152,8 @@ def download_chain(url: str, remote_height: int, local_height: int,
 
     return all_blocks
 
-
-# ============================================================
-# [FIX v2.1] IMPORT VIA accept_block — valida consenso completo
-# ============================================================
 def import_chain(blocks: list[dict], db_path: Path,
                  strict_validators: bool = False) -> tuple[int, int]:
-    """
-    Importa blocos baixados usando Blockchain.accept_block().
-
-    Comportamento:
-      - Pula blocos que já existem no DB local (height ocupado).
-      - Cada bloco é validado pelo consenso (PoW, merkle, auth_tag,
-        coinbase-limit, checkpoint, validators_sig se strict).
-      - Se um bloco é rejeitado, PARA. Não tenta "pular" — o próximo
-        bloco dependeria do anterior, então a cadeia ficaria inválida.
-
-    Retorna (importados, altura_final).
-    """
     try:
         from blockchain import Blockchain
     except ImportError as e:
@@ -231,7 +162,6 @@ def import_chain(blocks: list[dict], db_path: Path,
 
     bc = Blockchain(str(db_path), auto_genesis=False)
 
-    # [NEW v2.1] --strict: injeta trust para forçar multi-sig
     if strict_validators:
         try:
             from trust_network import TrustNetwork
@@ -275,7 +205,6 @@ def import_chain(blocks: list[dict], db_path: Path,
             pass
 
     return imported, after
-
 
 def main():
     ap = argparse.ArgumentParser(
@@ -345,7 +274,7 @@ def main():
     log(f'\n[2] Testando {len(all_urls)} peers...')
     probed = []
     for u in all_urls:
-        log(f'  {u}...', end=' ')
+        log(f'  {u}...', end=' ')  # AQUI ESTAVA O ERRO DO 'end'
         r = probe_peer(u, timeout=args.timeout)
         probed.append(r)
         if r['reachable']:
@@ -427,7 +356,6 @@ def main():
 
     log('\n[X] Falhou em todos os peers.')
     return 1
-
 
 if __name__ == '__main__':
     sys.exit(main())
