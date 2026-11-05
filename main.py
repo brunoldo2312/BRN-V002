@@ -1,12 +1,14 @@
-"""main.py — Entrypoint do nó BRN (v13.8.5)
+"""main.py — Entrypoint do nó BRN (v13.8.6)
 ================================================================
+v13.8.6 (2026-11-05):
+  [FIX CRÍTICO] Adicionado ensure_multisig() e broadcast_block.
+        Agora o bloco minerado é propagado e os peers são 
+        acionados para assinar (resolve o problema de fork solo).
+  [FIX] Carregamento automático da carteira (wallet_obj) e
+        injeção da SK no chain.set_local_validator_sk().
+  [FIX] Carregamento da identidade P2P (node_identity.enc).
 v13.8.5 (2026-11-04):
-  [FIX] Reinjetada a TrustNetwork no server.py (corrige erro 503).
-  [FIX] PoolClient e PBFT agora são inicializados dinamicamente
-        pelo server.py quando a carteira é desbloqueada.
   [FIX] GUI abre o index_wallet.html.
-v13.8.0 (2026-11-04):
-  [NEW] Integração PBFT.
 ================================================================
 """
 from __future__ import annotations
@@ -27,14 +29,11 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.8.5"
-    BUILD_DATE = "2026-11-04"
+    VERSION = "13.8.6"
+    BUILD_DATE = "2026-11-05"
 
 def parse_args():
-    p = argparse.ArgumentParser(
-        prog="main.py",
-        description=f"BRN Node v{VERSION} (build {BUILD_DATE})",
-    )
+    p = argparse.ArgumentParser(prog="main.py")
     p.add_argument("--headless", action="store_true", help="sem GUI")
     p.add_argument("--client-mode", action="store_true", help="nó cliente")
     p.add_argument("--origem", action="store_true", help="força BRN_IS_ORIGIN=1")
@@ -76,6 +75,58 @@ def _setup_logging(level: str = "INFO"):
         logging.basicConfig(level=getattr(logging, level, logging.INFO), format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
         return logging.getLogger("main")
 
+def _load_or_create_node_identity(password: str, path: str = "node_identity.enc"):
+    try:
+        from secure_store import load_node_identity, save_node_identity
+        from crypto import Ed25519PrivateKey
+    except Exception as e:
+        raise RuntimeError(f"crypto/secure_store indisponiveis: {e}") from e
+
+    p = Path(path)
+    if p.exists():
+        try:
+            data = load_node_identity(password, str(p))
+            if data and data.get("sk"):
+                priv = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(data["sk"]))
+                pub = priv.public_key().public_bytes_raw().hex()
+                return priv, pub
+        except Exception as e:
+            print(f"[identity] falha carregando {p}: {e} — recriando")
+
+    priv = Ed25519PrivateKey.generate()
+    sk_hex = priv.private_bytes_raw().hex()
+    pub = priv.public_key().public_bytes_raw().hex()
+    try:
+        save_node_identity({"sk": sk_hex, "pub": pub, "created_at": int(time.time())}, password, str(p))
+    except Exception as e:
+        print(f"[identity] nao consegui salvar {p}: {e}")
+    return priv, pub
+
+def _load_wallet(password: str):
+    try:
+        from secure_store import load_current_wallet
+        from wallet import Wallet
+    except Exception:
+        return None, "", ""
+
+    try:
+        w = load_current_wallet(password)
+    except Exception:
+        return None, "", ""
+
+    if not w or not w.get("ok"):
+        return None, "", ""
+
+    sk_hex = w.get("private_key") or w.get("priv_hex") or ""
+    if not sk_hex:
+        return None, "", ""
+
+    try:
+        wallet_obj = Wallet(private_key_hex=sk_hex)
+        return wallet_obj, wallet_obj.address, wallet_obj.pub_hex
+    except Exception:
+        return None, "", ""
+
 def main() -> int:
     args = parse_args()
     if args.version:
@@ -107,7 +158,21 @@ def main() -> int:
         port_guard.check_brn_ports(checar_explorer=not args.no_explorer)
     except Exception: pass
 
-    # 1. Blockchain
+    password = (
+        os.environ.get("BRN_NODE_PASSWORD", "").strip()
+        or os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
+    )
+
+    # 1. Identity (Ed25519 para P2P)
+    node_id_priv, node_id_pub = None, ""
+    if password:
+        try:
+            node_id_priv, node_id_pub = _load_or_create_node_identity(password)
+            log.info("[identity] carregada pub=%s…", node_id_pub[:16])
+        except Exception as e:
+            log.warning("[identity] falha: %s", e)
+
+    # 2. Blockchain
     try:
         from blockchain import Blockchain
         chain = Blockchain(db_path, auto_genesis=False)
@@ -116,38 +181,66 @@ def main() -> int:
         log.error("[chain] fatal: %s", e)
         return 2
 
-    # 2. Trust Network
+    # 3. Trust Network
     trust = None
     try:
         from trust_network import TrustNetwork
-        trust = TrustNetwork("trust_network.json", is_origin=is_origin)
+        trust = TrustNetwork("trust_network.json", is_origin=is_origin, node_sk=node_id_priv)
         chain.set_trust_net(trust)
         log.info("[trust] carregado")
     except Exception as e:
         log.warning("[trust] init falhou: %s", e)
 
-    # 3. P2P
+    # 4. Carteira (Wallet) e SK do Validador
+    wallet_obj, wallet_addr, wallet_pub = (None, "", "")
+    if password:
+        wallet_obj, wallet_addr, wallet_pub = _load_wallet(password)
+    if wallet_obj is not None:
+        try:
+            chain.set_local_validator_sk(wallet_obj)
+            log.info("[wallet] SK ativa instalada addr=%s pub=%s…", wallet_addr[:24], wallet_pub[:16])
+        except Exception as e:
+            log.warning("[wallet] set_local_validator_sk falhou: %s", e)
+
+    # 5. P2P
     p2p = None
     if not args.no_p2p:
         try:
             from p2p_unified import P2PManager
-            p2p = P2PManager(chain, tcp_port=p2p_port)
+            p2p = P2PManager(chain, node_id_priv=node_id_priv, tcp_port=p2p_port)
             chain.set_p2p(p2p)
             p2p.start()
             log.info("[p2p] iniciado na porta %d", p2p_port)
         except Exception as e:
             log.error("[p2p] init falhou: %s", e)
 
-    # 4. Sync Manager
+    # 6. Sync Manager
     sync_mgr = None
     if p2p:
         try:
             from sync_manager import ChainSyncManager
             sync_mgr = ChainSyncManager(chain, chain.db, p2p)
             sync_mgr.start_sync_loop()
-        except Exception: pass
+            log.info("[sync] ChainSyncManager iniciado")
+        except Exception as e: 
+            log.warning("[sync] init falhou: %s", e)
 
-    # 5. Pool Manager (somente Origem)
+    # 7. MULTI-SIG E BROADCAST DE BLOCOS (CRÍTICO)
+    if p2p and wallet_obj:
+        try:
+            from brn_multisig import ensure_multisig
+            ensure_multisig(chain, wallet_obj, p2p, trust=trust, logger=log)
+            log.info("[MULTISIG] Coletor de assinaturas configurado")
+        except Exception as e:
+            log.warning("[MULTISIG] Falha: %s", e)
+
+        try:
+            chain.on_block_mined = p2p.broadcast_block
+            log.info("[P2P] Broadcast de blocos ativado (propagação)")
+        except Exception as e:
+            log.warning("[P2P] Falha ao configurar broadcast: %s", e)
+
+    # 8. Pool Manager (somente Origem)
     pool = None
     if is_origin:
         try:
@@ -157,7 +250,7 @@ def main() -> int:
         except Exception as e:
             log.warning("[pool] init falhou: %s", e)
 
-    # 6. Web Server
+    # 9. Web Server
     try:
         import server as srv
         srv.set_chain(chain)
@@ -173,7 +266,7 @@ def main() -> int:
     except Exception as e:
         log.error("[server] falhou: %s", e)
 
-    # 7. Explorer
+    # 10. Explorer
     if not args.no_explorer:
         try:
             import explorer as exp
@@ -181,9 +274,10 @@ def main() -> int:
             def _run_exp():
                 exp.app.run(host="0.0.0.0", port=int(os.environ.get("BRN_EXPLORER_PORT", "8080")), threaded=True, use_reloader=False)
             threading.Thread(target=_run_exp, daemon=True, name="EXP").start()
+            log.info("[explorer] ativo na porta 8080")
         except Exception: pass
 
-    # 8. GUI
+    # 11. GUI
     if not args.headless:
         try:
             import webview
