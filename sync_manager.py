@@ -1,22 +1,19 @@
 """
-sync_manager.py — Sincronização + Reorg automático + Sync Paralelo (v9.1)
+sync_manager.py — Sincronização + Reorg automático + Sync Paralelo (v9.2)
 ================================================================
+v9.2 (2026-11-05):
+  [FIX CRÍTICO] sync_trust_network() agora remove os campos
+        "saved_at" e "client_written" do JSON ANTES de verificar
+        a assinatura Ed25519 do Origin. Antes, esses campos eram
+        adicionados DEPOIS da assinatura no trust_network.py, então
+        o payload reconstruído nunca batia e a assinatura era
+        sempre considerada inválida, travando o sync de validadores.
 v9.1 (2026-11-03):
-  [NEW] Sincronização do Trust Network (trust_network.json) via HTTP.
-        A cada 60s, o cliente baixa o arquivo assinado do Origem.
-        Se a assinatura for válida, ele atualiza a memória. Isso
-        permite que o cliente descubra que virou validador ao
-        acumular pontos no pool.
+  [NEW] Sincronização do Trust Network via HTTP.
 v9.0 (2026-11-03):
-  [NEW] SYNC PARALELO: Baixa blocos de múltiplos peers ao mesmo tempo.
-        Divide o intervalo de blocos em chunks e usa ThreadPoolExecutor.
-        Se um peer falhar, outro assume o chunk. Aumenta a velocidade
-        de sync em 3x-5x.
+  [NEW] SYNC PARALELO de blocos.
 v8.4.3 (2026-10-22):
-  [FIX CRÍTICO] _resolve_fork tentava importar funções inexistentes
-                de blockchain.py. Agora importa de checkpoints.py.
-  [FIX] Loop de busca do ancestral comum faz break ao encontrar.
-  [FIX] _fetch_chain_from aborta se receber lotes vazios repetidos.
+  [FIX] _resolve_fork importa funções de checkpoints.py.
 ================================================================
 """
 from __future__ import annotations
@@ -234,7 +231,7 @@ class ChainSyncManager:
         return True, ""
 
     # =================================================================
-    # [v9.1] SINCRONIZAÇÃO DO TRUST NETWORK VIA HTTP
+    # [v9.2] SINCRONIZAÇÃO DO TRUST NETWORK VIA HTTP (COM FIX DA ASSINATURA)
     # =================================================================
     def sync_trust_network(self) -> bool:
         """Baixa o trust_network.json do Origin e atualiza a memória local."""
@@ -250,13 +247,16 @@ class ChainSyncManager:
         url = f"{origin_url}/api/trust/download"
         
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "brn-sync/9.1"})
+            req = urllib.request.Request(url, headers={"User-Agent": "brn-sync/9.2"})
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             
             # Verifica a assinatura do Origin
             sig = data.pop("signature", None)
             origin_pub = data.pop("origin_pubkey", None)
+            # [FIX v9.2] Remove campos adicionados DEPOIS da assinatura
+            data.pop("saved_at", None)
+            data.pop("client_written", None)
             
             if sig and origin_pub and _HAS_CRYPTO:
                 payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -266,6 +266,9 @@ class ChainSyncManager:
                 except Exception as e:
                     log.error(f"[TRUST-SYNC] Assinatura do Origin INVÁLIDA: {e}")
                     return False
+            elif sig and origin_pub and not _HAS_CRYPTO:
+                log.warning("[TRUST-SYNC] crypto indisponível — não posso verificar assinatura")
+                return False
             
             # Atualiza o trust_network em memória
             trust = getattr(self.chain, "trust_net", None)
@@ -664,7 +667,7 @@ class ChainSyncManager:
             target=_loop, daemon=True, name="ChainSync"
         )
         self.sync_thread.start()
-        log.info(f"ChainSyncManager v9.1 (paralelo+trust) iniciado")
+        log.info(f"ChainSyncManager v9.2 (paralelo+trust) iniciado")
 
     def _best_peer_by_work(self) -> Optional[PeerStatus]:
         local_h = self._safe_height()
