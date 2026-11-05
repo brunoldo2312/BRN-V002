@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
-"""check_network.py — Diagnóstico completo de rede e consenso BRN (v3.0)
+"""check_network.py — Diagnóstico completo de rede e consenso BRN (v3.1)
 ================================================================
+v3.1 (2026-11-05):
+  [FIX CRÍTICO] Carrega brn_network.env ANTES de ler os.environ.
+        Antes, IS_ORIGIN/API/TIMEOUT/PEER_* eram lidos no nível do
+        módulo sem o .env carregado. Resultado: rodar o script num
+        shell sem BRN_IS_ORIGIN exportado fazia o Ubuntu (origem)
+        reportar como "cliente", escondendo alertas de PoolManager
+        vazio e de quórum de validadores. Também falhava se a API
+        fosse em porta diferente de 5000.
 v3.0 (2026-11-04):
-  [NEW] Verificação do PoolManager (mineradores, shares, blocos).
-  [NEW] Verificação do PBFT (status e commits no último bloco).
-  [NEW] Verificação do Trust Network (altura real dos validadores).
+  [NEW] PoolManager (mineradores, shares, blocos).
+  [NEW] PBFT (status e commits no último bloco).
+  [NEW] Trust Network (altura real dos validadores).
   [KEEP] Detecção de fork baseada em cumulative_work.
-  [KEEP] Multi-sig e sync.
 ================================================================
 """
 from __future__ import annotations
@@ -28,14 +35,46 @@ except ImportError:
 
 
 # ============================================================
-# CONFIG
+# [v3.1] CARREGA .env ANTES DE LER os.environ
 # ============================================================
 BASE_DIR = Path(__file__).resolve().parent
+
+_env_file = BASE_DIR / "brn_network.env"
+if _env_file.exists():
+    try:
+        _text = _env_file.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        _text = ""
+    for _line in _text.splitlines():
+        _s = _line.strip()
+        if not _s or _s.startswith("#") or "=" not in _s:
+            continue
+        _k, _, _v = _s.partition("=")
+        _k = _k.strip()
+        _v = _v.strip().strip('"').strip("'")
+        if _k and _k not in os.environ:
+            os.environ[_k] = _v
+
+
+# ============================================================
+# CONFIG (agora reflete o .env real)
+# ============================================================
 API = os.environ.get("BRN_API_URL", "http://127.0.0.1:5000").rstrip("/")
+
+# Se BRN_API_URL não veio do .env, monta a partir de BRN_WEB_PORT/BRN_WEB_HOST
+if API == "http://127.0.0.1:5000" and os.environ.get("BRN_WEB_PORT"):
+    _wp = os.environ.get("BRN_WEB_PORT", "5000").strip()
+    _wh = os.environ.get("BRN_WEB_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    if _wh in ("0.0.0.0", ""):
+        _wh = "127.0.0.1"
+    if _wp and _wp != "5000":
+        API = f"http://{_wh}:{_wp}"
+
 TIMEOUT = max(1, int(os.environ.get("BRN_HTTP_TIMEOUT", "5")))
 PEER_API_PORT = int(os.environ.get("BRN_PEER_API_PORT", "5000"))
 PEER_HTTP_TIMEOUT = max(1, int(os.environ.get("BRN_PEER_HTTP_TIMEOUT", "3")))
 IS_ORIGIN = os.environ.get("BRN_IS_ORIGIN", "0") == "1"
+
 
 # Cores
 class C:
@@ -129,7 +168,8 @@ def tcp_check(ip: str, port: int, timeout: float = 3.0) -> bool:
 def check_config() -> dict:
     header("1. Configuração local")
 
-    result = {"secret_ok": False, "fingerprint": "", "p2p_port": "6001", "is_origin": IS_ORIGIN}
+    result = {"secret_ok": False, "fingerprint": "", "p2p_port": "6001",
+              "is_origin": IS_ORIGIN, "api": API}
 
     env_file = BASE_DIR / "brn_network.env"
     secret = ""
@@ -154,6 +194,7 @@ def check_config() -> dict:
     p2p_port = os.environ.get("BRN_P2P_PORT", "6001")
     result["p2p_port"] = p2p_port
     info(f"P2P porta: {p2p_port}")
+    info(f"API: {API}")
     info(f"Modo: {'ORIGEM' if IS_ORIGIN else 'CLIENTE'}")
 
     return result
@@ -210,7 +251,7 @@ def check_chain() -> dict:
 
 
 # ============================================================
-# 4. POOL (NOVO v3.0)
+# 4. POOL
 # ============================================================
 def check_pool() -> dict:
     header("4. Pool (Mineração Compartilhada)")
@@ -250,7 +291,7 @@ def check_pool() -> dict:
 
 
 # ============================================================
-# 5. TRUST NETWORK (NOVO v3.0)
+# 5. TRUST NETWORK
 # ============================================================
 def check_trust_network() -> dict:
     header("5. Trust Network (Validadores)")
@@ -270,7 +311,6 @@ def check_trust_network() -> dict:
     out(f"  {'ENDEREÇO':<26} {'ALTURA':>8} {'SCORE':>8} {'STATUS':<12}")
     out(f"  {'─' * 26} {'─' * 8} {'─' * 8} {'─' * 12}")
 
-    now = int(time.time())
     for n in nodes[:10]:
         addr = (n.get("address") or "?")[:26]
         h = int(n.get("height", 0) or 0)
@@ -309,7 +349,10 @@ def check_peers() -> dict:
             h = p.get("height", 0) or 0
             last = int(p.get("last_seen", 0) or 0)
             age = int(time.time()) - last if last > 0 else -1
-            info(f"  {addr:<24} altura={h:<6} visto há {age}s" if age >= 0 else f"  {addr:<24} altura={h}")
+            if age >= 0:
+                info(f"  {addr:<24} altura={h:<6} visto há {age}s")
+            else:
+                info(f"  {addr:<24} altura={h}")
             parsed_peers.append({"address": addr, "height": h, "last_seen": last})
 
     return {"ok": count > 0, "count": count, "peers": parsed_peers}
@@ -349,7 +392,7 @@ def check_sync() -> dict:
 
 
 # ============================================================
-# 8. MULTI-SIG E PBFT (NOVO v3.0)
+# 8. MULTI-SIG E PBFT
 # ============================================================
 def check_consensus() -> dict:
     header("8. Multi-sig e PBFT")
@@ -378,7 +421,6 @@ def check_consensus() -> dict:
     info(f"Assinaturas (validators_sig): {len(sigs)}")
     info(f"Commits (pbft_commits): {len(pbft_commits)}")
 
-    # Veredito
     if required_sigs > 0 and len(sigs) >= required_sigs:
         ok(f"Multi-sig OK ({len(sigs)}/{required_sigs})")
     elif required_sigs > 0:
@@ -443,10 +485,13 @@ def final_summary(config: dict, chain: dict, pool: dict,
         issues.append(("WARN", "Não sincronizado"))
         severity = max(severity, 1)
 
-    # Pool
+    # Pool (só avisa se for origem)
     if IS_ORIGIN:
         pm = pool.get("manager")
-        if not pm or not pm.get("total", pm.get("active_miners", 0)):
+        if not pm:
+            issues.append(("WARN", "PoolManager não respondeu (você é Origin)"))
+            severity = max(severity, 1)
+        elif not pm.get("total", pm.get("active_miners", 0)):
             issues.append(("WARN", "PoolManager sem mineradores (você é Origin)"))
             severity = max(severity, 1)
 
@@ -457,7 +502,9 @@ def final_summary(config: dict, chain: dict, pool: dict,
 
     # Consensus
     if not consensus.get("ok"):
-        issues.append(("WARN", f"Multi-sig: {consensus.get('sigs', 0)}/{consensus.get('required_sigs', 0)} assinaturas"))
+        issues.append(("WARN",
+                       f"Multi-sig: {consensus.get('sigs', 0)}/"
+                       f"{consensus.get('required_sigs', 0)} assinaturas"))
         severity = max(severity, 1)
 
     if consensus.get("pbft_commits", 0) == 0:
@@ -503,9 +550,11 @@ def main() -> int:
     if not _QUIET:
         print()
         print(f"{C.BOLD}{'═' * 64}{C.RESET}")
-        print(f"{C.BOLD}  BRN Node — Verificação de Rede e Consenso (v3.0){C.RESET}")
+        print(f"{C.BOLD}  BRN Node — Verificação de Rede e Consenso (v3.1){C.RESET}")
         print(f"  {C.GRAY}{time.strftime('%Y-%m-%d %H:%M:%S')}  |  "
               f"Host: {socket.gethostname()}{C.RESET}")
+        print(f"  {C.GRAY}API: {API}  |  Modo: "
+              f"{'ORIGEM' if IS_ORIGIN else 'CLIENTE'}{C.RESET}")
         print(f"{C.BOLD}{'═' * 64}{C.RESET}")
 
     config = check_config()
@@ -524,9 +573,11 @@ def main() -> int:
 
     if args.json:
         print(json.dumps({
-            "version": "3.0",
+            "version": "3.1",
             "timestamp": time.time(),
             "hostname": socket.gethostname(),
+            "api": API,
+            "is_origin": IS_ORIGIN,
             "config": config,
             "chain": chain,
             "pool": pool,
