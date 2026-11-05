@@ -1,20 +1,18 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.20)
+server.py — Backend HTTP do nó BRN (v9.9.22)
 ================================================================
+v9.9.22 (2026-11-05):
+  [FIX] peers_discovered(): agora cruza os dados do banco com o
+        P2PManager para exibir a altura REAL dos peers na rota
+        /api/peers. Antes a altura vinha zerada do SQLite.
+v9.9.21 (2026-11-05):
+  [FIX CRÍTICO] pool_start_local() agora instancia o PoolClient 
+        passando a URL (string) como primeiro argumento.
 v9.9.20 (2026-11-04):
-  [FIX CRÍTICO] pool_start_local() e pool_stop_local() agora detectam
-        dinamicamente qual é o método correto de início/parada no 
-        PoolClient (start_mining, start, run, etc.), resolvendo o erro
-        "'PoolClient' object has no attribute 'start_mining'".
+  [FIX] Detecção dinâmica do método de início/parada no PoolClient.
 v9.9.19 (2026-11-04):
-  [FIX CRÍTICO] trust_nodes(): cruza os dados do Trust Network com 
-        o P2PManager para mostrar a altura real e o IP dos peers.
-  [FIX CRÍTICO] pool_start_local(): instancia o PoolClient 
-        dinamicamente se ele não existir, resolvendo o erro 503.
-  [FIX CRÍTICO] api_wallet_set_validator_sk(): inicializa o PBFT 
-        dinamicamente usando a chave da carteira (evita erro do boot).
-v9.9.18 (2026-11-03):
-  [NEW] Rota POST /api/wallet/set_validator_sk.
+  [FIX] trust_nodes(): cruza dados P2P para mostrar altura real.
+  [FIX] api_wallet_set_validator_sk(): inicializa PBFT dinamicamente.
 ================================================================
 """
 from __future__ import annotations
@@ -123,7 +121,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
             req = urllib.request.Request(
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
-                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.20"},
+                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.22"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -897,7 +895,7 @@ def pool_miners():
 
 
 # ============================================================
-# POOL LOCAL DINÂMICO E DETECÇÃO DE MÉTODOS [FIX v9.9.20]
+# POOL LOCAL DINÂMICO E DETECÇÃO DE MÉTODOS [FIX v9.9.22]
 # ============================================================
 @app.route("/api/pool/local_status", methods=["GET"])
 def pool_local_status():
@@ -923,20 +921,20 @@ def pool_start_local():
             pubkey = (data.get("pubkey") or "").strip()
             pool_url = os.environ.get("BRN_POOL_URL", "").strip() or "http://127.0.0.1:5000"
             
-            # Tenta instanciar com as variações de assinatura mais comuns
+            if not pubkey:
+                return jsonify({"ok": False, "msg": "pubkey obrigatoria para iniciar o PoolClient"}), 400
+                
+            # [FIX] Passa a URL (string) como primeiro argumento, não a blockchain
             try:
-                pc = PoolClient(address, pubkey, pool_url)
+                pc = PoolClient(pool_url, address, pubkey)
             except TypeError:
                 try:
-                    pc = PoolClient(pool_url, address, pubkey)
+                    pc = PoolClient(pool_url, pubkey)
                 except TypeError:
-                    try:
-                        pc = PoolClient(pool_url, pubkey)
-                    except TypeError:
-                        pc = PoolClient(pool_url)
+                    pc = PoolClient(pool_url)
             
             set_pool_client_local(pc)
-            log.info("[pool_client] Inicializado dinamicamente via start_local")
+            log.info("[pool_client] Inicializado dinamicamente (pool_url + address + pubkey)")
         except Exception as e:
             return jsonify({"ok": False, "msg": f"Falha ao inicializar PoolClient: {e}"}), 503
 
@@ -953,7 +951,7 @@ def pool_start_local():
                 break
         
         if start_method is None:
-            return jsonify({"ok": False, "msg": "PoolClient nao possui metodo de inicio (start_mining, start, etc)"}), 500
+            return jsonify({"ok": False, "msg": "PoolClient nao possui metodo de inicio"}), 500
 
         try:
             if address and pubkey:
@@ -1113,7 +1111,6 @@ def trust_nodes():
             except Exception: pass
 
         if hasattr(trust, "nodes"):
-            from dataclasses import asdict
             for pubkey, n in trust.nodes.items():
                 peer_addr = getattr(n, "peer_addr", "")
                 addr = getattr(n, "address", "")
@@ -1136,9 +1133,14 @@ def trust_nodes():
                 elif getattr(n, "trust_score", 0) >= 150:
                     status = "validator"
 
+                # Ignora nós fantasmas (sem IP válido)
+                endereco_final = peer_addr if (peer_addr and ":" in peer_addr) else addr
+                if ":" not in endereco_final:
+                    continue
+
                 nodes.append({
                     "node_id": pubkey,
-                    "address": peer_addr or addr or "desconhecido", 
+                    "address": endereco_final, 
                     "height": h,
                     "trust_score": getattr(n, "trust_score", 0),
                     "status": status,
@@ -1191,6 +1193,17 @@ def peers_discovered():
     try:
         chain = _get_chain()
         rows = chain.db.listar_peers(apenas_ativos=False)
+        
+        # [FIX v9.9.22] Pega as alturas reais do cache do P2P
+        p2p = _get_p2p_manager()
+        p2p_heights = {}
+        if p2p and hasattr(p2p, "get_peer_stats"):
+            try:
+                for stat in p2p.get_peer_stats():
+                    p2p_heights[stat["address"]] = stat.get("height", 0)
+            except Exception:
+                pass
+
         out, seen_ips = [], set()
         for p in rows:
             addr = (p.get("address") or "").strip()
@@ -1198,7 +1211,17 @@ def peers_discovered():
             ip = addr.rsplit(":", 1)[0] if ":" in addr else addr
             if ip.startswith("127.") or ip == "0.0.0.0" or ip in seen_ips: continue
             seen_ips.add(ip)
-            out.append({"ip": ip, "address": addr, "height": int(p.get("height", 0) or 0), "last_seen": int(p.get("last_seen", 0) or 0)})
+            
+            # Usa a altura do P2P; se não achar, usa a do banco
+            real_height = p2p_heights.get(addr, int(p.get("height", 0) or 0))
+            
+            out.append({
+                "ip": ip, 
+                "address": addr, 
+                "height": real_height, 
+                "last_seen": int(p.get("last_seen", 0) or 0)
+            })
+            
         out.sort(key=lambda x: x["last_seen"], reverse=True)
         return jsonify({"ok": True, "count": len(out), "peers": out, "active": len(out)})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
@@ -1208,7 +1231,7 @@ def peers_discovered():
 def health():
     try:
         return jsonify({
-            "ok": True, "height": _get_chain().db.height(), "version": "9.9.20",
+            "ok": True, "height": _get_chain().db.height(), "version": "9.9.22",
             "chain_injected": _CHAIN is not None, "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
             "pool_client_local": _POOL_CLIENT_LOCAL is not None,
@@ -1468,5 +1491,5 @@ def api_tx_status(txid_str):
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.20 (Dynamic Pool + Dynamic PBFT + Trust Nodes Fix)")
+    print(f"BRN Server v9.9.22 (Dynamic Pool + Dynamic PBFT + Real Peer Heights)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
