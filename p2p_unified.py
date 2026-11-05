@@ -1,42 +1,18 @@
 """
-p2p_unified.py — BRN P2P Network v6.7.8
+p2p_unified.py — BRN P2P Network v6.7.9
 ================================================================
+v6.7.9 (2026-11-05):
+  [FIX CRÍTICO] Adicionado suporte ao PBFT (Practical Byzantine 
+                Fault Tolerance). 
+                - `P2PServer` agora tem `set_pbft()`.
+                - `_process_message` roteia mensagens pbft_preprepare,
+                  pbft_prepare e pbft_commit.
+                Resolve o erro "'P2PServer' object has no attribute 
+                'set_pbft'" que impedia o PBFT de ligar.
 v6.7.8 (2026-11-04):
-  [FIX CRÍTICO] _handle_sign_block agora aceita TRÊS cenários:
-                a) block_h == local_h + 1 (normal)
-                b) block_h == local_h     (RACE RECOVERY)
-                c) block_h < local_h      (RACE RECOVERY REVERSA)
-                O cenário (c) acontece quando o peer está 1-2 blocos
-                À FRENTE do Origin, mas o bloco pedido JÁ ESTÁ na
-                chain do peer (recebeu via new_block antes do
-                sign_block). Antes, era recusado com "altura_fora",
-                resultando em blocos com apenas 1 assinatura.
-                Fix identificado em produção (Origin travado com
-                blocos 1-sig porque peers recusavam assinar).
+  [FIX] _handle_sign_block aceita cenário de race recovery reversa.
 v6.7.7 (2026-11-02):
-  [FIX CRÍTICO] _handle_sign_block agora aceita DOIS cenários:
-                a) block_h == local_h + 1 (normal)
-                b) block_h == local_h     (RACE RECOVERY)
-                O cenário (b) acontece quando o peer JÁ recebeu o
-                bloco via broadcast (new_block) ANTES de processar o
-                pedido de assinatura. Antes, o peer recusava com
-                "altura N != local+1 (N+1)" e a chain ficava com
-                apenas 1 assinante.
-  [NEW] Todos os returns de _handle_sign_block agora incluem um
-        campo "error" com o motivo exato da recusa.
-  [FIX] validate_block() agora recebe prev_block=prev_block (não
-        mais None) dentro de _handle_sign_block.
-v6.7.6 (2026-11-01):
-  [FIX CRÍTICO] _handle_sign_block chamava validate_block() com
-                validators=None (chicken-and-egg).
-                Fix: validators=[] → skip de _validate_validators_sig.
-v6.7.5 (2026-10-30):
-  [SECURITY] _handle_sign_block valida o bloco COMPLETO antes de
-             assinar (5 validações).
-v6.7.4 (2026-10-29):
-  [SECURITY/UX] announce_validator NÃO registra no trust_network.
-v6.7.3 (2026-10-28):
-  [FIX] Tratamento de erro se local_sk for inválido.
+  [FIX] _handle_sign_block aceita race recovery.
 ================================================================
 """
 from __future__ import annotations
@@ -123,7 +99,6 @@ TRACKER_URL             = os.environ.get("BRN_TRACKER", "").rstrip("/")
 TRACKER_INTERVAL        = 120
 BOOTSTRAP_PING_INTERVAL = 60
 
-# <<< IMPORTANTE: READ_ONLY precisa estar definido aqui (era o bug do Laban)
 READ_ONLY              = os.environ.get("BRN_READ_ONLY", "0") == "1"
 SYNC_BATCH_SIZE        = int(os.environ.get("BRN_SYNC_BATCH", "50"))
 SYNC_RETRY_MAX         = int(os.environ.get("BRN_SYNC_RETRY_MAX", "5"))
@@ -328,6 +303,7 @@ class P2PServer(threading.Thread):
         self.metrics = metrics
         self.on_new_block = on_new_block
         self.on_new_tx = on_new_tx
+        self.pbft = None  # [NOVO v6.7.9] Motor PBFT (injetado via set_pbft)
         self.on_peer_bad = on_peer_bad
         self.on_peer_good = on_peer_good
         self.get_peers_callback = get_peers_callback
@@ -353,6 +329,12 @@ class P2PServer(threading.Thread):
                 self.sock.close()
             except Exception:
                 pass
+
+    def set_pbft(self, pbft) -> None:
+        """[NOVO v6.7.9] Injeta o motor PBFT no servidor P2P."""
+        self.pbft = pbft
+        if pbft is not None:
+            log.info("[P2P] PBFT injetado no P2PServer")
 
     def _check_rate(self, addr: str) -> bool:
         agora = time.time()
@@ -486,12 +468,10 @@ class P2PServer(threading.Thread):
 
     def _handle_sign_block(self, msg: dict, addr, peer_id) -> dict:
         """
-        [v6.7.8] Valida o bloco antes de assinar. Aceita 3 cenários:
+        Valida o bloco antes de assinar. Aceita 3 cenários:
           a) block_h == local_h + 1 (normal)
           b) block_h == local_h     (RACE RECOVERY — bloco já é o tip)
-          c) block_h < local_h      (RACE RECOVERY REVERSA — peer à frente,
-                                     mas bloco já está na chain com hash bate)
-        Todos os retornos de recusa incluem "error" com o motivo.
+          c) block_h < local_h      (RACE RECOVERY REVERSA)
         """
         block = msg.get("block")
         if not block or not isinstance(block, dict):
@@ -593,9 +573,6 @@ class P2PServer(threading.Thread):
                     prev_block = self.bc.db.get_block(block_h - 1) if block_h > 0 else None
                     log.info("[SIG] assinando bloco #%d em RACE RECOVERY (já é o tip local)", block_h)
                 elif block_h < local_h:
-                    # [PATCH v6.7.8] RACE RECOVERY REVERSA
-                    # Peer à frente, mas bloco já existe na chain local
-                    # com mesmo hash. Pode assinar.
                     try:
                         _existing = self.bc.db.get_block(block_h)
                     except Exception:
@@ -736,6 +713,23 @@ class P2PServer(threading.Thread):
             if mtype == "sign_block":
                 self.metrics.inc("block_sigs_requested")
                 return self._handle_sign_block(msg, addr, peer_id)
+
+            # ─── [NOVO v6.7.9] PBFT ─────────────────────────────────
+            if mtype == "pbft_preprepare":
+                if self.pbft is None:
+                    return {"ok": False, "error": "pbft nao instalado"}
+                return self.pbft.handle_preprepare(msg)
+
+            if mtype == "pbft_prepare":
+                if self.pbft is None:
+                    return {"ok": False, "error": "pbft nao instalado"}
+                return self.pbft.handle_prepare(msg)
+
+            if mtype == "pbft_commit":
+                if self.pbft is None:
+                    return {"ok": False, "error": "pbft nao instalado"}
+                return self.pbft.handle_commit(msg)
+            # ────────────────────────────────────────────────────────
 
             if mtype == "announce_validator":
                 pub = (msg.get("pubkey") or "").strip()
