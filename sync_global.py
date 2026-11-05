@@ -24,7 +24,6 @@ DEFAULT_BOOTSTRAP_PEERS = [
     'http://100.64.151.67:5000',
 ]
 
-# [FIX] Função log corrigida para aceitar parâmetros extras (ex: end=' ')
 def log(msg: str, *args, **kwargs):
     print(msg, *args, flush=True, **kwargs)
 
@@ -161,6 +160,11 @@ def import_chain(blocks: list[dict], db_path: Path,
         return (0, -1)
 
     bc = Blockchain(str(db_path), auto_genesis=False)
+    
+    # [FIX] Força o nó a aceitar o bloco gênesis do peer se o banco estiver vazio
+    if bc.db.height() == -1:
+        log("  [sync] DB vazio — permitindo importar o genesis do peer (ignorando fixo)")
+        bc.genesis_expected_hash = None
 
     if strict_validators:
         try:
@@ -274,7 +278,7 @@ def main():
     log(f'\n[2] Testando {len(all_urls)} peers...')
     probed = []
     for u in all_urls:
-        log(f'  {u}...', end=' ')  # AQUI ESTAVA O ERRO DO 'end'
+        log(f'  {u}...', end=' ')
         r = probe_peer(u, timeout=args.timeout)
         probed.append(r)
         if r['reachable']:
