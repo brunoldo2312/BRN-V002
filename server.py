@@ -2,10 +2,12 @@
 server.py — Backend HTTP do nó BRN (v9.9.19)
 ================================================================
 v9.9.19 (2026-11-04):
-  [FIX CRÍTICO] pool_start_local() agora inicializa dinamicamente o 
-        PoolClient se ele for None. Resolve o erro 503 na GUI.
-  [FIX CRÍTICO] api_wallet_set_validator_sk() agora ativa o PBFT 
-        dinamicamente usando o objeto Wallet, evitando erro de 'pub_hex'.
+  [FIX CRÍTICO] trust_nodes(): cruza os dados do Trust Network com 
+        o P2PManager para mostrar a altura real e o IP dos peers.
+  [FIX CRÍTICO] pool_start_local(): instancia o PoolClient 
+        dinamicamente se ele não existir, resolvendo o erro 503.
+  [FIX CRÍTICO] api_wallet_set_validator_sk(): inicializa o PBFT 
+        dinamicamente usando a chave da carteira (evita erro do boot).
 v9.9.18 (2026-11-03):
   [NEW] Rota POST /api/wallet/set_validator_sk.
 ================================================================
@@ -192,7 +194,6 @@ def set_trust_network(trust) -> None:
 def _get_trust_network(): return _TRUST_NETWORK
 
 
-# PoolClient local
 _POOL_CLIENT_LOCAL = None
 _POOL_CLIENT_LOCK = threading.Lock()
 
@@ -891,7 +892,7 @@ def pool_miners():
 
 
 # ============================================================
-# [v9.9.19] POOL LOCAL DINÂMICO
+# POOL LOCAL DINÂMICO [FIX v9.9.19]
 # ============================================================
 @app.route("/api/pool/local_status", methods=["GET"])
 def pool_local_status():
@@ -962,7 +963,7 @@ def pool_stop_local():
 
 
 # ============================================================
-# [v9.9.19] WALLET — sincroniza SK e ATIVA PBFT DINAMICAMENTE
+# WALLET — sincroniza SK e ATIVA PBFT DINAMICAMENTE [FIX v9.9.19]
 # ============================================================
 @app.route("/api/wallet/set_validator_sk", methods=["POST"])
 def api_wallet_set_validator_sk():
@@ -1041,7 +1042,7 @@ def api_wallet_set_validator_sk():
 
 
 # ============================================================
-# TRUST NETWORK
+# TRUST NETWORK [FIX v9.9.19 - Altura e Status]
 # ============================================================
 @app.route("/api/trust/stats", methods=["GET"])
 @require_rate_limit("trust_stats")
@@ -1067,22 +1068,62 @@ def trust_nodes():
     if trust is None: return jsonify({"ok": False, "msg": "TrustNetwork indisponivel"}), 503
     try:
         limit = int(request.args.get("limit", 100))
-        if hasattr(trust, "peers"):
-            nodes = []
+        nodes = []
+        
+        # 1. Pega os dados do P2P (IP, Altura, Latência)
+        p2p = _get_p2p_manager()
+        p2p_peers = {}
+        if p2p and hasattr(p2p, "get_peer_stats"):
+            try:
+                for p in p2p.get_peer_stats():
+                    p2p_peers[p["address"]] = p
+            except Exception: pass
+
+        if hasattr(trust, "nodes"):
+            from dataclasses import asdict
+            for pubkey, n in trust.nodes.items():
+                peer_addr = getattr(n, "peer_addr", "")
+                addr = getattr(n, "address", "")
+                
+                # Cruza com os dados do P2P para achar a altura
+                h = 0
+                if peer_addr in p2p_peers:
+                    h = p2p_peers[peer_addr].get("height", 0)
+                elif addr in p2p_peers:
+                    h = p2p_peers[addr].get("height", 0)
+
+                # Define um status mais amigável
+                status = "new"
+                if getattr(n, "banned", False): 
+                    status = "banned"
+                elif getattr(n, "connected", False): 
+                    status = "connected"
+                elif getattr(n, "trust_level", "") in ("validator", "trusted"): 
+                    status = getattr(n, "trust_level")
+                elif getattr(n, "trust_score", 0) >= 150:
+                    status = "validator"
+
+                nodes.append({
+                    "node_id": pubkey,
+                    "address": peer_addr or addr or "desconhecido", 
+                    "height": h,
+                    "trust_score": getattr(n, "trust_score", 0),
+                    "status": status,
+                    "last_seen": getattr(n, "last_seen", 0),
+                })
+        else:
+            # Fallback
             for pubkey, data in trust.peers.items():
                 nodes.append({
-                    "node_id": pubkey, "address": "desconhecido", "trust_score": data.get("score", 0),
-                    "trust_level": data.get("status", "new"), "is_validator": data.get("status") == "trusted"
+                    "node_id": pubkey, "address": "desconhecido", 
+                    "height": 0, "trust_score": data.get("score", 0),
+                    "status": data.get("status", "new"), "last_seen": 0
                 })
-            nodes.sort(key=lambda x: x["trust_score"], reverse=True)
-            return jsonify({"ok": True, "count": len(nodes), "nodes": nodes[:limit]})
-        else:
-            from dataclasses import asdict
-            nodes_raw = list(trust.nodes.values()) if hasattr(trust, "nodes") else []
-            nodes = [asdict(n) for n in nodes_raw]
-            nodes.sort(key=lambda x: x.get("trust_score", 0), reverse=True)
-            return jsonify({"ok": True, "count": len(nodes), "nodes": nodes[:limit]})
-    except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
+                
+        nodes.sort(key=lambda x: x.get("trust_score", 0), reverse=True)
+        return jsonify({"ok": True, "count": len(nodes), "nodes": nodes[:limit]})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
 
 
 # ============================================================
@@ -1150,7 +1191,7 @@ def _shutdown():
 
 
 # ============================================================
-# PATCH v9.9.17 e outros
+# PATCH v9.9.17
 # ============================================================
 @app.route("/api/miner/stop", methods=["POST"])
 @require_rate_limit("miner_stop")
@@ -1394,5 +1435,5 @@ def api_tx_status(txid_str):
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.19 (Dynamic Pool + Dynamic PBFT)")
+    print(f"BRN Server v9.9.19 (Dynamic Pool + Dynamic PBFT + Trust Nodes Fix)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
