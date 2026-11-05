@@ -5,7 +5,6 @@
 <title>BRN — Monitor de Rede</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
-  /* [MANTENHA O CSS ORIGINAL AQUI, ELE ESTÁ PERFEITO] */
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0d1117; color: #e6edf3; padding: 20px; font-size: 14px; line-height: 1.5; }
   .container { max-width: 1400px; margin: 0 auto; }
@@ -36,6 +35,7 @@
   .badge.err    { background: rgba(248,81,73,0.15); color: #f85149; } .badge.info   { background: rgba(88,166,255,0.15); color: #58a6ff; }
   .badge.gray   { background: rgba(139,148,158,0.15); color: #8b949e; } .badge.auto   { background: rgba(163,113,247,0.15); color: #a371f7; }
   .badge.manual { background: rgba(88,166,255,0.12); color: #58a6ff; } .badge.mining { background: rgba(88,166,255,0.2); color: #58a6ff; animation: pulse 2s infinite; }
+  .badge.pool   { background: rgba(46,160,67,0.2); color: #3fb950; }
   @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.5 } }
   .node-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
   .stat .k { font-size: 0.7rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.4px; }
@@ -108,7 +108,7 @@
     </div>
   </div>
 
-  <div class="footer">BRN Monitor v1.3 · <a href="http://127.0.0.1:8080/">Explorer</a></div>
+  <div class="footer">BRN Monitor v1.4 · <a href="http://127.0.0.1:8080/">Explorer</a></div>
 </div>
 
 <div class="modal-overlay" id="addModal">
@@ -123,7 +123,7 @@
 
 <script>
 "use strict";
-const STORAGE_KEY = "brn_monitor_nodes_v4";
+const STORAGE_KEY = "brn_monitor_nodes_v5";
 
 // ⚠️ IPs DO SEU CLUSTER AQUI
 const DEFAULT_NODES = [
@@ -209,17 +209,19 @@ async function fetchFromNode(host, port, path, timeoutMs = 5000) {
 
 async function queryNode(node) {
   const { host, port } = node;
-  const [status, chain, sync, miner] = await Promise.all([
+  const [status, chain, sync, miner, pool] = await Promise.all([
     fetchFromNode(host, port, "/api/status"),
     fetchFromNode(host, port, "/api/chain-info"),
     fetchFromNode(host, port, "/api/sync/status"), 
     fetchFromNode(host, port, "/api/miner/status"),
+    fetchFromNode(host, port, "/api/pool/stats") // [NOVO] Puxa estatísticas do Pool
   ]);
   const anyOk = status.ok || chain.ok || sync.ok || miner.ok;
   return {
     name: node.name, host, port, role: node.role, auto: !!node.auto, online: anyOk,
     status: status.ok ? status.data : null, chain: chain.ok ? chain.data : null,
     sync: sync.ok ? sync.data : null, miner: miner.ok ? miner.data : null,
+    pool: (pool.ok && pool.data && pool.data.total !== undefined) ? pool.data : null,
     latency: Math.max(status.latency || 0, chain.latency || 0, sync.latency || 0, miner.latency || 0),
     error: !anyOk ? (status.error || "offline") : null, ts: Date.now(),
   };
@@ -252,15 +254,25 @@ function render() {
     const card = document.createElement("div"); card.className = "node-card";
     if (!st) { card.classList.add("offline"); const b0 = []; if (n.auto) b0.push('<span class="badge auto">auto</span>'); else if (n.manual) b0.push('<span class="badge manual">manual</span>'); b0.push('<span class="badge gray">carregando</span>'); card.innerHTML = `<div class="node-header"><div><div class="node-name">${escapeHtml(n.name)}</div><div class="node-host">${escapeHtml(n.host)}:${n.port}</div></div><div class="badges">${b0.join("")}</div></div>`; grid.appendChild(card); continue; }
     if (!st.online) { card.classList.add("offline"); const badges = []; if (n.auto) badges.push('<span class="badge auto">auto</span>'); else if (n.manual) badges.push('<span class="badge manual">manual</span>'); badges.push('<span class="badge err">offline</span>'); card.innerHTML = `<div class="node-header"><div><div class="node-name">${escapeHtml(n.name)}</div><div class="node-host">${escapeHtml(n.host)}:${n.port}</div></div><div class="badges">${badges.join("")}</div></div><div class="node-stats"><div class="stat"><div class="k">Erro</div><div class="v sm red">${escapeHtml(st.error || "?")}</div></div></div><div class="node-actions"><button class="btn" onclick="removeNode('${escapeAttr(n.host)}')">Remover</button></div>`; grid.appendChild(card); continue; }
-    const c = st.chain || {}; const s = st.status || {}; const sy = st.sync || {}; const m = st.miner || {};
+    const c = st.chain || {}; const s = st.status || {}; const sy = st.sync || {}; const m = st.miner || {}; const p = st.pool || {};
     const height = c.height ?? s.height ?? "?"; const tip = c.tip_hash || "?"; const diff = c.difficulty ?? s.difficulty ?? "?"; const peers = s.peers ?? "?";
+    
     const badges = []; if (n.auto) badges.push('<span class="badge auto">auto</span>'); else if (n.manual) badges.push('<span class="badge manual">manual</span>');
     if (m.running) badges.push('<span class="badge mining">⛏ minerando</span>'); else badges.push('<span class="badge gray">○ parado</span>');
+    if (p.total > 0) badges.push(`<span class="badge pool">🌐 pool (${p.total} miners)</span>`); // [NOVO] Badge do Pool
     if (sy.synced) badges.push('<span class="badge ok">✓ sync</span>'); else if (sy.syncing) badges.push('<span class="badge warn">↻ sync</span>');
     if (sy.forking) badges.push('<span class="badge err">⚠ fork</span>');
+    
     const allOnline = Object.values(nodeStates).filter(x => x && x.online); const maxHeight = Math.max(...allOnline.map(x => x.chain?.height || 0)); const isBehind = (c.height || 0) < maxHeight; const behindBy = maxHeight - (c.height || 0);
     if (isBehind && behindBy > 0) { card.classList.add("behind"); badges.push(`<span class="badge warn">↓ -${behindBy}</span>`); } else { card.classList.add("online"); }
-    card.innerHTML = `<div class="node-header"><div><div class="node-name">${escapeHtml(n.name)}</div><div class="node-host">${escapeHtml(n.host)}:${n.port} · <span style="color:#8b949e">${escapeHtml(n.role || "?")}</span></div></div><div class="badges">${badges.join("")}</div></div><div class="node-stats"><div class="stat"><div class="k">Altura</div><div class="v">${formatNum(height)}</div></div><div class="stat"><div class="k">Dificuldade</div><div class="v">${diff}</div></div><div class="stat"><div class="k">Peers</div><div class="v">${peers}</div></div><div class="stat"><div class="k">Latência</div><div class="v ${st.latency > 2000 ? 'yellow' : 'green'}">${st.latency}ms</div></div></div><div class="node-details"><div class="line"><span class="k">Tip hash</span><span class="v mono">${shortHash(tip)}</span></div><div class="line"><span class="k">Sync</span><span class="v ${sy.synced ? 'green' : 'yellow'}">${sy.local_height ?? "?"} → ${sy.target_height ?? "?"} (${(sy.progress ?? 0).toFixed(1)}%)</span></div><div class="line"><span class="k">Minerador</span><span class="v">${m.running ? `rodando · ${m.blocks_mined ?? 0} blocos` : "parado"}</span></div>${m.last_error ? `<div class="line"><span class="k">Último erro</span><span class="v alert">${escapeHtml(m.last_error)}</span></div>` : ""}</div><div class="node-actions"><button class="btn" onclick="removeNode('${escapeAttr(n.host)}')">Remover</button></div>`;
+    
+    // [NOVO] Linha extra para dados do Pool
+    let poolHtml = "";
+    if (p.total > 0) {
+        poolHtml = `<div class="line"><span class="k">Pool (Shares/Blocks)</span><span class="v">${p.shares || 0} shares · ${p.blocks || 0} blocos</span></div>`;
+    }
+
+    card.innerHTML = `<div class="node-header"><div><div class="node-name">${escapeHtml(n.name)}</div><div class="node-host">${escapeHtml(n.host)}:${n.port} · <span style="color:#8b949e">${escapeHtml(n.role || "?")}</span></div></div><div class="badges">${badges.join("")}</div></div><div class="node-stats"><div class="stat"><div class="k">Altura</div><div class="v">${formatNum(height)}</div></div><div class="stat"><div class="k">Dificuldade</div><div class="v">${diff}</div></div><div class="stat"><div class="k">Peers</div><div class="v">${peers}</div></div><div class="stat"><div class="k">Latência</div><div class="v ${st.latency > 2000 ? 'yellow' : 'green'}">${st.latency}ms</div></div></div><div class="node-details"><div class="line"><span class="k">Tip hash</span><span class="v mono">${shortHash(tip)}</span></div><div class="line"><span class="k">Sync</span><span class="v ${sy.synced ? 'green' : 'yellow'}">${sy.local_height ?? "?"} → ${sy.target_height ?? "?"} (${(sy.progress ?? 0).toFixed(1)}%)</span></div><div class="line"><span class="k">Minerador</span><span class="v">${m.running ? `rodando · ${m.blocks_mined ?? 0} blocos` : "parado"}</span></div>${poolHtml}${m.last_error ? `<div class="line"><span class="k">Último erro</span><span class="v alert">${escapeHtml(m.last_error)}</span></div>` : ""}</div><div class="node-actions"><button class="btn" onclick="removeNode('${escapeAttr(n.host)}')">Remover</button></div>`;
     grid.appendChild(card);
   }
   renderComparison();
