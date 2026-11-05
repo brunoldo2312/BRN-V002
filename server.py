@@ -1,6 +1,11 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.19)
+server.py — Backend HTTP do nó BRN (v9.9.20)
 ================================================================
+v9.9.20 (2026-11-04):
+  [FIX CRÍTICO] pool_start_local() e pool_stop_local() agora detectam
+        dinamicamente qual é o método correto de início/parada no 
+        PoolClient (start_mining, start, run, etc.), resolvendo o erro
+        "'PoolClient' object has no attribute 'start_mining'".
 v9.9.19 (2026-11-04):
   [FIX CRÍTICO] trust_nodes(): cruza os dados do Trust Network com 
         o P2PManager para mostrar a altura real e o IP dos peers.
@@ -118,7 +123,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
             req = urllib.request.Request(
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
-                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.19"},
+                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.20"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -892,7 +897,7 @@ def pool_miners():
 
 
 # ============================================================
-# POOL LOCAL DINÂMICO [FIX v9.9.19]
+# POOL LOCAL DINÂMICO E DETECÇÃO DE MÉTODOS [FIX v9.9.20]
 # ============================================================
 @app.route("/api/pool/local_status", methods=["GET"])
 def pool_local_status():
@@ -901,7 +906,7 @@ def pool_local_status():
         return jsonify({"ok": False, "running": False,
                         "msg": "PoolClient nao injetado"}), 200
     try:
-        st = pc.status()
+        st = pc.status() if hasattr(pc, "status") else {}
         return jsonify({"ok": True, **st})
     except Exception as e:
         return jsonify({"ok": False, "running": False, "msg": str(e)}), 200
@@ -918,14 +923,17 @@ def pool_start_local():
             pubkey = (data.get("pubkey") or "").strip()
             pool_url = os.environ.get("BRN_POOL_URL", "").strip() or "http://127.0.0.1:5000"
             
-            # [FIX] Tenta instanciar o PoolClient com as assinaturas mais comuns
+            # Tenta instanciar com as variações de assinatura mais comuns
             try:
-                pc = PoolClient(pool_url, pubkey)
+                pc = PoolClient(address, pubkey, pool_url)
             except TypeError:
                 try:
-                    pc = PoolClient(pool_url, address)
+                    pc = PoolClient(pool_url, address, pubkey)
                 except TypeError:
-                    pc = PoolClient(pool_url)
+                    try:
+                        pc = PoolClient(pool_url, pubkey)
+                    except TypeError:
+                        pc = PoolClient(pool_url)
             
             set_pool_client_local(pc)
             log.info("[pool_client] Inicializado dinamicamente via start_local")
@@ -937,15 +945,29 @@ def pool_start_local():
         address = (data.get("address") or "").strip()
         pubkey = (data.get("pubkey") or "").strip()
         
+        # Procura o método de inicio correto no PoolClient
+        start_method = None
+        for m in ("start_mining", "start", "run", "start_client", "start_pool_client", "connect"):
+            if hasattr(pc, m):
+                start_method = getattr(pc, m)
+                break
+        
+        if start_method is None:
+            return jsonify({"ok": False, "msg": "PoolClient nao possui metodo de inicio (start_mining, start, etc)"}), 500
+
         try:
             if address and pubkey:
-                ok, msg = pc.start_mining(address, pubkey)
+                ok, msg = start_method(address, pubkey)
             else:
-                ok, msg = pc.start_mining()
+                ok, msg = start_method()
         except TypeError:
-            ok, msg = pc.start_mining()
-            
-        return jsonify({"ok": bool(ok), "msg": msg, **pc.status()})
+            try:
+                ok, msg = start_method(address)
+            except TypeError:
+                ok, msg = start_method()
+
+        status = pc.status() if hasattr(pc, "status") else {}
+        return jsonify({"ok": bool(ok), "msg": msg, **status})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
@@ -956,14 +978,25 @@ def pool_stop_local():
     if pc is None:
         return jsonify({"ok": False, "msg": "PoolClient nao injetado"}), 503
     try:
-        ok, msg = pc.stop_mining()
-        return jsonify({"ok": bool(ok), "msg": msg, **pc.status()})
+        # Procura o método de parada correto
+        stop_method = None
+        for m in ("stop_mining", "stop", "disconnect", "stop_client"):
+            if hasattr(pc, m):
+                stop_method = getattr(pc, m)
+                break
+                
+        if stop_method is None:
+            return jsonify({"ok": False, "msg": "PoolClient nao possui metodo de parada"}), 500
+            
+        ok, msg = stop_method()
+        status = pc.status() if hasattr(pc, "status") else {}
+        return jsonify({"ok": bool(ok), "msg": msg, **status})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
 # ============================================================
-# WALLET — sincroniza SK e ATIVA PBFT DINAMICAMENTE [FIX v9.9.19]
+# WALLET — sincroniza SK e ATIVA PBFT DINAMICAMENTE
 # ============================================================
 @app.route("/api/wallet/set_validator_sk", methods=["POST"])
 def api_wallet_set_validator_sk():
@@ -1010,7 +1043,7 @@ def api_wallet_set_validator_sk():
             except Exception as e:
                 log.warning("[wallet_sk] sync no trust falhou: %s", e)
 
-        # [FIX] Ativa o PBFT dinamicamente se ainda não estiver rodando
+        # Ativa o PBFT dinamicamente se ainda não estiver rodando
         if chain._pbft is None and os.environ.get("BRN_PBFT_ENABLED") == "1":
             try:
                 from pbft_consensus import PBFTConsensus
@@ -1042,7 +1075,7 @@ def api_wallet_set_validator_sk():
 
 
 # ============================================================
-# TRUST NETWORK [FIX v9.9.19 - Altura e Status]
+# TRUST NETWORK (Altura e Status Reais)
 # ============================================================
 @app.route("/api/trust/stats", methods=["GET"])
 @require_rate_limit("trust_stats")
@@ -1175,7 +1208,7 @@ def peers_discovered():
 def health():
     try:
         return jsonify({
-            "ok": True, "height": _get_chain().db.height(), "version": "9.9.19",
+            "ok": True, "height": _get_chain().db.height(), "version": "9.9.20",
             "chain_injected": _CHAIN is not None, "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
             "pool_client_local": _POOL_CLIENT_LOCAL is not None,
@@ -1435,5 +1468,5 @@ def api_tx_status(txid_str):
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.19 (Dynamic Pool + Dynamic PBFT + Trust Nodes Fix)")
+    print(f"BRN Server v9.9.20 (Dynamic Pool + Dynamic PBFT + Trust Nodes Fix)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
