@@ -13,8 +13,9 @@ Assinatura compatível com main.py v12.5:
     save_node_identity(data, password, path="node_identity.enc")
     load_node_identity(password, path="node_identity.enc")
 
-Requer:
-    pip install cryptography argon2-cffi
+[FIX 2026-11-06]:
+  - A carteira ativa agora é salva na RAIZ e na pasta wallets/ simultaneamente.
+  - Leitura tenta na raiz, com fallback para a pasta wallets/.
 ================================================================
 """
 from __future__ import annotations
@@ -51,6 +52,25 @@ MIN_PASSWORD_LEN = 8
 ARGON2_TIME    = int(os.environ.get("BRN_ARGON2_TIME", "3"))
 ARGON2_MEMORY  = int(os.environ.get("BRN_ARGON2_MEMORY", "65536"))
 ARGON2_PAR     = int(os.environ.get("BRN_ARGON2_PARALLEL", "4"))
+
+# ============================================================
+# CAMINHOS DA CARTEIRA ATIVA (RAIZ + WALLETS)
+# ============================================================
+_BASE_DIR = Path(__file__).resolve().parent
+_WALLET_SUBDIR = _BASE_DIR / "wallets"
+
+# Cria a pasta wallets se não existir
+_WALLET_SUBDIR.mkdir(parents=True, exist_ok=True)
+
+# Caminhos absolutos para evitar problemas de CWD
+_DEFAULT_WALLET_ROOT = _BASE_DIR / "current_wallet.enc"
+_DEFAULT_WALLET_SUB  = _WALLET_SUBDIR / "current_wallet.enc"
+
+# Se a env BRN_CURRENT_WALLET estiver setada, ela tem prioridade (compatibilidade)
+# Mas na ausência dela, usamos a raiz.
+_env_wallet = os.environ.get("BRN_CURRENT_WALLET")
+CURRENT_WALLET_ENC = _env_wallet if _env_wallet else str(_DEFAULT_WALLET_ROOT)
+CURRENT_WALLET_JSON = str(_BASE_DIR / "current_wallet.json")
 
 
 def _derive_key(password: str, salt: bytes) -> bytes:
@@ -200,23 +220,33 @@ def delete_identity(path: str = "node_identity.enc", secure: bool = True) -> boo
     return True
 
 
-CURRENT_WALLET_ENC  = os.environ.get("BRN_CURRENT_WALLET", "current_wallet.enc")
-CURRENT_WALLET_JSON = "current_wallet.json"
-
-
+# ============================================================
+# CARTEIRA ATIVA (SALVA NOS DOIS LOCAIS)
+# ============================================================
 def save_current_wallet(password: str, data: dict) -> dict:
     try:
+        # 1. Salva na raiz (onde o main.py procura)
         _save_blob(CURRENT_WALLET_ENC, data, password, b"current_wallet")
-        return {"ok": True, "path": CURRENT_WALLET_ENC}
+        
+        # 2. Salva na pasta wallets/ (backup automático)
+        _save_blob(str(_DEFAULT_WALLET_SUB), data, password, b"current_wallet")
+        
+        return {"ok": True, "path": CURRENT_WALLET_ENC, "backup": str(_DEFAULT_WALLET_SUB)}
     except Exception as e:
         return {"ok": False, "msg": str(e)}
 
 
 def load_current_wallet(password: str) -> dict:
     try:
+        # 1. Tenta ler da raiz
         data = _load_blob(CURRENT_WALLET_ENC, password, b"current_wallet")
+        
+        # 2. Se não achou na raiz, tenta na pasta wallets/
         if data is None:
-            return {"ok": False, "msg": "current_wallet.enc nao existe"}
+            data = _load_blob(str(_DEFAULT_WALLET_SUB), password, b"current_wallet")
+            
+        if data is None:
+            return {"ok": False, "msg": "current_wallet.enc nao existe (nem na raiz nem em wallets/)"}
         return {"ok": True, **data}
     except Exception as e:
         return {"ok": False, "msg": str(e)}
