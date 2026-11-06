@@ -1,6 +1,11 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.5.3 | Data: 05/11/2026
+Versão: 9.5.4 | Data: 06/11/2026
 ================================================================
+v9.5.4 (2026-11-06):
+  [FIX] validate_block agora passa TODOS os blocos pelo validate_proof 
+        do PBFT (se _pbft não for None). Antes, se o bloco não tivesse 
+        o campo "pbft_commits", a validação era pulada, mesmo com 
+        BRN_PBFT_ENFORCE=1.
 v9.5.3 (2026-11-05):
   [FIX] validate_block agora aceita o Genesis de um peer se o DB
         local estiver vazio (height == -1). Isso permite que nós
@@ -9,20 +14,7 @@ v9.5.3 (2026-11-05):
         nao corresponde ao esperado".
 v9.5.2 (2026-11-05):
   [NEW] BRN_STRICT_MULTISIG: variável mestre que, quando =1,
-        DESATIVA todos os bypasses de multi-sig:
-          - BRN_BOOTSTRAP_SKIP_SIGS_UNTIL
-          - BRN_ASSUME_VALID_UNTIL (só para validação de bloco, sync continua funcionando abaixo da altura)
-          - bootstrap estrangeiro
-          - bootstrap local
-          - bootstrap estendido (trust_score >= 500)
-        Uso: produção multi-nó onde a rede deve travar se peers
-        não assinarem. Para bootstrap (rede em formação), use =0.
-  [NEW] Log explícito com "[STRICT]" quando a variável está ativa.
-  [KEEP] Todos os bypasses continuam disponíveis quando =0.
-v9.5.1 (2026-11-05):
-  [FIX] mine_block_interruptible respeita BRN_PBFT_ENFORCE.
-v9.5.0 (2026-11-04):
-  [NEW] Integração PBFT.
+        DESATIVA todos os bypasses de multi-sig.
 ================================================================
 """
 from __future__ import annotations
@@ -77,37 +69,29 @@ BOOTSTRAP_TRUST_THRESHOLD = float(
     os.environ.get("BRN_BOOTSTRAP_TRUST_THRESHOLD", "500")
 )
 
-# [v9.4.10] Bypass de multi-sig ate uma altura.
 BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = int(
     os.environ.get("BRN_BOOTSTRAP_SKIP_SIGS_UNTIL", "0") or "0"
 )
 
-# [v9.4.11] Assume Valid
 BRN_ASSUME_VALID_UNTIL = int(
     os.environ.get("BRN_ASSUME_VALID_UNTIL", "0") or "0"
 )
 
-# [v9.4.11] Checkpoint automático
 BRN_CHECKPOINT_AUTO_HEIGHT = int(
     os.environ.get("BRN_CHECKPOINT_AUTO_HEIGHT", "0") or "0"
 )
 
-# [PBFT] flag de enforcement
 BRN_PBFT_ENFORCE = os.environ.get("BRN_PBFT_ENFORCE", "0") == "1"
 
-# [v9.5.2] STRICT MULTISIG: desativa TODOS os bypasses de multi-sig.
 BRN_STRICT_MULTISIG = os.environ.get("BRN_STRICT_MULTISIG", "0") == "1"
 
 if BRN_STRICT_MULTISIG:
-    # Em modo estrito, ignoramos qualquer bypass configurado
     BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = 0
     BRN_ASSUME_VALID_UNTIL = 0
     log.warning(
         "[STRICT] BRN_STRICT_MULTISIG=1 — TODOS os bypasses de "
         "multi-sig foram desativados. A rede vai travar se os "
-        "validadores não assinarem. Bypasses ignorados: "
-        "BRN_BOOTSTRAP_SKIP_SIGS_UNTIL, BRN_ASSUME_VALID_UNTIL, "
-        "bootstrap local/estrangeiro/estendido."
+        "validadores não assinarem."
     )
 
 if not (0.0 < VALIDATOR_QUORUM <= 1.0):
@@ -862,7 +846,6 @@ class Blockchain:
         return need
 
     def _validate_validators_sig(self, block: dict, validators: Optional[list] = None) -> tuple:
-        # [v9.4.10] Bypass por altura (só se STRICT_MULTISIG=0)
         if not BRN_STRICT_MULTISIG and BRN_BOOTSTRAP_SKIP_SIGS_UNTIL > 0:
             try:
                 _bh = int(block.get("height", -1))
@@ -920,7 +903,6 @@ class Blockchain:
         # BYPASSES (só ativos quando STRICT_MULTISIG=0)
         # ═══════════════════════════════════════════════════════════
 
-        # Bypass 1: bootstrap estrangeiro (1 validador local, 1 assinatura estrangeira)
         if not BRN_STRICT_MULTISIG and len(validators) < 2 and got == 0 and got_foreign >= 1:
             try:
                 block_h = int(block.get("height", -1))
@@ -940,7 +922,6 @@ class Blockchain:
             )
             return True, ""
 
-        # Bypass 2: bootstrap local (só a própria SK assinou)
         if not BRN_STRICT_MULTISIG and got >= 1 and got_foreign == 0:
             local_pk = ""
             if self._local_validator_sk is not None:
@@ -964,7 +945,6 @@ class Blockchain:
                     )
                     return True, ""
 
-        # Bypass 3: bootstrap estendido (trust_score >= BOOTSTRAP_TRUST_THRESHOLD)
         if not BRN_STRICT_MULTISIG and got >= 1 and got_foreign == 0:
             trusted = False
             trusted_pubkey = ""
@@ -1028,7 +1008,6 @@ class Blockchain:
         if block["height"] != expected_height:
             return False, "altura invalida"
 
-        # [v9.4.11] ASSUME-VALID (só se STRICT_MULTISIG=0)
         h_int = int(block["height"])
         if not BRN_STRICT_MULTISIG and BRN_ASSUME_VALID_UNTIL > 0 and 0 < h_int <= BRN_ASSUME_VALID_UNTIL:
             try:
@@ -1113,7 +1092,8 @@ class Blockchain:
         if total_cb > reward + fees:
             return False, "coinbase acima do permitido"
 
-        if self._pbft is not None and "pbft_commits" in block:
+        # [FIX v9.5.4] Remove a condição "and pbft_commits in block"
+        if self._pbft is not None:
             try:
                 ok_pbft, why_pbft = self._pbft.validate_proof(block)
                 if not ok_pbft:
