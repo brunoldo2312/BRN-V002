@@ -1,6 +1,12 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.5.2 | Data: 05/11/2026
+Versão: 9.5.3 | Data: 05/11/2026
 ================================================================
+v9.5.3 (2026-11-05):
+  [FIX] validate_block agora aceita o Genesis de um peer se o DB
+        local estiver vazio (height == -1). Isso permite que nós
+        novos (ou que tiveram o DB apagado) se sincronizem com uma
+        rede recém-criada (novo Genesis) sem dar erro de "genesis
+        nao corresponde ao esperado".
 v9.5.2 (2026-11-05):
   [NEW] BRN_STRICT_MULTISIG: variável mestre que, quando =1,
         DESATIVA todos os bypasses de multi-sig:
@@ -1009,7 +1015,12 @@ class Blockchain:
     def validate_block(self, block: dict, prev_block=None, validators: Optional[list] = None) -> tuple:
         if block["height"] == 0 and prev_block is None:
             if (self.genesis_expected_hash and block["hash"] != self.genesis_expected_hash):
-                return False, f"genesis nao corresponde ao esperado"
+                if self.db.height() == -1:
+                    log.warning("[Blockchain] DB vazio — aceitando o Genesis do peer")
+                    self.genesis_expected_hash = block["hash"]
+                else:
+                    return False, f"genesis nao corresponde ao esperado"
+                    
         expected_prev = (prev_block["hash"] if prev_block else self.db.tip_hash())
         if block["prev_hash"] != expected_prev:
             return False, "prev_hash incorreto"
