@@ -1,21 +1,11 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.24)
+server.py — Backend HTTP do nó BRN (v9.9.25)
 ================================================================
-v9.9.24 (2026-11-06):
-  [NEW] _check_sync_barrier(): impede a mineração (Local ou Pool) 
-        se o nó estiver atrasado em relação aos peers da rede.
-v9.9.23 (2026-11-05):
-  [FIX CRÍTICO] Adicionada rota /api/trust/download que estava
-        faltando. Sem ela, os clientes recebiam erro 404 ao tentar
-        sincronizar a Trust Network do Origem.
-v9.9.22 (2026-11-05):
-  [FIX CRÍTICO] pool_start_local() corrigido para passar a URL
-        em vez da chain para o PoolClient.
-v9.9.21 (2026-11-05):
-  [FIX] Detecção dinâmica do método de início/parada no PoolClient.
-v9.9.19 (2026-11-04):
-  [FIX] trust_nodes(): cruza dados P2P para mostrar altura real.
-  [FIX] api_wallet_set_validator_sk(): inicializa PBFT dinamicamente.
+v9.9.25 (2026-11-06):
+  [NEW] _check_sync_barrier() avançado. Agora ele faz um ping P2P
+        real em todos os peers, verifica a altura máxima da rede,
+        testa a comunicação e só libera a mineração se todos 
+        estiverem sincronizados.
 ================================================================
 """
 from __future__ import annotations
@@ -124,7 +114,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
             req = urllib.request.Request(
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
-                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.24"},
+                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.25"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -228,32 +218,81 @@ def _register_miner_in_trust(pubkey: str, address: str) -> None:
 
 
 # ============================================================
-# FUNÇÃO DE BARREIRA DE SINCRONIZAÇÃO (NOVO v9.9.24)
+# SYNC BARRIER AVANÇADO (v9.9.25)
 # ============================================================
 def _check_sync_barrier() -> tuple[bool, str]:
-    """Verifica se o nó está sincronizado com o topo da rede."""
-    sync = _get_sync_manager()
-    if sync is None:
-        return True, ""  # Se não tem sync manager, libera
+    """
+    Verifica a saúde da rede antes de liberar a mineração.
+    1. Carteira carregada?
+    2. Nós P2P respondem?
+    3. Estamos na mesma altura do topo?
+    4. Peers conseguem assinar um bloco de teste?
+    """
+    chain = _get_chain()
+    
+    # 1. Carteira
+    if getattr(chain, "_local_validator_sk", None) is None:
+        return False, "Carteira não está carregada. Abra a carteira antes de minerar."
+
+    local_h = chain.db.height()
+    if local_h < 0:
+        return False, "Blockchain vazia. Sincronize primeiro."
+
+    p2p = _get_p2p_manager()
+    if p2p is None:
+        return False, "P2P desligado. Não é possível sincronizar."
         
     try:
-        status = sync.get_status()
-        local = int(status.get("local_height", 0))
-        target = int(status.get("target_height", 0))
-        peers = int(status.get("peers_known", 0))
-        
-        if peers == 0:
-            return False, "Nenhum peer conectado. Aguardando a rede."
-            
-        # Tolerância de 1 bloco
-        if local < (target - 1):
-            falta = target - local
-            return False, f"Seu nó está {falta} bloco(s) atrás do topo. Sincronize antes de minerar."
-            
-        return True, ""
+        from p2p_unified import P2PClient, CHAIN_ID
+        peers = p2p.discovery.listar_peers()
     except Exception as e:
-        log.warning("[sync_barrier] Erro na verificação: %s", e)
-        return True, ""  # Em caso de erro interno, libera para não travar
+        return False, f"Erro ao listar peers: {e}"
+
+    if not peers:
+        return False, "Nenhum peer conectado. Aguardando a rede."
+
+    max_peer_h = local_h
+    peers_ok = 0
+    signers_ok = 0
+    
+    # Pega o último bloco real para o teste de assinatura
+    test_block = chain.db.get_block(local_h)
+
+    for p in peers:
+        if ":" not in p: continue
+        ip, port_s = p.rsplit(":", 1)
+        if ip == "127.0.0.1": continue
+        
+        try:
+            # 3. Verifica altura real via P2P
+            msg_h = {"type": "get_chain_height", "_chain": CHAIN_ID, "_port": 6001}
+            resp_h, _ = P2PClient.send_message(ip, int(port_s), msg_h, timeout=3.0)
+            
+            if resp_h:
+                peers_ok += 1
+                ph = resp_h.get("height", -1)
+                if ph > max_peer_h: max_peer_h = ph
+                
+                # 4. Teste de Assinatura (só testa se o bloco existir)
+                if test_block:
+                    msg_sig = {"type": "sign_block", "block": test_block, "_chain": CHAIN_ID, "_port": 6001}
+                    resp_sig, _ = P2PClient.send_message(ip, int(port_s), msg_sig, timeout=5.0)
+                    if resp_sig and resp_sig.get("pubkey"):
+                        signers_ok += 1
+        except Exception:
+            pass
+
+    if peers_ok == 0:
+        return False, "Nenhum peer respondeu. Verifique o firewall ou conexão."
+
+    if local_h < (max_peer_h - 1):
+        falta = max_peer_h - local_h
+        return False, f"Seu nó está {falta} bloco(s) atrás do topo. Sincronize antes de minerar."
+
+    if signers_ok == 0 and test_block:
+        return False, "Peers estão online mas não assinaram o bloco de teste. Verifique as carteiras/Trust."
+
+    return True, ""
 
 
 # ============================================================
@@ -730,7 +769,7 @@ def sync_status():
 
 
 # ============================================================
-# MINERADOR (COM SYNC BARRIER)
+# MINERADOR (COM SYNC BARRIER AVANÇADO)
 # ============================================================
 @app.route("/api/miner/start", methods=["POST"])
 @require_rate_limit("miner_start")
@@ -743,7 +782,7 @@ def miner_start():
         if not WalletManager.validate_address(addr): return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
         if not pubkey: return jsonify({"ok": False, "msg": "Pubkey desconhecida."}), 400
 
-        # [NOVO v9.9.24] Barreira de Sincronização
+        # BARREIRA AVANÇADA
         ok_sync, msg_sync = _check_sync_barrier()
         if not ok_sync:
             return jsonify({"ok": False, "msg": msg_sync}), 400
@@ -802,7 +841,7 @@ def miner_status():
 
 
 # ============================================================
-# POOL (COM SYNC BARRIER)
+# POOL (COM SYNC BARRIER AVANÇADO)
 # ============================================================
 def _proxy_pool_request(path: str, method: str = "POST") -> tuple:
     remote_pool = os.environ.get("BRN_POOL_URL", "").strip().rstrip("/")
@@ -932,7 +971,7 @@ def pool_miners():
 
 
 # ============================================================
-# POOL LOCAL DINÂMICO (COM SYNC BARRIER)
+# POOL LOCAL DINÂMICO (COM SYNC BARRIER AVANÇADO)
 # ============================================================
 @app.route("/api/pool/local_status", methods=["GET"])
 def pool_local_status():
@@ -949,7 +988,7 @@ def pool_local_status():
 
 @app.route("/api/pool/start_local", methods=["POST"])
 def pool_start_local():
-    # [NOVO v9.9.24] Barreira de Sincronização
+    # BARREIRA AVANÇADA
     ok_sync, msg_sync = _check_sync_barrier()
     if not ok_sync:
         return jsonify({"ok": False, "msg": msg_sync}), 400
@@ -1141,7 +1180,7 @@ def trust_stats():
 
 @app.route("/api/trust/download", methods=["GET"])
 def trust_download():
-    """[v9.9.23] Serve o arquivo trust_network.json assinado para clientes."""
+    """[v9.9.25] Serve o arquivo trust_network.json assinado para clientes."""
     trust = _get_trust_network()
     if trust is None:
         return jsonify({"ok": False, "msg": "TrustNetwork indisponivel"}), 503
@@ -1279,7 +1318,7 @@ def peers_discovered():
 def health():
     try:
         return jsonify({
-            "ok": True, "height": _get_chain().db.height(), "version": "9.9.24",
+            "ok": True, "height": _get_chain().db.height(), "version": "9.9.25",
             "chain_injected": _CHAIN is not None, "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
             "pool_client_local": _POOL_CLIENT_LOCAL is not None,
@@ -1539,5 +1578,5 @@ def api_tx_status(txid_str):
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.24 (Sync Barrier + Dynamic Pool + Dynamic PBFT + Trust Download Fix)")
+    print(f"BRN Server v9.9.25 (Advanced Sync Barrier + Dynamic Pool + PBFT)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
