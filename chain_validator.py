@@ -1,22 +1,8 @@
 """chain_validator.py — Auditoria completa da cadeia BRN (v2.5)
 ================================================================
 v2.5 (2026-11-05):
-  [NEW] --network: Audita os peers, verificando quem está sincronizado,
-        atrasado ou em fork (comparando a altura local e tip).
-  [NEW] --clean: Limpa o bootstrap_peers.json mantendo apenas os
-        peers saudáveis (excluindo os atrasados além da tolerância).
-  [NEW] --consensus: Mostra os validadores ativos e quem assinou
-        o último bloco.
-v2.4 (2026-10-28):
-  [FIX CRÍTICO] _verify_tx_signature agora usa Wallet.verify (que
-                aceita Schnorr BIP-340 E ECDSA como fallback). Antes
-                chamava verify_ecdsa diretamente — rejeitava blocos
-                novos assinados com Schnorr.
-  [FIX] Remove import direto de verify_ecdsa (só usado via Wallet).
-v2.3:
-  [FIX] validators_sig None → [] em blocos antigos.
-v2.2:
-  [NEW] Verificação de validators_sig.
+  [FIX] Correção de erro de sintaxe no print final (f-string com
+        backslash). Python < 3.12 não permite \ dentro de {}.
 ================================================================
 """
 from __future__ import annotations
@@ -709,7 +695,10 @@ if __name__ == "__main__":
     print(f"  Altura              : {r.height}")
     print(f"  Blocos verificados  : {r.blocks_checked}")
     print(f"  Assinaturas válidas : {r.validators_checked}")
-    print(f"  Status              : {'\033[92mSALDAVEL\033[0m' if r.valid else '\033[91mINVALIDA\033[0m'}")
+    
+    # FIX: Remover backslash de dentro da f-string para compatibilidade com Python < 3.12
+    cor_status = "\033[92mSALDAVEL\033[0m" if r.valid else "\033[91mINVALIDA\033[0m"
+    print(f"  Status              : {cor_status}")
     
     if r.errors:
         print(f"\n  Erros ({len(r.errors)}):")
@@ -726,9 +715,6 @@ if __name__ == "__main__":
         
         if args.clean_peers:
             if healthy:
-                # Preserva o localhost se estiver lá
-                local_peers = [p for p in healthy if "127.0.0.1" in p or "localhost" in p]
-                
                 BOOTSTRAP_FILE.write_text(json.dumps(healthy, indent=2), encoding="utf-8")
                 print(f"\n\033[92m[OK]\033[0m bootstrap_peers.json atualizado com {len(healthy)} peer(s) saudáveis!")
             else:
