@@ -25,11 +25,19 @@ class FakeDB:
     def __init__(self): self.h = 0
     def height(self): return self.h
 
+class FakeP2P:
+    """[FIX] Mock do P2PManager para a rede em memória"""
+    def __init__(self, peers: list[str]):
+        self.discovery = self
+        self._peers = peers
+    def listar_peers(self):
+        return self._peers
+
 class FakeChain:
-    def __init__(self, validators):
+    def __init__(self, validators, peers):
         self.db = FakeDB()
         self._validators = validators
-        self.p2p = None
+        self.p2p = FakeP2P(peers)  # [FIX] Injeta o mock de P2P
         self._local_validator_sk = None
     def _get_active_validators(self):
         return list(self._validators)
@@ -96,8 +104,14 @@ def test_scenario(n_honest: int, n_bizantine: int, label: str):
     net = InMemoryNet()
     chains = []
     consensuses = []
+    
+    # [FIX] Lista de todos os endereços na rede
+    all_addrs = [f"node-{i}" for i in range(total)]
+    
     for i in range(total):
-        chain = FakeChain(pubs)
+        # Passa a lista de peers (excluindo o próprio nó)
+        my_peers = [a for a in all_addrs if a != f"node-{i}"]
+        chain = FakeChain(pubs, my_peers)
         net_addr = f"node-{i}"
         def send_fn(peer_addr, msg, _net=net, _me=net_addr):
             return _net.deliver(_me, peer_addr, msg)
@@ -110,7 +124,6 @@ def test_scenario(n_honest: int, n_bizantine: int, label: str):
     leader = consensuses[0]
     # Bizantinos: desativar votos
     for i in range(n_honest, total):
-        consensuses[i].handle_prepare = lambda m: {"ok": False, "error": "byzantine"}
         consensuses[i].handle_prepare = lambda m: {"ok": False, "error": "byzantine"}
         consensuses[i].handle_commit  = lambda m: {"ok": False, "error": "byzantine"}
         consensuses[i].handle_preprepare = lambda m: {"ok": False, "error": "byzantine"}
@@ -166,8 +179,11 @@ def main():
     wallets = [FakeWallet(f"node-{i}") for i in range(4)]
     pubs = [w.pub_hex for w in wallets]
     net = InMemoryNet()
+    
+    all_addrs = [f"node-{i}" for i in range(4)]
     for i in range(4):
-        chain = FakeChain(pubs)
+        my_peers = [a for a in all_addrs if a != f"node-{i}"]
+        chain = FakeChain(pubs, my_peers)
         def send_fn(peer_addr, msg, _net=net, _me=f"node-{i}"):
             return _net.deliver(_me, peer_addr, msg)
         c = PBFTConsensus(chain, wallets[i], send_fn)
