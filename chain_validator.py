@@ -1,8 +1,12 @@
-"""chain_validator.py — Auditoria completa da cadeia BRN (v2.5)
+"""chain_validator.py — Auditoria completa da cadeia BRN (v2.5.1)
 ================================================================
+v2.5.1 (2026-11-06):
+  [FIX] Corrigido SyntaxWarning causado por caractere de escape no docstring.
 v2.5 (2026-11-05):
   [FIX] Correção de erro de sintaxe no print final (f-string com
-        backslash). Python < 3.12 não permite \ dentro de {}.
+        backslash). Python < 3.12 não permite backslash dentro de {}.
+v2.4 (2026-10-28):
+  [FIX CRÍTICO] _verify_tx_signature agora usa Wallet.verify
 ================================================================
 """
 from __future__ import annotations
@@ -21,7 +25,7 @@ from crypto import sha256, double_sha256
 
 log = logging.getLogger("chain_validator")
 
-__version__ = "2.5"
+__version__ = "2.5.1"
 BASE_DIR = Path(__file__).resolve().parent
 BOOTSTRAP_FILE = BASE_DIR / "bootstrap_peers.json"
 PEERS_FILE = BASE_DIR / "peers_discovered.json"
@@ -348,7 +352,7 @@ def _verify_validator_sigs(block: dict, chain, strict: bool = False) -> tuple:
 
 
 # ============================================================
-# AUDITORIA DE REDE E CONSENSO (NOVO v2.5)
+# AUDITORIA DE REDE E CONSENSO
 # ============================================================
 def _fetch_peer_info(ip, port=5000, timeout=3.0):
     """Consulta /api/chain-info para saber a altura e o tip do peer."""
@@ -696,7 +700,6 @@ if __name__ == "__main__":
     print(f"  Blocos verificados  : {r.blocks_checked}")
     print(f"  Assinaturas válidas : {r.validators_checked}")
     
-    # FIX: Remover backslash de dentro da f-string para compatibilidade com Python < 3.12
     cor_status = "\033[92mSALDAVEL\033[0m" if r.valid else "\033[91mINVALIDA\033[0m"
     print(f"  Status              : {cor_status}")
     
