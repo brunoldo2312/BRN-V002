@@ -1,10 +1,9 @@
-"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.17)
+"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.18)
 ================================================================
-v3.17 (2026-11-06):
-  [FIX] generate_wallet() e create_and_unlock() agora garantem que a
-        carteira seja salva em disco (current_wallet.enc) usando a 
-        senha do .env, mesmo que o nó esteja offline. Em seguida, 
-        envia a chave para o nó em memória.
+v3.18 (2026-11-06):
+  [NEW] check_sync_barrier(): impede a mineração se o nó estiver
+        atrasado em relação aos peers da rede (evita forks e 
+        rejeições de blocos).
 ================================================================
 """
 from __future__ import annotations
@@ -18,7 +17,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "3.17"
+__version__ = "3.18"
 
 try:
     import requests
@@ -161,7 +160,6 @@ class WalletApi:
 
     def create_and_unlock(self, password: str) -> dict:
         global _WALLET_SESSION
-        # [FIX] Usa a senha fornecida ou a do .env
         pwd = (password or "").strip() or _get_default_password()
         
         if not pwd:
@@ -224,9 +222,6 @@ class WalletApi:
             return {"ok": True, **_WALLET_SESSION}
         return {"ok": False, "msg": "locked"}
 
-    # =================================================================
-    # [FIX v3.17] Gera carteira localmente e salva em disco, sem depender da API
-    # =================================================================
     def generate_wallet(self, password: str = "") -> dict:
         try:
             from wallet import Wallet
@@ -236,10 +231,8 @@ class WalletApi:
             if not pwd:
                 return {"erro": "Senha não definida na GUI e não encontrada no .env"}
 
-            # 1. Gera a carteira
             w = Wallet()
             
-            # 2. Salva em disco (current_wallet.enc)
             r = save_current_wallet(pwd, {
                 "address": w.address,
                 "private_key": w.priv_hex,
@@ -249,7 +242,6 @@ class WalletApi:
             if not r.get("ok"):
                 return {"erro": f"Falha ao salvar carteira: {r.get('msg')}"}
 
-            # 3. Atualiza sessão local
             global _WALLET_SESSION
             _WALLET_SESSION.update({
                 "address": w.address,
@@ -257,7 +249,6 @@ class WalletApi:
                 "public_key": w.pub_hex,
             })
 
-            # 4. Manda a chave para o nó (para minerar e assinar)
             _sync_sk_to_chain(w.priv_hex, w.address, w.pub_hex)
 
             return {
@@ -467,6 +458,35 @@ class WalletApi:
             return _get(f"/api/verificar-recebimento/{address}/{txid}")
         except Exception as e:
             return {"ok": False, "msg": str(e)}
+
+    def check_sync_barrier(self) -> dict:
+        """Verifica se o nó está sincronizado antes de minerar."""
+        try:
+            st = _get("/api/status", timeout=5.0)
+            if "error" in st:
+                return {"ok": False, "msg": "Nó offline. Verifique o main.py."}
+            
+            local_h = st.get("height", 0)
+            if local_h < 0:
+                return {"ok": False, "msg": "Blockchain vazia. Sincronize primeiro."}
+
+            sync = _get("/api/sync-info", timeout=5.0)
+            if "error" in sync:
+                return {"ok": True, "msg": "Sem dados de sync. Liberando mineração."}
+            
+            target_h = sync.get("sync", {}).get("target", local_h)
+            peers = sync.get("sync", {}).get("peers", 0)
+
+            if peers == 0:
+                return {"ok": False, "msg": "Nenhum peer conectado. Aguardando a rede."}
+
+            if local_h < (target_h - 1):
+                falta = target_h - local_h
+                return {"ok": False, "msg": f"Você está {falta} bloco(s) atrás do topo. Sincronizando..."}
+
+            return {"ok": True, "msg": "Sincronizado. Iniciando mineração."}
+        except Exception as e:
+            return {"ok": False, "msg": f"Erro na verificação: {e}"}
 
     def start_mining(self, address: str, pubkey: str) -> dict:
         try:
