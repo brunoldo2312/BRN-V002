@@ -1,14 +1,8 @@
-"""main.py — Entrypoint do nó BRN (v13.8.6)
+"""main.py — Entrypoint do nó BRN (v13.9.0)
 ================================================================
-v13.8.6 (2026-11-05):
-  [FIX CRÍTICO] Adicionado ensure_multisig() e broadcast_block.
-        Agora o bloco minerado é propagado e os peers são 
-        acionados para assinar (resolve o problema de fork solo).
-  [FIX] Carregamento automático da carteira (wallet_obj) e
-        injeção da SK no chain.set_local_validator_sk().
-  [FIX] Carregamento da identidade P2P (node_identity.enc).
-v13.8.5 (2026-11-04):
-  [FIX] GUI abre o index_wallet.html.
+v13.9.0 (2026-11-06):
+  [NEW] Integração do TrustDaemon (auto-cura da rede).
+  [KEEP] Coleta de assinaturas P2P em background.
 ================================================================
 """
 from __future__ import annotations
@@ -29,8 +23,8 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.8.6"
-    BUILD_DATE = "2026-11-05"
+    VERSION = "13.9.0"
+    BUILD_DATE = "2026-11-06"
 
 def parse_args():
     p = argparse.ArgumentParser(prog="main.py")
@@ -240,6 +234,25 @@ def main() -> int:
         except Exception as e:
             log.warning("[P2P] Falha ao configurar broadcast: %s", e)
 
+    # [NOVO] 7.1 Inicia o Daemon da Trust Network
+    if trust:
+        try:
+            from trust_daemon import start_daemon
+            if not hasattr(chain, "_stop_trust_daemon"):
+                chain._stop_trust_daemon = threading.Event()
+            
+            start_daemon(
+                chain=chain, 
+                trust=trust, 
+                p2p=p2p, 
+                password=password, 
+                is_origin=is_origin, 
+                stop_event=chain._stop_trust_daemon
+            )
+            log.info("[TrustDaemon] Auto-gerenciamento da rede ativado.")
+        except Exception as e:
+            log.warning("[TrustDaemon] Falha ao iniciar: %s", e)
+
     # 8. Pool Manager (somente Origem)
     pool = None
     if is_origin:
@@ -294,6 +307,8 @@ def main() -> int:
 
     def _shutdown(*_):
         log.info("[shutdown] encerrando...")
+        if hasattr(chain, "_stop_trust_daemon"):
+            chain._stop_trust_daemon.set()
         try: chain.db.close()
         except Exception: pass
         os._exit(0)
