@@ -23,43 +23,58 @@
   .status-banner.info    { background: rgba(88,166,255,0.1); border-color: #58a6ff; color: #58a6ff; }
   .status-banner .icon   { font-size: 2rem; } .status-banner .main   { flex: 1; }
   .status-banner .title  { font-size: 1.1rem; font-weight: 700; } .status-banner .detail { font-size: 0.85rem; opacity: 0.9; margin-top: 2px; }
-  .nodes-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; margin-bottom: 20px; }
+  
+  .nodes-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; margin-bottom: 20px; }
   .node-card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 16px 18px; transition: border-color 0.3s; }
   .node-card.online    { border-left: 4px solid #3fb950; } .node-card.offline   { border-left: 4px solid #f85149; opacity: 0.6; }
   .node-card.fork      { border-left: 4px solid #f85149; background: rgba(248,81,73,0.05); } .node-card.behind    { border-left: 4px solid #d29922; }
-  .node-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 8px; }
-  .node-name { font-size: 1rem; font-weight: 700; } .node-host { font-size: 0.75rem; color: #8b949e; }
-  .badges { display: flex; gap: 6px; flex-wrap: wrap; }
-  .badge { padding: 3px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px; }
+  
+  .node-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; flex-wrap: wrap; gap: 8px; }
+  .node-name { font-size: 1rem; font-weight: 700; } .node-host { font-size: 0.75rem; color: #8b949e; margin-top: 2px; }
+  .node-id { font-size: 0.72rem; color: #8b949e; font-family: ui-monospace, monospace; margin-top: 2px; }
+  
+  .badges { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; max-width: 60%; }
+  .badge { padding: 3px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px; white-space: nowrap;}
   .badge.ok     { background: rgba(63,185,80,0.15); color: #3fb950; } .badge.warn   { background: rgba(210,153,34,0.15); color: #d29922; }
   .badge.err    { background: rgba(248,81,73,0.15); color: #f85149; } .badge.info   { background: rgba(88,166,255,0.15); color: #58a6ff; }
   .badge.gray   { background: rgba(139,148,158,0.15); color: #8b949e; } .badge.auto   { background: rgba(163,113,247,0.15); color: #a371f7; }
-  .badge.manual { background: rgba(88,166,255,0.12); color: #58a6ff; } .badge.mining { background: rgba(88,166,255,0.2); color: #58a6ff; animation: pulse 2s infinite; }
+  .badge.manual { background: rgba(88,166,255,0.12); color: #58a6ff; } 
+  .badge.mining { background: rgba(88,166,255,0.2); color: #58a6ff; animation: pulse 2s infinite; }
   .badge.pool   { background: rgba(46,160,67,0.2); color: #3fb950; }
+  .badge.validator { background: rgba(163,113,247,0.2); color: #a371f7; border: 1px solid #a371f7; }
+  .badge.signed { background: rgba(63,185,80,0.2); color: #3fb950; border: 1px solid #3fb950; }
+  .badge.unsigned { background: rgba(210,153,34,0.2); color: #d29922; border: 1px solid #d29922; }
   @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.5 } }
+  
   .node-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
   .stat .k { font-size: 0.7rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.4px; }
   .stat .v { font-size: 1.05rem; font-weight: 600; color: #58a6ff; font-variant-numeric: tabular-nums; word-break: break-all; }
   .stat .v.sm { font-size: 0.85rem; } .stat .v.green { color: #3fb950; } .stat .v.red   { color: #f85149; } .stat .v.yellow { color: #d29922; }
+  
   .node-details { border-top: 1px solid #21262d; padding-top: 10px; font-size: 0.8rem; }
   .node-details .line { display: flex; justify-content: space-between; margin-bottom: 4px; gap: 8px; }
   .node-details .line .k { color: #8b949e; } .node-details .line .v { color: #e6edf3; font-variant-numeric: tabular-nums; text-align: right; word-break: break-all; }
   .node-details .line .v.mono { font-family: ui-monospace, Menlo, monospace; font-size: 0.75rem; } .node-details .line .v.alert { color: #f85149; font-weight: 700; }
+  
   .node-actions { margin-top: 10px; display: flex; gap: 6px; flex-wrap: wrap; }
   .section { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 16px 20px; margin-bottom: 16px; }
-  .section h2 { font-size: 1rem; margin-bottom: 12px; }
+  .section h2 { font-size: 1rem; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center;}
+  .section h2 .consensus-info { font-size: 0.8rem; font-weight: normal; color: #8b949e; }
+  
   table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
   th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #21262d; font-variant-numeric: tabular-nums; }
   th { color: #8b949e; font-weight: 500; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.5px; }
   tr:hover { background: #1c2128; }
   td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 0.78rem; color: #79c0ff; }
   td.green { color: #3fb950; } td.red   { color: #f85149; font-weight: 700; } td.yellow { color: #d29922; }
+  
   .alerts { margin-bottom: 16px; }
   .alert { padding: 10px 14px; border-radius: 6px; margin-bottom: 8px; font-size: 0.85rem; display: flex; align-items: flex-start; gap: 10px; }
   .alert.err  { background: rgba(248,81,73,0.1); border: 1px solid rgba(248,81,73,0.4); color: #f85149; }
   .alert.warn { background: rgba(210,153,34,0.1); border: 1px solid rgba(210,153,34,0.4); color: #d29922; }
   .alert.info { background: rgba(88,166,255,0.1); border: 1px solid rgba(88,166,255,0.4); color: #58a6ff; }
   .alert .icon { flex-shrink: 0; }
+  
   .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); display: none; align-items: center; justify-content: center; z-index: 1000; }
   .modal-overlay.show { display: flex; }
   .modal { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 24px; max-width: 460px; width: 90%; }
@@ -94,8 +109,23 @@
   <div class="nodes-grid" id="nodesGrid"></div>
 
   <div class="section" id="comparisonSection" style="display:none;">
-    <h2>📊 Comparação</h2>
-    <table><thead><tr><th>Nó</th><th>Host</th><th>Altura</th><th>Tip (hash)</th><th>Dific.</th><th>Peers</th><th>Mineração</th><th>Sync</th><th>Latência</th></tr></thead><tbody id="comparisonBody"></tbody></table>
+    <h2>
+      📊 Comparação e Consenso
+      <span id="globalConsensusText" class="consensus-info"></span>
+    </h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Nó</th>
+          <th>Host</th>
+          <th>Altura</th>
+          <th>Tip (hash)</th>
+          <th>Consenso</th>
+          <th>Latência</th>
+        </tr>
+      </thead>
+      <tbody id="comparisonBody"></tbody>
+    </table>
   </div>
 
   <div class="section">
@@ -108,7 +138,7 @@
     </div>
   </div>
 
-  <div class="footer">BRN Monitor v1.4 · <a href="http://127.0.0.1:8080/">Explorer</a></div>
+  <div class="footer">BRN Monitor v1.5 · <a href="http://127.0.0.1:8080/">Explorer</a></div>
 </div>
 
 <div class="modal-overlay" id="addModal">
@@ -123,7 +153,7 @@
 
 <script>
 "use strict";
-const STORAGE_KEY = "brn_monitor_nodes_v5";
+const STORAGE_KEY = "brn_monitor_nodes_v6";
 
 // ⚠️ IPs DO SEU CLUSTER AQUI
 const DEFAULT_NODES = [
@@ -140,6 +170,12 @@ let nodeStates = {};
 let autoTimer = null;
 let lastDiscoveryTs = 0;
 let discoveryInFlight = false;
+
+// Estado Global de Consenso
+let activeValidators = [];
+let requiredSigs = 0;
+let lastBlockSigs = new Set();
+let ipToPubkeyMap = {};
 
 function loadNodes() {
   try { const raw = localStorage.getItem(STORAGE_KEY); if (raw) { const parsed = JSON.parse(raw); if (Array.isArray(parsed) && parsed.length > 0) return parsed; } } catch (e) {}
@@ -214,7 +250,7 @@ async function queryNode(node) {
     fetchFromNode(host, port, "/api/chain-info"),
     fetchFromNode(host, port, "/api/sync/status"), 
     fetchFromNode(host, port, "/api/miner/status"),
-    fetchFromNode(host, port, "/api/pool/stats") // [NOVO] Puxa estatísticas do Pool
+    fetchFromNode(host, port, "/api/pool/stats") 
   ]);
   const anyOk = status.ok || chain.ok || sync.ok || miner.ok;
   return {
@@ -225,6 +261,42 @@ async function queryNode(node) {
     latency: Math.max(status.latency || 0, chain.latency || 0, sync.latency || 0, miner.latency || 0),
     error: !anyOk ? (status.error || "offline") : null, ts: Date.now(),
   };
+}
+
+// [NOVO] Busca dados globais de consenso de apenas UM nó (para não sobrecarregar)
+async function fetchGlobalConsensus() {
+  const firstOnline = nodes.find(n => nodeStates[n.host] && nodeStates[n.host].online) || nodes[0];
+  if (!firstOnline) return;
+  
+  const [trustData, consData, latestData] = await Promise.all([
+    fetchFromNode(firstOnline.host, firstOnline.port, "/api/trust/nodes"),
+    fetchFromNode(firstOnline.host, firstOnline.port, "/api/consensus/validators"),
+    fetchFromNode(firstOnline.host, firstOnline.port, "/api/latest")
+  ]);
+
+  // 1. Mapear IP -> Pubkey
+  ipToPubkeyMap = {};
+  if (trustData.ok && trustData.data.ok) {
+    for (const n of trustData.data.nodes) {
+      if (n.address && n.node_id) {
+        const ip = n.address.split(":")[0];
+        ipToPubkeyMap[ip] = n.node_id.toLowerCase();
+      }
+    }
+  }
+
+  // 2. Validadores Ativos e Quórum
+  if (consData.ok && consData.data.ok) {
+    activeValidators = (consData.data.validators || []).map(v => (v.pubkey_full || "").toLowerCase());
+    requiredSigs = consData.data.required_sigs || 0;
+  }
+
+  // 3. Quem assinou o último bloco
+  if (latestData.ok && Array.isArray(latestData.data) && latestData.data.length > 0) {
+    const lastBlock = latestData.data[0];
+    const sigs = lastBlock.validators_sig || [];
+    lastBlockSigs = new Set(sigs.map(s => (s.pubkey || "").toLowerCase()));
+  }
 }
 
 function analyzeNetwork(states) {
@@ -238,10 +310,18 @@ function analyzeNetwork(states) {
   for (const [h, hashes] of Object.entries(tipMap)) { if (hashes.size > 1) { forkAtHeight = parseInt(h); break; } }
   const minersRunning = online.filter(s => s.miner && s.miner.running);
   let level = "ok"; let title = "Rede OK — todos sincronizados"; let detail = `${online.length} nó(s) online · altura ${maxH}`;
+  
   if (forkAtHeight !== null) { level = "err"; title = `🔴 FORK DETECTADO no bloco #${forkAtHeight}`; detail = "Nós têm hashes diferentes na mesma altura."; alerts.push({ type: "err", msg: `FORK em #${forkAtHeight}: blocos divergentes.` }); }
   else if (diffH > 0) { if (diffH <= 2) { level = "warn"; title = "Sincronizando — diferença pequena"; detail = `Diferença de ${diffH} bloco(s) — normal.`; } else if (diffH <= 10) { level = "warn"; title = `Atenção — ${diffH} blocos de diferença`; detail = "Alguns nós estão atrás."; } else { level = "err"; title = `Problema — ${diffH} blocos de diferença`; detail = "Nós muito dessincronizados."; } }
   if (minersRunning.length === 0) { if (level === "ok") level = "warn"; alerts.push({ type: "warn", msg: "⚠ Nenhum nó está minerando." }); }
   else if (minersRunning.length > 1) { if (level === "ok") level = "warn"; alerts.push({ type: "warn", msg: `⚠ ${minersRunning.length} nós minerando simultaneamente.` }); }
+  
+  // Checagem de Consenso Global
+  if (requiredSigs > 0 && lastBlockSigs.size < requiredSigs) {
+    if (level === "ok") level = "warn";
+    alerts.push({ type: "warn", msg: `⚠ Multi-sig incompleto no último bloco: ${lastBlockSigs.size}/${requiredSigs} assinaturas.` });
+  }
+
   return { level, title, detail, alerts };
 }
 
@@ -249,46 +329,120 @@ function render() {
   const grid = document.getElementById("nodesGrid");
   if (nodes.length === 0) return grid.innerHTML = `<div class="node-card"><p style="color:#8b949e;text-align:center">Nenhum nó configurado.</p></div>`;
   grid.innerHTML = "";
+  
   for (const n of nodes) {
     const st = nodeStates[n.host];
     const card = document.createElement("div"); card.className = "node-card";
     if (!st) { card.classList.add("offline"); const b0 = []; if (n.auto) b0.push('<span class="badge auto">auto</span>'); else if (n.manual) b0.push('<span class="badge manual">manual</span>'); b0.push('<span class="badge gray">carregando</span>'); card.innerHTML = `<div class="node-header"><div><div class="node-name">${escapeHtml(n.name)}</div><div class="node-host">${escapeHtml(n.host)}:${n.port}</div></div><div class="badges">${b0.join("")}</div></div>`; grid.appendChild(card); continue; }
     if (!st.online) { card.classList.add("offline"); const badges = []; if (n.auto) badges.push('<span class="badge auto">auto</span>'); else if (n.manual) badges.push('<span class="badge manual">manual</span>'); badges.push('<span class="badge err">offline</span>'); card.innerHTML = `<div class="node-header"><div><div class="node-name">${escapeHtml(n.name)}</div><div class="node-host">${escapeHtml(n.host)}:${n.port}</div></div><div class="badges">${badges.join("")}</div></div><div class="node-stats"><div class="stat"><div class="k">Erro</div><div class="v sm red">${escapeHtml(st.error || "?")}</div></div></div><div class="node-actions"><button class="btn" onclick="removeNode('${escapeAttr(n.host)}')">Remover</button></div>`; grid.appendChild(card); continue; }
+    
     const c = st.chain || {}; const s = st.status || {}; const sy = st.sync || {}; const m = st.miner || {}; const p = st.pool || {};
     const height = c.height ?? s.height ?? "?"; const tip = c.tip_hash || "?"; const diff = c.difficulty ?? s.difficulty ?? "?"; const peers = s.peers ?? "?";
     
+    // [NOVO] Lógica de Validador e Assinatura
+    const nodePubkey = ipToPubkeyMap[n.host] || (n.node_id || "").toLowerCase();
+    const isValidator = nodePubkey && activeValidators.includes(nodePubkey);
+    const hasSigned = nodePubkey && lastBlockSigs.has(nodePubkey);
+
     const badges = []; if (n.auto) badges.push('<span class="badge auto">auto</span>'); else if (n.manual) badges.push('<span class="badge manual">manual</span>');
+    
+    if (isValidator) {
+        badges.push('<span class="badge validator">🛡️ VALIDADOR</span>');
+        if (hasSigned) badges.push('<span class="badge signed">✓ Assinou</span>');
+        else badges.push('<span class="badge unsigned">✗ Não Assinou</span>');
+    }
+
     if (m.running) badges.push('<span class="badge mining">⛏ minerando</span>'); else badges.push('<span class="badge gray">○ parado</span>');
-    if (p.total > 0) badges.push(`<span class="badge pool">🌐 pool (${p.total} miners)</span>`); // [NOVO] Badge do Pool
+    if (p.total > 0) badges.push(`<span class="badge pool">🌐 pool (${p.total} miners)</span>`); 
     if (sy.synced) badges.push('<span class="badge ok">✓ sync</span>'); else if (sy.syncing) badges.push('<span class="badge warn">↻ sync</span>');
     if (sy.forking) badges.push('<span class="badge err">⚠ fork</span>');
     
     const allOnline = Object.values(nodeStates).filter(x => x && x.online); const maxHeight = Math.max(...allOnline.map(x => x.chain?.height || 0)); const isBehind = (c.height || 0) < maxHeight; const behindBy = maxHeight - (c.height || 0);
     if (isBehind && behindBy > 0) { card.classList.add("behind"); badges.push(`<span class="badge warn">↓ -${behindBy}</span>`); } else { card.classList.add("online"); }
     
-    // [NOVO] Linha extra para dados do Pool
     let poolHtml = "";
     if (p.total > 0) {
         poolHtml = `<div class="line"><span class="k">Pool (Shares/Blocks)</span><span class="v">${p.shares || 0} shares · ${p.blocks || 0} blocos</span></div>`;
     }
 
-    card.innerHTML = `<div class="node-header"><div><div class="node-name">${escapeHtml(n.name)}</div><div class="node-host">${escapeHtml(n.host)}:${n.port} · <span style="color:#8b949e">${escapeHtml(n.role || "?")}</span></div></div><div class="badges">${badges.join("")}</div></div><div class="node-stats"><div class="stat"><div class="k">Altura</div><div class="v">${formatNum(height)}</div></div><div class="stat"><div class="k">Dificuldade</div><div class="v">${diff}</div></div><div class="stat"><div class="k">Peers</div><div class="v">${peers}</div></div><div class="stat"><div class="k">Latência</div><div class="v ${st.latency > 2000 ? 'yellow' : 'green'}">${st.latency}ms</div></div></div><div class="node-details"><div class="line"><span class="k">Tip hash</span><span class="v mono">${shortHash(tip)}</span></div><div class="line"><span class="k">Sync</span><span class="v ${sy.synced ? 'green' : 'yellow'}">${sy.local_height ?? "?"} → ${sy.target_height ?? "?"} (${(sy.progress ?? 0).toFixed(1)}%)</span></div><div class="line"><span class="k">Minerador</span><span class="v">${m.running ? `rodando · ${m.blocks_mined ?? 0} blocos` : "parado"}</span></div>${poolHtml}${m.last_error ? `<div class="line"><span class="k">Último erro</span><span class="v alert">${escapeHtml(m.last_error)}</span></div>` : ""}</div><div class="node-actions"><button class="btn" onclick="removeNode('${escapeAttr(n.host)}')">Remover</button></div>`;
+    const nodeIdText = nodePubkey ? shortHash(nodePubkey) : "Desconhecido";
+
+    card.innerHTML = `
+      <div class="node-header">
+        <div>
+          <div class="node-name">${escapeHtml(n.name)}</div>
+          <div class="node-host">${escapeHtml(n.host)}:${n.port} · <span style="color:#8b949e">${escapeHtml(n.role || "?")}</span></div>
+          <div class="node-id" title="${nodePubkey}">ID: ${nodeIdText}</div>
+        </div>
+        <div class="badges">${badges.join("")}</div>
+      </div>
+      <div class="node-stats">
+        <div class="stat"><div class="k">Altura</div><div class="v">${formatNum(height)}</div></div>
+        <div class="stat"><div class="k">Dificuldade</div><div class="v">${diff}</div></div>
+        <div class="stat"><div class="k">Peers</div><div class="v">${peers}</div></div>
+        <div class="stat"><div class="k">Latência</div><div class="v ${st.latency > 2000 ? 'yellow' : 'green'}">${st.latency}ms</div></div>
+      </div>
+      <div class="node-details">
+        <div class="line"><span class="k">Tip hash</span><span class="v mono">${shortHash(tip)}</span></div>
+        <div class="line"><span class="k">Sync</span><span class="v ${sy.synced ? 'green' : 'yellow'}">${sy.local_height ?? "?"} → ${sy.target_height ?? "?"} (${(sy.progress ?? 0).toFixed(1)}%)</span></div>
+        <div class="line"><span class="k">Minerador</span><span class="v">${m.running ? `rodando · ${m.blocks_mined ?? 0} blocos` : "parado"}</span></div>
+        ${poolHtml}
+        ${m.last_error ? `<div class="line"><span class="k">Último erro</span><span class="v alert">${escapeHtml(m.last_error)}</span></div>` : ""}
+      </div>
+      <div class="node-actions">
+        <button class="btn" onclick="removeNode('${escapeAttr(n.host)}')">Remover</button>
+      </div>`;
     grid.appendChild(card);
   }
   renderComparison();
 }
 
 function renderComparison() {
-  const section = document.getElementById("comparisonSection"); const tbody = document.getElementById("comparisonBody"); const online = Object.values(nodeStates).filter(s => s.online && s.chain);
+  const section = document.getElementById("comparisonSection"); 
+  const tbody = document.getElementById("comparisonBody"); 
+  const online = Object.values(nodeStates).filter(s => s.online && s.chain);
+  
+  const consText = document.getElementById("globalConsensusText");
+  if (requiredSigs > 0) {
+      consText.innerHTML = `Quórum: ${lastBlockSigs.size}/${requiredSigs} assinaturas`;
+  } else {
+      consText.innerHTML = `Modo Bootstrap (sem quórum)`;
+  }
+
   if (online.length === 0) return section.style.display = "none";
   section.style.display = "block";
+  
   const tipMap = {};
   for (const s of online) { const h = s.chain.height; if (!tipMap[h]) tipMap[h] = new Set(); tipMap[h].add(s.chain.tip_hash); }
   let forkAtHeight = null; for (const [h, hashes] of Object.entries(tipMap)) { if (hashes.size > 1) { forkAtHeight = parseInt(h); break; } }
+  
   tbody.innerHTML = "";
   for (const s of online) {
-    const tr = document.createElement("tr"); const h = s.chain.height; const tip = s.chain.tip_hash; const isForkHere = forkAtHeight === h; const maxH = Math.max(...online.map(x => x.chain.height));
-    tr.innerHTML = `<td><strong>${escapeHtml(s.name)}</strong></td><td class="mono">${escapeHtml(s.host)}</td><td class="${h < maxH ? 'yellow' : 'green'}">${formatNum(h)}</td><td class="mono ${isForkHere ? 'red' : ''}">${shortHash(tip)}</td><td>${s.chain.difficulty ?? "?"}</td><td>${s.status?.peers ?? "?"}</td><td class="${s.miner?.running ? 'green' : ''}">${s.miner?.running ? "⛏ " + (s.miner.blocks_mined ?? 0) : "—"}</td><td class="${s.sync?.synced ? 'green' : 'yellow'}">${s.sync?.synced ? "✓" : "↻"} ${(s.sync?.progress ?? 0).toFixed(1)}%</td><td>${s.latency}ms</td>`;
+    const tr = document.createElement("tr"); 
+    const h = s.chain.height; 
+    const tip = s.chain.tip_hash; 
+    const isForkHere = forkAtHeight === h; 
+    const maxH = Math.max(...online.map(x => x.chain.height));
+    
+    // Dados de Consenso para a Tabela
+    const node = nodes.find(n => n.host === s.host) || {};
+    const nodePubkey = ipToPubkeyMap[s.host] || (node.node_id || "").toLowerCase();
+    const isValidator = nodePubkey && activeValidators.includes(nodePubkey);
+    const hasSigned = nodePubkey && lastBlockSigs.has(nodePubkey);
+    
+    let consHtml = "—";
+    if (isValidator) {
+        consHtml = hasSigned ? `<span style="color:#3fb950">✓ Assinou</span>` : `<span style="color:#d29922">✗ Não Assinou</span>`;
+    }
+
+    tr.innerHTML = `
+      <td><strong>${escapeHtml(s.name)}</strong></td>
+      <td class="mono">${escapeHtml(s.host)}</td>
+      <td class="${h < maxH ? 'yellow' : 'green'}">${formatNum(h)}</td>
+      <td class="mono ${isForkHere ? 'red' : ''}">${shortHash(tip)}</td>
+      <td>${consHtml}</td>
+      <td>${s.latency}ms</td>
+    `;
     tbody.appendChild(tr);
   }
 }
@@ -299,15 +453,24 @@ async function loadAll() {
     discoveryInFlight = true;
     try { const discovered = await fetchDiscoveredPeers(); if (discovered.length > 0) mergeDiscoveredPeers(discovered); lastDiscoveryTs = now; } catch (e) {} finally { discoveryInFlight = false; }
   }
+  
   const results = await Promise.all(nodes.map(n => queryNode(n)));
   for (const r of results) nodeStates[r.host] = r;
+  
+  // Puxa dados de consenso baseado no estado atualizado
+  await fetchGlobalConsensus();
+
   const allStates = Object.values(nodeStates).filter(s => s && nodes.some(n => n.host === s.host));
   const analysis = analyzeNetwork(allStates);
+  
   const banner = document.getElementById("statusBanner"); banner.style.display = "flex"; banner.className = `status-banner ${analysis.level}`;
   document.getElementById("bannerIcon").textContent = analysis.level === "ok" ? "✓" : analysis.level === "warn" ? "⚠" : "✗";
   document.getElementById("bannerTitle").textContent = analysis.title; document.getElementById("bannerDetail").textContent = analysis.detail;
+  
   const alertEl = document.getElementById("alerts");
-  if (analysis.alerts.length === 0) alertEl.innerHTML = ""; else alertEl.innerHTML = analysis.alerts.map(a => `<div class="alert ${a.type}"><span class="icon">${a.type === "err" ? "✗" : "⚠"}</span><span>${escapeHtml(a.msg)}</span></div>`).join("");
+  if (analysis.alerts.length === 0) alertEl.innerHTML = ""; 
+  else alertEl.innerHTML = analysis.alerts.map(a => `<div class="alert ${a.type}"><span class="icon">${a.type === "err" ? "✗" : "⚠"}</span><span>${escapeHtml(a.msg)}</span></div>`).join("");
+  
   render();
 }
 
