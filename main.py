@@ -1,5 +1,8 @@
-"""main.py — Entrypoint do nó BRN (v13.9.0)
+"""main.py — Entrypoint do nó BRN (v13.9.1)
 ================================================================
+v13.9.1 (2026-11-06):
+  [NEW] Auto-detecção de IP (Tailscale/LAN) e atualização automática
+        do BRN_SEU_ENDERECO no arquivo brn_network.env.
 v13.9.0 (2026-11-06):
   [NEW] Integração do TrustDaemon (auto-cura da rede).
   [KEEP] Coleta de assinaturas P2P em background.
@@ -15,6 +18,9 @@ import threading
 import time
 import json
 import logging
+import re
+import socket
+import subprocess
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -23,7 +29,7 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.0"
+    VERSION = "13.9.1"
     BUILD_DATE = "2026-11-06"
 
 def parse_args():
@@ -40,6 +46,61 @@ def parse_args():
     p.add_argument("--version", action="store_true", help="mostra versão")
     p.add_argument("--skip-verify", action="store_true", help="pula verificações")
     return p.parse_args()
+
+def _auto_update_env_ip():
+    """Detecta o IP da máquina (Tailscale ou LAN) e atualiza o .env."""
+    env_file = BASE_DIR / "brn_network.env"
+    if not env_file.exists():
+        return
+
+    # 1. Tenta Tailscale
+    best_ip = None
+    try:
+        r = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=3)
+        if r.returncode == 0 and r.stdout.strip():
+            best_ip = r.stdout.strip().split("\n")[0].strip()
+    except Exception:
+        pass
+
+    # 2. Fallback para LAN
+    if not best_ip:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            best_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            pass
+
+    if not best_ip or best_ip.startswith("127."):
+        return
+
+    try:
+        content = env_file.read_text(encoding="utf-8")
+        
+        # Pega a porta P2P do arquivo (se existir) ou usa 6001
+        p2p_port = "6001"
+        port_match = re.search(r"^BRN_P2P_PORT=(\d+)", content, re.MULTILINE)
+        if port_match:
+            p2p_port = port_match.group(1)
+
+        full_addr = f"{best_ip}:{p2p_port}"
+
+        # Verifica se já está atualizado
+        if re.search(rf"^BRN_SEU_ENDERECO={re.escape(full_addr)}$", content, re.MULTILINE):
+            return
+            
+        # Atualiza a linha ou adiciona no final
+        if "BRN_SEU_ENDERECO=" in content:
+            content = re.sub(r"^BRN_SEU_ENDERECO=.*$", f"BRN_SEU_ENDERECO={full_addr}", content, flags=re.MULTILINE)
+        else:
+            content += f"\nBRN_SEU_ENDERECO={full_addr}\n"
+            
+        env_file.write_text(content, encoding="utf-8")
+        print(f"[auto-ip] BRN_SEU_ENDERECO atualizado automaticamente para {full_addr}")
+        
+    except Exception as e:
+        print(f"[auto-ip] Falha ao atualizar .env: {e}")
 
 def _load_env_file():
     env_file = BASE_DIR / "brn_network.env"
@@ -130,6 +191,8 @@ def main() -> int:
     if args.skip_verify:
         print("[main] --skip-verify: assumindo que o .bat já fez as verificações")
 
+    # Chama a auto-detecção de IP antes de carregar o .env para os.environ
+    _auto_update_env_ip()
     _load_env_file()
 
     if args.client_mode: os.environ["BRN_IS_ORIGIN"] = "0"
@@ -234,7 +297,7 @@ def main() -> int:
         except Exception as e:
             log.warning("[P2P] Falha ao configurar broadcast: %s", e)
 
-    # [NOVO] 7.1 Inicia o Daemon da Trust Network
+    # 7.1 Inicia o Daemon da Trust Network
     if trust:
         try:
             from trust_daemon import start_daemon
