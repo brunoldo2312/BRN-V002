@@ -1,15 +1,4 @@
 """test_pbft_consensus.py — teste isolado do motor PBFT (sem rede).
-
-Simula 4 nós em um único processo usando sockets em memória e
-verifica que:
-  1. Com 4 validadores, quórum=3 e f=1 (tolera 1 bizantino).
-  2. Com todos honestos, decisão acontece.
-  3. Com 1 bizantino (não vota), ainda decide (3 de 4).
-  4. Com 2 bizantinos (não votam), NÃO decide (2 < quorum=3).
-  5. Voto com assinatura inválida é rejeitado.
-
-Uso:
-    BRN_PBFT_ENABLED=1 python test_pbft_consensus.py
 """
 from __future__ import annotations
 import os
@@ -18,6 +7,7 @@ os.environ["BRN_PBFT_ENABLED"] = "1"
 import sys
 import time
 import hashlib
+import threading
 from typing import Optional
 
 # ─── Mock chain mínimo ───────────────────────────────────────────────
@@ -26,7 +16,6 @@ class FakeDB:
     def height(self): return self.h
 
 class FakeP2P:
-    """[FIX] Mock do P2PManager para a rede em memória"""
     def __init__(self, peers: list[str]):
         self.discovery = self
         self._peers = peers
@@ -37,7 +26,7 @@ class FakeChain:
     def __init__(self, validators, peers):
         self.db = FakeDB()
         self._validators = validators
-        self.p2p = FakeP2P(peers)  # [FIX] Injeta o mock de P2P
+        self.p2p = FakeP2P(peers)
         self._local_validator_sk = None
     def _get_active_validators(self):
         return list(self._validators)
@@ -49,18 +38,15 @@ class FakeChain:
 
 class FakeWallet:
     def __init__(self, tag: str):
-        # chave fake — só precisamos de pub_hex e sign/verify consistentes
         self.tag = tag
         self.pub_hex = hashlib.sha256(tag.encode()).hexdigest()
     def sign(self, data: bytes) -> str:
-        # "assinatura" determinística para teste
         return hashlib.sha256(self.pub_hex.encode() + data).hexdigest()
 
 def fake_verify(data: bytes, sig: str, pub: str) -> bool:
     expected = hashlib.sha256(pub.encode() + data).hexdigest()
     return sig == expected
 
-# Monkey-patch Wallet.verify para testes
 import wallet as _w
 _w.Wallet.verify = staticmethod(fake_verify)
 
@@ -69,34 +55,43 @@ from pbft_consensus import (
     _PHASE_PRE, _PHASE_PP, _PHASE_COM,
 )
 
-# ─── Simulador de rede local (entrega mensagens diretamente) ─────────
+# ─── Simulador de rede local (assíncrono via fila) ───────────────────
 class InMemoryNet:
     def __init__(self):
         self.nodes: dict[str, PBFTConsensus] = {}
+        self.queue = []
+        self.lock = threading.Lock()
+        
     def register(self, addr: str, consensus: PBFTConsensus):
         self.nodes[addr] = consensus
+        
     def deliver(self, src: str, dst: str, msg: dict) -> Optional[dict]:
-        if dst not in self.nodes:
-            return None
-        tgt = self.nodes[dst]
-        typ = msg.get("type")
-        try:
-            if typ == "pbft_preprepare":
-                return tgt.handle_preprepare(msg)
-            if typ == "pbft_prepare":
-                return tgt.handle_prepare(msg)
-            if typ == "pbft_commit":
-                return tgt.handle_commit(msg)
-        except Exception:
-            return None
-        return None
+        with self.lock:
+            self.queue.append((src, dst, msg))
+        return {"ok": True}
+        
+    def process_queue(self):
+        while True:
+            with self.lock:
+                if not self.queue:
+                    break
+                src, dst, msg = self.queue.pop(0)
+            if dst not in self.nodes:
+                continue
+            tgt = self.nodes[dst]
+            typ = msg.get("type")
+            try:
+                if typ == "pbft_preprepare":
+                    tgt.handle_preprepare(msg)
+                elif typ == "pbft_prepare":
+                    tgt.handle_prepare(msg)
+                elif typ == "pbft_commit":
+                    tgt.handle_commit(msg)
+            except Exception:
+                pass
 
 # ─── Test runner ─────────────────────────────────────────────────────
 def test_scenario(n_honest: int, n_bizantine: int, label: str):
-    """
-    Cria n_honest + n_bizantine validadores. Todos os honestos respondem
-    a todas as mensagens. Bizantinos são no-op (não votam, não respondem).
-    """
     total = n_honest + n_bizantine
     wallets = [FakeWallet(f"node-{i}") for i in range(total)]
     pubs = [w.pub_hex for w in wallets]
@@ -105,11 +100,9 @@ def test_scenario(n_honest: int, n_bizantine: int, label: str):
     chains = []
     consensuses = []
     
-    # [FIX] Lista de todos os endereços na rede
     all_addrs = [f"node-{i}" for i in range(total)]
     
     for i in range(total):
-        # Passa a lista de peers (excluindo o próprio nó)
         my_peers = [a for a in all_addrs if a != f"node-{i}"]
         chain = FakeChain(pubs, my_peers)
         net_addr = f"node-{i}"
@@ -120,8 +113,8 @@ def test_scenario(n_honest: int, n_bizantine: int, label: str):
         consensuses.append(c)
         net.register(net_addr, c)
 
-    # O líder é node-0 (honesto)
     leader = consensuses[0]
+    
     # Bizantinos: desativar votos
     for i in range(n_honest, total):
         consensuses[i].handle_prepare = lambda m: {"ok": False, "error": "byzantine"}
@@ -130,7 +123,23 @@ def test_scenario(n_honest: int, n_bizantine: int, label: str):
 
     block = {"height": 1, "hash": "aa" * 32, "transactions": []}
     t0 = time.time()
-    decided = leader.propose(block, timeout=3.0)
+    decided_result = [False]
+    
+    # Roda o propose em uma thread separada
+    def run_propose():
+        decided_result[0] = leader.propose(block, timeout=2.0)
+        
+    t = threading.Thread(target=run_propose)
+    t.start()
+    
+    # Processa a fila enquanto o líder espera as respostas
+    start_time = time.time()
+    while t.is_alive() and time.time() - start_time < 2.5:
+        net.process_queue()
+        time.sleep(0.01)
+        
+    t.join()
+    decided = decided_result[0]
     elapsed = time.time() - t0
 
     expected = len([i for i in range(total) if i < n_honest]) >= _quorum(total)
@@ -151,12 +160,8 @@ def main():
     print("=" * 64)
     print()
 
-    # n=4 → f=1, quorum=3
-    # 4 honestos:     3 de 4 ✓ decide
     test_scenario(4, 0, "[1] 4 honestos, 0 bizantinos")
-    # 3 honestos+1 biz: 3 de 4 ✓ decide (tolera 1)
     test_scenario(3, 1, "[2] 3 honestos, 1 bizantino (no limite)")
-    # 2 honestos+2 biz: 2 de 4 ✗ NÃO decide (perdeu o quórum)
     test_scenario(2, 2, "[3] 2 honestos, 2 bizantinos (acima do limite)")
 
     print()
@@ -169,7 +174,6 @@ def main():
     test_scenario(5, 2, "[6] 5 honestos, 2 bizantinos (no limite)")
     test_scenario(4, 3, "[7] 4 honestos, 3 bizantinos (acima do limite)")
 
-    # ─── Teste 3: assinatura forjada é rejeitada ──────────────────────
     print()
     print("=" * 64)
     print(" TESTE PBFT — assinatura forjada é rejeitada")
@@ -190,12 +194,10 @@ def main():
         net.register(f"node-{i}", c)
 
     leader = net.nodes["node-0"]
-    # Força criação de estado manual
     from pbft_consensus import PBFTState
     st = PBFTState(0, 99, "bb" * 32, pubs[0])
     leader.states[(0, 99)] = st
 
-    # Tenta preparar com assinatura inválida
     bad_sig = "00" * 64
     resp = leader.handle_prepare({
         "view": 0, "seq": 99, "block_hash": "bb" * 32,
@@ -204,7 +206,6 @@ def main():
     assert resp.get("ok") is False, f"assinatura forjada deveria ser rejeitada, got {resp}"
     print("    [ok] prepare com assinatura inválida → rejeitado")
 
-    # Prepara com assinatura válida
     valid_sig = wallets[1].sign(_msg_bytes(_PHASE_PRE, 0, 99, "bb" * 32))
     resp = leader.handle_prepare({
         "view": 0, "seq": 99, "block_hash": "bb" * 32,
