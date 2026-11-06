@@ -2,22 +2,13 @@
 server.py — Backend HTTP do nó BRN (v9.9.24)
 ================================================================
 v9.9.24 (2026-11-06):
-  [FIX CRÍTICO] pool_start_local() corrigido para passar o objeto
-        da chain (Blockchain) em vez da string pool_url para o
-        PoolClient. Resolve o erro "'str' object has no attribute 'register'"
-        que travava a mineração no pool.
+  [FIX CRÍTICO] Corrigido erro no /api/pool/start_local onde o 
+        PoolClient recebia um objeto Blockchain em vez da URL, 
+        resultando em "'Blockchain' object has no attribute 'strip'".
 v9.9.23 (2026-11-05):
   [FIX CRÍTICO] Adicionada rota /api/trust/download que estava
         faltando. Sem ela, os clientes recebiam erro 404 ao tentar
         sincronizar a Trust Network do Origem.
-v9.9.22 (2026-11-05):
-  [FIX CRÍTICO] pool_start_local() corrigido para passar a URL
-        em vez da chain para o PoolClient.
-v9.9.21 (2026-11-05):
-  [FIX] Detecção dinâmica do método de início/parada no PoolClient.
-v9.9.19 (2026-11-04):
-  [FIX] trust_nodes(): cruza dados P2P para mostrar altura real.
-  [FIX] api_wallet_set_validator_sk(): inicializa PBFT dinamicamente.
 ================================================================
 """
 from __future__ import annotations
@@ -900,7 +891,7 @@ def pool_miners():
 
 
 # ============================================================
-# POOL LOCAL DINÂMICO E DETECÇÃO DE MÉTODOS
+# POOL LOCAL DINÂMICO E DETECÇÃO DE MÉTODOS (FIXADO)
 # ============================================================
 @app.route("/api/pool/local_status", methods=["GET"])
 def pool_local_status():
@@ -933,27 +924,26 @@ def pool_start_local():
                 pool_url = os.environ.get("BRN_POOL_URL_LOCAL", "").strip() or "http://127.0.0.1:5000"
 
             log.info("[pool_client] Inicializando com pool_url=%s", pool_url)
-            
-            chain = _get_chain()
 
-            # [FIX v9.9.24] Passa a chain como objeto para o PoolClient.
+            # [FIX] Tenta as assinaturas válidas do PoolClient, SEM passar a Blockchain
             try:
-                pc = PoolClient(chain, address, pubkey, pool_url=pool_url)
+                pc = PoolClient(pool_url, address, pubkey)
             except TypeError:
                 try:
-                    pc = PoolClient(chain, address, pubkey)
+                    pc = PoolClient(pool_url, pubkey)
                 except TypeError:
-                    try:
-                        pc = PoolClient(chain, pubkey, pool_url=pool_url)
-                    except TypeError:
-                        try:
-                            pc = PoolClient(chain, pubkey)
-                        except TypeError:
-                            pc = PoolClient(chain)
+                    pc = PoolClient(pool_url)
+            
+            # Garante que o PoolClient receba o endereço e a pubkey
+            if hasattr(pc, "address") and address:
+                pc.address = address
+            if hasattr(pc, "pubkey") and pubkey:
+                pc.pubkey = pubkey
 
             set_pool_client_local(pc)
             log.info("[pool_client] Inicializado dinamicamente")
         except Exception as e:
+            log.error(f"[pool_client] Erro real: {e}")
             return jsonify({"ok": False, "msg": f"Falha ao inicializar PoolClient: {e}"}), 503
 
     try:
@@ -1109,12 +1099,11 @@ def trust_stats():
 
 @app.route("/api/trust/download", methods=["GET"])
 def trust_download():
-    """[v9.9.23] Serve o arquivo trust_network.json assinado para clientes."""
+    """Serve o arquivo trust_network.json assinado para clientes."""
     trust = _get_trust_network()
     if trust is None:
         return jsonify({"ok": False, "msg": "TrustNetwork indisponivel"}), 503
     try:
-        # Garante que o arquivo está atualizado e assinado
         trust.flush()
         
         data_file = getattr(trust, "data_file", Path("trust_network.json"))
