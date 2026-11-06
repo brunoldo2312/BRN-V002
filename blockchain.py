@@ -2,10 +2,11 @@
 Versão: 9.5.4 | Data: 06/11/2026
 ================================================================
 v9.5.4 (2026-11-06):
-  [FIX] validate_block agora passa TODOS os blocos pelo validate_proof 
-        do PBFT (se _pbft não for None). Antes, se o bloco não tivesse 
-        o campo "pbft_commits", a validação era pulada, mesmo com 
-        BRN_PBFT_ENFORCE=1.
+  [NEW] BRN_PBFT_START_HEIGHT: Permite ativar o modo estrito do PBFT
+        (BRN_PBFT_ENFORCE=1) apenas a partir de uma altura específica.
+        Blocos abaixo dessa altura ignoram a exigência de pbft_commits,
+        permitindo que nós novos sincronizem o histórico antigo sem
+        travar por falta de provas PBFT.
 v9.5.3 (2026-11-05):
   [FIX] validate_block agora aceita o Genesis de um peer se o DB
         local estiver vazio (height == -1). Isso permite que nós
@@ -69,29 +70,39 @@ BOOTSTRAP_TRUST_THRESHOLD = float(
     os.environ.get("BRN_BOOTSTRAP_TRUST_THRESHOLD", "500")
 )
 
+# [v9.4.10] Bypass de multi-sig ate uma altura.
 BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = int(
     os.environ.get("BRN_BOOTSTRAP_SKIP_SIGS_UNTIL", "0") or "0"
 )
 
+# [v9.4.11] Assume Valid
 BRN_ASSUME_VALID_UNTIL = int(
     os.environ.get("BRN_ASSUME_VALID_UNTIL", "0") or "0"
 )
 
+# [v9.4.11] Checkpoint automático
 BRN_CHECKPOINT_AUTO_HEIGHT = int(
     os.environ.get("BRN_CHECKPOINT_AUTO_HEIGHT", "0") or "0"
 )
 
+# [PBFT] flag de enforcement e altura de ativação
 BRN_PBFT_ENFORCE = os.environ.get("BRN_PBFT_ENFORCE", "0") == "1"
+# [NOVO v9.5.4] A partir de qual altura o PBFT passa a ser obrigatório
+BRN_PBFT_START_HEIGHT = int(os.environ.get("BRN_PBFT_START_HEIGHT", "0"))
 
+# [v9.5.2] STRICT MULTISIG: desativa TODOS os bypasses de multi-sig.
 BRN_STRICT_MULTISIG = os.environ.get("BRN_STRICT_MULTISIG", "0") == "1"
 
 if BRN_STRICT_MULTISIG:
+    # Em modo estrito, ignoramos qualquer bypass configurado
     BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = 0
     BRN_ASSUME_VALID_UNTIL = 0
     log.warning(
         "[STRICT] BRN_STRICT_MULTISIG=1 — TODOS os bypasses de "
         "multi-sig foram desativados. A rede vai travar se os "
-        "validadores não assinarem."
+        "validadores não assinarem. Bypasses ignorados: "
+        "BRN_BOOTSTRAP_SKIP_SIGS_UNTIL, BRN_ASSUME_VALID_UNTIL, "
+        "bootstrap local/estrangeiro/estendido."
     )
 
 if not (0.0 < VALIDATOR_QUORUM <= 1.0):
@@ -106,6 +117,8 @@ if BRN_ASSUME_VALID_UNTIL < 0:
     BRN_ASSUME_VALID_UNTIL = 0
 if BRN_CHECKPOINT_AUTO_HEIGHT < 0:
     BRN_CHECKPOINT_AUTO_HEIGHT = 0
+if BRN_PBFT_START_HEIGHT < 0:
+    BRN_PBFT_START_HEIGHT = 0
 
 if BRN_ASSUME_VALID_UNTIL > 0:
     log.warning(
@@ -121,7 +134,9 @@ if BRN_CHECKPOINT_AUTO_HEIGHT > 0:
     )
 if BRN_PBFT_ENFORCE:
     log.warning(
-        "[PBFT] ENFORCE=1 — blocos sem pbft_commits válidos serão rejeitados."
+        "[PBFT] ENFORCE=1 — blocos a partir da altura %d sem "
+        "pbft_commits válidos serão rejeitados.",
+        BRN_PBFT_START_HEIGHT,
     )
 
 GENESIS_PREV      = "0" * 64
@@ -846,6 +861,7 @@ class Blockchain:
         return need
 
     def _validate_validators_sig(self, block: dict, validators: Optional[list] = None) -> tuple:
+        # [v9.4.10] Bypass por altura (só se STRICT_MULTISIG=0)
         if not BRN_STRICT_MULTISIG and BRN_BOOTSTRAP_SKIP_SIGS_UNTIL > 0:
             try:
                 _bh = int(block.get("height", -1))
@@ -903,6 +919,7 @@ class Blockchain:
         # BYPASSES (só ativos quando STRICT_MULTISIG=0)
         # ═══════════════════════════════════════════════════════════
 
+        # Bypass 1: bootstrap estrangeiro (1 validador local, 1 assinatura estrangeira)
         if not BRN_STRICT_MULTISIG and len(validators) < 2 and got == 0 and got_foreign >= 1:
             try:
                 block_h = int(block.get("height", -1))
@@ -922,6 +939,7 @@ class Blockchain:
             )
             return True, ""
 
+        # Bypass 2: bootstrap local (só a própria SK assinou)
         if not BRN_STRICT_MULTISIG and got >= 1 and got_foreign == 0:
             local_pk = ""
             if self._local_validator_sk is not None:
@@ -945,6 +963,7 @@ class Blockchain:
                     )
                     return True, ""
 
+        # Bypass 3: bootstrap estendido (trust_score >= BOOTSTRAP_TRUST_THRESHOLD)
         if not BRN_STRICT_MULTISIG and got >= 1 and got_foreign == 0:
             trusted = False
             trusted_pubkey = ""
@@ -1008,6 +1027,7 @@ class Blockchain:
         if block["height"] != expected_height:
             return False, "altura invalida"
 
+        # [v9.4.11] ASSUME-VALID (só se STRICT_MULTISIG=0)
         h_int = int(block["height"])
         if not BRN_STRICT_MULTISIG and BRN_ASSUME_VALID_UNTIL > 0 and 0 < h_int <= BRN_ASSUME_VALID_UNTIL:
             try:
@@ -1092,16 +1112,21 @@ class Blockchain:
         if total_cb > reward + fees:
             return False, "coinbase acima do permitido"
 
-        # [FIX v9.5.4] Remove a condição "and pbft_commits in block"
+        # [NOVO v9.5.4] PBFT com altura de ativação
         if self._pbft is not None:
-            try:
-                ok_pbft, why_pbft = self._pbft.validate_proof(block)
-                if not ok_pbft:
-                    return False, f"pbft: {why_pbft}"
-            except Exception as e:
-                log.warning("[PBFT] validate_proof exceção: %s", e)
-                if BRN_PBFT_ENFORCE:
-                    return False, f"pbft: exceção {e}"
+            enforce_this_block = BRN_PBFT_ENFORCE and (h_int >= BRN_PBFT_START_HEIGHT)
+            
+            if "pbft_commits" in block:
+                try:
+                    ok_pbft, why_pbft = self._pbft.validate_proof(block)
+                    if not ok_pbft:
+                        return False, f"pbft: {why_pbft}"
+                except Exception as e:
+                    log.warning("[PBFT] validate_proof exceção: %s", e)
+                    if enforce_this_block:
+                        return False, f"pbft: exceção {e}"
+            elif enforce_this_block:
+                return False, f"bloco #{h_int} sem prova PBFT (pbft_commits)"
 
         return True, "ok"
 
@@ -1292,19 +1317,19 @@ class Blockchain:
                 if decided:
                     if not self._pbft.attach_proof(block):
                         log.warning(f"[PBFT] bloco #{height} decidiu mas attach_proof falhou")
-                        if BRN_PBFT_ENFORCE:
+                        if BRN_PBFT_ENFORCE and (height >= BRN_PBFT_START_HEIGHT):
                             return None
                     else:
                         log.info("[PBFT] bloco #%d decidido com %d commit(s)", height, len(block.get("pbft_commits", [])))
                 else:
-                    if BRN_PBFT_ENFORCE:
+                    if BRN_PBFT_ENFORCE and (height >= BRN_PBFT_START_HEIGHT):
                         log.warning(f"[PBFT] bloco #{height} NÃO decidido — descartando (ENFORCE=1)")
                         return None
                     else:
                         log.warning(f"[PBFT] bloco #{height} sem quórum PBFT — continuando via multi-sig (ENFORCE=0)")
             except Exception as e:
                 log.error("[PBFT] propose falhou para #%d: %s", height, e)
-                if BRN_PBFT_ENFORCE:
+                if BRN_PBFT_ENFORCE and (height >= BRN_PBFT_START_HEIGHT):
                     return None
 
         ok, msg = self.accept_block(block, validators=validators)
