@@ -1,11 +1,10 @@
-"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.16)
+"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.17)
 ================================================================
-v3.16 (2026-11-04):
-  [FIX CRÍTICO] pool_start_mining() agora envia o endereço e a pubkey
-        da carteira para o servidor. Antes enviava um dict vazio {},
-        fazendo o PoolClient minerar sem saber para quem pagar.
-v3.15 (2026-11-03):
-  [NEW] _sync_sk_to_chain() — propaga a SK da carteira ativa.
+v3.17 (2026-11-06):
+  [FIX] generate_wallet() e create_and_unlock() agora garantem que a
+        carteira seja salva em disco (current_wallet.enc) usando a 
+        senha do .env, mesmo que o nó esteja offline. Em seguida, 
+        envia a chave para o nó em memória.
 ================================================================
 """
 from __future__ import annotations
@@ -19,7 +18,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "3.16"
+__version__ = "3.17"
 
 try:
     import requests
@@ -37,7 +36,6 @@ API_TIMEOUT  = float(os.environ.get("BRN_API_TIMEOUT", "200"))
 GET_TIMEOUT  = float(os.environ.get("BRN_API_GET_TIMEOUT", "30"))
 MAX_RETRIES  = int(os.environ.get("BRN_API_RETRIES", "2"))
 RETRY_DELAY  = float(os.environ.get("BRN_API_RETRY_DELAY", "0.5"))
-
 
 _WALLET_SESSION: dict = {}
 
@@ -64,6 +62,11 @@ def _sync_sk_to_chain(sk_hex: str, address: str = "", pubkey: str = "") -> dict:
         log.warning("_sync_sk_to_chain exception: %s", e)
         return {"ok": False, "msg": str(e)}
 
+def _get_default_password() -> str:
+    return (
+        os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
+        or os.environ.get("BRN_NODE_PASSWORD", "").strip()
+    )
 
 def _post(path: str, body: dict, timeout: float = None,
           retries: int = None) -> dict:
@@ -158,10 +161,12 @@ class WalletApi:
 
     def create_and_unlock(self, password: str) -> dict:
         global _WALLET_SESSION
-        if not password:
-            return {"ok": False, "msg": "A senha é obrigatória."}
-        if len(password) < 8:
-            return {"ok": False, "msg": "A senha deve ter pelo menos 8 caracteres."}
+        # [FIX] Usa a senha fornecida ou a do .env
+        pwd = (password or "").strip() or _get_default_password()
+        
+        if not pwd:
+            return {"ok": False, "msg": "A senha é obrigatória (não encontrada na GUI nem no .env)."}
+            
         try:
             from wallet import Wallet
             from secure_store import save_current_wallet
@@ -171,9 +176,10 @@ class WalletApi:
                 "private_key": w.priv_hex,
                 "public_key":  w.pub_hex,
             }
-            r = save_current_wallet(password, data)
+            r = save_current_wallet(pwd, data)
             if not r.get("ok"):
                 return {"ok": False, "msg": "Erro ao salvar: " + str(r.get("msg", ""))}
+            
             _WALLET_SESSION.update(data)
             _sync_sk_to_chain(w.priv_hex, w.address, w.pub_hex)
             return {"ok": True, "address": w.address}
@@ -182,9 +188,10 @@ class WalletApi:
 
     def unlock_wallet(self, password: str) -> dict:
         global _WALLET_SESSION
+        pwd = (password or "").strip() or _get_default_password()
         try:
             from secure_store import load_current_wallet
-            r = load_current_wallet(password)
+            r = load_current_wallet(pwd)
             if r and r.get("ok"):
                 _WALLET_SESSION["address"]     = r.get("address", "")
                 _WALLET_SESSION["private_key"] = r.get("private_key", "")
@@ -216,6 +223,52 @@ class WalletApi:
         if _WALLET_SESSION.get("address"):
             return {"ok": True, **_WALLET_SESSION}
         return {"ok": False, "msg": "locked"}
+
+    # =================================================================
+    # [FIX v3.17] Gera carteira localmente e salva em disco, sem depender da API
+    # =================================================================
+    def generate_wallet(self, password: str = "") -> dict:
+        try:
+            from wallet import Wallet
+            from secure_store import save_current_wallet
+            
+            pwd = (password or "").strip() or _get_default_password()
+            if not pwd:
+                return {"erro": "Senha não definida na GUI e não encontrada no .env"}
+
+            # 1. Gera a carteira
+            w = Wallet()
+            
+            # 2. Salva em disco (current_wallet.enc)
+            r = save_current_wallet(pwd, {
+                "address": w.address,
+                "private_key": w.priv_hex,
+                "public_key": w.pub_hex,
+            })
+            
+            if not r.get("ok"):
+                return {"erro": f"Falha ao salvar carteira: {r.get('msg')}"}
+
+            # 3. Atualiza sessão local
+            global _WALLET_SESSION
+            _WALLET_SESSION.update({
+                "address": w.address,
+                "private_key": w.priv_hex,
+                "public_key": w.pub_hex,
+            })
+
+            # 4. Manda a chave para o nó (para minerar e assinar)
+            _sync_sk_to_chain(w.priv_hex, w.address, w.pub_hex)
+
+            return {
+                "address": w.address, 
+                "private_key": w.priv_hex, 
+                "public_key": w.pub_hex,
+                "ok": True
+            }
+        except Exception as e:
+            log.error("generate_wallet falhou: %s", e)
+            return {"erro": str(e)}
 
     def get_experiment_variant(self) -> dict:
         try:
@@ -347,31 +400,6 @@ class WalletApi:
         except Exception as e:
             return {"erro": str(e)}
 
-    def generate_wallet(self, password: str = "") -> dict:
-        try:
-            r = _post("/api/nova-carteira", {})
-            if not r.get("success"):
-                return {"erro": r.get("error", "falha")}
-            address, private_key, public_key = r["address"], r["private_key"], r["public_key"]
-            pwd = ((password or "").strip()
-                   or os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
-                   or os.environ.get("BRN_NODE_PASSWORD", "").strip())
-            if pwd:
-                try:
-                    from secure_store import save_current_wallet
-                    save_result = save_current_wallet(pwd, {
-                        "address": address, "private_key": private_key, "public_key": public_key,
-                    })
-                    if save_result.get("ok"):
-                        _WALLET_SESSION.update({
-                            "address": address, "private_key": private_key, "public_key": public_key,
-                        })
-                except Exception as e:
-                    log.warning("Falha salvando carteira em disco: %s", e)
-            return {"address": address, "private_key": private_key, "public_key": public_key}
-        except Exception as e:
-            return {"erro": str(e)}
-
     def save_wallet(self, name: str, password: str,
                     address: str, sk: str, pk: str) -> dict:
         try:
@@ -478,9 +506,6 @@ class WalletApi:
             return env_pool.rstrip("/")
         return API_BASE
 
-    # =================================================================
-    # [FIX v3.16] Envia address e pubkey para o servidor
-    # =================================================================
     def pool_start_mining(self, address: str, pubkey: str) -> dict:
         if not address or not pubkey:
             return {"ok": False, "msg": "address e pubkey obrigatorios"}
