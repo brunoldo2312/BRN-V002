@@ -1,5 +1,8 @@
-"""main.py — Entrypoint do nó BRN (v13.9.1)
+"""main.py — Entrypoint do nó BRN (v13.9.2)
 ================================================================
+v13.9.2 (2026-11-06):
+  [FIX] Adicionado os.system("") para habilitar cores ANSI
+        no terminal do Windows e evitar texto embaralhado.
 v13.9.1 (2026-11-06):
   [NEW] Auto-detecção de IP (Tailscale/LAN) e atualização automática
         do BRN_SEU_ENDERECO no arquivo brn_network.env.
@@ -29,7 +32,7 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.1"
+    VERSION = "13.9.2"
     BUILD_DATE = "2026-11-06"
 
 def parse_args():
@@ -183,6 +186,9 @@ def _load_wallet(password: str):
         return None, "", ""
 
 def main() -> int:
+    # [FIX] Habilita cores ANSI no terminal do Windows
+    os.system("")
+
     args = parse_args()
     if args.version:
         print(f"BRN Node v{VERSION} (build {BUILD_DATE})")
