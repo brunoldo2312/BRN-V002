@@ -66,8 +66,13 @@ def start_daemon(chain, trust, p2p, password, is_origin, stop_event):
                         pk = (p.get("public_key") or "").strip().lower()
                         peer_addr = p.get("address", "")
                         
-                        # Ignora o próprio IP
-                        if "127.0.0.1" in peer_addr or (chain.p2p and getattr(chain.p2p, 'tcp_port', 0) and f":{chain.p2p.tcp_port}" in peer_addr and "100." not in peer_addr):
+                        # Ignora o próprio IP para não tentar conectar em si mesmo
+                        if "127.0.0.1" in peer_addr:
+                            continue
+                        
+                        # Tenta evitar auto-conexão se o IP for o local
+                        meu_ip = os.environ.get("BRN_SEU_ENDERECO", "")
+                        if meu_ip and peer_addr == meu_ip:
                             continue
 
                         # Se não tem pubkey válida no banco, busca via P2P
