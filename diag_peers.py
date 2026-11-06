@@ -22,8 +22,18 @@ trust = TrustNetwork("trust_network.json")
 chain.set_trust_net(trust)
 pw = os.environ.get("BRN_WALLET_SESSION_PASS") or os.environ.get("BRN_NODE_PASSWORD", "")
 w = load_current_wallet(pw)
-sk = Wallet(private_key_hex=w["private_key"])
-chain.set_local_validator_sk(sk)
+
+# [FIX] Trata os possíveis nomes da chave privada
+sk_hex = None
+if w and w.get("ok"):
+    sk_hex = w.get("private_key") or w.get("priv_hex") or w.get("sk")
+
+if sk_hex:
+    sk = Wallet(private_key_hex=sk_hex)
+    chain.set_local_validator_sk(sk)
+else:
+    print("[X] A carteira carregou, mas não foi possível encontrar a chave privada (private_key / priv_hex / sk).")
+    sys.exit(1)
 
 h = chain.db.height()
 tip = chain.db.tip_hash()
