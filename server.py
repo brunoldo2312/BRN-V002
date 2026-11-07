@@ -1,16 +1,11 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.26)
+server.py — Backend HTTP do nó BRN (v9.9.27)
 ================================================================
-v9.9.26 (2026-11-06):
-  [NEW] Rotas do L2 Bridge (BTC -> BRN).
-        Adicionado /api/l2/quote, /api/l2/create, /api/l2/escrows,
-        /api/l2/stats e /api/l2/cancel. Agora a interface gráfica
-        consegue criar e monitorar ordens de compra de BRN com BTC.
-v9.9.25 (2026-11-06):
-  [NEW] _check_sync_barrier() avançado. Agora ele faz um ping P2P
-        real em todos os peers, verifica a altura máxima da rede,
-        testa a comunicação e só libera a mineração se todos 
-        estiverem sincronizados.
+v9.9.27 (2026-11-07):
+  [FIX CRÍTICO] pool_start_local() agora passa o objeto PoolManager
+        local (em vez da URL) para o PoolClient quando o nó é Origem.
+        Isso resolve o erro "'str' object has no attribute 'register'"
+        que impedia a mineração em pool.
 ================================================================
 """
 from __future__ import annotations
@@ -120,7 +115,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
             req = urllib.request.Request(
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
-                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.26"},
+                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.27"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -236,12 +231,11 @@ def _register_miner_in_trust(pubkey: str, address: str) -> None:
 
 
 # ============================================================
-# SYNC BARRIER AVANÇADO (v9.9.25 OTIMIZADO)
+# SYNC BARRIER AVANÇADO
 # ============================================================
 def _check_sync_barrier() -> tuple[bool, str]:
     chain = _get_chain()
     
-    # 1. Carteira
     if getattr(chain, "_local_validator_sk", None) is None:
         return False, "Carteira não está carregada. Abra a carteira antes de minerar."
 
@@ -801,7 +795,6 @@ def miner_start():
         if not WalletManager.validate_address(addr): return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
         if not pubkey: return jsonify({"ok": False, "msg": "Pubkey desconhecida."}), 400
 
-        # BARREIRA AVANÇADA
         ok_sync, msg_sync = _check_sync_barrier()
         if not ok_sync:
             return jsonify({"ok": False, "msg": msg_sync}), 400
@@ -990,7 +983,7 @@ def pool_miners():
 
 
 # ============================================================
-# POOL LOCAL DINÂMICO (COM SYNC BARRIER AVANÇADO)
+# POOL LOCAL DINÂMICO (COM SYNC BARRIER AVANÇADO + FIX v9.9.27)
 # ============================================================
 @app.route("/api/pool/local_status", methods=["GET"])
 def pool_local_status():
@@ -1023,27 +1016,44 @@ def pool_start_local():
             if not pubkey:
                 return jsonify({"ok": False, "msg": "pubkey obrigatoria para iniciar o PoolClient"}), 400
 
-            pool_url = os.environ.get("BRN_POOL_URL", "").strip()
-            if not pool_url:
-                pool_url = os.environ.get("BRN_POOL_URL_LOCAL", "").strip() or "http://127.0.0.1:5000"
-
-            log.info("[pool_client] Inicializando com pool_url=%s", pool_url)
-
-            try:
-                pc = PoolClient(pool_url, address, pubkey)
-            except TypeError:
+            # [FIX v9.9.27] Detecta se estamos na Origem (PoolManager local)
+            pool_mgr = _get_pool_manager()
+            
+            if pool_mgr is not None:
+                # ORIGEM: passa o objeto PoolManager diretamente
+                log.info("[pool_client] Inicializando PoolClient LOCAL (PoolManager em memória)")
                 try:
-                    pc = PoolClient(pool_url, pubkey)
+                    pc = PoolClient(pool_mgr, address, pubkey)
                 except TypeError:
                     try:
-                        pc = PoolClient(pool_url)
+                        pc = PoolClient(pool_mgr, pubkey)
                     except TypeError:
-                        chain = _get_chain()
-                        pc = PoolClient(chain, pubkey)
+                        pc = PoolClient(pool_mgr)
+            else:
+                # CLIENTE: usa URL HTTP para conectar ao pool remoto
+                pool_url = os.environ.get("BRN_POOL_URL", "").strip()
+                if not pool_url:
+                    pool_url = os.environ.get("BRN_POOL_URL_LOCAL", "").strip() or "http://127.0.0.1:5000"
+                
+                log.info("[pool_client] Inicializando PoolClient REMOTO (url=%s)", pool_url)
+                try:
+                    pc = PoolClient(pool_url, address, pubkey)
+                except TypeError:
+                    try:
+                        pc = PoolClient(pool_url, pubkey)
+                    except TypeError:
+                        pc = PoolClient(pool_url)
+
+            # Garante que o PoolClient tenha os dados
+            if hasattr(pc, "address") and address:
+                pc.address = address
+            if hasattr(pc, "pubkey") and pubkey:
+                pc.pubkey = pubkey
 
             set_pool_client_local(pc)
-            log.info("[pool_client] Inicializado dinamicamente")
+            log.info("[pool_client] Inicializado com sucesso")
         except Exception as e:
+            log.error(f"[pool_client] Erro ao inicializar: {e}")
             return jsonify({"ok": False, "msg": f"Falha ao inicializar PoolClient: {e}"}), 503
 
     try:
@@ -1425,7 +1435,7 @@ def peers_discovered():
 def health():
     try:
         return jsonify({
-            "ok": True, "height": _get_chain().db.height(), "version": "9.9.26",
+            "ok": True, "height": _get_chain().db.height(), "version": "9.9.27",
             "chain_injected": _CHAIN is not None, "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
             "pool_client_local": _POOL_CLIENT_LOCAL is not None,
@@ -1685,5 +1695,5 @@ def api_tx_status(txid_str):
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.26 (Advanced Sync Barrier + Dynamic Pool + PBFT + L2 Bridge)")
+    print(f"BRN Server v9.9.27 (Fixed PoolClient + Sync Barrier + PBFT + L2 Bridge)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
