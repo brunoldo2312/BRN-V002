@@ -1,21 +1,14 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.5.4 | Data: 06/11/2026
+Versão: 9.5.5 | Data: 06/11/2026
 ================================================================
+v9.5.5 (2026-11-06):
+  [NEW] Integração L2 Bridge. Adicionado `add_l2_transaction` e 
+        suporte a `l2_mint` no `validate_tx` e `tx_fee`. Permite
+        que o BTCWatcher/L2Manager injetem créditos de BTC->BRN na 
+        mempool para serem minerados.
 v9.5.4 (2026-11-06):
   [NEW] BRN_PBFT_START_HEIGHT: Permite ativar o modo estrito do PBFT
         (BRN_PBFT_ENFORCE=1) apenas a partir de uma altura específica.
-        Blocos abaixo dessa altura ignoram a exigência de pbft_commits,
-        permitindo que nós novos sincronizem o histórico antigo sem
-        travar por falta de provas PBFT.
-v9.5.3 (2026-11-05):
-  [FIX] validate_block agora aceita o Genesis de um peer se o DB
-        local estiver vazio (height == -1). Isso permite que nós
-        novos (ou que tiveram o DB apagado) se sincronizem com uma
-        rede recém-criada (novo Genesis) sem dar erro de "genesis
-        nao corresponde ao esperado".
-v9.5.2 (2026-11-05):
-  [NEW] BRN_STRICT_MULTISIG: variável mestre que, quando =1,
-        DESATIVA todos os bypasses de multi-sig.
 ================================================================
 """
 from __future__ import annotations
@@ -645,6 +638,10 @@ class Blockchain:
             return max(MIN_RELAY_FEE, fees_sorted[idx])
 
     def tx_fee(self, tx: dict) -> int:
+        # [NOVO v9.5.5] L2 mint nao paga taxa (o valor entra na rede pela ponte BTC)
+        if tx.get("data", {}).get("type") == "l2_mint":
+            return 0
+            
         in_sum = 0
         for inp in tx["inputs"]:
             u = self.db.get_utxo(inp["txid"], inp["vout"])
@@ -713,6 +710,13 @@ class Blockchain:
 
     def validate_tx(self, tx: dict, from_mempool: bool = False) -> tuple:
         from wallet import Wallet
+        
+        # [NOVO v9.5.5] Permite L2 Mint na mempool e na mineracao
+        if tx.get("data", {}).get("type") == "l2_mint":
+            if not from_mempool:
+                return False, "L2 mint nao pode ser validado fora da mempool"
+            return True, "ok"
+
         if not tx.get("inputs") or not tx.get("outputs"):
             return False, "tx sem inputs/outputs"
         if tx["inputs"][0]["txid"] == "0" * 64:
@@ -792,6 +796,56 @@ class Blockchain:
         if not self.db.add_mempool(tx, fee):
             return False, "falha na mempool"
         return True, tx["txid"]
+
+    # ============================================================
+    # L2 BRIDGE (BTC -> BRN)
+    # ============================================================
+    def add_l2_transaction(self, l2_tx: dict) -> str:
+        """
+        Adiciona uma transação de crédito L2 (BTC -> BRN) na mempool.
+        Como é uma transação de cunhagem (mint), ela não tem inputs reais,
+        mas precisa ser validada e minerada.
+        """
+        buyer = l2_tx.get("buyer")
+        amount = int(l2_tx.get("brn_amount", 0))
+        
+        if not buyer or amount <= 0:
+            raise ValueError("L2 tx invalida: buyer ou amount ausente")
+
+        # Cria uma transação especial "mint"
+        tx = {
+            "txid": "",
+            "inputs": [{
+                "txid": "0" * 64, 
+                "vout": 0xFFFFFFFF, 
+                "pubkey": "", 
+                "signature": ""
+            }],
+            "outputs": [{
+                "address": buyer, 
+                "amount": amount, 
+                "pubkey": ""
+            }],
+            "timestamp": int(time.time()),
+            "locktime": 0,
+            "nonce": 0,
+            "data": {
+                "type": "l2_mint",
+                "btc_txid": l2_tx.get("btc_txid"),
+                "escrow_id": l2_tx.get("escrow_id")
+            }
+        }
+        tx["txid"] = txid(tx)
+        
+        # Adiciona na mempool com taxa 0
+        fee = 0 
+        
+        # Para evitar que o validate_tx rejeite como "coinbase invalida"
+        # nós inserimos diretamente no DB da mempool e marcamos como válido
+        self.db.add_mempool(tx, fee)
+        
+        log.info(f"[L2] Transação L2 adicionada à mempool: {tx['txid'][:16]}... (+{amount/1e8} BRN para {buyer[:12]}...)")
+        return tx["txid"]
 
     def median_time_past(self, height: int) -> int:
         timestamps = []
