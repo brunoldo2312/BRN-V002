@@ -1,13 +1,11 @@
-"""main.py — Entrypoint do nó BRN (v13.9.2)
+"""main.py — Entrypoint do nó BRN (v13.9.3)
 ================================================================
+v13.9.3 (2026-11-07):
+  [FIX CRÍTICO] Adicionado chain.is_origin = is_origin. Sem isso,
+        o brn_multisig achava que o nó era cliente e não instalava
+        o autosign nem definia a chave da Origem.
 v13.9.2 (2026-11-06):
   [NEW] Integração do BTCWatcher (L2 Bridge BTC -> BRN).
-        O monitor de depósitos BTC agora inicia junto com a Origem.
-v13.9.1 (2026-11-06):
-  [NEW] Inicialização do PBFTConsensus (Consenso Bizantino).
-  [NEW] Integração com TrustDaemon (auto-cura da rede).
-  [FIX] Carregamento seguro de carteira (permite iniciar sem senha no .env
-        para usar a GUI).
 ================================================================
 """
 from __future__ import annotations
@@ -28,8 +26,8 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.2"
-    BUILD_DATE = "2026-11-06"
+    VERSION = "13.9.3"
+    BUILD_DATE = "2026-11-07"
 
 def parse_args():
     p = argparse.ArgumentParser(prog="main.py")
@@ -175,6 +173,7 @@ def main() -> int:
     try:
         from blockchain import Blockchain
         chain = Blockchain(db_path, auto_genesis=False)
+        chain.is_origin = is_origin  # <--- [FIX CRÍTICO] Avisa à chain qual é o papel do nó
         log.info("[chain] aberta height=%d", chain.db.height())
     except Exception as e:
         log.error("[chain] fatal: %s", e)
@@ -288,7 +287,7 @@ def main() -> int:
         except Exception as e:
             log.warning("[pool] init falhou: %s", e)
 
-    # 8.2 [NOVO] BTC Watcher (L2 Bridge)
+    # 8.2 BTC Watcher (L2 Bridge)
     btc_watcher = None
     if is_origin:
         try:
