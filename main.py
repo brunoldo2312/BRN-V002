@@ -1,5 +1,8 @@
-"""main.py — Entrypoint do nó BRN (v13.9.1)
+"""main.py — Entrypoint do nó BRN (v13.9.2)
 ================================================================
+v13.9.2 (2026-11-06):
+  [NEW] Integração do BTCWatcher (L2 Bridge BTC -> BRN).
+        O monitor de depósitos BTC agora inicia junto com a Origem.
 v13.9.1 (2026-11-06):
   [NEW] Inicialização do PBFTConsensus (Consenso Bizantino).
   [NEW] Integração com TrustDaemon (auto-cura da rede).
@@ -25,7 +28,7 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.1"
+    VERSION = "13.9.2"
     BUILD_DATE = "2026-11-06"
 
 def parse_args():
@@ -285,6 +288,17 @@ def main() -> int:
         except Exception as e:
             log.warning("[pool] init falhou: %s", e)
 
+    # 8.2 [NOVO] BTC Watcher (L2 Bridge)
+    btc_watcher = None
+    if is_origin:
+        try:
+            from btc_watcher import get_watcher
+            btc_watcher = get_watcher(chain.db, chain)
+            btc_watcher.start()
+            log.info("[btc_watcher] Monitor de depósitos BTC iniciado")
+        except Exception as e:
+            log.warning("[btc_watcher] init falhou: %s", e)
+
     # 9. Web Server
     try:
         import server as srv
@@ -331,6 +345,9 @@ def main() -> int:
         log.info("[shutdown] encerrando...")
         if hasattr(chain, "_stop_trust_daemon"):
             chain._stop_trust_daemon.set()
+        if btc_watcher:
+            try: btc_watcher.stop()
+            except Exception: pass
         try: chain.db.close()
         except Exception: pass
         os._exit(0)
