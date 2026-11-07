@@ -1,6 +1,11 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.25)
+server.py — Backend HTTP do nó BRN (v9.9.26)
 ================================================================
+v9.9.26 (2026-11-06):
+  [NEW] Rotas do L2 Bridge (BTC -> BRN).
+        Adicionado /api/l2/quote, /api/l2/create, /api/l2/escrows,
+        /api/l2/stats e /api/l2/cancel. Agora a interface gráfica
+        consegue criar e monitorar ordens de compra de BRN com BTC.
 v9.9.25 (2026-11-06):
   [NEW] _check_sync_barrier() avançado. Agora ele faz um ping P2P
         real em todos os peers, verifica a altura máxima da rede,
@@ -20,6 +25,7 @@ import sys
 import threading
 import urllib.request
 import urllib.error
+import concurrent.futures
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from functools import wraps
 from pathlib import Path
@@ -114,7 +120,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
             req = urllib.request.Request(
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
-                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.25"},
+                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.26"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -152,7 +158,7 @@ CHAIN = _LazyChain()
 
 
 # ============================================================
-# P2P / POOL / SYNC / TRUST / POOL_CLIENT LOCAIS
+# P2P / POOL / SYNC / TRUST / POOL_CLIENT / L2 LOCAIS
 # ============================================================
 _P2P_MANAGER = None
 _P2P_LOCK = threading.Lock()
@@ -192,15 +198,27 @@ def _get_trust_network(): return _TRUST_NETWORK
 
 _POOL_CLIENT_LOCAL = None
 _POOL_CLIENT_LOCK = threading.Lock()
-
 def set_pool_client_local(pc) -> None:
     global _POOL_CLIENT_LOCAL
-    with _POOL_CLIENT_LOCK:
-        _POOL_CLIENT_LOCAL = pc
+    with _POOL_CLIENT_LOCK: _POOL_CLIENT_LOCAL = pc
     log.info("server: PoolClient local %s", "injetado" if pc else "removido")
+def _get_pool_client_local(): return _POOL_CLIENT_LOCAL
 
-def _get_pool_client_local():
-    return _POOL_CLIENT_LOCAL
+
+_L2_MANAGER = None
+_L2_LOCK = threading.Lock()
+def _get_l2_manager():
+    global _L2_MANAGER
+    if _L2_MANAGER is not None: return _L2_MANAGER
+    with _L2_LOCK:
+        if _L2_MANAGER is None:
+            try:
+                from l2_manager import L2Manager
+                _L2_MANAGER = L2Manager(_get_chain().db, _get_chain())
+                log.info("server: L2Manager inicializado (lazy)")
+            except Exception as e:
+                log.error(f"server: Falha ao iniciar L2Manager: {e}")
+        return _L2_MANAGER
 
 
 def _register_miner_in_trust(pubkey: str, address: str) -> None:
@@ -218,16 +236,9 @@ def _register_miner_in_trust(pubkey: str, address: str) -> None:
 
 
 # ============================================================
-# SYNC BARRIER AVANÇADO (v9.9.25)
+# SYNC BARRIER AVANÇADO (v9.9.25 OTIMIZADO)
 # ============================================================
 def _check_sync_barrier() -> tuple[bool, str]:
-    """
-    Verifica a saúde da rede antes de liberar a mineração.
-    1. Carteira carregada?
-    2. Nós P2P respondem?
-    3. Estamos na mesma altura do topo?
-    4. Peers conseguem assinar um bloco de teste?
-    """
     chain = _get_chain()
     
     # 1. Carteira
@@ -251,46 +262,54 @@ def _check_sync_barrier() -> tuple[bool, str]:
     if not peers:
         return False, "Nenhum peer conectado. Aguardando a rede."
 
+    test_block = chain.db.get_block(local_h)
+
+    def check_peer(peer_addr):
+        if ":" not in peer_addr: return None
+        ip, port_s = peer_addr.rsplit(":", 1)
+        if ip == "127.0.0.1": return None
+        
+        try:
+            port = int(port_s)
+            msg_h = {"type": "get_chain_height", "_chain": CHAIN_ID, "_port": 6001}
+            resp_h, _ = P2PClient.send_message(ip, port, msg_h, timeout=3.0)
+            
+            if not resp_h: return None
+            
+            ph = resp_h.get("height", -1)
+            signed = False
+            
+            if test_block:
+                msg_sig = {"type": "sign_block", "block": test_block, "_chain": CHAIN_ID, "_port": 6001}
+                resp_sig, _ = P2PClient.send_message(ip, port, msg_sig, timeout=3.0)
+                if resp_sig and resp_sig.get("pubkey"):
+                    signed = True
+                    
+            return {"height": ph, "signed": signed}
+        except Exception:
+            return None
+
     max_peer_h = local_h
     peers_ok = 0
     signers_ok = 0
     
-    # Pega o último bloco real para o teste de assinatura
-    test_block = chain.db.get_block(local_h)
-
-    for p in peers:
-        if ":" not in p: continue
-        ip, port_s = p.rsplit(":", 1)
-        if ip == "127.0.0.1": continue
-        
-        try:
-            # 3. Verifica altura real via P2P
-            msg_h = {"type": "get_chain_height", "_chain": CHAIN_ID, "_port": 6001}
-            resp_h, _ = P2PClient.send_message(ip, int(port_s), msg_h, timeout=3.0)
-            
-            if resp_h:
-                peers_ok += 1
-                ph = resp_h.get("height", -1)
-                if ph > max_peer_h: max_peer_h = ph
-                
-                # 4. Teste de Assinatura (só testa se o bloco existir)
-                if test_block:
-                    msg_sig = {"type": "sign_block", "block": test_block, "_chain": CHAIN_ID, "_port": 6001}
-                    resp_sig, _ = P2PClient.send_message(ip, int(port_s), msg_sig, timeout=5.0)
-                    if resp_sig and resp_sig.get("pubkey"):
-                        signers_ok += 1
-        except Exception:
-            pass
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+        results = pool.map(check_peer, peers)
+        for res in results:
+            if res is None: continue
+            peers_ok += 1
+            if res["height"] > max_peer_h: max_peer_h = res["height"]
+            if res["signed"]: signers_ok += 1
 
     if peers_ok == 0:
-        return False, "Nenhum peer respondeu. Verifique o firewall ou conexão."
+        return False, "Nenhum peer respondeu ao ping P2P. Verifique o firewall."
 
     if local_h < (max_peer_h - 1):
         falta = max_peer_h - local_h
         return False, f"Seu nó está {falta} bloco(s) atrás do topo. Sincronize antes de minerar."
 
     if signers_ok == 0 and test_block:
-        return False, "Peers estão online mas não assinaram o bloco de teste. Verifique as carteiras/Trust."
+        return False, "Peers estão online mas não assinaram o bloco de teste. Verifique se a carteira deles está aberta."
 
     return True, ""
 
@@ -1081,6 +1100,97 @@ def pool_stop_local():
 
 
 # ============================================================
+# L2 BRIDGE (BTC -> BRN)
+# ============================================================
+@app.route("/api/l2/quote", methods=["POST"])
+@require_rate_limit("l2_quote")
+def l2_quote():
+    try:
+        data = request.get_json(force=True) or {}
+        btc_sats = int(data.get("btc_amount_sats", 0) or 0)
+        
+        l2 = _get_l2_manager()
+        if not l2:
+            return jsonify({"ok": False, "msg": "L2Manager indisponivel"}), 503
+            
+        r = l2.quote(btc_sats)
+        return jsonify({"ok": True, **r})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 400
+
+
+@app.route("/api/l2/create", methods=["POST"])
+@require_rate_limit("l2_create")
+def l2_create():
+    try:
+        data = request.get_json(force=True) or {}
+        btc_sats = int(data.get("btc_amount_sats", 0) or 0)
+        buyer = (data.get("buyer_brn") or "").strip()
+        
+        if not buyer.startswith("brn1"):
+            return jsonify({"ok": False, "msg": "Endereco BRN invalido."}), 400
+            
+        l2 = _get_l2_manager()
+        if not l2:
+            return jsonify({"ok": False, "msg": "L2Manager indisponivel"}), 503
+            
+        r = l2.create_order(btc_sats, buyer)
+        return jsonify({"ok": True, **r})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 400
+
+
+@app.route("/api/l2/escrows", methods=["GET"])
+@require_rate_limit("l2_list")
+def l2_list():
+    try:
+        buyer = request.args.get("buyer", "").strip()
+        status = request.args.get("status", "OPEN").strip()
+        limit = int(request.args.get("limit", 50))
+        
+        l2 = _get_l2_manager()
+        if not l2:
+            return jsonify({"ok": False, "msg": "L2Manager indisponivel"}), 503
+            
+        orders = l2.list_orders(buyer=buyer or None, status=status, limit=limit)
+        return jsonify({"ok": True, "escrows": orders})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/l2/stats", methods=["GET"])
+@require_rate_limit("l2_stats")
+def l2_stats():
+    try:
+        l2 = _get_l2_manager()
+        if not l2:
+            return jsonify({"ok": False, "msg": "L2Manager indisponivel"}), 503
+            
+        return jsonify({"ok": True, **l2.stats()})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/l2/cancel", methods=["POST"])
+@require_rate_limit("l2_cancel")
+def l2_cancel():
+    try:
+        data = request.get_json(force=True) or {}
+        escrow_id = (data.get("escrow_id") or "").strip()
+        if not escrow_id:
+            return jsonify({"ok": False, "msg": "escrow_id obrigatorio"}), 400
+            
+        l2 = _get_l2_manager()
+        if not l2:
+            return jsonify({"ok": False, "msg": "L2Manager indisponivel"}), 503
+            
+        r = l2.cancel_order(escrow_id)
+        return jsonify(r), (200 if r.get("ok") else 400)
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+# ============================================================
 # WALLET — sincroniza SK e ATIVA PBFT DINAMICAMENTE
 # ============================================================
 @app.route("/api/wallet/set_validator_sk", methods=["POST"])
@@ -1180,14 +1290,11 @@ def trust_stats():
 
 @app.route("/api/trust/download", methods=["GET"])
 def trust_download():
-    """[v9.9.25] Serve o arquivo trust_network.json assinado para clientes."""
     trust = _get_trust_network()
     if trust is None:
         return jsonify({"ok": False, "msg": "TrustNetwork indisponivel"}), 503
     try:
-        # Garante que o arquivo está atualizado e assinado
         trust.flush()
-        
         data_file = getattr(trust, "data_file", Path("trust_network.json"))
         if not data_file.is_absolute():
             data_file = BASE_DIR / data_file
@@ -1318,7 +1425,7 @@ def peers_discovered():
 def health():
     try:
         return jsonify({
-            "ok": True, "height": _get_chain().db.height(), "version": "9.9.25",
+            "ok": True, "height": _get_chain().db.height(), "version": "9.9.26",
             "chain_injected": _CHAIN is not None, "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
             "pool_client_local": _POOL_CLIENT_LOCAL is not None,
@@ -1578,5 +1685,5 @@ def api_tx_status(txid_str):
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.25 (Advanced Sync Barrier + Dynamic Pool + PBFT)")
+    print(f"BRN Server v9.9.26 (Advanced Sync Barrier + Dynamic Pool + PBFT + L2 Bridge)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
