@@ -1,53 +1,21 @@
-"""mining_pool.py — Pool de mineração BRN (v6.3)
+"""mining_pool.py — Pool de mineração BRN (v6.4)
 ================================================================
+v6.4 (2026-11-08):
+  [FIX CRÍTICO] PoolClient.__init__ agora detecta automaticamente
+        se o primeiro argumento é um PoolManager (Origem), uma URL
+        (Cliente) ou os argumentos na ordem padrão (address, pubkey).
+        Isso resolve o erro 'str' object has no attribute 'register'
+        e 'PoolManager' object has no attribute 'strip'.
 v6.3 (2026-11-04):
   [FIX CRÍTICO] _assemble_and_accept_block agora coleta assinaturas
-                via chain._collect_signatures(block) ANTES de chamar
-                chain.accept_block(block). Sem isso, o bloco saía
-                com validators_sig=[] e era rejeitado por
-                _validate_validators_sig com "sem assinaturas
-                válidas" — pool em loop infinito (bloco achado mas
-                nunca aceito, altura travada).
-                chain._collect_signatures já faz: assina localmente
-                + chama _sign_collector (peers) + dedup por pubkey
-                + filtra por valid_set. Mesma função usada por
-                mine_block_interruptible, então comportamento é
-                idêntico entre miner local e pool.
-                Fallback: se _collect_signatures não existir
-                (blockchain.py antigo), chama _sign_collector puro.
+        via chain._collect_signatures(block) ANTES de chamar
+        chain.accept_block(block). Sem isso, o bloco saía
+        com validators_sig=[] e era rejeitado por
+        _validate_validators_sig com "sem assinaturas
+        válidas" — pool em loop infinito (bloco achado mas
+        nunca aceito, altura travada).
 v6.2 (2026-11-03):
-  [NEW] PoolClient — cliente de mineração que faltava. Roda em
-        thread daemon, minera jobs do PoolManager local (modo
-        local) ou de um pool remoto (modo HTTP, se BRN_POOL_URL
-        setado), e expõe os atributos que app_wallet_v3.py espera:
-          _job: dict do último job (job_id, height, difficulty,
-                share_difficulty)
-          _last_known_share_diff: int
-          running: bool
-          hashrate_khs: float
-        Métodos: start(), stop(), status().
-        Singleton: get_pool_client() / reset_pool_client().
-        Fecha o gap em que server.py chamava "/api/pool/start_local"
-        e recebia "PoolClient nao injetado".
-  [NEW] Suporte a BRN_POOL_URL para mineração remota (HTTP).
-        Se vazio, usa o PoolManager local (mesmo processo).
-v6.1 (2026-10-27):
-  [FIX CRÍTICO] Unifica a fonte de reputação no consenso.
-                Antes:
-                  - pool usava trust_system.py      (peer_trust_data.json)
-                  - consenso usava trust_network.py (trust_network.json)
-                Resultado: pool pontuava em uma fonte que o consenso
-                NÃO lia → multi-sig sempre em modo bootstrap, e
-                reputação de mineradores do pool nunca afetava a
-                lista de validadores.
-                Agora:
-                  - register(): registra o minerador em chain.trust_net
-                  - _assemble_and_accept_block(): credita o bloco via
-                    chain.trust_net.record_block_validated()
-v6 (2026-10-25):
-  [FIX CRÍTICO] Proteção contra UNIQUE constraint failed.
-v5 (2026-10-23):
-  [NEW] Vardiff: dificuldade variável por minerador.
+  [NEW] PoolClient — cliente de mineração que faltava.
 ================================================================
 """
 from __future__ import annotations
@@ -85,7 +53,7 @@ VARDIFF_MAX_SAMPLES     = 100
 VARDIFF_MIN_SAMPLES     = 3
 
 # ============================================================
-# POOLCLIENT — parâmetros do cliente de mineração (v6.2)
+# POOLCLIENT — parâmetros do cliente de mineração
 # ============================================================
 POOLCLIENT_JOB_MAX_S        = 30.0
 POOLCLIENT_HEARTBEAT_S      = 10.0
@@ -199,7 +167,6 @@ class PoolManager:
         self.phase2_threshold = 20
         self.miner_queue = list(self.chain.fila_mineracao.keys())
 
-        # [v6.1] Informa qual fonte de trust está ativa
         _trust = getattr(self.chain, "trust_net", None)
         if _trust is not None:
             log.info("PoolManager: usando chain.trust_net (unificado com consenso)")
@@ -217,9 +184,6 @@ class PoolManager:
         threading.Thread(target=self._maintenance_loop, daemon=True, name="Pool-Maint").start()
         log.info("PoolManager iniciado — Blockchain + Vardiff + Trust unificado + Multi-sig")
 
-    # ============================================================
-    # [v6.1] Helpers de integração com o trust network
-    # ============================================================
     def _register_in_trust(self, miner_id: str, address: str, pubkey: str) -> None:
         trust = getattr(self.chain, "trust_net", None)
         if trust is not None:
@@ -265,9 +229,6 @@ class PoolManager:
         except Exception:
             pass
 
-    # ============================================================
-    # Registro de mineradores
-    # ============================================================
     def register(self, address: str, pubkey: str, miner_id: Optional[str] = None) -> dict:
         if not address or not address.startswith("brn1"):
             return {"ok": False, "msg": "address invalido"}
@@ -311,9 +272,6 @@ class PoolManager:
             self.miners.pop(miner_id, None)
         return {"ok": True}
 
-    # ============================================================
-    # VARDIFF
-    # ============================================================
     def _apply_vardiff(self, m: MinerState, job: Job) -> None:
         now = time.time()
         cutoff = now - VARDIFF_WINDOW_S
@@ -551,21 +509,6 @@ class PoolManager:
         # ═══════════════════════════════════════════════════════════
         # [v6.3] FIX CRÍTICO: coletar assinaturas ANTES do accept_block
         # ═══════════════════════════════════════════════════════════
-        # blockchain.accept_block NÃO preenche validators_sig — ele
-        # apenas VALIDA. Sem essa coleta, o bloco do pool sai com 0
-        # sigs e é rejeitado por _validate_validators_sig com
-        # "sem assinaturas válidas", causando loop infinito (bloco
-        # achado, aceito, altura travada).
-        #
-        # chain._collect_signatures é a MESMA função usada por
-        # mine_block_interruptible. Ela faz:
-        #   1. Assina localmente com chain._local_validator_sk
-        #   2. Chama chain._sign_collector (que pede aos peers)
-        #   3. Deduplica por pubkey
-        #   4. Filtra por valid_set (só aceita sigs de validadores
-        #      ativos no trust_network local)
-        # Então o comportamento é idêntico ao miner local — sem
-        # divergência.
         _collector = getattr(self.chain, "_collect_signatures", None)
         if callable(_collector):
             try:
@@ -585,8 +528,6 @@ class PoolManager:
             except Exception as _e:
                 log.exception("[POOL] _collect_signatures falhou: %s", _e)
         else:
-            # Fallback: blockchain.py muito antigo — tenta _sign_collector puro
-            # (perde a assinatura local do origin, mas ao menos pega dos peers)
             _sc = getattr(self.chain, "_sign_collector", None)
             if _sc is not None:
                 try:
@@ -730,16 +671,31 @@ class PoolManager:
 
 
 # ══════════════════════════════════════════════════════════════
-# PoolClient — cliente de mineração (v6.2, inalterado em v6.3)
+# PoolClient — cliente de mineração (v6.4 - FIX CRÍTICO DE COMPATIBILIDADE)
 # ══════════════════════════════════════════════════════════════
 class PoolClient:
     def __init__(self, address: str, pubkey: str,
                  pool_manager: Optional[PoolManager] = None,
                  pool_url: str = ""):
-        self.address = (address or "").strip()
-        self.pubkey = (pubkey or "").strip()
-        self.pm = pool_manager
-        self.pool_url = (pool_url or "").strip().rstrip("/")
+        # --- FIX v6.4: Detecta assinatura antiga (URL ou Manager, address, pubkey) ---
+        if hasattr(address, "register") or hasattr(address, "get_work"):
+            # Chamado como PoolClient(manager, address, pubkey)
+            self.pm = address
+            self.address = (pubkey or "").strip()
+            self.pubkey = (pool_manager or "").strip() if isinstance(pool_manager, str) else ""
+            self.pool_url = ""
+        elif isinstance(address, str) and (address.startswith("http://") or address.startswith("https://")):
+            # Chamado como PoolClient(pool_url, address, pubkey)
+            self.pm = None
+            self.address = (pubkey or "").strip()
+            self.pubkey = (pool_manager or "").strip() if isinstance(pool_manager, str) else ""
+            self.pool_url = address.strip().rstrip("/")
+        else:
+            # Chamado corretamente como PoolClient(address, pubkey, pool_manager, pool_url)
+            self.address = (address or "").strip()
+            self.pubkey = (pubkey or "").strip()
+            self.pm = pool_manager
+            self.pool_url = (pool_url or "").strip().rstrip("/")
 
         self.running = False
         self._stop_evt = threading.Event()
@@ -981,7 +937,7 @@ class PoolClient:
                 url,
                 data=_json.dumps(body).encode(),
                 headers={"Content-Type": "application/json",
-                         "User-Agent": "brn-poolclient/6.3"},
+                         "User-Agent": "brn-poolclient/6.4"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
