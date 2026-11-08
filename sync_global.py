@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sync_global.py v2.1 — Sincroniza com filtro de altura e peer explícito.
+"""sync_global.py v2.2 — Sincroniza com filtro de altura e peer explícito.
 """
 from __future__ import annotations
 import argparse
@@ -86,7 +86,7 @@ def fetch_status(url: str, timeout: float = 30.0) -> Optional[dict]:
     try:
         r = requests.get(f'{url}/api/status', timeout=timeout,
                          proxies={'http': None, 'https': None},
-                         headers={'User-Agent': 'brn-sync-global/2.1'})
+                         headers={'User-Agent': 'brn-sync-global/2.2'})
         if r.status_code == 200:
             return r.json()
     except Exception:
@@ -114,7 +114,7 @@ def fetch_blocks(url: str, start: int, batch: int = 100,
         try:
             r = requests.get(full_url, timeout=timeout,
                              proxies={'http': None, 'https': None},
-                             headers={'User-Agent': 'brn-sync-global/2.1'})
+                             headers={'User-Agent': 'brn-sync-global/2.2'})
             if r.status_code == 200:
                 return r.json().get('blocks', [])
         except Exception:
@@ -183,9 +183,10 @@ def import_chain(blocks: list[dict], db_path: Path,
 
     before = bc.db.height()
     imported = 0
+    total = len(blocks)
 
     try:
-        for block in blocks:
+        for idx, block in enumerate(blocks, 1):
             h = block.get('height')
             if h is None:
                 log('  [!] bloco sem campo height — ignorando')
@@ -198,10 +199,17 @@ def import_chain(blocks: list[dict], db_path: Path,
 
             ok, msg = bc.accept_block(block)
             if not ok:
-                log(f'  [X] bloco #{h} rejeitado: {msg}')
+                log(f'\n  [X] bloco #{h} rejeitado: {msg}')
                 break
             imported += 1
+            
+            # [NOVO] Barra de progresso a cada 100 blocos ou no final
+            if imported % 100 == 0 or idx == total:
+                pct = (idx / total) * 100
+                print(f'\r  [>] Validando blocos: {idx}/{total} ({pct:.1f}%)', end='', flush=True)
+                
     finally:
+        print() # Pula linha após a barra
         after = bc.db.height()
         try:
             bc.db.close()
@@ -232,7 +240,7 @@ def main():
     db_path = Path(args.db) if args.db else DB_PATH
 
     log('=' * 70)
-    log(' SYNC GLOBAL v2.1 (consenso ativo)')
+    log(' SYNC GLOBAL v2.2 (consenso ativo + progresso)')
     if args.strict:
         log(' MODO: --strict (multi-sig obrigatório)')
     if args.only:
