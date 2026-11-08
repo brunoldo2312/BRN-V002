@@ -1,17 +1,16 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.28)
+server.py — Backend HTTP do nó BRN (v9.9.29)
 ================================================================
+v9.9.29 (2026-11-08):
+  [NEW] Dispara o `auto.py` automaticamente em background quando
+        a carteira é desbloqueada na GUI (/api/wallet/set_validator_sk).
+        Isso sincroniza o Trust Network e assina o JSON sem precisar
+        rodar o comando manualmente no terminal.
 v9.9.28 (2026-11-07):
-  [FIX CRÍTICO] Adicionado _PoolManagerWrapper. Agora o PoolClient
-        é inicializado com sucesso na Origem, passando um objeto
-        que se comporta como URL (str) mas executa os métodos
-        do PoolManager local. Resolve o erro 'PoolManager' object
-        has no attribute 'strip'.
+  [FIX CRÍTICO] Adicionado _PoolManagerWrapper. Resolve o erro
+        'PoolManager' object has no attribute 'strip'.
 v9.9.25 (2026-11-06):
-  [NEW] _check_sync_barrier() avançado. Agora ele faz um ping P2P
-        real em todos os peers, verifica a altura máxima da rede,
-        testa a comunicação e só libera a mineração se todos 
-        estiverem sincronizados.
+  [NEW] _check_sync_barrier() avançado (paralelo via ThreadPool).
 ================================================================
 """
 from __future__ import annotations
@@ -23,6 +22,7 @@ import atexit
 import hmac
 import logging
 import sys
+import subprocess  # [NOVO v9.9.29] Para disparar o auto.py
 import threading
 import urllib.request
 import urllib.error
@@ -121,7 +121,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
             req = urllib.request.Request(
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
-                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.28"},
+                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.29"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -240,16 +240,8 @@ def _register_miner_in_trust(pubkey: str, address: str) -> None:
 # SYNC BARRIER AVANÇADO
 # ============================================================
 def _check_sync_barrier() -> tuple[bool, str]:
-    """
-    Verifica a saúde da rede antes de liberar a mineração.
-    1. Carteira carregada?
-    2. Nós P2P respondem?
-    3. Estamos na mesma altura do topo?
-    4. Peers conseguem assinar um bloco de teste?
-    """
     chain = _get_chain()
     
-    # 1. Carteira
     if getattr(chain, "_local_validator_sk", None) is None:
         return False, "Carteira não está carregada. Abra a carteira antes de minerar."
 
@@ -809,7 +801,6 @@ def miner_start():
         if not WalletManager.validate_address(addr): return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
         if not pubkey: return jsonify({"ok": False, "msg": "Pubkey desconhecida."}), 400
 
-        # BARREIRA AVANÇADA
         ok_sync, msg_sync = _check_sync_barrier()
         if not ok_sync:
             return jsonify({"ok": False, "msg": msg_sync}), 400
@@ -1030,7 +1021,6 @@ def pool_local_status():
 
 @app.route("/api/pool/start_local", methods=["POST"])
 def pool_start_local():
-    # BARREIRA AVANÇADA
     ok_sync, msg_sync = _check_sync_barrier()
     if not ok_sync:
         return jsonify({"ok": False, "msg": msg_sync}), 400
@@ -1228,7 +1218,7 @@ def l2_cancel():
 
 
 # ============================================================
-# WALLET — sincroniza SK e ATIVA PBFT DINAMICAMENTE
+# WALLET — sincroniza SK, ATIVA PBFT e DISPARA AUTO.PY
 # ============================================================
 @app.route("/api/wallet/set_validator_sk", methods=["POST"])
 def api_wallet_set_validator_sk():
@@ -1297,6 +1287,25 @@ def api_wallet_set_validator_sk():
                 log.info("[PBFT] Ativado dinamicamente via API de wallet")
             except Exception as e:
                 log.warning("[PBFT] Falha ao ativar dinamicamente: %s", e)
+
+        # ============================================================
+        # [NOVO v9.9.29] Dispara o auto.py em background
+        # ============================================================
+        try:
+            def _run_auto():
+                try:
+                    subprocess.Popen(
+                        [sys.executable, "auto.py"],
+                        cwd=str(BASE_DIR),
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception as e:
+                    log.warning("[auto.py] Falha ao executar: %s", e)
+            threading.Thread(target=_run_auto, daemon=True, name="AutoTrust").start()
+            log.info("[wallet_sk] auto.py disparado em background para sincronizar peers")
+        except Exception as e:
+            log.warning("[wallet_sk] Falha ao agendar auto.py: %s", e)
 
         log.info("[wallet_sk] SK atualizada em runtime — pk=%s… trust=%s", installed_pk[:16], "ok" if trust_synced else "skip")
         return jsonify({"ok": True, "pubkey": installed_pk, "trust_synced": trust_synced})
@@ -1462,7 +1471,7 @@ def peers_discovered():
 def health():
     try:
         return jsonify({
-            "ok": True, "height": _get_chain().db.height(), "version": "9.9.28",
+            "ok": True, "height": _get_chain().db.height(), "version": "9.9.29",
             "chain_injected": _CHAIN is not None, "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
             "pool_client_local": _POOL_CLIENT_LOCAL is not None,
@@ -1722,5 +1731,5 @@ def api_tx_status(txid_str):
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.28 (Sync Barrier + Dynamic Pool + PBFT + L2 Bridge)")
+    print(f"BRN Server v9.9.29 (Auto Trust + Wrapper fix + Sync Barrier + PBFT + L2)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
