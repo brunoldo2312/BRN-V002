@@ -1,23 +1,10 @@
-"""verify.py — Verificação completa do ambiente BRN
+"""verify.py — Verificação completa do ambiente BRN (v2.0)
 ================================================================
-Verifica sem modificar nada:
-  1. Arquivos essenciais no disco (existência + tamanho mínimo)
-  2. Importação de módulos e símbolos públicos esperados
-  3. Assinaturas de funções críticas (compat entre módulos)
-  4. Blockchain aceita `auto_genesis`
-  5. Schema do DB SQLite (mempool, peers, transactions, etc.)
-  6. Variáveis de ambiente essenciais
-  7. Estrutura de pastas (contracts/, wallets/)
-
-Uso:
-    python3 verify.py
-    python3 verify.py --db brn_v2_chain.db
-    python3 verify.py --strict
-    python3 verify.py --no-db
-
-Exit code:
-    0 = tudo OK (avisos opcionais)
-    1 = há erros bloqueantes
+v2.0 (2026-11-08):
+  [FIX] Carrega brn_network.env ANTES de importar módulos.
+        Antes, p2p_unified e discovery_v2 falhavam com RuntimeError
+        porque BRN_NETWORK_SECRET não estava no os.environ.
+  [FIX] RelayManager agora é OPCIONAL em p2p_relay (é fallback).
 ================================================================
 """
 from __future__ import annotations
@@ -32,6 +19,33 @@ from pathlib import Path
 
 
 BASE = Path(__file__).resolve().parent
+
+
+# ============================================================
+# LOAD ENV ANTES DE TUDO
+# ============================================================
+def _load_env_file() -> int:
+    """Carrega brn_network.env no os.environ. Deve ser chamado ANTES
+    de qualquer import de módulo que dependa dessas variáveis."""
+    env_file = BASE / "brn_network.env"
+    if not env_file.exists():
+        return 0
+    loaded = 0
+    try:
+        text = env_file.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return 0
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        k, _, v = s.partition("=")
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        if k and k not in os.environ:
+            os.environ[k] = v
+            loaded += 1
+    return loaded
 
 
 # ============================================================
@@ -82,7 +96,6 @@ FILES = [
 # ============================================================
 # 2) MÓDULOS E SÍMBOLOS ESPERADOS
 # ============================================================
-# módulo: (símbolos obrigatórios, símbolos opcionais)
 MODULES = {
     "crypto": (
         ["Ed25519PrivateKey", "Ed25519PublicKey", "sha256", "double_sha256",
@@ -156,8 +169,8 @@ MODULES = {
         [],
     ),
     "p2p_relay": (
-        ["RelayManager"],
-        [],
+        [],  # [FIX v2] RelayManager agora é opcional (é fallback)
+        ["RelayManager", "RelayClient"],
     ),
     "sync_manager": (
         ["ChainSyncManager"],
@@ -300,7 +313,6 @@ def check_files(r: Result):
         else:
             print(f"  [ok] {nome:<28} {size} bytes")
 
-    # pasta contracts/
     contracts_dir = BASE / "contracts"
     if contracts_dir.is_dir():
         print(f"  [ok] contracts/                    (diretorio existe)")
@@ -355,10 +367,8 @@ def check_signatures(r: Result):
     print("\n3) Assinaturas de funções críticas")
     print("-" * 64)
 
-    # secure_store.save_wallet(data, password, path)
     try:
         from secure_store import save_wallet, load_wallet
-
         params = list(inspect.signature(save_wallet).parameters)
         if params[:2] not in (["data", "password"],
                               ["wallet_data", "password"]):
@@ -377,7 +387,6 @@ def check_signatures(r: Result):
         print(f"  [!] secure_store: {e}")
         r.warn(f"nao consegui verificar secure_store: {e}")
 
-    # blockchain.Blockchain.__init__ aceita auto_genesis
     try:
         from blockchain import Blockchain
         params = list(inspect.signature(Blockchain.__init__).parameters)
@@ -390,7 +399,6 @@ def check_signatures(r: Result):
         print(f"  [!] Blockchain: {e}")
         r.warn(f"nao consegui inspecionar Blockchain: {e}")
 
-    # wallet.Wallet.verify estático
     try:
         from wallet import Wallet
         if not hasattr(Wallet, "verify"):
@@ -402,7 +410,6 @@ def check_signatures(r: Result):
         print(f"  [!] Wallet: {e}")
         r.warn(f"Wallet: {e}")
 
-    # server.set_chain
     try:
         import server
         if not hasattr(server, "set_chain"):
@@ -414,7 +421,6 @@ def check_signatures(r: Result):
         print(f"  [!] server: {e}")
         r.warn(f"server: {e}")
 
-    # P2PManager aceita (chain, node_id_priv, tcp_port, enable_upnp)
     try:
         from p2p_unified import P2PManager
         params = set(inspect.signature(P2PManager.__init__).parameters)
@@ -466,7 +472,6 @@ def check_db_schema(r: Result, db_path: str):
             print(f"  [!] {table:<14} erro: {e}")
             r.warn(f"{table}: {e}")
 
-    # altura
     try:
         row = conn.execute("SELECT MAX(height) FROM blocks").fetchone()
         h = row[0] if row else None
@@ -546,6 +551,11 @@ def main() -> int:
     print("  BRN — Verificação completa (arquivos, módulos, DB, env)")
     print(f"  Base: {BASE}")
     print("=" * 64)
+
+    # [FIX v2] Carrega .env ANTES de qualquer import de módulo
+    loaded = _load_env_file()
+    if loaded > 0:
+        print(f"\n[env] brn_network.env carregado ({loaded} variáveis)")
 
     r = Result()
 
