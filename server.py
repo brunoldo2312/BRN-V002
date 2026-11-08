@@ -7,9 +7,6 @@ v9.9.28 (2026-11-07):
         que se comporta como URL (str) mas executa os métodos
         do PoolManager local. Resolve o erro 'PoolManager' object
         has no attribute 'strip'.
-v9.9.27 (2026-11-07):
-  [FIX] pool_start_local() passava o objeto PoolManager direto,
-        causando erro no .strip() do PoolClient.
 ================================================================
 """
 from __future__ import annotations
@@ -235,12 +232,11 @@ def _register_miner_in_trust(pubkey: str, address: str) -> None:
 
 
 # ============================================================
-# SYNC BARRIER AVANÇADO (v9.9.25 OTIMIZADO)
+# SYNC BARRIER AVANÇADO
 # ============================================================
 def _check_sync_barrier() -> tuple[bool, str]:
     chain = _get_chain()
     
-    # 1. Carteira
     if getattr(chain, "_local_validator_sk", None) is None:
         return False, "Carteira não está carregada. Abra a carteira antes de minerar."
 
@@ -991,30 +987,18 @@ def pool_miners():
 # POOL LOCAL DINÂMICO (FIX v9.9.28)
 # ============================================================
 class _PoolManagerWrapper(str):
-    """Invólucro que engana o PoolClient: age como string (URL) mas repassa métodos ao PoolManager."""
     def __new__(cls, pool_mgr):
         obj = super().__new__(cls, "http://127.0.0.1:5000")
         obj._pool_mgr = pool_mgr
         return obj
-
-    def strip(self, *args, **kwargs):
-        return self
-    def rstrip(self, *args, **kwargs):
-        return self
-    def lstrip(self, *args, **kwargs):
-        return self
-        
-    def register(self, *args, **kwargs):
-        return self._pool_mgr.register(*args, **kwargs)
-    def get_work(self, *args, **kwargs):
-        return self._pool_mgr.get_work(*args, **kwargs)
-    def submit_share(self, *args, **kwargs):
-        return self._pool_mgr.submit_share(*args, **kwargs)
-    def heartbeat(self, *args, **kwargs):
-        return self._pool_mgr.heartbeat(*args, **kwargs)
-        
-    def __getattr__(self, name):
-        return getattr(self._pool_mgr, name)
+    def strip(self, *args, **kwargs): return self
+    def rstrip(self, *args, **kwargs): return self
+    def lstrip(self, *args, **kwargs): return self
+    def register(self, *args, **kwargs): return self._pool_mgr.register(*args, **kwargs)
+    def get_work(self, *args, **kwargs): return self._pool_mgr.get_work(*args, **kwargs)
+    def submit_share(self, *args, **kwargs): return self._pool_mgr.submit_share(*args, **kwargs)
+    def heartbeat(self, *args, **kwargs): return self._pool_mgr.heartbeat(*args, **kwargs)
+    def __getattr__(self, name): return getattr(self._pool_mgr, name)
 
 
 @app.route("/api/pool/local_status", methods=["GET"])
@@ -1032,7 +1016,6 @@ def pool_local_status():
 
 @app.route("/api/pool/start_local", methods=["POST"])
 def pool_start_local():
-    # BARREIRA AVANÇADA
     ok_sync, msg_sync = _check_sync_barrier()
     if not ok_sync:
         return jsonify({"ok": False, "msg": msg_sync}), 400
@@ -1051,7 +1034,6 @@ def pool_start_local():
             pool_mgr = _get_pool_manager()
             
             if pool_mgr is not None:
-                # ORIGEM: usa o Invólucro (Wrapper)
                 log.info("[pool_client] Inicializando PoolClient LOCAL (wrapper PoolManager)")
                 wrapped_mgr = _PoolManagerWrapper(pool_mgr)
                 try:
@@ -1062,7 +1044,6 @@ def pool_start_local():
                     except TypeError:
                         pc = PoolClient(wrapped_mgr)
             else:
-                # CLIENTE: usa URL HTTP real
                 pool_url = os.environ.get("BRN_POOL_URL", "").strip()
                 if not pool_url:
                     pool_url = os.environ.get("BRN_POOL_URL_LOCAL", "").strip() or "http://127.0.0.1:5000"
@@ -1076,7 +1057,6 @@ def pool_start_local():
                     except TypeError:
                         pc = PoolClient(pool_url)
 
-            # Garante que o PoolClient tenha os dados
             if hasattr(pc, "address") and address:
                 pc.address = address
             if hasattr(pc, "pubkey") and pubkey:
