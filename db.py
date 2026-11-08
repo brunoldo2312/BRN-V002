@@ -1,15 +1,26 @@
-"""db.py — Banco SQLite do BRN (v7.2 - Conexão de leitura separada)
+"""db.py — Banco SQLite do BRN (v7.3 - Batch seguro)
 ================================================================
+v7.3 (2026-11-08) — PATCH DE AUDITORIA:
+  [FIX CRÍTICO] _flush_batch: futures só são marcadas como done
+        APÓS o COMMIT. Antes, `set_result()` era chamado DURANTE a
+        transação. Se uma op posterior no mesmo batch falhasse, o
+        ROLLBACK desfazia tudo, mas as futures anteriores já
+        retornavam "ok" para os callers. Efeito: add_mempool,
+        set_meta, upsert_peer (todas batch_safe=True) reportavam
+        sucesso mas o dado tinha sido desfeito. Perda silenciosa.
+  [FIX] _add_peer_score_impl: retornava self.get_peer_score() que
+        lê de read_conn. Em WAL, read_conn dentro da transação do
+        writer vê o valor PRÉ-COMMIT (stale). Agora lê da própria
+        self.conn (mesma transação), retornando o valor correto.
+  [FIX] _flush_batch: log warning explícito com nº de ops e motivo
+        quando um batch inteiro é desfeito. Antes, o log era genérico.
+  [KEEP] v7.2: leitura separada (read_conn + WAL).
+  [KEEP] v7.1: locks de leitura.
+  [KEEP] v7.0: Writer Queue + Batch Commits.
+
 v7.2 (2026-11-05):
   [ARCH] Conexão SQLite separada para LEITURAS (read_conn) e
          ESCRITAS (conn). Ambas usam WAL.
-         - conn       + self.lock      → Writer Queue exclusivo
-         - read_conn  + self.read_lock → todas as leituras
-         Com WAL, leituras rodam em PARALELO com escritas sem
-         colisão de lock. Elimina InterfaceError E a contenção
-         entre assinatura/multi-sig e o Writer Queue.
-  [FIX] get_blocks_by_heights() — leitura em lote (1 query).
-        Usado pelo _resolve_fork para evitar 100+ round-trips.
 v7.1 (2026-11-05):
   [FIX] InterfaceError por falta de lock em leituras.
 v7.0:
@@ -18,7 +29,7 @@ v7.0:
 """
 from __future__ import annotations
 
-__version__ = "7.2"
+__version__ = "7.3"
 
 import os
 import time
@@ -43,7 +54,7 @@ _FUTURE_TIMEOUT     = float(os.environ.get("BRN_DB_FUTURE_TIMEOUT", "60.0"))
 
 
 class _WriteOp:
-    __slots__ = ("fn", "args", "kwargs", "batch_safe", "future")
+    __slots__ = ("fn", "args", "kwargs", "batch_safe", "future", "_pending_result")
 
     def __init__(self, fn, args, kwargs, batch_safe):
         self.fn = fn
@@ -51,6 +62,7 @@ class _WriteOp:
         self.kwargs = kwargs
         self.batch_safe = batch_safe
         self.future = concurrent.futures.Future()
+        self._pending_result = None
 
 
 class ChainDB:
@@ -156,24 +168,56 @@ class ChainDB:
             self._flush_batch(batch)
 
     def _flush_batch(self, batch: list) -> None:
+        """
+        Executa um batch de ops batch_safe=True numa transação.
+
+        [FIX v7.3] Futures só são marcadas como done APÓS o COMMIT.
+        Se qualquer op falhar, o batch inteiro é desfeito e TODAS as
+        futures recebem a mesma exceção — os callers sabem que nada
+        foi salvo (antes, ops anteriores à que falhou reportavam
+        sucesso mesmo com ROLLBACK).
+        """
+        pending: list[tuple] = []   # [(op, result | None, exc | None)]
         try:
             self.conn.execute("BEGIN IMMEDIATE")
             for op in batch:
                 try:
                     result = op.fn(*op.args, **op.kwargs)
-                    op.future.set_result(result)
+                    pending.append((op, result, None))
                 except Exception as e:
-                    op.future.set_exception(e)
+                    pending.append((op, None, e))
                     raise
             self.conn.execute("COMMIT")
+            # [FIX v7.3] Só marca futures como done APÓS o COMMIT.
+            for op, result, exc in pending:
+                if exc is not None:
+                    op.future.set_exception(exc)
+                else:
+                    op.future.set_result(result)
         except Exception as e:
             try:
                 self.conn.execute("ROLLBACK")
             except Exception:
                 pass
-            for op in batch:
+
+            # [FIX v7.3] Log explícito: quais ops foram desfeitas
+            done_before = len(pending)
+            total = len(batch)
+            log.warning(
+                f"[db] batch de {total} ops desfeito por ROLLBACK "
+                f"({done_before} executadas antes da falha): {e}"
+            )
+
+            # Ops que executaram antes da falha: recebem set_exception
+            for op, _result, _exc in pending:
                 if not op.future.done():
-                    self._exec_one(op)
+                    op.future.set_exception(e)
+
+            # Ops que NÃO chegaram a executar: também falham
+            pending_ids = {id(op) for op, _, _ in pending}
+            for op in batch:
+                if id(op) not in pending_ids and not op.future.done():
+                    op.future.set_exception(e)
 
     def _exec_one(self, op: _WriteOp) -> None:
         try:
@@ -661,6 +705,8 @@ class ChainDB:
 
     def _rollback_block_impl(self, height):
         with self.lock:
+            # get_block usa read_conn — o bloco já foi commitado antes de
+            # rollback_block ser enfileirado, então a leitura vê.
             block = self.get_block(height)
             if not block:
                 return
@@ -869,10 +915,19 @@ class ChainDB:
         return self._enqueue(self._add_peer_score_impl, address, delta, batch_safe=True)
 
     def _add_peer_score_impl(self, address, delta):
+        """
+        [FIX v7.3] Retorna o valor JÁ ATUALIZADO pela conn writer.
+        Antes chamava self.get_peer_score() que lê de read_conn —
+        em WAL, dentro da transação do writer, read_conn vê o valor
+        PRÉ-COMMIT (stale).
+        """
         self.conn.execute(
             "UPDATE peers SET score = COALESCE(score, 0) + ? WHERE address=?", (delta, address),
         )
-        return self.get_peer_score(address)
+        row = self.conn.execute(
+            "SELECT score FROM peers WHERE address=?", (address,)
+        ).fetchone()
+        return int(row["score"]) if row else 0
 
     def listar_peers(self, apenas_ativos=True, janela=300):
         with self.read_lock:
@@ -1112,8 +1167,15 @@ class ChainDB:
         )
 
     def _update_l2_escrow_status_impl(self, escrow_id, status, btc_txid=None):
-        escrow = self.get_l2_escrow_by_id(escrow_id)
-        if not escrow:
+        # Lê pela conn writer para ver estado atual da transação
+        row = self.conn.execute(
+            "SELECT raw_json FROM l2_escrows WHERE escrow_id=?", (escrow_id,)
+        ).fetchone()
+        if not row:
+            return
+        try:
+            escrow = json.loads(row["raw_json"])
+        except Exception:
             return
         escrow['status'] = status
         if btc_txid:
@@ -1255,17 +1317,23 @@ class ChainDB:
                         "UPDATE utxos SET spent=1, spent_by=? WHERE txid=? AND vout=?",
                         (txid_base, txid, vout),
                     )
+                # height: lê da conn writer (dentro da transação) — o valor
+                # é o mesmo do read_conn se não houver add_block pendente.
+                cur_h = self.conn.execute(
+                    "SELECT MAX(height) AS h FROM blocks"
+                ).fetchone()
+                h_now = int(cur_h["h"]) if cur_h and cur_h["h"] is not None else -1
                 self.conn.execute(
                     "INSERT INTO utxos(txid, vout, address, amount, pubkey, block_height, spent) "
                     "VALUES (?,?,?,?,?,?,0)",
-                    (txid_base, 0, to_addr, amount, "", self.height()),
+                    (txid_base, 0, to_addr, amount, "", h_now),
                 )
                 troco = total - amount
                 if troco > 0:
                     self.conn.execute(
                         "INSERT INTO utxos(txid, vout, address, amount, pubkey, block_height, spent) "
                         "VALUES (?,?,?,?,?,?,0)",
-                        (txid_base, 1, from_addr, troco, "", self.height()),
+                        (txid_base, 1, from_addr, troco, "", h_now),
                     )
                 self.conn.execute("COMMIT")
             except Exception:
