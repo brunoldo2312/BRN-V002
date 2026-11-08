@@ -1,6 +1,24 @@
 """
-sync_manager.py — Sincronização + Reorg automático + Sync Paralelo (v9.2)
+sync_manager.py — Sincronização + Reorg automático + Sync Paralelo (v9.3)
 ================================================================
+v9.3 (2026-11-08):
+  [FIX CRÍTICO] sync_trust_network() agora REJEITA payloads de
+        trust_network.json SEM assinatura Ed25519 do Origin.
+        Antes: se "signature" e "origin_pubkey" estivessem ausentes,
+        o código simplesmente caía no merge (o `if sig and origin_pub:
+        ...` não tinha um `else: return False`). Um cliente
+        comprometido podia servir um trust sem assinatura, com nós
+        do atacante, e o sync_manager aceitava — envenenando o
+        quórum de validadores da rede.
+        Também adiciona `_HAS_CRYPTO=False` como rejeição
+        (antes logava warning e continuava o merge).
+  [NEW] BRN_TRUST_REQUIRE_SIGNATURE (default "1"). Se "0", aceita
+        payload sem assinatura COM AVISO ALTO — só para bootstrap
+        controlado / rede de dev. Em produção MANTER "1".
+  [NEW] Valida que `data["nodes"]` é dict e ignora nós malformados
+        individualmente (não aborta o sync inteiro por 1 nó ruim).
+  [KEEP] Todas as correções de v9.2 (fix da ordem de pop dos campos
+        em sync_trust_network).
 v9.2 (2026-11-05):
   [FIX CRÍTICO] sync_trust_network() agora remove os campos
         "saved_at" e "client_written" do JSON ANTES de verificar
@@ -41,6 +59,12 @@ BATCH_DELAY_S      = float(os.environ.get("BRN_SYNC_BATCH_DELAY", "0.06"))
 PARALLEL_WORKERS   = int(os.environ.get("BRN_SYNC_PARALLEL_WORKERS", "4"))
 TRUST_SYNC_INTERVAL= float(os.environ.get("BRN_TRUST_SYNC_INTERVAL", "60"))
 
+# [v9.3] Exige assinatura do Origin no payload de trust.
+# Default: True (produção). "0" só para bootstrap controlado.
+BRN_TRUST_REQUIRE_SIGNATURE = (
+    os.environ.get("BRN_TRUST_REQUIRE_SIGNATURE", "1") == "1"
+)
+
 REORG_LOOKBACK       = int(os.environ.get("BRN_REORG_LOOKBACK", "500"))
 REORG_WORK_THRESHOLD = float(os.environ.get("BRN_REORG_WORK_THRESHOLD", "1.0"))
 REORG_FETCH_BATCH    = int(os.environ.get("BRN_REORG_FETCH_BATCH", "200"))
@@ -61,6 +85,10 @@ try:
     _HAS_CRYPTO = True
 except ImportError:
     _HAS_CRYPTO = False
+    log.warning(
+        "[sync] crypto.Ed25519PublicKey indisponível — sync de trust "
+        "SERÁ REJEITADO (payload sem verificação de assinatura é inseguro)."
+    )
 
 
 @dataclass
@@ -231,7 +259,17 @@ class ChainSyncManager:
         return True, ""
 
     # =================================================================
-    # [v9.2] SINCRONIZAÇÃO DO TRUST NETWORK VIA HTTP (COM FIX DA ASSINATURA)
+    # [v9.3] SINCRONIZAÇÃO DO TRUST NETWORK VIA HTTP
+    # -----------------------------------------------------------------
+    # Regra de segurança:
+    #   - Payload DEVE ter "signature" e "origin_pubkey".
+    #   - Assinatura DEVE verificar com a pubkey do Origin.
+    #   - Caso contrário, REJEITA (a menos que
+    #     BRN_TRUST_REQUIRE_SIGNATURE=0, modo bootstrap explícito).
+    #
+    # Antes (v9.2 e anteriores): se sig/origin_pub faltassem, o merge
+    # acontecia mesmo assim. Um cliente comprometido podia servir
+    # trust sem assinatura, com nós do atacante, e envenenar o quórum.
     # =================================================================
     def sync_trust_network(self) -> bool:
         """Baixa o trust_network.json do Origin e atualiza a memória local."""
@@ -242,50 +280,111 @@ class ChainSyncManager:
         now = time.time()
         if now - self._last_trust_sync < TRUST_SYNC_INTERVAL:
             return False
-            
+
         self._last_trust_sync = now
         url = f"{origin_url}/api/trust/download"
-        
+
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "brn-sync/9.2"})
+            req = urllib.request.Request(url, headers={"User-Agent": "brn-sync/9.3"})
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-            
-            # Verifica a assinatura do Origin
+
+            if not isinstance(data, dict):
+                log.error("[TRUST-SYNC] payload não é dict — rejeitando")
+                return False
+
+            # Extrai a assinatura e a pubkey do Origin
             sig = data.pop("signature", None)
             origin_pub = data.pop("origin_pubkey", None)
-            # [FIX v9.2] Remove campos adicionados DEPOIS da assinatura
+            # Campos adicionados DEPOIS da assinatura no flush() do Origin
             data.pop("saved_at", None)
             data.pop("client_written", None)
-            
-            if sig and origin_pub and _HAS_CRYPTO:
-                payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+            # [FIX v9.3] REJEITA se não há assinatura, a menos que
+            # BRN_TRUST_REQUIRE_SIGNATURE=0 (bootstrap explícito).
+            if not sig or not origin_pub:
+                if BRN_TRUST_REQUIRE_SIGNATURE:
+                    log.error(
+                        "[TRUST-SYNC] REJEITADO: payload sem assinatura "
+                        "do Origin (sig=%s origin_pub=%s). "
+                        "Configure BRN_TRUST_REQUIRE_SIGNATURE=0 APENAS "
+                        "em bootstrap controlado.",
+                        bool(sig), bool(origin_pub),
+                    )
+                    return False
+                log.warning(
+                    "[TRUST-SYNC] ATENÇÃO: aceitando trust SEM assinatura "
+                    "(BRN_TRUST_REQUIRE_SIGNATURE=0). Use SÓ em dev."
+                )
+
+            if sig and origin_pub:
+                if not _HAS_CRYPTO:
+                    log.error(
+                        "[TRUST-SYNC] REJEITADO: crypto.Ed25519PublicKey "
+                        "indisponível — não posso verificar a assinatura."
+                    )
+                    return False
+                payload = json.dumps(
+                    data, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
                 try:
                     pk = Ed25519PublicKey.from_public_bytes(bytes.fromhex(origin_pub))
                     pk.verify(bytes.fromhex(sig), payload)
                 except Exception as e:
                     log.error(f"[TRUST-SYNC] Assinatura do Origin INVÁLIDA: {e}")
                     return False
-            elif sig and origin_pub and not _HAS_CRYPTO:
-                log.warning("[TRUST-SYNC] crypto indisponível — não posso verificar assinatura")
+
+            # Sanity: 'nodes' tem que ser dict
+            nodes_payload = data.get("nodes")
+            if not isinstance(nodes_payload, dict):
+                log.error(
+                    "[TRUST-SYNC] payload.nodes não é dict (%s) — rejeitando",
+                    type(nodes_payload).__name__,
+                )
                 return False
-            
-            # Atualiza o trust_network em memória
+
             trust = getattr(self.chain, "trust_net", None)
-            if trust is not None:
-                from trust_network import NodeRecord
-                with trust._lock:
-                    merged = 0
-                    for nid, nd in data.get("nodes", {}).items():
-                        try:
-                            trust.nodes[nid] = NodeRecord.from_dict(nd)
-                            merged += 1
-                        except Exception:
-                            pass
-                    trust._mark_dirty()
-                    trust.flush()
-                log.info(f"[TRUST-SYNC] {merged} nós atualizados do Origin via HTTP")
+            if trust is None:
+                log.debug("[TRUST-SYNC] chain.trust_net ausente — nada a fazer")
+                return False
+
+            # Se o nó é Origin, um sync de outro Origin é conflito.
+            if getattr(trust, "is_origin", False):
+                log.warning(
+                    "[TRUST-SYNC] este nó é Origin mas BRN_POOL_URL está "
+                    "setado para %s. Ignorando sync de trust externo.",
+                    origin_url,
+                )
+                return False
+
+            from trust_network import NodeRecord
+            merged = 0
+            rejected = 0
+            with trust._lock:
+                for nid, nd in nodes_payload.items():
+                    if not isinstance(nd, dict):
+                        rejected += 1
+                        continue
+                    try:
+                        trust.nodes[nid] = NodeRecord.from_dict(nd)
+                        merged += 1
+                    except Exception:
+                        rejected += 1
+                trust._mark_dirty()
+                trust.flush()
+
+            if rejected:
+                log.warning(
+                    "[TRUST-SYNC] %d nó(s) ignorado(s) por formato inválido "
+                    "(de %d total)", rejected, len(nodes_payload),
+                )
+            log.info(
+                "[TRUST-SYNC] %d nós atualizados do Origin via HTTP "
+                "(assinatura=%s)", merged,
+                "válida" if sig and origin_pub else "AUSENTE",
+            )
             return True
+
         except urllib.error.URLError as e:
             log.debug(f"[TRUST-SYNC] Conexão falhou: {e}")
             return False
@@ -327,7 +426,7 @@ class ChainSyncManager:
                     )
                     if resp and "blocks" in resp:
                         return (chunk_start, resp["blocks"])
-                except Exception as e:
+                except Exception:
                     continue
             return (chunk_start, [])
 
@@ -638,7 +737,7 @@ class ChainSyncManager:
                     try:
                         # [v9.1] Sincroniza o Trust Network via HTTP
                         self.sync_trust_network()
-                        
+
                         self._refresh_peers_from_p2p()
 
                         fork_peer = self._detect_fork()
@@ -667,7 +766,7 @@ class ChainSyncManager:
             target=_loop, daemon=True, name="ChainSync"
         )
         self.sync_thread.start()
-        log.info(f"ChainSyncManager v9.2 (paralelo+trust) iniciado")
+        log.info("ChainSyncManager v9.3 (paralelo+trust-assinado) iniciado")
 
     def _best_peer_by_work(self) -> Optional[PeerStatus]:
         local_h = self._safe_height()
@@ -727,6 +826,7 @@ class ChainSyncManager:
             "blocos_faltando":     max(0, target - local),
             "parallel_workers":    PARALLEL_WORKERS,
             "peers_in_cooldown":   blocked,
+            "trust_require_signature": BRN_TRUST_REQUIRE_SIGNATURE,
         }
 
     def __enter__(self):
