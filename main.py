@@ -1,26 +1,35 @@
-"""main.py — Entrypoint do nó BRN (v13.9.0)
+"""main.py — Entrypoint do nó BRN (v13.9.1)
 ================================================================
+v13.9.1 (2026-11-08):
+  [FIX CRÍTICO] _load_or_create_node_identity: se node_identity.enc
+                EXISTE mas a senha está errada, ABORTA o boot com
+                RuntimeError. Antes, recriava a identidade com
+                Ed25519PrivateKey.generate() e sobrescrevia o arquivo
+                — o nó perdia o node_id em silêncio, peers rejeitavam,
+                trust ficava inconsistente. Uma das piores falhas
+                possíveis em produção: você não percebe até ver o
+                handshake P2P falhar com todos os peers.
+  [FIX CRÍTICO] Removido "gergerger" hardcoded de identity_password
+                e de _load_wallet(). Antes, se o .env não carregasse,
+                o nó gerava identidade com senha previsível (e a
+                primeira execução criava node_identity.enc cifrado
+                com "gergerger"). Isso é um vetor de ataque óbvio:
+                qualquer um com o arquivo podia decifrá-lo.
+  [FIX CRÍTICO] _setup_multisig: se brn_multisig não existir E
+                BRN_STRICT_MULTISIG=1, ABORTA o boot. Antes, só
+                logava warning e continuava sem _sign_collector —
+                a rede inteira rejeitava os blocos do minerador
+                (fork silencioso que ninguém percebia).
+  [FIX] _setup_multisig: quando brn_multisig ausente E
+        STRICT_MULTISIG=0, loga ERROR (era warning). Operador
+        precisa saber que a rede está sem multi-sig.
+  [KEEP] Tudo do v13.9.0 (multisig, pbft, trust daemon, broadcast).
 v13.9.0 (2026-11-05):
-  [FIX CRÍTICO] _load_wallet() tenta múltiplas senhas:
-                  1. BRN_WALLET_SESSION_PASS
-                  2. BRN_NODE_PASSWORD
-                  3. "gergerger" (fallback final)
-                Resolve o caso em que o .bat tem senha errada mas
-                o .env tem a correta.
-  [NEW] _setup_multisig() — configura coletor de assinaturas para
-        os peers assinarem blocos minerados pelo Windows.
-        Chamado APÓS p2p.start() e wallet carregada.
-  [NEW] _setup_pbft() — injeta PBFTConsensus na chain se
-        BRN_PBFT_ENABLED=1. Ativa via server.py se a carteira
-        for desbloqueada depois.
-  [NEW] chain.on_block_mined = p2p.broadcast_block — propaga blocos
-        aceitos para todos os peers (fecha o loop do consenso).
-  [NEW] _setup_trust_daemon() — tenta importar trust_daemon.TrustDaemon
-        (custom do Bruno); se não existir, cria versão inline básica
-        que periodicamente renova last_seen e limpa fantasmas.
-  [KEEP] --skip-verify (compat com o .bat).
-  [KEEP] --headless, --client-mode, --origem, --no-p2p, etc.
-  [KEEP] GUI abre index_wallet.html.
+  [NEW] _setup_multisig() — configura coletor de assinaturas.
+  [NEW] _setup_pbft() — injeta PBFTConsensus na chain.
+  [NEW] chain.on_block_mined = p2p.broadcast_block.
+  [NEW] _setup_trust_daemon() — auto-gerencia trust.
+  [KEEP] --skip-verify, --headless, --client-mode, --origem, etc.
 ================================================================
 """
 from __future__ import annotations
@@ -41,8 +50,8 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.0"
-    BUILD_DATE = "2026-11-05"
+    VERSION = "13.9.1"
+    BUILD_DATE = "2026-11-08"
 
 
 # ============================================================
@@ -107,9 +116,23 @@ def _setup_logging(level: str = "INFO"):
 
 
 # ============================================================
-# IDENTITY
+# IDENTITY — [FIX CRÍTICO v13.9.1]
 # ============================================================
 def _load_or_create_node_identity(password: str, path: str = "node_identity.enc"):
+    """
+    Carrega OU cria a identidade Ed25519 do nó.
+
+    Regras (após v13.9.1):
+      - Se o arquivo EXISTE e a senha decifra:           OK, usa.
+      - Se o arquivo EXISTE e a senha NÃO decifra:       FATAL. Não recria.
+      - Se o arquivo NÃO existe e há senha:              cria.
+      - Se o arquivo NÃO existe e não há senha:          FATAL (não podemos
+        persistir a identidade sem senha — usar senha previsível é inseguro).
+
+    Antes (v13.9.0), o segundo caso recriava a identidade silenciosamente,
+    o que apagava o node_id do nó. Todos os peers rejeitavam o handshake
+    P2P porque o node_id era diferente, e o trust ficava inconsistente.
+    """
     try:
         from secure_store import load_node_identity, save_node_identity
         from crypto import Ed25519PrivateKey
@@ -117,42 +140,75 @@ def _load_or_create_node_identity(password: str, path: str = "node_identity.enc"
         raise RuntimeError(f"crypto/secure_store indisponiveis: {e}") from e
 
     p = Path(path)
-    if p.exists() and password:
+    file_exists = p.exists()
+
+    if not password:
+        if file_exists:
+            raise RuntimeError(
+                f"[identity] FATAL: {p} existe mas NENHUMA senha configurada "
+                f"(BRN_NODE_PASSWORD vazio). Recusando recriar a identidade. "
+                f"Configure BRN_NODE_PASSWORD ou remova {p} manualmente."
+            )
+        raise RuntimeError(
+            "[identity] FATAL: sem BRN_NODE_PASSWORD e sem arquivo de "
+            "identidade. NÃO vou criar identidade com senha previsível. "
+            "Configure BRN_NODE_PASSWORD no brn_network.env."
+        )
+
+    if file_exists:
         try:
             data = load_node_identity(password, str(p))
-            if data and data.get("sk"):
-                priv = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(data["sk"]))
-                pub = priv.public_key().public_bytes_raw().hex()
-                return priv, pub
+            if not data or not data.get("sk"):
+                raise ValueError("arquivo decifrou mas não tem 'sk'")
+            priv = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(data["sk"]))
+            pub = priv.public_key().public_bytes_raw().hex()
+            print(f"[identity] carregada ({p.name}) pub={pub[:16]}…")
+            return priv, pub
         except Exception as e:
-            print(f"[identity] falha carregando {p}: {e} — recriando")
+            # [FIX CRÍTICO] NÃO recria silenciosamente. Aborta.
+            raise RuntimeError(
+                f"[identity] FATAL: não consegui decifrar {p} com a senha "
+                f"configurada. Erro: {e}. "
+                f"Corrija BRN_NODE_PASSWORD no brn_network.env, ou — se "
+                f"você tem certeza de que quer PERDER o node_id — mova "
+                f"{p} para outro lugar e reinicie."
+            ) from e
 
+    # Arquivo não existe, senha configurada → criar
     priv = Ed25519PrivateKey.generate()
     sk_hex = priv.private_bytes_raw().hex()
     pub = priv.public_key().public_bytes_raw().hex()
-    if password:
-        try:
-            save_node_identity(
-                {"sk": sk_hex, "pub": pub, "created_at": int(time.time())},
-                password, str(p),
-            )
-        except Exception as e:
-            print(f"[identity] nao consegui salvar {p}: {e}")
+    try:
+        save_node_identity(
+            {"sk": sk_hex, "pub": pub, "created_at": int(time.time())},
+            password, str(p),
+        )
+        print(f"[identity] CRIADA NOVA ({p.name}) pub={pub[:16]}…")
+        print(f"[identity] ⚠ guarde BRN_NODE_PASSWORD — sem ela, o node_id "
+              f"é inutilizável.")
+    except Exception as e:
+        raise RuntimeError(
+            f"[identity] não consegui salvar {p}: {e}"
+        ) from e
     return priv, pub
 
 
 # ============================================================
-# WALLET (multi-password)
+# WALLET — [FIX v13.9.1] Removido "gergerger"
 # ============================================================
 def _load_wallet() -> tuple:
     """
-    [v13.9.0] Tenta várias senhas para decifrar current_wallet.enc.
+    Tenta as senhas configuradas no .env para decifrar current_wallet.enc.
+
     Retorna (wallet_obj | None, address, pub_hex, password_usada).
 
     Ordem:
       1. BRN_WALLET_SESSION_PASS
       2. BRN_NODE_PASSWORD
-      3. "gergerger" (fallback final)
+
+    Sem fallback hardcoded. Se nenhuma funcionar, retorna (None, "", "", "")
+    e o main() loga aviso claro — o nó roda sem SK local (não minera
+    nem assina).
     """
     try:
         from secure_store import load_current_wallet
@@ -166,8 +222,13 @@ def _load_wallet() -> tuple:
         v = (os.environ.get(k, "") or "").strip()
         if v and v not in candidates:
             candidates.append(v)
-    if "gergerger" not in candidates:
-        candidates.append("gergerger")
+
+    if not candidates:
+        logging.getLogger("main").warning(
+            "[wallet] nenhuma senha configurada "
+            "(BRN_WALLET_SESSION_PASS / BRN_NODE_PASSWORD vazias)"
+        )
+        return None, "", "", ""
 
     for pwd in candidates:
         try:
@@ -236,26 +297,60 @@ def _setup_sync(chain, p2p):
 
 
 # ============================================================
-# MULTISIG — [NOVO v13.9.0]
+# MULTISIG — [FIX CRÍTICO v13.9.1]
 # ============================================================
 def _setup_multisig(chain, wallet_obj, p2p, trust):
     """
     Configura o coletor de assinaturas (brn_multisig).
-    Precisa ser chamado APÓS:
-      - p2p.start() (discovery precisa estar ativo)
-      - chain.set_local_validator_sk(wallet_obj)
+
+    [FIX v13.9.1] Se brn_multisig NÃO existir:
+      - STRICT_MULTISIG=1 → aborta o boot (RuntimeError). Não faz sentido
+        subir um nó em modo estrito sem o módulo que faz o multi-sig.
+      - STRICT_MULTISIG=0 → loga ERROR bem visível. Operador precisa
+        saber que o nó está SEM multi-sig (blocos vão sair com 1 sig
+        e serão rejeitados pelos peers).
     """
     log = logging.getLogger("main")
+    strict = os.environ.get("BRN_STRICT_MULTISIG", "0") == "1"
+
     if not p2p or not wallet_obj:
         log.info("[MULTISIG] pulado (p2p ou wallet ausente)")
+        if strict:
+            raise RuntimeError(
+                "[MULTISIG] STRICT_MULTISIG=1 mas p2p ou wallet ausente. "
+                "Sem multi-sig, o nó não pode operar em modo estrito."
+            )
         return False
+
     try:
         from brn_multisig import ensure_multisig
+    except ImportError as e:
+        msg = (
+            f"[MULTISIG] módulo 'brn_multisig' NÃO ENCONTRADO ({e}). "
+            f"O nó vai rodar SEM coletor de assinaturas. "
+            f"Blocos minerados aqui vão sair com 1 sig e serão "
+            f"REJEITADOS pelos peers em rede multi-nó."
+        )
+        if strict:
+            raise RuntimeError(
+                f"[MULTISIG] STRICT_MULTISIG=1 e brn_multisig ausente. "
+                f"Abortando o boot (o nó não pode operar em modo estrito "
+                f"sem este módulo). Erro: {e}"
+            ) from e
+        log.error(msg)
+        return False
+
+    try:
         ensure_multisig(chain, wallet_obj, p2p, trust=trust, logger=log)
         log.info("[MULTISIG] Coletor de assinaturas configurado")
         return True
     except Exception as e:
-        log.warning(f"[MULTISIG] falha: {e}")
+        log.error(f"[MULTISIG] ensure_multisig falhou: {e}")
+        if strict:
+            raise RuntimeError(
+                f"[MULTISIG] STRICT_MULTISIG=1 e ensure_multisig falhou. "
+                f"Abortando o boot. Erro: {e}"
+            ) from e
         return False
 
 
@@ -274,7 +369,7 @@ def _setup_broadcast(chain, p2p):
 
 
 # ============================================================
-# PBFT — [NOVO v13.9.0]
+# PBFT
 # ============================================================
 def _setup_pbft(chain, wallet_obj, p2p):
     """
@@ -332,7 +427,7 @@ def _setup_pbft(chain, wallet_obj, p2p):
 
 
 # ============================================================
-# TRUST DAEMON — [NOVO v13.9.0]
+# TRUST DAEMON
 # ============================================================
 def _setup_trust_daemon(chain, trust, wallet_obj, p2p):
     """
@@ -389,7 +484,6 @@ def _setup_trust_daemon(chain, trust, wallet_obj, p2p):
                     trust.heartbeat_self(pub)
             except Exception:
                 pass
-            # remove fantasmas a cada 60s
             now = time.time()
             if now - last_ghost >= 60:
                 last_ghost = now
@@ -527,23 +621,31 @@ def main() -> int:
     try:
         import port_guard
         port_guard.check_brn_ports(checar_explorer=not args.no_explorer)
+    except SystemExit:
+        raise
     except Exception:
         pass
 
-    # 2. Senha para identidade (usa NODE_PASSWORD, fallback WALLET_SESSION_PASS)
+    # 2. Senha para identidade — SEM fallback hardcoded (v13.9.1)
     identity_password = (
         os.environ.get("BRN_NODE_PASSWORD", "").strip()
         or os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
-        or "gergerger"
     )
+    if not identity_password:
+        log.warning(
+            "[identity] BRN_NODE_PASSWORD e BRN_WALLET_SESSION_PASS vazios. "
+            "A identidade do nó NÃO será persistida. Defina uma senha no "
+            "brn_network.env para operar em produção."
+        )
 
-    # 3. Node identity
+    # 3. Node identity — [FIX CRÍTICO] aborta se arquivo existe + senha errada
     node_id_priv, node_id_pub = None, ""
     try:
         node_id_priv, node_id_pub = _load_or_create_node_identity(identity_password)
         log.info("[identity] carregada pub=%s…", node_id_pub[:16])
-    except Exception as e:
-        log.warning(f"[identity] falha: {e}")
+    except RuntimeError as e:
+        log.error(str(e))
+        return 3
 
     # 4. Blockchain
     try:
@@ -559,7 +661,7 @@ def main() -> int:
     if trust is not None:
         log.info("[trust] carregado")
 
-    # 6. Carteira (multi-password) + injeta SK na chain
+    # 6. Carteira (sem fallback hardcoded) + injeta SK na chain
     wallet_obj, wallet_addr, wallet_pub, used_pwd = _load_wallet()
     if wallet_obj is not None:
         try:
@@ -572,7 +674,8 @@ def main() -> int:
             log.warning(f"[wallet] set_local_validator_sk falhou: {e}")
     else:
         log.warning("[wallet] NAO consegui decifrar current_wallet.enc "
-                    "(nenhuma senha funcionou). O nó vai rodar sem SK local.")
+                    "(nenhuma senha configurada ou todas falharam). "
+                    "O nó vai rodar sem SK local (não minera nem assina).")
 
     # 7. P2P
     p2p = None
@@ -588,9 +691,13 @@ def main() -> int:
         if sync_mgr:
             log.info("[sync] ChainSyncManager iniciado")
 
-    # 9. MULTISIG + BROADCAST (crítico para 3/3 sigs)
+    # 9. MULTISIG + BROADCAST — [FIX CRÍTICO] pode abortar com STRICT_MULTISIG=1
     if p2p and wallet_obj is not None:
-        _setup_multisig(chain, wallet_obj, p2p, trust)
+        try:
+            _setup_multisig(chain, wallet_obj, p2p, trust)
+        except RuntimeError as e:
+            log.error(str(e))
+            return 4
         _setup_broadcast(chain, p2p)
 
     # 10. PBFT
