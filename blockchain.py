@@ -1,10 +1,41 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.5.5 | Data: 08/11/2026
+Versão: 9.5.6 | Data: 08/11/2026
 ================================================================
+v9.5.6 (2026-11-08) — PATCH DE AUDITORIA:
+  [FIX CRÍTICO] _validate_validators_sig: Bypass 2 (bootstrap local) e
+        Bypass 3 (bootstrap estendido) agora exigem len(validators) < 2.
+        ANTES: em rede 3+ nós, um bloco com 1 assinatura local era
+        aceito por _validate_validators_sig mesmo com required=3, o
+        que fazia o minerador crescer a chain local em FORK. Os peers
+        (sem a pubkey local) rejeitavam, e o nó divergia em silêncio.
+        Esse era o sintoma "co-assinatura falhando" no
+        verify_cosign.py / test_co_sign.py.
+  [FIX] require_auth_tag agora respeita BRN_REQUIRE_AUTH_TAG=0.
+        Antes: com BRN_NETWORK_SECRET setado, o flag virava True
+        sempre. O verify.py (item [12]) detectava isso como
+        "patch auth_tag NÃO aplicado".
+  [FIX] set_network_secret: não força mais require_auth_tag=True
+        por presença de secret. Recomputa a partir da intenção
+        original (env / caller).
+  [FIX] _collect_signatures: SIG_COLLECT_TIMEOUT agora é respeitado
+        de verdade. Antes, `with ThreadPoolExecutor(...)` bloqueava
+        no __exit__ até o _sign_collector retornar, ignorando o
+        timeout. Agora usa `pool.shutdown(wait=False)`.
+  [FIX] _get_active_validators: o fallback duplicado para
+        get_top_validators (quando active == []) agora só dispara
+        se BRN_TRUST_FALLBACK_TO_TOP=1. Default: desligado. Isso
+        evita ressuscitar nós fantasmas por um segundo caminho,
+        mesmo quando o trust_network.py já foi corrigido.
+  [FIX] mine_block_interruptible: fallback defensivo para
+        pbft.attach_proof. Se self.seq avançou entre propose() e
+        attach_proof() (ex.: duas chamadas concorrentes de
+        propose()), busca o estado pelo hash do bloco antes de
+        desistir. Sem isso, BRN_PBFT_ENFORCE=1 travava a mineração.
+
 v9.5.5 (2026-11-08):
-  [NEW] Integração L2 Bridge. Adicionado `add_l2_transaction` e 
+  [NEW] Integração L2 Bridge. Adicionado `add_l2_transaction` e
         suporte a `l2_mint` no `validate_tx` e `tx_fee`. Permite
-        que o BTCWatcher/L2Manager injetem créditos de BTC->BRN na 
+        que o BTCWatcher/L2Manager injetem créditos de BTC->BRN na
         mempool para serem minerados.
   [FIX] Correção de import circular (reorg e chain_validator) usando
         importação lazy no final do arquivo.
@@ -93,6 +124,10 @@ BRN_PBFT_START_HEIGHT = int(os.environ.get("BRN_PBFT_START_HEIGHT", "0"))
 # [v9.5.2] STRICT MULTISIG: desativa TODOS os bypasses de multi-sig.
 BRN_STRICT_MULTISIG = os.environ.get("BRN_STRICT_MULTISIG", "0") == "1"
 
+# [v9.5.6] Fallback para get_top_validators em _get_active_validators.
+# Default: DESLIGADO, para não ressuscitar nós fantasmas.
+BRN_TRUST_FALLBACK_TO_TOP = os.environ.get("BRN_TRUST_FALLBACK_TO_TOP", "0") == "1"
+
 if BRN_STRICT_MULTISIG:
     # Em modo estrito, ignoramos qualquer bypass configurado
     BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = 0
@@ -137,6 +172,12 @@ if BRN_PBFT_ENFORCE:
         "[PBFT] ENFORCE=1 — blocos a partir da altura %d sem "
         "pbft_commits válidos serão rejeitados.",
         BRN_PBFT_START_HEIGHT,
+    )
+if BRN_TRUST_FALLBACK_TO_TOP:
+    log.warning(
+        "[TRUST] BRN_TRUST_FALLBACK_TO_TOP=1 — _get_active_validators "
+        "vai usar get_top_validators() quando active estiver vazio. "
+        "ISSO PODE INTRODUZIR FANTASMAS NO QUÓRUM."
     )
 
 GENESIS_PREV      = "0" * 64
@@ -461,7 +502,15 @@ class Blockchain:
         self.db = ChainDB(db_path)
         self.genesis_expected_hash = None
         self.network_secret = network_secret if network_secret is not None else NETWORK_SECRET
-        self.require_auth_tag = bool(self.network_secret) if require_auth_tag is None else bool(require_auth_tag)
+
+        # [FIX v9.5.6] require_auth_tag agora respeita BRN_REQUIRE_AUTH_TAG=0
+        # ANTES: bool(self.network_secret) if require_auth_tag is None else bool(require_auth_tag)
+        # Bug: com BRN_NETWORK_SECRET setado, o flag virava True SEMPRE.
+        if require_auth_tag is None:
+            require_auth_tag = os.environ.get("BRN_REQUIRE_AUTH_TAG", "1") == "1"
+        self._auth_tag_requested = bool(require_auth_tag)
+        self.require_auth_tag = self._auth_tag_requested and bool(self.network_secret)
+
         self.on_block_mined = None
         self._fork_signal = None
 
@@ -567,10 +616,15 @@ class Blockchain:
         return g
 
     def set_network_secret(self, secret: str) -> None:
+        # [FIX v9.5.6] Recomputa a partir da intenção original, em vez de
+        # forçar True por presença de secret (o bug do v9.5.5).
         self.network_secret = (secret or "").strip()
-        if os.environ.get("BRN_REQUIRE_AUTH_TAG", "1") == "1":
-            if self.require_auth_tag is False:
-                self.require_auth_tag = bool(self.network_secret)
+        self.require_auth_tag = self._auth_tag_requested and bool(self.network_secret)
+        if self._auth_tag_requested and not self.network_secret:
+            log.warning(
+                "[auth_tag] BRN_REQUIRE_AUTH_TAG=1 mas secret vazio — "
+                "require_auth_tag ficou False até o secret ser definido."
+            )
 
     def current_reward(self, height: int) -> int:
         halvings = height // HALVING_INTERVAL
@@ -648,7 +702,7 @@ class Blockchain:
         # [NOVO v9.5.5] L2 mint nao paga taxa (o valor entra na rede pela ponte BTC)
         if tx.get("data", {}).get("type") == "l2_mint":
             return 0
-            
+
         in_sum = 0
         for inp in tx["inputs"]:
             u = self.db.get_utxo(inp["txid"], inp["vout"])
@@ -717,7 +771,7 @@ class Blockchain:
 
     def validate_tx(self, tx: dict, from_mempool: bool = False) -> tuple:
         from wallet import Wallet
-        
+
         # [NOVO v9.5.5] Permite L2 Mint na mempool e na mineracao
         if tx.get("data", {}).get("type") == "l2_mint":
             if not from_mempool:
@@ -816,14 +870,14 @@ class Blockchain:
         tx = {
             "txid": "",
             "inputs": [{
-                "txid": "0" * 64, 
-                "vout": 0xFFFFFFFF, 
-                "pubkey": "", 
+                "txid": "0" * 64,
+                "vout": 0xFFFFFFFF,
+                "pubkey": "",
                 "signature": ""
             }],
             "outputs": [{
-                "address": buyer, 
-                "amount": amount, 
+                "address": buyer,
+                "amount": amount,
                 "pubkey": ""
             }],
             "timestamp": int(time.time()),
@@ -867,18 +921,30 @@ class Blockchain:
                 log.warning(f"[VALIDATORS] falhou: {e}")
                 validators = []
 
+            # [FIX v9.5.6] Fallback duplicado agora gated por env.
+            # ANTES: sempre disparava quando get_active_validators() == [].
+            # Isso permitia que fantasmas entrassem no quórum por um segundo
+            # caminho, mesmo com trust_network.py corrigido.
             if not validators and hasattr(trust, "get_top_validators"):
-                try:
-                    validators = list(trust.get_top_validators(count=MAX_VALIDATORS) or [])
-                    if validators:
-                        log.warning(
-                            "[VALIDATORS] active_validators vazio; usando "
-                            "get_top_validators() como fallback (%d validador(es))",
-                            len(validators),
-                        )
-                except Exception as e:
-                    log.warning(f"[VALIDATORS] fallback get_top_validators falhou: {e}")
-                    validators = []
+                if BRN_TRUST_FALLBACK_TO_TOP:
+                    try:
+                        validators = list(trust.get_top_validators(count=MAX_VALIDATORS) or [])
+                        if validators:
+                            log.warning(
+                                "[VALIDATORS] active_validators vazio; usando "
+                                "get_top_validators() como fallback "
+                                "(BRN_TRUST_FALLBACK_TO_TOP=1) — %d validador(es)",
+                                len(validators),
+                            )
+                    except Exception as e:
+                        log.warning(f"[VALIDATORS] fallback get_top_validators falhou: {e}")
+                        validators = []
+                else:
+                    log.warning(
+                        "[VALIDATORS] active_validators vazio e "
+                        "BRN_TRUST_FALLBACK_TO_TOP=0 — quórum fica vazio "
+                        "(bootstrap, multi-sig desligado)."
+                    )
 
         local_sk = self._local_validator_sk
         if local_sk is not None:
@@ -964,6 +1030,13 @@ class Blockchain:
 
         # ═══════════════════════════════════════════════════════════
         # BYPASSES (só ativos quando STRICT_MULTISIG=0)
+        #
+        # [FIX CRÍTICO v9.5.6] Bypass 2 e Bypass 3 agora exigem
+        # len(validators) < 2, IGUAL ao Bypass 1. Sem esse guard,
+        # em rede 3+ nós o nó aceitava bloco com 1 sig local mesmo
+        # com required=3, fazendo o minerador crescer a chain local
+        # em FORK. Os peers (sem a pubkey local) rejeitavam, e o nó
+        # divergia em silêncio — o sintoma "co-assinatura falhando".
         # ═══════════════════════════════════════════════════════════
 
         # Bypass 1: bootstrap estrangeiro (1 validador local, 1 assinatura estrangeira)
@@ -987,7 +1060,12 @@ class Blockchain:
             return True, ""
 
         # Bypass 2: bootstrap local (só a própria SK assinou)
-        if not BRN_STRICT_MULTISIG and got >= 1 and got_foreign == 0:
+        # [FIX CRÍTICO] exige len(validators) < 2 — senão, em rede 3+ nós,
+        # aceita com 1 sig local e forka.
+        if (not BRN_STRICT_MULTISIG
+                and len(validators) < 2
+                and got >= 1
+                and got_foreign == 0):
             local_pk = ""
             if self._local_validator_sk is not None:
                 try:
@@ -1011,7 +1089,11 @@ class Blockchain:
                     return True, ""
 
         # Bypass 3: bootstrap estendido (trust_score >= BOOTSTRAP_TRUST_THRESHOLD)
-        if not BRN_STRICT_MULTISIG and got >= 1 and got_foreign == 0:
+        # [FIX CRÍTICO] mesmo guard: exige len(validators) < 2.
+        if (not BRN_STRICT_MULTISIG
+                and len(validators) < 2
+                and got >= 1
+                and got_foreign == 0):
             trusted = False
             trusted_pubkey = ""
             if self.trust_net is not None:
@@ -1066,7 +1148,7 @@ class Blockchain:
                     self.genesis_expected_hash = block["hash"]
                 else:
                     return False, f"genesis nao corresponde ao esperado"
-                    
+
         expected_prev = (prev_block["hash"] if prev_block else self.db.tip_hash())
         if block["prev_hash"] != expected_prev:
             return False, "prev_hash incorreto"
@@ -1162,7 +1244,7 @@ class Blockchain:
         # [NOVO v9.5.4] PBFT com altura de ativação
         if self._pbft is not None:
             enforce_this_block = BRN_PBFT_ENFORCE and (h_int >= BRN_PBFT_START_HEIGHT)
-            
+
             if "pbft_commits" in block:
                 try:
                     ok_pbft, why_pbft = self._pbft.validate_proof(block)
@@ -1256,14 +1338,25 @@ class Blockchain:
 
         if self._sign_collector is not None:
             extra: list = []
+            # [FIX v9.5.6] pool.shutdown(wait=False) para o timeout valer de verdade.
+            # ANTES: `with ThreadPoolExecutor(...)` bloqueava no __exit__ até o
+            # collector retornar, ignorando SIG_COLLECT_TIMEOUT.
             try:
                 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
-                with ThreadPoolExecutor(max_workers=1, thread_name_prefix="sig-collect") as pool:
-                    fut = pool.submit(self._sign_collector, block)
+                _pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sig-collect")
+                try:
+                    _fut = _pool.submit(self._sign_collector, block)
                     try:
-                        extra = fut.result(timeout=SIG_COLLECT_TIMEOUT) or []
+                        extra = _fut.result(timeout=SIG_COLLECT_TIMEOUT) or []
                     except FutTimeout:
-                        log.warning(f"[SIG] _sign_collector timeout após {SIG_COLLECT_TIMEOUT:.1f}s")
+                        log.warning(
+                            f"[SIG] _sign_collector timeout após "
+                            f"{SIG_COLLECT_TIMEOUT:.1f}s "
+                            f"(thread abandonada em background)"
+                        )
+                        extra = []
+                finally:
+                    _pool.shutdown(wait=False)
             except Exception as e:
                 log.warning(f"[SIG] _sign_collector falhou: {e}")
 
@@ -1363,9 +1456,35 @@ class Blockchain:
                 decided = self._pbft.propose(block)
                 if decided:
                     if not self._pbft.attach_proof(block):
-                        log.warning(f"[PBFT] bloco #{height} decidiu mas attach_proof falhou")
-                        if BRN_PBFT_ENFORCE and (height >= BRN_PBFT_START_HEIGHT):
-                            return None
+                        # [FIX v9.5.6] Fallback defensivo: se self.seq avançou
+                        # entre propose() e attach_proof() (duas chamadas
+                        # concorrentes), busca o estado pelo hash do bloco.
+                        _matched = False
+                        try:
+                            _lock = getattr(self._pbft, "lock", None)
+                            _states = getattr(self._pbft, "states", None)
+                            if _lock is not None and _states is not None:
+                                with _lock:
+                                    for (_v, _s), _st in _states.items():
+                                        if (getattr(_st, "decided", False)
+                                                and getattr(_st, "block_hash", None) == block.get("hash")):
+                                            block["pbft_view"] = _st.view
+                                            block["pbft_seq"] = _st.seq
+                                            block["pbft_commits"] = [
+                                                {"pubkey": _pk, "signature": _sg}
+                                                for _pk, _sg in _st.commits.items()
+                                            ]
+                                            _matched = True
+                                            break
+                        except Exception as _e:
+                            log.debug("[PBFT] fallback attach_proof falhou: %s", _e)
+
+                        if not _matched:
+                            log.warning(f"[PBFT] bloco #{height} decidiu mas attach_proof falhou")
+                            if BRN_PBFT_ENFORCE and (height >= BRN_PBFT_START_HEIGHT):
+                                return None
+                        else:
+                            log.info(f"[PBFT] bloco #{height} attach via fallback (seq avançou)")
                     else:
                         log.info("[PBFT] bloco #%d decidido com %d commit(s)", height, len(block.get("pbft_commits", [])))
                 else:
@@ -1408,6 +1527,8 @@ class Blockchain:
             "assume_valid_until": BRN_ASSUME_VALID_UNTIL,
             "checkpoint_auto_height": BRN_CHECKPOINT_AUTO_HEIGHT,
             "strict_multisig": BRN_STRICT_MULTISIG,
+            "trust_fallback_to_top": BRN_TRUST_FALLBACK_TO_TOP,
+            "require_auth_tag": self.require_auth_tag,
         }
         if self._pbft is not None:
             try:
