@@ -1,7 +1,24 @@
-"""pbft_consensus.py — PBFT simplificado para o BRN (v1.0)
+"""pbft_consensus.py — PBFT simplificado para o BRN (v1.1)
 ================================================================
-Implementa consenso de 2 fases (prepare + commit) com quórum 2f+1,
-usando as assinaturas Ed25519 já existentes em wallet.Wallet.
+v1.1 (2026-11-08) — PATCH DE AUDITORIA:
+  [FIX] handle_commit rejeita commits se st.preprepare_sig é None.
+        Antes, aceitava commits mesmo sem preprepare — defesa em
+        profundidade (atacante enviando commits não solicitados).
+  [FIX] attach_proof com fallback por block_hash. Antes usava só
+        (self.view, self.seq); se self.seq avançou entre propose()
+        e attach_proof() (chamadas concorrentes ou reentrância),
+        attach falhava e (com BRN_PBFT_ENFORCE=1) travava o nó.
+  [FIX] _peers() aceita string "ip:port" E dict {"ip": ..., "port": ...}.
+        Antes, assumia string — se p2p_unified.listar_peers() devolvia
+        dicts, _broadcast perdia todas as mensagens em silêncio e
+        PBFT ficava em timeout eterno.
+  [NEW] propose_with_seq() devolve (decided, view, seq). Compat:
+        propose() mantém a assinatura antiga (só retorna decided).
+  [NEW] status() expõe peers_visible (nº de peers no discovery).
+
+v1.0 (base):
+  Implementa consenso de 2 fases (prepare + commit) com quórum 2f+1,
+  usando as assinaturas Ed25519 já existentes em wallet.Wallet.
 
 Modelo matemático:
     n = |validadores ativos|
@@ -55,7 +72,7 @@ from typing import Optional, Callable
 
 log = logging.getLogger("pbft")
 
-__version__ = "1.0"
+__version__ = "1.1"
 
 # ─── Config ──────────────────────────────────────────────────────────
 PBFT_ENABLED   = os.environ.get("BRN_PBFT_ENABLED", "0") == "1"
@@ -146,13 +163,45 @@ class PBFTConsensus:
             return []
 
     def _peers(self) -> list[str]:
+        """
+        [FIX v1.1] Aceita string "ip:port" E dict {"ip"/"address", "port"}.
+
+        Antes, assumia string — se p2p_unified.listar_peers() devolvia
+        dicts (como faz listar_peers_com_altura), _broadcast perdia
+        todas as mensagens em silêncio e o PBFT ficava em timeout eterno.
+        """
         p2p = getattr(self.chain, "p2p", None)
         if p2p is None:
             return []
-        try:
-            return p2p.discovery.listar_peers() or []
-        except Exception:
+
+        disc = getattr(p2p, "discovery", None)
+        if disc is None or not hasattr(disc, "listar_peers"):
             return []
+
+        try:
+            raw = disc.listar_peers() or []
+        except Exception as e:
+            log.debug("pbft _peers falhou: %s", e)
+            return []
+
+        out: list[str] = []
+        for p in raw:
+            if isinstance(p, str):
+                if ":" in p:
+                    out.append(p)
+            elif isinstance(p, dict):
+                addr = str(p.get("address") or p.get("ip") or "").strip()
+                if not addr:
+                    continue
+                if ":" in addr:
+                    out.append(addr)
+                else:
+                    port = p.get("port") or p.get("tcp_port") or 6001
+                    try:
+                        out.append(f"{addr}:{int(port)}")
+                    except (TypeError, ValueError):
+                        continue
+        return out
 
     def _broadcast(self, msg: dict) -> int:
         sent = 0
@@ -230,24 +279,40 @@ class PBFTConsensus:
         """
         Líder propõe bloco. Bloqueia até decisão ou timeout.
         Retorna True se decidido (bloco pode ser aceito), False caso contrário.
+
+        Compat: mesma assinatura da v1.0. Internamente usa propose_with_seq().
+        """
+        decided, _v, _s = self.propose_with_seq(block, timeout=timeout)
+        return decided
+
+    def propose_with_seq(self, block: dict,
+                         timeout: float = None) -> tuple[bool, int, int]:
+        """
+        [NEW v1.1] Como propose(), mas devolve (decided, view, seq).
+
+        Chamar attach_proof(block, view=v, seq=s) após a decisão garante
+        que o estado correto é usado mesmo se self.seq avançou entre
+        a chamada e o attach (chamadas concorrentes ou reentrância).
         """
         if not PBFT_ENABLED:
-            return True   # desligado → comportamento antigo
+            return True, self.view, self.seq   # desligado → comportamento antigo
 
         validators = self._validators()
         n = len(validators)
         if n < 1:
             log.warning("[PBFT] sem validadores — aceitando bloco em bootstrap")
-            return True
+            return True, self.view, self.seq
 
         block_hash = block.get("hash", "")
         if not block_hash:
-            return False
+            return False, self.view, self.seq
 
         with self.lock:
             self.seq += 1
-            st = PBFTState(self.view, self.seq, block_hash, self.pub)
-            self.states[(self.view, self.seq)] = st
+            view_used = self.view
+            seq_used = self.seq
+            st = PBFTState(view_used, seq_used, block_hash, self.pub)
+            self.states[(view_used, seq_used)] = st
 
         # 1) assina e transmite pre-prepare
         pp_sig = self._sign(_msg_bytes(_PHASE_PP, st.view, st.seq, block_hash))
@@ -280,13 +345,13 @@ class PBFTConsensus:
                     self._emit_commit(st)
                 if self._maybe_decide(st, block):
                     self._gc()
-                    return True
+                    return True, view_used, seq_used
             time.sleep(0.05)
 
         log.warning("[PBFT] TIMEOUT propose view=%d seq=%d — prepares=%d/%d commits=%d/%d",
                     st.view, st.seq, len(st.prepares), q, len(st.commits), q)
         self._gc()
-        return st.decided
+        return st.decided, view_used, seq_used
 
     # ────────────────────────────────────────────────────────────
     # Handlers de mensagens (chamados pelo P2PServer)
@@ -387,6 +452,13 @@ class PBFTConsensus:
             st = self.states.get((view, seq))
             if st is None:
                 return {"ok": False, "error": "sem estado"}
+
+            # [FIX v1.1] Rejeita commit se preprepare nunca foi visto.
+            # Honestos só assinam commit após ver quórum de prepares;
+            # se este nó não viu preprepare, não pode contar o commit.
+            if st.preprepare_sig is None:
+                return {"ok": False, "error": "commit sem preprepare"}
+
             if st.block_hash != bh:
                 return {"ok": False, "error": "hash divergente"}
             st.commits[pk] = sig
@@ -450,20 +522,50 @@ class PBFTConsensus:
     # ────────────────────────────────────────────────────────────
     # Anexa commits ao bloco antes do accept_block
     # ────────────────────────────────────────────────────────────
-    def attach_proof(self, block: dict) -> bool:
-        """Após propose() decidir, anexa view/seq/commits ao bloco."""
-        key = (self.view, self.seq)
+    def attach_proof(self, block: dict,
+                     view: Optional[int] = None,
+                     seq: Optional[int] = None) -> bool:
+        """
+        Anexa view/seq/commits ao bloco.
+
+        [FIX v1.1] Se (view, seq) explícitos não forem passados, tenta
+        (self.view, self.seq). Se não bater, faz fallback buscando o
+        estado pelo block_hash — self.seq pode ter avançado entre
+        propose() e attach_proof() (chamadas concorrentes ou reentrância).
+        """
+        target_hash = block.get("hash")
+        if not target_hash:
+            return False
+
         with self.lock:
-            st = self.states.get(key)
-            if st is None or not st.decided or st.block_hash != block.get("hash"):
+            st: Optional[PBFTState] = None
+
+            # 1) Tenta (view, seq) explícitos
+            if view is not None and seq is not None:
+                st = self.states.get((int(view), int(seq)))
+
+            # 2) Tenta (self.view, self.seq)
+            if st is None:
+                st = self.states.get((self.view, self.seq))
+
+            # 3) Fallback: busca pelo hash do bloco
+            if st is None or not st.decided or st.block_hash != target_hash:
+                st = None
+                for (_v, _s), candidate in self.states.items():
+                    if candidate.decided and candidate.block_hash == target_hash:
+                        st = candidate
+                        break
+
+            if st is None:
                 return False
+
             block["pbft_view"] = st.view
             block["pbft_seq"] = st.seq
             block["pbft_commits"] = [
                 {"pubkey": pk, "signature": sg}
                 for pk, sg in st.commits.items()
             ]
-        return True
+            return True
 
     # ────────────────────────────────────────────────────────────
     # Status
@@ -472,6 +574,7 @@ class PBFTConsensus:
         with self.lock:
             n = len(self._validators())
             return {
+                "version": __version__,
                 "enabled": PBFT_ENABLED,
                 "enforce": PBFT_ENFORCE,
                 "view": self.view,
@@ -481,4 +584,5 @@ class PBFTConsensus:
                 "validators": n,
                 "faults_tolerated_f": _faults(n),
                 "quorum_2f_plus_1": _quorum(n),
+                "peers_visible": len(self._peers()),
             }
