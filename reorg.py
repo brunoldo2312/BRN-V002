@@ -1,11 +1,29 @@
-"""reorg.py — Reorganização de cadeia (Chain Reorganization) BRN (v2.1)
+"""reorg.py — Reorganização de cadeia (Chain Reorganization) BRN (v2.2)
 ================================================================
+v2.2 (2026-11-08) — PATCH DE AUDITORIA:
+  [FIX] _should_use_remote: em EMPATE de work, mantém a cadeia local.
+        Antes, desempatava por timestamp (preferindo o MAIS ANTIGO) e
+        depois por hash (preferindo o MENOR). Um atacante podia forjar
+        um timestamp ligeiramente anterior (ainda dentro do MTP, janela
+        de 50 blocos) e igualar o work → o nó adotava o fork dele.
+        Bitcoin usa a regra do "first seen" (não reorg em empate);
+        esta versão alinha com essa regra.
+  [FIX] _restore_backups_direct (nova): quando um bloco remoto falha
+        em accept_block durante uma reorg, os backups locais são
+        restaurados DIRETO no DB (db.add_block + db.apply_tx), sem
+        re-validar multi-sig. Antes, o `for ob in backups: try:
+        chain.accept_block(ob) except: pass` re-validava sigs contra o
+        validator set ATUAL (que pode ser diferente do set da época),
+        falhava, engolia o erro com except: pass, e deixava a chain
+        truncada em fork_h em silêncio. Os blocos em `backups` já
+        foram aceitos antes — PoW/merkle/auth_tag já foram verificados.
+  [KEEP] v2.1: find_fork_point detecta fork em local_h + 1.
+  [KEEP] v2.0: comentário sobre desempate (removido no v2.2).
+
 v2.1:
   [FIX] CRÍTICO: find_fork_point agora detecta corretamente o fork
         quando o lote remoto começa em local_h + 1 e o prev_hash
         do primeiro bloco bate com o tip local.
-        Antes, o loop descendente não encontrava o ancestral e
-        retornava -1, travando o sync com "sem ancestral comum".
 v2.0:
   [FIX] Desempate de forks na MESMA altura por timestamp e hash.
 ================================================================
@@ -50,8 +68,9 @@ def _local_work_above(chain, fh):
         if b: total += _work(b.get("difficulty", 0))
     return total
 
+
 # ============================================================
-# [FIX v2.1] find_fork_point — detecta fork em local_h + 1
+# find_fork_point — detecta fork em local_h + 1
 # ============================================================
 def find_fork_point(chain, remote_blocks, max_depth=200):
     if not remote_blocks: return -1
@@ -63,7 +82,7 @@ def find_fork_point(chain, remote_blocks, max_depth=200):
         except Exception: continue
     if not remote_by_h: return -1
 
-    # [FIX] Se o lote começa exatamente no próximo bloco local,
+    # [v2.1] Se o lote começa exatamente no próximo bloco local,
     # e o prev_hash do primeiro bloco remoto bate com o topo local,
     # o ponto de fork é o próprio topo local.
     min_remote_h = min(remote_by_h.keys())
@@ -87,29 +106,37 @@ def find_fork_point(chain, remote_blocks, max_depth=200):
 
 
 def _should_use_remote(chain, fork_h, blocks_to_add, local_h):
+    """
+    Decide se a cadeia remota deve substituir a local.
+
+    [FIX v2.2] Regra simplificada (alinhada com Bitcoin "first seen"):
+      - work_remote > work_local → adota remoto
+      - work_remote <= work_local → MANTÉM local
+
+    A v2.1 tinha desempate em empate:
+      - ts_remote < ts_local → adotava remoto   ← perigoso
+      - ts_remote > ts_local → mantinha local
+      - hash_remote < hash_local → adotava remoto
+
+    Em empate de work, o "primeiro visto vence" é o comportamento
+    seguro: quem chegou primeiro fica. Adotar fork remoto com work
+    igual é um vetor de ataque barato (o atacante só precisa igualar
+    o work — algo que ele já fez para produzir o fork — e forjar um
+    timestamp ligeiramente anterior, dentro da janela do MTP).
+    """
     work_remote = _cum_work(blocks_to_add)
     work_local = _local_work_above(chain, fork_h)
+
     if work_remote > work_local:
-        log.warning(f"[REORG] work remoto {work_remote} > local {work_local}")
+        log.warning(f"[REORG] work remoto {work_remote} > local {work_local} — adota remoto")
         return True, "work_maior"
-    if work_remote < work_local:
-        log.info(f"[REORG] work remoto {work_remote} < local {work_local}")
-        return False, "work_menor"
-    first_remote = blocks_to_add[0]
-    first_local = chain.db.get_block(fork_h + 1)
-    if not first_local: return True, "local_sem_bloco"
-    ts_r = int(first_remote.get("timestamp", 0))
-    ts_l = int(first_local.get("timestamp", 0))
-    if ts_r < ts_l:
-        log.warning(f"[REORG] timestamps: remoto #{ts_r} < local #{ts_l} → escolhe remoto")
-        return True, "timestamp_mais_antigo"
-    if ts_r > ts_l:
-        return False, "timestamp_mais_novo"
-    hr = str(first_remote.get("hash", ""))
-    hl = str(first_local.get("hash", ""))
-    if hr < hl:
-        return True, "hash_menor"
-    return False, "hash_maior"
+
+    if work_remote == work_local:
+        log.info(f"[REORG] work remoto == local ({work_remote}) — mantém local (first seen)")
+        return False, "work_empate_first_seen"
+
+    log.info(f"[REORG] work remoto {work_remote} < local {work_local} — mantém local")
+    return False, "work_menor"
 
 
 def _pre_validate(chain, fork_h, new_blocks):
@@ -168,6 +195,51 @@ def _rollback_to(chain, fork_h, current_tip):
     else:
         raise RuntimeError("ChainDB sem rollback_block/delete_blocks_above")
     return removed
+
+
+# ============================================================
+# [FIX v2.2] Restore de backups SEM re-validar multi-sig
+# ============================================================
+def _restore_backups_direct(chain, backups):
+    """
+    Restaura blocos locais de backup diretamente no DB.
+
+    Por que NÃO usar chain.accept_block() aqui:
+      - Os blocos em `backups` JÁ FORAM ACEITOS antes (foram validados
+        quando entraram na chain originalmente).
+      - Re-aceitar via accept_block re-valida multi-sig contra o
+        validator set ATUAL, que pode ser diferente do set da época
+        (heartbeats expiram, TTL de 300s, remove_ghosts, etc.).
+      - Quando isso acontece, a restauração falha e — no código antigo
+        — o erro era engolido com `except: pass`, deixando a chain
+        truncada em fork_h em silêncio.
+
+    O que ESTE restore faz:
+      - db.add_block(ob) + db.apply_tx(...) direto — sem re-validação.
+      - PoW/merkle/auth_tag desses blocos já foram verificados e são
+        imutáveis (hash depende só de prev/merkle/timestamp/nonce/diff).
+      - O único check que poderia divergir (sig contra o set atual)
+        é justamente o que NÃO interessa para reorg de blocos já-aceitos.
+
+    Retorna (restored, failed). O caller deve gritar se failed > 0.
+    """
+    restored = 0
+    failed = 0
+    for ob in backups:
+        try:
+            h = int(ob["height"])
+            if chain.db.get_block(h):
+                # já está lá — pode ser uma reorg que restaurou parte,
+                # ou o rollback deixou o fork_h e re-add pegou antes.
+                continue
+            chain.db.add_block(ob)
+            for i, t in enumerate(ob["transactions"]):
+                chain.db.apply_tx(t, h, coinbase=(i == 0))
+            restored += 1
+        except Exception as e:
+            log.error(f"[REORG] restore #{ob.get('height')} falhou: {e}")
+            failed += 1
+    return restored, failed
 
 
 def _set_fork_signal(chain, active):
@@ -243,9 +315,21 @@ def reorg_to(chain, new_blocks, max_depth=DEFAULT_MAX_DEPTH, allow_genesis_reorg
                         cur = chain.db.height()
                         if cur > fork_h: _rollback_to(chain, fork_h, cur)
                     except Exception: pass
-                    for ob in backups:
-                        try: chain.accept_block(ob)
-                        except Exception: pass
+
+                    # [FIX v2.2] Restore direto, SEM re-validar multi-sig.
+                    # ANTES (v2.1): for ob in backups: try: chain.accept_block(ob)
+                    #               except Exception: pass
+                    # Re-validação falhava se o validator set mudou, o
+                    # except: pass engolia, e a chain ficava truncada em
+                    # fork_h em silêncio.
+                    restored, restore_failed = _restore_backups_direct(chain, backups)
+                    if restore_failed > 0:
+                        log.error(
+                            f"[REORG] ATENÇÃO: restore incompleto "
+                            f"({restored}/{len(backups)}, {restore_failed} falhas). "
+                            f"Chain pode estar em estado inconsistente. "
+                            f"Rode sync_all_peers.py para reparar."
+                        )
                     res.blocks_added = added
                     res.msg = f"falha #{b.get('height')}: {msg_acc}"
                     res.duration_s = time.time() - t0; return res
