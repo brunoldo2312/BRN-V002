@@ -7,6 +7,11 @@ v9.9.28 (2026-11-07):
         que se comporta como URL (str) mas executa os métodos
         do PoolManager local. Resolve o erro 'PoolManager' object
         has no attribute 'strip'.
+v9.9.25 (2026-11-06):
+  [NEW] _check_sync_barrier() avançado. Agora ele faz um ping P2P
+        real em todos os peers, verifica a altura máxima da rede,
+        testa a comunicação e só libera a mineração se todos 
+        estiverem sincronizados.
 ================================================================
 """
 from __future__ import annotations
@@ -235,8 +240,16 @@ def _register_miner_in_trust(pubkey: str, address: str) -> None:
 # SYNC BARRIER AVANÇADO
 # ============================================================
 def _check_sync_barrier() -> tuple[bool, str]:
+    """
+    Verifica a saúde da rede antes de liberar a mineração.
+    1. Carteira carregada?
+    2. Nós P2P respondem?
+    3. Estamos na mesma altura do topo?
+    4. Peers conseguem assinar um bloco de teste?
+    """
     chain = _get_chain()
     
+    # 1. Carteira
     if getattr(chain, "_local_validator_sk", None) is None:
         return False, "Carteira não está carregada. Abra a carteira antes de minerar."
 
@@ -796,6 +809,7 @@ def miner_start():
         if not WalletManager.validate_address(addr): return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
         if not pubkey: return jsonify({"ok": False, "msg": "Pubkey desconhecida."}), 400
 
+        # BARREIRA AVANÇADA
         ok_sync, msg_sync = _check_sync_barrier()
         if not ok_sync:
             return jsonify({"ok": False, "msg": msg_sync}), 400
@@ -1016,6 +1030,7 @@ def pool_local_status():
 
 @app.route("/api/pool/start_local", methods=["POST"])
 def pool_start_local():
+    # BARREIRA AVANÇADA
     ok_sync, msg_sync = _check_sync_barrier()
     if not ok_sync:
         return jsonify({"ok": False, "msg": msg_sync}), 400
@@ -1707,5 +1722,5 @@ def api_tx_status(txid_str):
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.28 (Wrapper fix + Sync Barrier + PBFT + L2 Bridge)")
+    print(f"BRN Server v9.9.28 (Sync Barrier + Dynamic Pool + PBFT + L2 Bridge)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
