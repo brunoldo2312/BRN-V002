@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sync_global.py v2.2 — Sincroniza com filtro de altura e peer explícito.
+"""sync_global.py v2.3 — Sincroniza com filtro de altura e peer explícito.
 """
 from __future__ import annotations
 import argparse
@@ -86,7 +86,7 @@ def fetch_status(url: str, timeout: float = 30.0) -> Optional[dict]:
     try:
         r = requests.get(f'{url}/api/status', timeout=timeout,
                          proxies={'http': None, 'https': None},
-                         headers={'User-Agent': 'brn-sync-global/2.2'})
+                         headers={'User-Agent': 'brn-sync-global/2.3'})
         if r.status_code == 200:
             return r.json()
     except Exception:
@@ -114,7 +114,7 @@ def fetch_blocks(url: str, start: int, batch: int = 100,
         try:
             r = requests.get(full_url, timeout=timeout,
                              proxies={'http': None, 'https': None},
-                             headers={'User-Agent': 'brn-sync-global/2.2'})
+                             headers={'User-Agent': 'brn-sync-global/2.3'})
             if r.status_code == 200:
                 return r.json().get('blocks', [])
         except Exception:
@@ -161,7 +161,6 @@ def import_chain(blocks: list[dict], db_path: Path,
 
     bc = Blockchain(str(db_path), auto_genesis=False)
     
-    # [FIX] Força o nó a aceitar o bloco gênesis do peer se o banco estiver vazio
     if bc.db.height() == -1:
         log("  [sync] DB vazio — permitindo importar o genesis do peer (ignorando fixo)")
         bc.genesis_expected_hash = None
@@ -184,12 +183,12 @@ def import_chain(blocks: list[dict], db_path: Path,
     before = bc.db.height()
     imported = 0
     total = len(blocks)
+    t0 = time.time()
 
     try:
         for idx, block in enumerate(blocks, 1):
             h = block.get('height')
             if h is None:
-                log('  [!] bloco sem campo height — ignorando')
                 continue
             try:
                 if bc.db.get_block(h) is not None:
@@ -203,13 +202,17 @@ def import_chain(blocks: list[dict], db_path: Path,
                 break
             imported += 1
             
-            # [NOVO] Barra de progresso a cada 100 blocos ou no final
+            # [NOVO v2.3] Progresso com ETA a cada 100 blocos
             if imported % 100 == 0 or idx == total:
                 pct = (idx / total) * 100
-                print(f'\r  [>] Validando blocos: {idx}/{total} ({pct:.1f}%)', end='', flush=True)
+                elapsed = time.time() - t0
+                rate = imported / max(0.1, elapsed)
+                remaining = total - idx
+                eta = remaining / max(0.1, rate) if rate > 0 else 0
+                print(f'\r  [>] Validando: {idx}/{total} ({pct:.1f}%) | {rate:.0f} bl/s | ETA {eta:.0f}s', end='', flush=True)
                 
     finally:
-        print() # Pula linha após a barra
+        print()
         after = bc.db.height()
         try:
             bc.db.close()
@@ -223,35 +226,26 @@ def main():
         description='Sincroniza de peers usando consenso (accept_block).'
     )
     ap.add_argument('--peer', action='append', default=[])
-    ap.add_argument('--only', action='store_true',
-                    help='Usa SÓ --peer (ignora env/tailscale/defaults)')
-    ap.add_argument('--target-height', type=int, default=None,
-                    help='Só sincroniza de peers com esta altura EXATA')
+    ap.add_argument('--only', action='store_true')
+    ap.add_argument('--target-height', type=int, default=None)
     ap.add_argument('--batch', type=int, default=100)
     ap.add_argument('--timeout', type=float, default=120.0)
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--no-tailscale', action='store_true')
-    ap.add_argument('--strict', action='store_true',
-                    help='Força validação multi-sig (injeta trust_network.json)')
-    ap.add_argument('--db', type=str, default=None,
-                    help='DB alternativo (default: brn_v2_chain.db)')
+    ap.add_argument('--strict', action='store_true')
+    ap.add_argument('--db', type=str, default=None)
     args = ap.parse_args()
 
     db_path = Path(args.db) if args.db else DB_PATH
 
     log('=' * 70)
-    log(' SYNC GLOBAL v2.2 (consenso ativo + progresso)')
-    if args.strict:
-        log(' MODO: --strict (multi-sig obrigatório)')
-    if args.only:
-        log(' MODO: --only (só --peer explícito)')
-    if args.target_height is not None:
-        log(f' FILTRO: altura == {args.target_height}')
-    if args.db:
-        log(f' DB: {db_path}')
+    log(' SYNC GLOBAL v2.3 (consenso + ETA na importacao)')
+    if args.strict: log(' MODO: --strict (multi-sig obrigatório)')
+    if args.only: log(' MODO: --only (só --peer explícito)')
+    if args.target_height is not None: log(f' FILTRO: altura == {args.target_height}')
+    if args.db: log(f' DB: {db_path}')
     log('=' * 70)
 
-    # ===== 1. Descobrir =====
     sources = []
     if args.peer:
         urls = [normalize_url(u) for u in args.peer]
@@ -264,10 +258,7 @@ def main():
         urls = discover_from_env(env)
         log(f'    brn_network.env: {len(urls)}')
         sources.extend(urls)
-
-        for u in DEFAULT_BOOTSTRAP_PEERS:
-            sources.append(normalize_url(u))
-
+        for u in DEFAULT_BOOTSTRAP_PEERS: sources.append(normalize_url(u))
         if not args.no_tailscale:
             urls = discover_from_tailscale()
             log(f'    Tailscale: {len(urls)}')
@@ -275,26 +266,21 @@ def main():
 
     all_urls = dedupe(sources)
     log(f'\n    Total únicos: {len(all_urls)}')
-    for u in all_urls:
-        log(f'      - {u}')
+    for u in all_urls: log(f'      - {u}')
 
     if not all_urls:
         log('\n[X] Nenhum peer.')
         return 1
 
-    # ===== 2. Testar =====
     log(f'\n[2] Testando {len(all_urls)} peers...')
     probed = []
     for u in all_urls:
         log(f'  {u}...', end=' ')
         r = probe_peer(u, timeout=args.timeout)
         probed.append(r)
-        if r['reachable']:
-            log(f'OK — altura={r["height"]}')
-        else:
-            log(f'FALHOU ({r["error"]})')
+        if r['reachable']: log(f'OK — altura={r["height"]}')
+        else: log(f'FALHOU ({r["error"]})')
 
-    # ===== 3. Selecionar =====
     try:
         from db import ChainDB
         db = ChainDB(str(db_path))
@@ -310,8 +296,7 @@ def main():
         exact = [p for p in reachable if p['height'] == args.target_height]
         log(f'\n[3] Altura local: {local_height}')
         log(f'    Peers com altura {args.target_height}: {len(exact)}')
-        for p in exact:
-            log(f'      - {p["url"]} (altura={p["height"]})')
+        for p in exact: log(f'      - {p["url"]} (altura={p["height"]})')
         if not exact:
             log(f'\n[X] Nenhum peer tem altura {args.target_height}.')
             return 1
@@ -337,7 +322,6 @@ def main():
         log('\n[DRY-RUN] Sairia agora.')
         return 0
 
-    # ===== 4. Sincronizar via accept_block =====
     log(f'\n[4] Baixando e validando (primeiro = mais alto)...')
     for peer in valid:
         log(f'\n--- {peer["url"]} (altura={peer["height"]}) ---')
@@ -363,8 +347,7 @@ def main():
             continue
 
         if final_h < peer['height']:
-            log(f'  [!] Parcial ({final_h}/{peer["height"]}) — '
-                f'rejeição em algum bloco. Tentando próximo peer.')
+            log(f'  [!] Parcial ({final_h}/{peer["height"]}) — rejeição em algum bloco. Tentando próximo peer.')
 
     log('\n[X] Falhou em todos os peers.')
     return 1
