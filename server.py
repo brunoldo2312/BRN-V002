@@ -1,16 +1,19 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.29)
+server.py — Backend HTTP do nó BRN (v9.9.24)
 ================================================================
-v9.9.29 (2026-11-08):
-  [NEW] Dispara o `auto.py` automaticamente em background quando
-        a carteira é desbloqueada na GUI (/api/wallet/set_validator_sk).
-        Isso sincroniza o Trust Network e assina o JSON sem precisar
-        rodar o comando manualmente no terminal.
-v9.9.28 (2026-11-07):
-  [FIX CRÍTICO] Adicionado _PoolManagerWrapper. Resolve o erro
-        'PoolManager' object has no attribute 'strip'.
-v9.9.25 (2026-11-06):
-  [NEW] _check_sync_barrier() avançado (paralelo via ThreadPool).
+v9.9.24 (2026-11-05):
+  [FIX CRÍTICO] api_wallet_set_validator_sk() agora chama
+        ensure_multisig() depois de instalar a nova SK. Resolve
+        o caso em que o usuário desbloqueia a GUI com uma carteira
+        diferente e a máquina continua sem coletar assinaturas
+        dos peers (_sign_collector ficava no objeto antigo).
+        Também reconfigura o PBFT se a SK mudou.
+  [FIX CRÍTICO] pool_start_local() e pool_stop_local() agora
+        detectam corretamente a assinatura do PoolClient.
+v9.9.23 (2026-11-05):
+  [FIX CRÍTICO] Adicionada rota /api/trust/download.
+v9.9.22 (2026-11-05):
+  [FIX] pool_start_local() passa URL em vez de chain.
 ================================================================
 """
 from __future__ import annotations
@@ -22,11 +25,9 @@ import atexit
 import hmac
 import logging
 import sys
-import subprocess  # [NOVO v9.9.29] Para disparar o auto.py
 import threading
 import urllib.request
 import urllib.error
-import concurrent.futures
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from functools import wraps
 from pathlib import Path
@@ -121,7 +122,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
             req = urllib.request.Request(
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
-                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.29"},
+                headers={"Content-Type": "application/json", "User-Agent": "brn-server/9.9.24"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -159,7 +160,7 @@ CHAIN = _LazyChain()
 
 
 # ============================================================
-# P2P / POOL / SYNC / TRUST / POOL_CLIENT / L2 LOCAIS
+# P2P / POOL / SYNC / TRUST / POOL_CLIENT LOCAIS
 # ============================================================
 _P2P_MANAGER = None
 _P2P_LOCK = threading.Lock()
@@ -199,27 +200,15 @@ def _get_trust_network(): return _TRUST_NETWORK
 
 _POOL_CLIENT_LOCAL = None
 _POOL_CLIENT_LOCK = threading.Lock()
+
 def set_pool_client_local(pc) -> None:
     global _POOL_CLIENT_LOCAL
-    with _POOL_CLIENT_LOCK: _POOL_CLIENT_LOCAL = pc
+    with _POOL_CLIENT_LOCK:
+        _POOL_CLIENT_LOCAL = pc
     log.info("server: PoolClient local %s", "injetado" if pc else "removido")
-def _get_pool_client_local(): return _POOL_CLIENT_LOCAL
 
-
-_L2_MANAGER = None
-_L2_LOCK = threading.Lock()
-def _get_l2_manager():
-    global _L2_MANAGER
-    if _L2_MANAGER is not None: return _L2_MANAGER
-    with _L2_LOCK:
-        if _L2_MANAGER is None:
-            try:
-                from l2_manager import L2Manager
-                _L2_MANAGER = L2Manager(_get_chain().db, _get_chain())
-                log.info("server: L2Manager inicializado (lazy)")
-            except Exception as e:
-                log.error(f"server: Falha ao iniciar L2Manager: {e}")
-        return _L2_MANAGER
+def _get_pool_client_local():
+    return _POOL_CLIENT_LOCAL
 
 
 def _register_miner_in_trust(pubkey: str, address: str) -> None:
@@ -234,84 +223,6 @@ def _register_miner_in_trust(pubkey: str, address: str) -> None:
             trust.mark_connected(pubkey)
     except Exception as e:
         log.warning(f"[Trust] Falha ao registrar minerador {pubkey[:12]}: {e}")
-
-
-# ============================================================
-# SYNC BARRIER AVANÇADO
-# ============================================================
-def _check_sync_barrier() -> tuple[bool, str]:
-    chain = _get_chain()
-    
-    if getattr(chain, "_local_validator_sk", None) is None:
-        return False, "Carteira não está carregada. Abra a carteira antes de minerar."
-
-    local_h = chain.db.height()
-    if local_h < 0:
-        return False, "Blockchain vazia. Sincronize primeiro."
-
-    p2p = _get_p2p_manager()
-    if p2p is None:
-        return False, "P2P desligado. Não é possível sincronizar."
-        
-    try:
-        from p2p_unified import P2PClient, CHAIN_ID
-        peers = p2p.discovery.listar_peers()
-    except Exception as e:
-        return False, f"Erro ao listar peers: {e}"
-
-    if not peers:
-        return False, "Nenhum peer conectado. Aguardando a rede."
-
-    test_block = chain.db.get_block(local_h)
-
-    def check_peer(peer_addr):
-        if ":" not in peer_addr: return None
-        ip, port_s = peer_addr.rsplit(":", 1)
-        if ip == "127.0.0.1": return None
-        
-        try:
-            port = int(port_s)
-            msg_h = {"type": "get_chain_height", "_chain": CHAIN_ID, "_port": 6001}
-            resp_h, _ = P2PClient.send_message(ip, port, msg_h, timeout=3.0)
-            
-            if not resp_h: return None
-            
-            ph = resp_h.get("height", -1)
-            signed = False
-            
-            if test_block:
-                msg_sig = {"type": "sign_block", "block": test_block, "_chain": CHAIN_ID, "_port": 6001}
-                resp_sig, _ = P2PClient.send_message(ip, port, msg_sig, timeout=3.0)
-                if resp_sig and resp_sig.get("pubkey"):
-                    signed = True
-                    
-            return {"height": ph, "signed": signed}
-        except Exception:
-            return None
-
-    max_peer_h = local_h
-    peers_ok = 0
-    signers_ok = 0
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
-        results = pool.map(check_peer, peers)
-        for res in results:
-            if res is None: continue
-            peers_ok += 1
-            if res["height"] > max_peer_h: max_peer_h = res["height"]
-            if res["signed"]: signers_ok += 1
-
-    if peers_ok == 0:
-        return False, "Nenhum peer respondeu ao ping P2P. Verifique o firewall."
-
-    if local_h < (max_peer_h - 1):
-        falta = max_peer_h - local_h
-        return False, f"Seu nó está {falta} bloco(s) atrás do topo. Sincronize antes de minerar."
-
-    if signers_ok == 0 and test_block:
-        return False, "Peers estão online mas não assinaram o bloco de teste. Verifique se a carteira deles está aberta."
-
-    return True, ""
 
 
 # ============================================================
@@ -788,7 +699,7 @@ def sync_status():
 
 
 # ============================================================
-# MINERADOR (COM SYNC BARRIER AVANÇADO)
+# MINERADOR
 # ============================================================
 @app.route("/api/miner/start", methods=["POST"])
 @require_rate_limit("miner_start")
@@ -800,10 +711,6 @@ def miner_start():
 
         if not WalletManager.validate_address(addr): return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
         if not pubkey: return jsonify({"ok": False, "msg": "Pubkey desconhecida."}), 400
-
-        ok_sync, msg_sync = _check_sync_barrier()
-        if not ok_sync:
-            return jsonify({"ok": False, "msg": msg_sync}), 400
 
         chain = _get_chain()
         chain.adicionar_na_fila(addr, pubkey)
@@ -859,7 +766,7 @@ def miner_status():
 
 
 # ============================================================
-# POOL (COM SYNC BARRIER AVANÇADO)
+# POOL (PROXY PARA CLIENTES)
 # ============================================================
 def _proxy_pool_request(path: str, method: str = "POST") -> tuple:
     remote_pool = os.environ.get("BRN_POOL_URL", "").strip().rstrip("/")
@@ -989,23 +896,8 @@ def pool_miners():
 
 
 # ============================================================
-# POOL LOCAL DINÂMICO (FIX v9.9.28)
+# POOL LOCAL DINÂMICO
 # ============================================================
-class _PoolManagerWrapper(str):
-    def __new__(cls, pool_mgr):
-        obj = super().__new__(cls, "http://127.0.0.1:5000")
-        obj._pool_mgr = pool_mgr
-        return obj
-    def strip(self, *args, **kwargs): return self
-    def rstrip(self, *args, **kwargs): return self
-    def lstrip(self, *args, **kwargs): return self
-    def register(self, *args, **kwargs): return self._pool_mgr.register(*args, **kwargs)
-    def get_work(self, *args, **kwargs): return self._pool_mgr.get_work(*args, **kwargs)
-    def submit_share(self, *args, **kwargs): return self._pool_mgr.submit_share(*args, **kwargs)
-    def heartbeat(self, *args, **kwargs): return self._pool_mgr.heartbeat(*args, **kwargs)
-    def __getattr__(self, name): return getattr(self._pool_mgr, name)
-
-
 @app.route("/api/pool/local_status", methods=["GET"])
 def pool_local_status():
     pc = _get_pool_client_local()
@@ -1021,10 +913,6 @@ def pool_local_status():
 
 @app.route("/api/pool/start_local", methods=["POST"])
 def pool_start_local():
-    ok_sync, msg_sync = _check_sync_barrier()
-    if not ok_sync:
-        return jsonify({"ok": False, "msg": msg_sync}), 400
-
     pc = _get_pool_client_local()
     if pc is None:
         try:
@@ -1036,41 +924,27 @@ def pool_start_local():
             if not pubkey:
                 return jsonify({"ok": False, "msg": "pubkey obrigatoria para iniciar o PoolClient"}), 400
 
-            pool_mgr = _get_pool_manager()
-            
-            if pool_mgr is not None:
-                log.info("[pool_client] Inicializando PoolClient LOCAL (wrapper PoolManager)")
-                wrapped_mgr = _PoolManagerWrapper(pool_mgr)
-                try:
-                    pc = PoolClient(wrapped_mgr, address, pubkey)
-                except TypeError:
-                    try:
-                        pc = PoolClient(wrapped_mgr, pubkey)
-                    except TypeError:
-                        pc = PoolClient(wrapped_mgr)
-            else:
-                pool_url = os.environ.get("BRN_POOL_URL", "").strip()
-                if not pool_url:
-                    pool_url = os.environ.get("BRN_POOL_URL_LOCAL", "").strip() or "http://127.0.0.1:5000"
-                
-                log.info("[pool_client] Inicializando PoolClient REMOTO (url=%s)", pool_url)
-                try:
-                    pc = PoolClient(pool_url, address, pubkey)
-                except TypeError:
-                    try:
-                        pc = PoolClient(pool_url, pubkey)
-                    except TypeError:
-                        pc = PoolClient(pool_url)
+            pool_url = os.environ.get("BRN_POOL_URL", "").strip()
+            if not pool_url:
+                pool_url = os.environ.get("BRN_POOL_URL_LOCAL", "").strip() or "http://127.0.0.1:5000"
 
-            if hasattr(pc, "address") and address:
-                pc.address = address
-            if hasattr(pc, "pubkey") and pubkey:
-                pc.pubkey = pubkey
+            log.info("[pool_client] Inicializando com pool_url=%s", pool_url)
+
+            try:
+                pc = PoolClient(pool_url, address, pubkey)
+            except TypeError:
+                try:
+                    pc = PoolClient(pool_url, pubkey)
+                except TypeError:
+                    try:
+                        pc = PoolClient(pool_url)
+                    except TypeError:
+                        chain = _get_chain()
+                        pc = PoolClient(chain, pubkey)
 
             set_pool_client_local(pc)
-            log.info("[pool_client] Inicializado com sucesso")
+            log.info("[pool_client] Inicializado dinamicamente")
         except Exception as e:
-            log.error(f"[pool_client] Erro ao inicializar: {e}")
             return jsonify({"ok": False, "msg": f"Falha ao inicializar PoolClient: {e}"}), 503
 
     try:
@@ -1127,101 +1001,18 @@ def pool_stop_local():
 
 
 # ============================================================
-# L2 BRIDGE (BTC -> BRN)
-# ============================================================
-@app.route("/api/l2/quote", methods=["POST"])
-@require_rate_limit("l2_quote")
-def l2_quote():
-    try:
-        data = request.get_json(force=True) or {}
-        btc_sats = int(data.get("btc_amount_sats", 0) or 0)
-        
-        l2 = _get_l2_manager()
-        if not l2:
-            return jsonify({"ok": False, "msg": "L2Manager indisponivel"}), 503
-            
-        r = l2.quote(btc_sats)
-        return jsonify({"ok": True, **r})
-    except Exception as e:
-        return jsonify({"ok": False, "msg": str(e)}), 400
-
-
-@app.route("/api/l2/create", methods=["POST"])
-@require_rate_limit("l2_create")
-def l2_create():
-    try:
-        data = request.get_json(force=True) or {}
-        btc_sats = int(data.get("btc_amount_sats", 0) or 0)
-        buyer = (data.get("buyer_brn") or "").strip()
-        
-        if not buyer.startswith("brn1"):
-            return jsonify({"ok": False, "msg": "Endereco BRN invalido."}), 400
-            
-        l2 = _get_l2_manager()
-        if not l2:
-            return jsonify({"ok": False, "msg": "L2Manager indisponivel"}), 503
-            
-        r = l2.create_order(btc_sats, buyer)
-        return jsonify({"ok": True, **r})
-    except Exception as e:
-        return jsonify({"ok": False, "msg": str(e)}), 400
-
-
-@app.route("/api/l2/escrows", methods=["GET"])
-@require_rate_limit("l2_list")
-def l2_list():
-    try:
-        buyer = request.args.get("buyer", "").strip()
-        status = request.args.get("status", "OPEN").strip()
-        limit = int(request.args.get("limit", 50))
-        
-        l2 = _get_l2_manager()
-        if not l2:
-            return jsonify({"ok": False, "msg": "L2Manager indisponivel"}), 503
-            
-        orders = l2.list_orders(buyer=buyer or None, status=status, limit=limit)
-        return jsonify({"ok": True, "escrows": orders})
-    except Exception as e:
-        return jsonify({"ok": False, "msg": str(e)}), 500
-
-
-@app.route("/api/l2/stats", methods=["GET"])
-@require_rate_limit("l2_stats")
-def l2_stats():
-    try:
-        l2 = _get_l2_manager()
-        if not l2:
-            return jsonify({"ok": False, "msg": "L2Manager indisponivel"}), 503
-            
-        return jsonify({"ok": True, **l2.stats()})
-    except Exception as e:
-        return jsonify({"ok": False, "msg": str(e)}), 500
-
-
-@app.route("/api/l2/cancel", methods=["POST"])
-@require_rate_limit("l2_cancel")
-def l2_cancel():
-    try:
-        data = request.get_json(force=True) or {}
-        escrow_id = (data.get("escrow_id") or "").strip()
-        if not escrow_id:
-            return jsonify({"ok": False, "msg": "escrow_id obrigatorio"}), 400
-            
-        l2 = _get_l2_manager()
-        if not l2:
-            return jsonify({"ok": False, "msg": "L2Manager indisponivel"}), 503
-            
-        r = l2.cancel_order(escrow_id)
-        return jsonify(r), (200 if r.get("ok") else 400)
-    except Exception as e:
-        return jsonify({"ok": False, "msg": str(e)}), 500
-
-
-# ============================================================
-# WALLET — sincroniza SK, ATIVA PBFT e DISPARA AUTO.PY
+# WALLET — sincroniza SK + MULTISIG + PBFT [v9.9.24]
 # ============================================================
 @app.route("/api/wallet/set_validator_sk", methods=["POST"])
 def api_wallet_set_validator_sk():
+    """
+    [v9.9.24] Quando a carteira muda (GUI), faz:
+      1. chain.set_local_validator_sk(sk_hex) — SK em runtime
+      2. trust.sync_local_validator(pubkey, addr) — trust atualizado
+      3. ensure_multisig(chain, wallet, p2p) — RECONFIGURA o coletor
+         de assinaturas (antes ficava apontando para a SK antiga)
+      4. Ativa PBFT dinamicamente se ainda não estiver
+    """
     try:
         data = request.get_json(force=True) or {}
         sk_hex  = (data.get("sk_hex")  or "").strip()
@@ -1251,6 +1042,7 @@ def api_wallet_set_validator_sk():
         if not pubkey:
             pubkey = installed_pk
 
+        # ---- TRUST ----
         trust_synced = False
         trust = _get_trust_network()
         if trust is not None:
@@ -1260,11 +1052,35 @@ def api_wallet_set_validator_sk():
                     trust_synced = True
                 elif hasattr(trust, "register_node"):
                     trust.register_node(node_id=installed_pk, address=address or installed_pk[:16], public_key=installed_pk)
-                    if hasattr(trust, "mark_connected"): trust.mark_connected(installed_pk)
+                    if hasattr(trust, "mark_connected"):
+                        trust.mark_connected(installed_pk)
                     trust_synced = True
             except Exception as e:
                 log.warning("[wallet_sk] sync no trust falhou: %s", e)
 
+        # ---- [NOVO v9.9.24] MULTISIG RECONFIGURADO ----
+        # Sem isso, se o usuário desbloqueia uma carteira DIFERENTE
+        # pela GUI, o _sign_collector continua apontando para a SK
+        # antiga e a máquina não coleta assinaturas dos peers.
+        multisig_ok = False
+        p2p = _get_p2p_manager()
+        if p2p is not None and chain._local_validator_sk is not None:
+            try:
+                from brn_multisig import ensure_multisig
+                ensure_multisig(
+                    chain,
+                    chain._local_validator_sk,
+                    p2p,
+                    trust=trust,
+                    logger=log,
+                )
+                multisig_ok = True
+                log.info("[wallet_sk] multisig reconfigurado com a nova SK")
+            except Exception as e:
+                log.warning("[wallet_sk] falha ao reconfigurar multisig: %s", e)
+
+        # ---- PBFT DINÂMICO ----
+        pbft_ok = False
         if chain._pbft is None and os.environ.get("BRN_PBFT_ENABLED") == "1":
             try:
                 from pbft_consensus import PBFTConsensus
@@ -1280,35 +1096,29 @@ def api_wallet_set_validator_sk():
                 pbft = PBFTConsensus(chain, w_obj, _pbft_send)
                 chain.set_pbft(pbft)
 
-                p2p = _get_p2p_manager()
                 if p2p and p2p.server:
                     p2p.server.set_pbft(pbft)
 
-                log.info("[PBFT] Ativado dinamicamente via API de wallet")
+                pbft_ok = True
+                log.info("[wallet_sk] PBFT ativado dinamicamente")
             except Exception as e:
-                log.warning("[PBFT] Falha ao ativar dinamicamente: %s", e)
+                log.warning("[wallet_sk] PBFT dinâmico falhou: %s", e)
 
-        # ============================================================
-        # [NOVO v9.9.29] Dispara o auto.py em background
-        # ============================================================
-        try:
-            def _run_auto():
-                try:
-                    subprocess.Popen(
-                        [sys.executable, "auto.py"],
-                        cwd=str(BASE_DIR),
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                except Exception as e:
-                    log.warning("[auto.py] Falha ao executar: %s", e)
-            threading.Thread(target=_run_auto, daemon=True, name="AutoTrust").start()
-            log.info("[wallet_sk] auto.py disparado em background para sincronizar peers")
-        except Exception as e:
-            log.warning("[wallet_sk] Falha ao agendar auto.py: %s", e)
+        log.info(
+            "[wallet_sk] SK atualizada — pk=%s… trust=%s multisig=%s pbft=%s",
+            installed_pk[:16],
+            "ok" if trust_synced else "skip",
+            "ok" if multisig_ok else "skip",
+            "ok" if pbft_ok else ("already" if chain._pbft else "skip"),
+        )
 
-        log.info("[wallet_sk] SK atualizada em runtime — pk=%s… trust=%s", installed_pk[:16], "ok" if trust_synced else "skip")
-        return jsonify({"ok": True, "pubkey": installed_pk, "trust_synced": trust_synced})
+        return jsonify({
+            "ok": True,
+            "pubkey": installed_pk,
+            "trust_synced": trust_synced,
+            "multisig_configured": multisig_ok,
+            "pbft_activated": pbft_ok,
+        })
     except Exception as e:
         log.exception("api_wallet_set_validator_sk falhou: %s", e)
         return jsonify({"ok": False, "msg": str(e)}), 500
@@ -1344,13 +1154,10 @@ def trust_download():
         data_file = getattr(trust, "data_file", Path("trust_network.json"))
         if not data_file.is_absolute():
             data_file = BASE_DIR / data_file
-            
         if not data_file.exists():
             return jsonify({"ok": False, "msg": "Arquivo de trust nao encontrado"}), 404
-            
         with open(data_file, "r", encoding="utf-8") as f:
             data = json.load(f)
-            
         return jsonify(data)
     except Exception as e:
         log.error(f"[trust_download] Erro: {e}")
@@ -1470,11 +1277,32 @@ def peers_discovered():
 @app.route("/health", methods=["GET"])
 def health():
     try:
+        chain = _get_chain()
+        p2p = _get_p2p_manager()
+        has_sk = False
+        try:
+            has_sk = chain._local_validator_sk is not None
+        except Exception:
+            pass
+
+        has_multisig = False
+        try:
+            has_multisig = getattr(chain, "_sign_collector", None) is not None
+        except Exception:
+            pass
+
         return jsonify({
-            "ok": True, "height": _get_chain().db.height(), "version": "9.9.29",
-            "chain_injected": _CHAIN is not None, "pool_injected": _POOL_MANAGER is not None,
+            "ok": True,
+            "height": chain.db.height(),
+            "version": "9.9.24",
+            "chain_injected": _CHAIN is not None,
+            "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
             "pool_client_local": _POOL_CLIENT_LOCAL is not None,
+            "p2p_injected": p2p is not None,
+            "wallet_sk_installed": has_sk,
+            "multisig_configured": has_multisig,
+            "pbft_configured": getattr(chain, "_pbft", None) is not None,
         })
     except Exception as e: return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -1487,7 +1315,7 @@ def _shutdown():
 
 
 # ============================================================
-# PATCH v9.9.17
+# OUTRAS ROTAS
 # ============================================================
 @app.route("/api/miner/stop", methods=["POST"])
 @require_rate_limit("miner_stop")
@@ -1625,9 +1453,6 @@ def api_get_block(height):
         return jsonify({"error": str(e)}), 500
 
 
-# ============================================================
-# Multi-sig / Top 5 validadores
-# ============================================================
 @app.route("/api/consensus/validators", methods=["GET"])
 @require_rate_limit("status")
 def consensus_validators():
@@ -1694,9 +1519,6 @@ def block_signatures(height):
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
-# ============================================================
-# WORK / TX STATUS
-# ============================================================
 @app.route("/api/work", methods=["GET"])
 def api_work():
     try:
@@ -1731,5 +1553,5 @@ def api_tx_status(txid_str):
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.29 (Auto Trust + Wrapper fix + Sync Barrier + PBFT + L2)")
+    print(f"BRN Server v9.9.24 (Wallet-SK → multisig + PBFT dinâmico)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
