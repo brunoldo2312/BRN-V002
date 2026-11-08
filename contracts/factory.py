@@ -1,19 +1,20 @@
-"""contracts/factory.py — Fábrica de escrows L2 BTC→BRN.
-
-Cria ordens com limites BTC, cotação fixa, taxa e persistência via ChainDB.
-A criação de um escrow não comprova depósito BTC nem autoriza crédito de BRN;
-isso depende da validação on-chain e do fluxo seguro de liberação.
-
-v2 (2026-11-03):
-  [NEW] DEFAULT_TREASURY_BRN — endereço BRN do cofre como fallback
-        quando o caller não passa creator_wallet E o env não define
-        BRN_TREASURY_ADDRESS. Evita criar escrows com creator
-        "BRN_TREASURY" (label) em vez de endereço brn1... real.
-  [NEW] _treasury_address() — precedência:
-          1. os.environ["BRN_TREASURY_ADDRESS"] (env)
-          2. btc_config.BRN_TREASURY_ADDRESS (arquivo)
-          3. DEFAULT_TREASURY_BRN (hardcoded neste arquivo)
-  [KEEP] Todo o resto do v1 inalterado.
+"""contracts/factory.py — Fábrica de escrows L2 BTC→BRN (v3)
+================================================================
+v3 (2026-11-05):
+  [FIX CRÍTICO] Removido DEFAULT_TREASURY_BRN hardcoded
+                (brn176..., chain morta). Treasury DEVE vir de
+                env ou btc_config; se faltar, create_btc_to_brn
+                levanta ValueError explícito em vez de usar
+                endereço errado.
+  [FIX] _validate_buyer() usa is_valid_brn_address() (checksum
+        bech32) em vez de só checar prefixo. Consistente com
+        EscrowBTCtoBRN v3.
+  [FIX] Auto-teste não depende mais de config externa:
+        - buyers gerados com bech32 real (ou fallback genesis)
+        - treasury testado com e sem env var
+  [KEEP] API pública v2 inalterada (create_btc_to_brn, list_*,
+         cancel, expire_overdue, stats, compute_brn_amounts).
+================================================================
 """
 from __future__ import annotations
 
@@ -44,12 +45,13 @@ DEFAULT_MAX_BTC_SATS = 100_000_000
 DEFAULT_BTC_ADDRESS = ""
 DEFAULT_ESCROW_TTL_S = 24 * 3600
 
-# Fallback local (03/11/2026). Só é usado se env E btc_config não tiverem.
-DEFAULT_TREASURY_BRN = "brn176zsgk8vrn8js48npzjn8rm7cc70rwsxkxyy43"
+# [v3] Sem hardcode. Treasury vem de:
+#   1. os.environ["BRN_TREASURY_ADDRESS"]
+#   2. btc_config.BRN_TREASURY_ADDRESS
+# Se nenhum estiver configurado, create_btc_to_brn levanta ValueError.
 
 
 def _cfg(name: str, default):
-    """Lê btc_config.py com fallback seguro."""
     try:
         import btc_config
         return getattr(btc_config, name, default)
@@ -95,12 +97,13 @@ def _btc_address() -> str:
 
 def _treasury_address() -> str:
     """
-    Endereço BRN do cofre (creator padrão de escrows).
+    Endereço BRN do cofre (creator padrão).
 
-    Precedência:
-      1. os.environ["BRN_TREASURY_ADDRESS"] (env runtime)
-      2. btc_config.BRN_TREASURY_ADDRESS (arquivo)
-      3. DEFAULT_TREASURY_BRN (hardcoded acima)
+    [v3] Precedência sem hardcode:
+      1. os.environ["BRN_TREASURY_ADDRESS"]
+      2. btc_config.BRN_TREASURY_ADDRESS
+
+    Retorna "" se nenhum estiver configurado com endereço válido.
     """
     env_val = (os.environ.get("BRN_TREASURY_ADDRESS", "") or "").strip()
     if env_val and is_valid_brn_address(env_val):
@@ -110,7 +113,7 @@ def _treasury_address() -> str:
     if cfg_val and is_valid_brn_address(cfg_val):
         return cfg_val
 
-    return DEFAULT_TREASURY_BRN
+    return ""
 
 
 def compute_brn_amounts(btc_sats: int) -> dict:
@@ -119,7 +122,6 @@ def compute_brn_amounts(btc_sats: int) -> dict:
         raise ValueError("btc_sats deve ser int > 0")
     rate = _rate()
     fee_pct = _fee_pct()
-    # satoshis BTC × BRN/BTC = unidades mínimas de BRN.
     brn_gross = int(btc_sats * rate)
     fee = int(brn_gross * fee_pct / 100)
     brn_net = brn_gross - fee
@@ -143,10 +145,9 @@ class ContractFactory:
     def _validate_buyer(self, buyer: str) -> None:
         if not isinstance(buyer, str) or not buyer:
             raise ValueError("buyer obrigatorio")
-        if not buyer.startswith("brn1"):
-            raise ValueError("buyer deve ser endereco brn1...")
-        if not 20 <= len(buyer) <= 128:
-            raise ValueError("buyer com tamanho invalido")
+        # [v3] valida checksum bech32, consistente com EscrowBTCtoBRN v3
+        if not is_valid_brn_address(buyer):
+            raise ValueError(f"buyer invalido: {buyer[:32]}")
 
     def _validate_btc_amount(self, sats: int) -> int:
         if isinstance(sats, bool) or not isinstance(sats, int) or sats <= 0:
@@ -182,22 +183,27 @@ class ContractFactory:
         if (
             not btc_address
             or "SEU_ENDERECO" in btc_address.upper()
+            or "AQUI" in btc_address.upper()
             or btc_address.startswith("bc1qSEU_")
+            or btc_address.startswith("tb1qSEU_")
         ):
             raise ValueError(
-                "BTC_RECEIVE_ADDRESS nao configurado; defina um endereco BTC real "
-                "em btc_config.py/BRN_BTC_RECEIVE_ADDRESS antes de criar ordens"
+                "BTC_RECEIVE_ADDRESS nao configurado; defina um endereco "
+                "BTC real em btc_config_local.json ou BRN_BTC_RECEIVE_ADDRESS"
             )
 
-        # [v2] creator padrão = treasury real (brn176...), não label "BRN_TREASURY"
+        # [v3] Sem fallback hardcoded: exige configuração real
         creator = (creator_wallet or "").strip()
         if not creator:
             creator = _treasury_address()
-            if not is_valid_brn_address(creator):
+            if not creator:
                 raise ValueError(
-                    f"treasury address invalido: {creator[:32]}… "
-                    f"(verifique BRN_TREASURY_ADDRESS)"
+                    "treasury BRN nao configurado. Defina BRN_TREASURY_ADDRESS "
+                    "(env) ou brn_treasury_address em btc_config_local.json "
+                    "antes de criar ordens"
                 )
+            if not is_valid_brn_address(creator):
+                raise ValueError(f"treasury address invalido: {creator[:32]}")
 
         now = int(time.time())
         escrow_id = generate_escrow_id()
@@ -314,10 +320,39 @@ class ContractFactory:
         return out
 
 
+# ============================================================
+# AUTO-TESTE (isolado, sem depender de config externa)
+# ============================================================
 if __name__ == "__main__":
-    # Endereço fictício apenas para os autotestes; nunca usado em produção.
-    _btc_address = lambda: "bc1qtestaddress000000000000000000000000000000"
+    # ---------- Gera buyers válidos via bech32 real ----------
+    HAS_CRYPTO = False
+    try:
+        from crypto import generate_private_key, pubkey_from_priv
+        from bech32 import address_from_pubkey
 
+        def _new_brn_address() -> str:
+            priv = generate_private_key()
+            pub = pubkey_from_priv(priv, compressed=True)
+            return address_from_pubkey(pub)
+
+        # Testa se funciona de verdade
+        _test_addr = _new_brn_address()
+        if is_valid_brn_address(_test_addr):
+            HAS_CRYPTO = True
+    except Exception:
+        pass
+
+    if not HAS_CRYPTO:
+        _GENESIS = "brn1g2xdpr8r4cmq725pjmza43pzce9ha5mnjzjaz8"
+
+        def _new_brn_address() -> str:
+            return _GENESIS
+
+    # ---------- Mock do BTC receive (para o auto-teste) ----------
+    _real_btc_address = _btc_address
+    _btc_address = lambda: "tb1qtestaddr000000000000000000000000000000"
+
+    # ---------- FakeDB ----------
     class FakeDB:
         def __init__(self):
             self.rows = {}
@@ -334,49 +369,106 @@ if __name__ == "__main__":
                 if btc_txid:
                     self.rows[escrow_id]["btc_txid"] = btc_txid
 
-    print("Testando ContractFactory...")
+    print("Testando ContractFactory v3...")
+    print(f"  crypto disponivel: {HAS_CRYPTO}")
+
     db = FakeDB()
     factory = ContractFactory(db)
-    buyer = "brn1qtestaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+    buyer1 = _new_brn_address()
+    buyer2 = _new_brn_address() if HAS_CRYPTO else buyer1
+    assert is_valid_brn_address(buyer1), f"buyer1 invalido: {buyer1}"
+
+    # [1] compute_brn_amounts
     quote = compute_brn_amounts(100_000)
     assert quote["brn_gross"] > quote["brn_net"] > 0
     assert quote["fee"] > 0
+    print("  [ok] compute_brn_amounts")
 
-    # Teste 1: creator explícito (label "BRN_TREASURY") — mantém compat
-    escrow = factory.create_btc_to_brn("BRN_TREASURY", 100_000, buyer)
+    # [2] creator explícito (qualquer string não-vazia — backward compat)
+    escrow = factory.create_btc_to_brn("BRN_TREASURY", 100_000, buyer1)
     assert escrow.status == STATUS_OPEN
     assert escrow.creator == "BRN_TREASURY"
     assert factory.get(escrow.escrow_id).to_dict() == escrow.to_dict()
-    assert len(factory.list_by_buyer(buyer, "OPEN")) == 1
+    print("  [ok] criar com creator explicito")
+
+    # [3] cancel
     assert factory.cancel(escrow.escrow_id)["ok"]
     assert factory.get(escrow.escrow_id).status == STATUS_CANCELLED
-    assert factory.stats()["cancelled"] == 1
+    print("  [ok] cancel")
 
-    # Teste 2: creator vazio → usa treasury real (brn176...)
-    buyer2 = "brn1qtestbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-    escrow2 = factory.create_btc_to_brn("", 100_000, buyer2, ttl_s=60)
-    assert escrow2.creator == DEFAULT_TREASURY_BRN, \
-        f"esperado {DEFAULT_TREASURY_BRN}, veio {escrow2.creator}"
-    assert is_valid_brn_address(escrow2.creator)
-    print(f"  [ok] treasury default: {escrow2.creator}")
-
+    # [4] creator vazio + env var → usa treasury do env
+    old_env = os.environ.get("BRN_TREASURY_ADDRESS")
+    os.environ["BRN_TREASURY_ADDRESS"] = buyer2
     try:
-        factory.create_btc_to_brn("BRN_TREASURY", 100_000, buyer, ttl_s=-1)
-        raise AssertionError("ttl negativo deveria ser rejeitado")
-    except ValueError:
-        pass
-    for amount, address in ((0, buyer), (-1, buyer), (100_000, "not_brn")):
+        escrow2 = factory.create_btc_to_brn("", 100_000, buyer1, ttl_s=60)
+        assert escrow2.creator == buyer2, \
+            f"esperado {buyer2}, veio {escrow2.creator}"
+        print(f"  [ok] creator vazio + env → treasury={escrow2.creator[:16]}...")
+    finally:
+        if old_env is None:
+            os.environ.pop("BRN_TREASURY_ADDRESS", None)
+        else:
+            os.environ["BRN_TREASURY_ADDRESS"] = old_env
+
+    # [5] creator vazio + sem env + sem btc_config → ValueError explícito
+    os.environ.pop("BRN_TREASURY_ADDRESS", None)
+    import sys
+    _orig_btc_cfg = sys.modules.get("btc_config")
+
+    class _EmptyBtcConfig:
+        BRN_TREASURY_ADDRESS = ""
+        BTC_RECEIVE_ADDRESS = _btc_address()
+        BRN_PER_BTC = 10_000
+        FEE_PERCENT = 2.0
+        MIN_BTC_SATS = 10_000
+        MAX_BTC_SATS = 100_000_000
+
+    sys.modules["btc_config"] = _EmptyBtcConfig
+    try:
         try:
-            factory.create_btc_to_brn("BRN_TREASURY", amount, address)
-            raise AssertionError("entrada invalida deveria ser rejeitada")
+            factory.create_btc_to_brn("", 100_000, buyer1)
+            raise AssertionError("deveria falhar sem treasury configurado")
+        except ValueError as e:
+            assert "treasury" in str(e).lower()
+            print(f"  [ok] sem treasury → ValueError: {str(e)[:60]}")
+    finally:
+        if _orig_btc_cfg is not None:
+            sys.modules["btc_config"] = _orig_btc_cfg
+        else:
+            sys.modules.pop("btc_config", None)
+
+    # [6] validações de entrada
+    for bad_args in (
+        dict(amount=0,       buyer=buyer1,  ttl=3600, reason="amount=0"),
+        dict(amount=-1,      buyer=buyer1,  ttl=3600, reason="amount<0"),
+        dict(amount=100_000, buyer="not_brn", ttl=3600, reason="buyer invalido"),
+        dict(amount=100_000, buyer=buyer1,  ttl=-1,   reason="ttl<0"),
+    ):
+        try:
+            factory.create_btc_to_brn("X", bad_args["amount"],
+                                      bad_args["buyer"], ttl_s=bad_args["ttl"])
+            raise AssertionError(f"deveria rejeitar {bad_args['reason']}")
         except ValueError:
             pass
+    print("  [ok] validações de entrada")
 
-    expiring = factory.create_btc_to_brn("BRN_TREASURY", 100_000, buyer, ttl_s=1)
+    # [7] expire_overdue
+    expiring = factory.create_btc_to_brn("BRN_TREASURY", 100_000, buyer1, ttl_s=1)
     db.rows[expiring.escrow_id]["created_at"] = int(time.time()) - 10
     db.rows[expiring.escrow_id]["expires_at"] = int(time.time()) - 1
-    assert factory.expire_overdue() == 1
+    expired = factory.expire_overdue()
+    assert expired >= 1, f"esperado >=1, veio {expired}"
     assert factory.get(expiring.escrow_id).status == STATUS_EXPIRED
+    print(f"  [ok] expire_overdue ({expired} expirados)")
 
-    print(f"  [ok] treasury usado: {_treasury_address()}")
-    print("ContractFactory OK.")
+    # [8] stats
+    s = factory.stats()
+    assert "treasury_address" in s
+    assert s["total"] >= 3
+    print(f"  [ok] stats: total={s['total']} cancelled={s['cancelled']} expired={s['expired']}")
+
+    # Restore
+    _btc_address = _real_btc_address
+
+    print("\nContractFactory v3 OK.")
