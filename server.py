@@ -1,33 +1,17 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.27)
+server.py — Backend HTTP do nó BRN (v9.9.28)
 ================================================================
-v9.9.27 (2026-11-09) — PROPAGAÇÃO DE VALIDADORES:
-  [NEW] Rota /api/validator/announce: cliente POSTa sua pubkey para
-        o Origin registrar no trust. Sem isso, a pubkey do cliente
-        nunca entra no top5 do Origin e ele nunca é contado no
-        consenso multi-sig.
-  [NEW] api_wallet_set_validator_sk detecta se é Origin:
-        - Origin: propaga via P2P broadcast_validator_registration
-        - Cliente: POST /api/validator/announce no BRN_POOL_URL
-  [KEEP] v9.9.26: wallet_integrator.integrate, persist_sk_for_reboot,
-        STRICT_MULTISIG-aware, trust_download assinado, proxy pool
-        timeout 30s, bootstrap_add valida pubkey 66 hex.
-
-v9.9.26 (2026-11-09):
-  [NEW] wallet_integrator.integrate (ponto único).
-  [NEW] persist_sk_for_reboot (re-salva .enc pós-integração).
-  [FIX] Retorna HTTP 500 quando STRICT_MULTISIG=1 e multisig falho.
-
-v9.9.25 (2026-11-08):
-  [FIX] trust_download recusa payload sem assinatura.
-  [FIX] _proxy_pool_request: timeout 100s → 30s.
-  [FIX] bootstrap_add valida pubkey 66 hex.
-  [NEW] /health expõe multisig_configured, wallet_sk_installed.
-
-v9.9.24 (2026-11-05):
-  [FIX] api_wallet_set_validator_sk reconfigura multisig.
-v9.9.23 (2026-11-05):
-  [NEW] /api/trust/download.
+v9.9.28 (2026-11-09) — CARTEIRA SÓ VIA GUI:
+  [BREAKING] api_wallet_set_validator_sk NÃO usa mais .env para
+        senha. Removeu password=... e persist_sk_for_reboot().
+        A carteira vem exclusivamente do POST do GUI (via
+        app_wallet_v3.unlock_wallet), que passa sk_hex/address/pubkey
+        já decifrados.
+  [BREAKING] Removida persist_sk_for_reboot do import — não é mais
+        chamada. O GUI já salvou current_wallet.enc antes de POSTar.
+  [KEEP] v9.9.27: /api/validator/announce, integrate_and_propagate
+        no api_wallet_set_validator_sk, trust_download assinado.
+  [KEEP] v9.9.26: STRICT_MULTISIG-aware, proxy pool timeout 30s.
 ================================================================
 """
 from __future__ import annotations
@@ -172,7 +156,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
                 headers={"Content-Type": "application/json",
-                         "User-Agent": "brn-server/9.9.27"},
+                         "User-Agent": "brn-server/9.9.28"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -371,6 +355,10 @@ def _registrar_pubkey(addr, pk):
 
 
 def auto_registrar_carteira_atual() -> dict:
+    """
+    NÃO USADO NO BOOT. Mantido para compatibilidade.
+    Use /api/wallet/set_validator_sk via GUI.
+    """
     senha = (
         os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
         or os.environ.get("BRN_NODE_PASSWORD", "").strip()
@@ -1082,6 +1070,13 @@ def pool_work():
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
+@app.route("/api/pool/getwork", methods=["POST"])
+@require_rate_limit("pool_work")
+def pool_getwork_compat():
+    """Alias para peers antigos que chamam /api/pool/getwork."""
+    return pool_work()
+
+
 @app.route("/api/pool/submit", methods=["POST"])
 @require_rate_limit("pool_submit")
 def pool_submit():
@@ -1289,23 +1284,31 @@ def pool_stop_local():
 
 
 # ============================================================
-# WALLET — integração completa [v9.9.26/27]
+# WALLET — integração completa [v9.9.28: SÓ GUI]
 # ============================================================
 @app.route("/api/wallet/set_validator_sk", methods=["POST"])
 def api_wallet_set_validator_sk():
     """
-    [v9.9.26] Usa wallet_integrator.integrate() — ponto único.
-    [v9.9.27] Se cliente, propaga pubkey ao Origin.
+    [v9.9.28] SÓ aceita carteira vinda do GUI (via app_wallet_v3).
+    NÃO usa .env para senha. NÃO persiste .enc (GUI já salvou antes).
+    NÃO tenta recarregar em caso de erro.
+
+    Body (do GUI):
+      {
+        "sk_hex":  "abc...",   # 64 hex
+        "address": "brn1...",
+        "pubkey":  "02..."
+      }
+
+    Retorno:
+      {ok, pubkey, sk_installed, in_trust, in_top5, multisig_ready,
+       pbft_ready, propagated, peers_notified, warnings, errors}
     """
     try:
         data = request.get_json(force=True) or {}
-        sk_hex = (data.get("sk_hex") or "").strip()
+        sk_hex  = (data.get("sk_hex")  or "").strip()
         address = (data.get("address") or "").strip()
-        pubkey = (data.get("pubkey") or "").strip()
-        password = (data.get("password") or "").strip() or (
-            os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
-            or os.environ.get("BRN_NODE_PASSWORD", "").strip()
-        )
+        pubkey  = (data.get("pubkey")  or "").strip()
 
         if not sk_hex or len(sk_hex) != 64:
             return jsonify({
@@ -1317,18 +1320,22 @@ def api_wallet_set_validator_sk():
         except ValueError:
             return jsonify({"ok": False, "msg": "sk_hex não é hex"}), 400
 
-        from wallet_integrator import (
-            integrate as _integrate_local,
-            integrate_and_propagate as _integrate_prop,
-            persist_sk_for_reboot,
-        )
+        # ─── Wallet integrator (ponto único) ───
+        try:
+            from wallet_integrator import (
+                integrate as _integrate_local,
+                integrate_and_propagate as _integrate_prop,
+            )
+        except ImportError as e:
+            return jsonify({
+                "ok": False,
+                "msg": f"wallet_integrator indisponível: {e}",
+            }), 500
 
         chain = _get_chain()
-        p2p = _get_p2p_manager()
+        p2p   = _get_p2p_manager()
         trust = _get_trust_network()
 
-        # Tenta integração + propagação; se falhar por qualquer motivo,
-        # cai no integrate() básico (que sempre funcionou).
         try:
             r = _integrate_prop(
                 chain, sk_hex,
@@ -1356,23 +1363,9 @@ def api_wallet_set_validator_sk():
             )
             return jsonify(r), http_status
 
-        # Persiste SK para o próximo reboot
-        if password:
-            try:
-                r["persisted"] = persist_sk_for_reboot(sk_hex, password)
-                if not r["persisted"]:
-                    r.setdefault("warnings", []).append(
-                        "SK ativa agora, mas pode não recarregar no próximo "
-                        "boot. Verifique se BRN_WALLET_SESSION_PASS no .env "
-                        "é a senha correta."
-                    )
-            except Exception as e:
-                log.warning("[wallet_sk] persist falhou: %s", e)
-                r["persisted"] = False
-
         log.info(
-            "[wallet_sk] integração OK — pk=%s… sk=%s trust=%s "
-            "top5=%s multisig=%s pbft=%s propagated=%s peers=%s",
+            "[wallet_sk] OK — pk=%s… sk=%s trust=%s top5=%s "
+            "multisig=%s pbft=%s propagated=%s peers=%s",
             r.get("pubkey", "")[:16],
             r.get("sk_installed"), r.get("in_trust"), r.get("in_top5"),
             r.get("multisig_ready"), r.get("pbft_ready"),
@@ -1386,30 +1379,14 @@ def api_wallet_set_validator_sk():
 
 
 # ============================================================
-# [NOVO v9.9.27] PROPAGAÇÃO DE VALIDADORES
+# [v9.9.27] PROPAGAÇÃO DE VALIDADORES
 # ============================================================
 @app.route("/api/validator/announce", methods=["POST"])
 def api_validator_announce():
-    """
-    [NEW v9.9.27] Recebe announce de um cliente e registra a pubkey no
-    trust. Re-assina o trust_network.json (se for Origin) e propaga
-    via HTTP/P2P.
-
-    Fluxo:
-      Cliente POSTa aqui → Origin adiciona no trust → re-assina →
-      broadcast via P2P → cliente faz sync_trust_network.
-
-    Body:
-      {
-        "pubkey": "0248505dcf91...",   # pubkey do cliente
-        "address": "brn1ufzz...",      # endereço do cliente (opcional)
-        "peer_addr": "100.84.11.48:6001"  # peer addr (opcional)
-      }
-    """
     try:
         data = request.get_json(force=True) or {}
-        pubkey = (data.get("pubkey") or "").strip().lower()
-        address = (data.get("address") or "").strip()
+        pubkey    = (data.get("pubkey")    or "").strip().lower()
+        address   = (data.get("address")   or "").strip()
         peer_addr = (data.get("peer_addr") or "").strip()
 
         if not pubkey or len(pubkey) < 32:
@@ -1420,21 +1397,18 @@ def api_validator_announce():
             return jsonify({"ok": False, "msg": "pubkey não é hex"}), 400
 
         trust = _get_trust_network()
-        chain = _get_chain()
         if trust is None:
             return jsonify({"ok": False, "msg": "TrustNetwork indisponível"}), 503
 
         is_origin = bool(getattr(trust, "is_origin", False)) or (
             os.environ.get("BRN_IS_ORIGIN", "0") == "1"
         )
-
         if not is_origin:
             return jsonify({
                 "ok": False,
                 "msg": "este nó não é Origin — envie announce para o Origin",
             }), 403
 
-        # Registra no trust
         try:
             if hasattr(trust, "sync_local_validator"):
                 trust.sync_local_validator(pubkey, address or "", peer_addr)
@@ -1456,13 +1430,11 @@ def api_validator_announce():
             log.exception("[announce] trust register falhou: %s", e)
             return jsonify({"ok": False, "msg": str(e)}), 500
 
-        # Re-assina e flusha
         try:
             trust.flush()
         except Exception as e:
             log.warning("[announce] flush falhou: %s", e)
 
-        # Verifica se está no top5
         in_top5 = False
         try:
             top = trust.get_top_validators(count=5) or []
@@ -1470,7 +1442,6 @@ def api_validator_announce():
         except Exception:
             pass
 
-        # Propaga para os peers via P2P (best-effort)
         peers_notified = 0
         try:
             p2p = _get_p2p_manager()
@@ -1599,7 +1570,6 @@ def trust_nodes():
                 pass
 
         if hasattr(trust, "nodes"):
-            from dataclasses import asdict
             for pubkey, n in trust.nodes.items():
                 peer_addr = getattr(n, "peer_addr", "")
                 addr = getattr(n, "address", "")
@@ -1735,7 +1705,7 @@ def health():
         return jsonify({
             "ok": True,
             "height": chain.db.height(),
-            "version": "9.9.27",
+            "version": "9.9.28",
             "chain_injected": _CHAIN is not None,
             "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
@@ -2001,5 +1971,5 @@ def api_tx_status(txid_str):
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print("BRN Server v9.9.27 (validator announce + wallet_integrator + persistência pós-reboot)")
+    print("BRN Server v9.9.28 (carteira SÓ via GUI; sem .env para wallet)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
