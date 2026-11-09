@@ -2,7 +2,7 @@
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
-<title>BRN Wallet v3.13</title>
+<title>BRN Wallet v3.20</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -218,7 +218,6 @@
     color: #8b949e; font-size: .85rem; margin-top: 8px;
   }
 
-  /* Peers mini-card no topbar */
   .peers-summary {
     display: flex; gap: 6px; align-items: center;
     font-size: .75rem; color: #8b949e;
@@ -229,12 +228,17 @@
   }
   .peers-summary .pill.warn { background: #2d2200; color: #e3b341; }
   .peers-summary .pill.err { background: #2d1416; color: #ffa198; }
+
+  /* [v3.20] Hint para arquivos .wallet */
+  .wallet-hint {
+    font-size: .72rem; color: #8b949e; margin-top: 4px;
+    font-style: italic;
+  }
 </style>
 </head>
 <body>
 <div class="wrap">
 
-  <!-- CTA de Mineração (Variante B do Teste A/B) -->
   <div id="abBanner" style="display:none; background: linear-gradient(90deg, #238636 0%, #2ea043 100%); padding: 16px; border-radius: 8px; margin-bottom: 20px; text-align: center; border: 2px solid #3fb950; box-shadow: 0 4px 12px rgba(46,160,67,0.3);">
     <h2 style="color: #fff; margin: 0 0 10px 0;">⛏️ Ajude a rede a crescer!</h2>
     <p style="color: #e6edf3; margin: 0 0 15px 0; font-size: 0.9rem;">
@@ -610,6 +614,7 @@
       <h2>Salvar carteira criptografada</h2>
       <label>Nome do arquivo</label>
       <input id="svName" placeholder="minha_carteira">
+      <div class="wallet-hint">Ex: "minha_carteira" → salva como wallets/minha_carteira.wallet</div>
       <label>Senha</label>
       <input id="svPass" type="password" placeholder="••••••••">
       <div class="row"><button class="btn p" id="bSalvar">💾 Salvar</button></div>
@@ -620,8 +625,9 @@
       <h2>Carregar carteira</h2>
       <label>Arquivos salvos</label>
       <select id="ldList"><option value="">— carregando —</option></select>
+      <div class="wallet-hint">Selecione na lista ou digite o nome abaixo (com ou sem .wallet)</div>
       <label>Ou digite o nome</label>
-      <input id="ldName" placeholder="minha_carteira">
+      <input id="ldName" placeholder="minha_carteira ou minha_carteira.wallet">
       <label>Senha</label>
       <input id="ldPass" type="password" placeholder="••••••••">
       <div class="row">
@@ -632,7 +638,7 @@
     </div>
   </div>
 
-  <div class="footer">BRN Wallet v3.13 · ponte pywebview · <span id="apiLbl">—</span></div>
+  <div class="footer">BRN Wallet v3.20 · ponte pywebview · <span id="apiLbl">—</span></div>
 </div>
 
 <script>
@@ -825,14 +831,12 @@ async function refreshSyncInfo() {
 }
 
 // ============================================================
-// PEERS (Trust System + DB)
+// PEERS
 // ============================================================
 async function refreshPeers() {
   try {
-    // [FIX v3.13] Puxa do novo Trust System
     const s = await api("get_trust_nodes");
-    
-    // Se o Trust System ainda não tiver dados, usa o DB antigo
+
     let peers = [];
     if (s && s.nodes) {
       peers = s.nodes;
@@ -840,32 +844,30 @@ async function refreshPeers() {
       const old = await api("peers_score");
       peers = old.peers || [];
     }
-    
+
     _lastPeers = peers;
 
-    // Summary no topbar
     const summary = $("peerScoreSummary");
     if (peers.length === 0) {
       summary.innerHTML = "";
     } else {
       let trusted = 0, banned = 0;
       let maxScore = 0;
-      
+
       for (const p of peers) {
         if (p.status === "trusted") trusted++;
         else if (p.status === "banned") banned++;
-        
+
         const sc = p.trust_score != null ? p.trust_score : (p.score || 0);
         if (sc > maxScore) maxScore = sc;
       }
-      
+
       let html = `<span class="pill" style="background:#1f2d1f;color:#7ee787;" title="Maior pontuação da rede">Top: ${maxScore.toFixed(1)} pts</span>`;
       if (trusted > 0) html += `<span class="pill" style="background:#0d2818;color:#7ee787;">${trusted} confiável(eis)</span>`;
       if (banned > 0) html += `<span class="pill err">${banned} banido(s)</span>`;
       summary.innerHTML = html;
     }
 
-    // Tabela
     const card = $("peersCard");
     const tbody = $("tbodyPeers");
     $("peersTableCount").textContent = peers.length;
@@ -875,20 +877,16 @@ async function refreshPeers() {
       return;
     }
 
-    const localH = _lastStatus ? (_lastStatus.height || 0) : 0;
     tbody.innerHTML = "";
-    
+
     for (const p of peers.slice(0, 100)) {
       const tr = document.createElement("tr");
-      
-      // Dados do Trust System
+
       const addr = p.address || "?";
-      const h = p.height || 0; 
+      const h = p.height || 0;
       const status = p.status || "new";
-      
-      // Pega a pontuação correta (trust_score ou score)
       const score = p.trust_score != null ? p.trust_score : (p.score || 0);
-      
+
       let statusHtml = `<span class="badge">${status.toUpperCase()}</span>`;
       if (status === "trusted") statusHtml = `<span class="badge trusted">✓ CONFIÁVEL</span>`;
       else if (status === "banned") statusHtml = `<span class="badge banned">✗ BANIDO</span>`;
@@ -1484,7 +1482,6 @@ async function minerarPool() {
 // ATUALIZAR UI DE MINERAÇÃO (com Vardiff)
 // ============================================================
 async function updateMiningUI() {
-  // ---------- MINER LOCAL ----------
   try {
     const st = await api("mining_status");
     const btn = $("bMinerar");
@@ -1518,7 +1515,6 @@ async function updateMiningUI() {
     }
   } catch (e) { /* silencioso */ }
 
-  // ---------- POOL ----------
   try {
     const pst = await api("pool_status");
     const btn = $("bMinerarPool");
@@ -1549,8 +1545,7 @@ async function updateMiningUI() {
       $("poolSharesOk").textContent   = pst.shares_accepted || 0;
       $("poolSharesTotal").textContent = pst.shares_submitted || 0;
       $("poolBlocks").textContent     = pst.blocks_found || 0;
-      
-      // [NEW v3.13] Vardiff Display
+
       const sd = pst.job_share_diff != null ? pst.job_share_diff : "—";
       $("poolShareDiff").textContent  = sd;
 
@@ -1562,21 +1557,6 @@ async function updateMiningUI() {
       box.classList.remove("show");
     }
   } catch (e) { /* silencioso */ }
-}
-
-async function faucet() {
-  clearMsg("mMine");
-  if (!wallet.address) { msg("mMine", "❌ Sem carteira.", "err"); return; }
-  try {
-    const r = await api("call_faucet",
-      wallet.address, wallet.private_key, wallet.public_key);
-    if (r.ok) {
-      msg("mMine", "✅ " + (r.msg || "Faucet recebido!"), "ok", 6000);
-      await atualizarSaldo();
-    } else {
-      msg("mMine", "❌ " + (r.msg || "falha"), "err");
-    }
-  } catch (e) { msg("mMine", "❌ " + e.message, "err"); }
 }
 
 // ============================================================
@@ -1685,7 +1665,7 @@ async function bridgeClaim() {
 }
 
 // ============================================================
-// SALVAR / CARREGAR
+// SALVAR / CARREGAR — [FIX v3.20] aceita w.name e .wallet
 // ============================================================
 async function salvar() {
   clearMsg("mSalvar");
@@ -1707,25 +1687,35 @@ async function salvar() {
   } catch (e) { msg("mSalvar", "❌ " + e.message, "err"); }
 }
 
+// [FIX v3.20] app_wallet_v3.py v3.19 retorna {name, address, public_key}
+// (antes era {filename}). Aceita ambos por segurança.
 async function listarWallets() {
   try {
     const lista = await api("list_wallets");
     const sel = $("ldList");
     sel.innerHTML = '<option value="">— selecione —</option>';
     (lista || []).forEach(function(w) {
+      const fname = w.name || w.filename || w.nome || w.file || "";
+      if (!fname) return;
       const o = document.createElement("option");
-      o.value = w.filename; o.textContent = w.filename;
+      o.value = fname;
+      o.textContent = fname;
       sel.appendChild(o);
     });
   } catch (e) { /* silent */ }
 }
 
+// [FIX v3.20] strip de .wallet para tolerar tanto "masmas" quanto "masmas.wallet"
 async function carregar() {
   clearMsg("mCarregar");
-  const name = $("ldList").value || $("ldName").value.trim();
+  let name = $("ldList").value || $("ldName").value.trim();
   const pass = $("ldPass").value;
   if (!name) { msg("mCarregar", "❌ Escolha/digite o arquivo.", "err"); return; }
   if (!pass) { msg("mCarregar", "❌ Informe a senha.", "err"); return; }
+  // strip .wallet (Python também faz, mas aqui garantimos)
+  if (name.toLowerCase().endsWith(".wallet")) {
+    name = name.slice(0, -7);
+  }
   try {
     const r = await api("load_wallet", name, pass);
     if (r.ok) {
@@ -1774,7 +1764,6 @@ function configTabs() {
 }
 
 function configEventos() {
-  // Sync
   $("bSyncCheck").onclick = syncCheckConnection;
   $("bSyncStart").onclick = syncStart;
   $("bSyncStop").onclick  = syncStop;
@@ -1785,7 +1774,6 @@ function configEventos() {
   $("bVerMaisBlocos").onclick = () => carregarBlocos(false);
   $("bVerTodosBlocos").onclick = carregarTodosBlocos;
 
-  // Restante
   $("bGerar").onclick      = gerarCarteira;
   $("bAtualizar").onclick  = atualizarSaldo;
   $("bMyTxs").onclick      = () => carregarMinhasTxs();
@@ -1868,7 +1856,6 @@ async function boot() {
   setInterval(function() { if (wallet.address) atualizarSaldo(); }, 20000);
   setInterval(function() { if (wallet.address) carregarMinhasTxs(); }, 30000);
 
-  // Banner de fork global
   setInterval(async () => {
     try {
       const d = await api("sync_info");
