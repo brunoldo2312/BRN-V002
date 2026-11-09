@@ -1,3 +1,27 @@
+ONRAMP (BTC → BRN)
+Para provar que a ponte funciona de verdade:
+
+Abra a sua carteira de Bitcoin (onde você tem BTC real) e envie uma quantia bem pequena, por exemplo, 10.000 sats (0.0001 BTC), para o endereço 1BBKio11f87a5f3jD2QHCa6mALw667Liag.
+
+Assim que você enviar, olhe o terminal do main.py. Em até 30 segundos, o Watcher vai detectar a transação na mempool e logar algo como: [BTC Watcher] tx ... VISTA mas UNDERPAID (se for menor) ou aguardando confirmações.
+
+Como o sistema exige 3 confirmações (BTC_MIN_CONFIRMATIONS=3), isso vai levar de 30 a 60 minutos.
+
+Quando confirmar, o log vai disparar ════════ BTC CONFIRMADO ════════ e você verá os BRNs caindo na sua carteira brn1ufzz....
+
+3. Teste Real: OFFRAMP (BRN → BTC)
+(Só faça isso depois que o cofre tiver saldo do passo 2)
+
+Vá na GUI, na aba Bridge, na parte de baixo (Converter BTC -> BRN). Ou use a sua carteira BRN para enviar BRN para o cofre.
+
+O btc_sender.py vai entrar em ação, assinar a transação com a sua WIF e transmitir os BTCs reais de volta para o endereço que você escolher.
+
+⚠️ Último Aviso de Segurança (Mainnet)
+Valor mínimo: Envie apenas o que você está disposto a perder para testar. O sistema está maduro, mas é melhor validar com centavos antes de colocar um valor alto.
+
+Taxas: Se a rede Bitcoin estiver congestionada no momento do saque (Offramp), a taxa pode ser maior que o valor que você está tirando. O btc_sender.py já calcula a taxa automaticamente pelo mempool.space, mas fique de olho.
+
+Resumo: O seu trabalho de desenvolvimento e correção de bugs acabou. A Bridge está de pé, o consenso está funcionando, e a rede está pronta para receber depósitos e fazer trocas. Pode fazer o teste de Onramp!
 🚀 BRN (BrunoCoin) — Blockchain P2P
 Uma blockchain Layer-1 completa e autônoma, desenvolvida em Python do zero.
 📋 Sumário
