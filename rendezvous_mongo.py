@@ -1,9 +1,26 @@
-"""rendezvous_mongo.py — Descoberta de peers via MongoDB (v1)
+"""rendezvous_mongo.py — Descoberta de peers via MongoDB (v1.1)
 ================================================================
-Substitui o rendezvous HTTP e o tracker.py. Cada nó:
-  1. Anuncia seu peer na coleção `rendezvous` a cada N segundos
-  2. Lê todos os peers ativos da coleção e chama on_peer() para os novos
-  3. MongoDB cuida do TTL (auto-expira entradas antigas)
+v1.1 (2026-11-08) — PATCH DE ROBUSTEZ:
+  [FIX] _dispatch: self._seen usa janela = self.ttl_s (era 300s
+        hardcoded). Se um peer expira do Mongo (parou de anunciar)
+        e volta antes do TTL, on_peer é chamado de novo. Antes, um
+        peer que reconectava entre 300s e 600s ficava invisível
+        ao P2P por até 200s.
+  [FIX] _dispatch: só marca _seen[key] APÓS on_peer() suceder.
+        Antes, on_peer() com exceção deixava o peer marcado como
+        "visto" mesmo sem ter entrado no P2P — o peer ficava
+        invisível por 300s. Isso acontece quando o P2P ainda está
+        subindo e on_peer() levanta por fila cheia.
+  [NEW] _dispatch: log de on_peer que falhou (era debug e mudo).
+        Ajuda a diagnosticar "por que peer X não conecta".
+  [NEW] status() expõe peers_failed (contador de on_peer com exceção).
+  [KEEP] Tudo da v1 (announce, fetch, run, stop, status).
+
+v1 (base):
+  Substitui o rendezvous HTTP e o tracker.py. Cada nó:
+    1. Anuncia seu peer na coleção `rendezvous` a cada N segundos
+    2. Lê todos os peers ativos da coleção e chama on_peer() para os novos
+    3. MongoDB cuida do TTL (auto-expira entradas antigas)
 
 Esquema da coleção:
     {
@@ -126,6 +143,7 @@ class RendezvousMongo(threading.Thread):
             "announces_ok":     0,
             "announces_fail":   0,
             "peers_added":      0,
+            "peers_failed":     0,   # [NEW v1.1] on_peer que falhou
             "last_ok_ts":       0.0,
             "last_fail_ts":     0.0,
             "last_error":       "",
@@ -241,17 +259,27 @@ class RendezvousMongo(threading.Thread):
             return False
 
     # ============================================================
-    # DISPATCH
+    # DISPATCH — [v1.1] só marca _seen após on_peer() suceder
     # ============================================================
     def _dispatch(self, peers: list) -> int:
-        """Chama on_peer() para peers ainda não vistos."""
+        """
+        Chama on_peer() para peers ainda não vistos.
+
+        [FIX v1.1]
+          - janela de dedup usa self.ttl_s (era 300s hardcoded). Se o
+            peer expirou do Mongo (600s) e voltou, ele é re-adicionado.
+          - só marca _seen[key] APÓS on_peer() suceder. Antes, uma
+            exceção deixava o peer "visto" por 300s e ele nunca era
+            re-tentado — peer ficava invisível no P2P.
+        """
         added = 0
+        failed = 0
         now = time.time()
 
         # clean: se dict ficou grande, remove antigos
         with self._seen_lock:
             if len(self._seen) > 2000:
-                cutoff = now - 300
+                cutoff = now - self.ttl_s    # [FIX] era 300
                 for k in [k for k, t in self._seen.items() if t < cutoff]:
                     del self._seen[k]
 
@@ -271,15 +299,28 @@ class RendezvousMongo(threading.Thread):
             key = f"{ip}:{port}"
 
             with self._seen_lock:
-                if key in self._seen and (now - self._seen[key]) < 300:
+                last = self._seen.get(key)
+                if last is not None and (now - last) < self.ttl_s:
                     continue
-                self._seen[key] = now
+                # [FIX v1.1] Não marca ainda — só depois do on_peer() OK
 
             try:
                 self.on_peer(ip, port)
+                with self._seen_lock:
+                    self._seen[key] = now
                 added += 1
             except Exception as e:
-                log.debug("on_peer(%s) falhou: %s", key, e)
+                failed += 1
+                # [FIX v1.1] log warning (era debug). Se on_peer falha,
+                # o peer não entra no P2P e ele nunca saberá — precisa
+                # ser visível no log.
+                log.warning("on_peer(%s) falhou (não marcado em _seen): %s",
+                            key, e)
+                # Não adiciona a _seen — o próximo ciclo re-tenta.
+
+        if failed:
+            with self._m_lock:
+                self._metrics["peers_failed"] += failed
 
         return added
 
@@ -374,6 +415,7 @@ class RendezvousMongo(threading.Thread):
             "announces_ok":      m["announces_ok"],
             "announces_fail":    m["announces_fail"],
             "peers_added":       m["peers_added"],
+            "peers_failed":      m["peers_failed"],   # [NEW]
             "last_peer_count":   m["last_peer_count"],
             "consecutive_fail":  m["consecutive_fail"],
             "last_ok_ago_s":     (int(now - m["last_ok_ts"])
@@ -405,7 +447,7 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-    print("Testando RendezvousMongo (dry-run)...")
+    print("Testando RendezvousMongo v1.1 (dry-run)...")
 
     # ---- 1. Instanciação ----
     stop = [False]
@@ -436,6 +478,7 @@ if __name__ == "__main__":
     print(f"  running:    {st['running']}")
     assert st["backend"] == "mongo"
     assert st["running"] is False
+    assert "peers_failed" in st   # [NEW]
 
     # ---- 3. _dispatch funciona sem Mongo ----
     fake_peers = [
@@ -453,7 +496,35 @@ if __name__ == "__main__":
     print(f"  dispatch 2: +{n2} peer(s) (dedup)")
     assert n2 == 0, f"esperado 0 (dedup), obteve {n2}"
 
-    # ---- 5. Status final ----
+    # ---- 5. [NOVO v1.1] on_peer com exceção NÃO marca _seen ----
+    # Simula P2P cheio: on_peer levanta na primeira chamada
+    called = []
+    def flaky_on_peer(ip, port):
+        called.append((ip, port))
+        if len(called) == 1:
+            raise RuntimeError("P2P fila cheia (simulado)")
+        # Segunda chamada passa
+
+    rdv2 = RendezvousMongo(
+        tcp_port=6001,
+        node_uuid="flaky" * 10 + "1"[:2],
+        on_peer=flaky_on_peer,
+        running_flag=running,
+    )
+    one_peer = [{"uuid": "p1", "ip": "10.0.0.5", "port": 6001}]
+
+    n3 = rdv2._dispatch(one_peer)
+    print(f"  flaky 1:    +{n3} peer(s) (esperado 0, on_peer falhou)")
+    assert n3 == 0
+    assert "10.0.0.5:6001" not in rdv2._seen, \
+        "_seen marcou peer APÓS on_peer falhar — bug v1 reapareceu"
+
+    n4 = rdv2._dispatch(one_peer)
+    print(f"  flaky 2:    +{n4} peer(s) (esperado 1, on_peer passou)")
+    assert n4 == 1, f"esperado 1 na retentativa, obteve {n4}"
+    assert "10.0.0.5:6001" in rdv2._seen
+
+    # ---- 6. Status final ----
     print(f"  status:     {json.dumps(rdv.status(), ensure_ascii=False)}")
 
-    print("RendezvousMongo OK (mongo real nao testado).")
+    print("RendezvousMongo v1.1 OK (mongo real nao testado).")
