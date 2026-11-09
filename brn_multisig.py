@@ -1,24 +1,33 @@
-"""brn_multisig.py — Multi-sig drop-in para o BRN (v2.1)
+"""brn_multisig.py — Multi-sig drop-in para o BRN (v2.2)
 ================================================================
+v2.2 (2026-11-08) — PATCH DE AUDITORIA:
+  [FIX CRÍTICO] _chain_is_origin(): detecta origin por
+        chain.is_origin OU BRN_IS_ORIGIN env. Antes, o código
+        usava getattr(chain, "is_origin", False), mas
+        blockchain.py v9.5.6 NÃO define self.is_origin — o
+        atributo não existe. Resultado: is_origin era SEMPRE
+        False, e a v2.1 fix CRÍTICA era silentemente no-op.
+        Efeitos:
+          - Origin nunca chamava trust.set_origin_pubkey() →
+            _origin_pubkey ficava vazio ou stale
+          - Origin nunca instalava accept_block autosign → pool
+            não se beneficiava do retry de assinatura
+          - status() reportava is_origin=False sempre
+        Fix: fallback para BRN_IS_ORIGIN quando chain.is_origin
+        não existe (ou é False).
+  [FIX] install_multisig(): avisa quando p2p é None (antes,
+        collector falhava silenciosamente em cada peer).
+  [KEEP] v2.1: cliente preserva _origin_pubkey.
+  [KEEP] v2.0: coletor paralelo, autosign.
+
 v2.1 (2026-11-04):
-  [FIX CRÍTICO] install_multisig() agora checa chain.is_origin antes
-                de chamar trust.set_origin_pubkey(). Antes, o cliente
-                (Windows/Mayra) sobrescrevia o _origin_pubkey correto
-                (do trust_network.json, assinado pelo Origin Ubuntu)
-                com a própria pubkey local. Resultado:
-                  - get_active_validators() do cliente tratava ele
-                    mesmo como "origin ativo" indevidamente
-                  - Log dizia "trust._origin_pubkey = 020a23cc..."
-                    (Mayra) em vez de 021de63b... (Ubuntu)
-                Agora:
-                  - Origin: set_origin_pubkey(sk.pub_hex)  (correto)
-                  - Cliente: preserva o origin_pubkey do arquivo
+  [FIX CRÍTICO] install_multisig() checa chain.is_origin antes
+                de set_origin_pubkey().
 v2.0 (2026-11-04):
-  - Coletor paralelo com ThreadPoolExecutor (6 peers em ~1s)
-  - accept_block autosign para o pool (só no origin)
-  - set_origin_pubkey sem check is_origin  ← BUG
+  - Coletor paralelo com ThreadPoolExecutor.
+  - accept_block autosign para o pool (só no origin).
 v1.0:
-  - Versão inicial sequencial
+  - Versão inicial sequencial.
 ================================================================
 
 Uso no main.py (após p2p.start() e set_local_validator_sk):
@@ -37,7 +46,27 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 log = logging.getLogger("multisig")
 
-__version__ = "2.1"
+__version__ = "2.2"
+
+
+# ═══════════════════════════════════════════════════════════════
+# [FIX v2.2] Detecção de origin robusta
+# ═══════════════════════════════════════════════════════════════
+def _chain_is_origin(chain) -> bool:
+    """
+    [FIX v2.2] Detecta origin por chain.is_origin OU BRN_IS_ORIGIN env.
+
+    blockchain.py v9.5.6 não define self.is_origin, então getattr()
+    sempre retorna False — a v2.1 fix era silentemente no-op.
+
+    Precedência:
+      1. chain.is_origin (atributo explícito, se existir e for True)
+      2. BRN_IS_ORIGIN env == "1"
+      3. False
+    """
+    if bool(getattr(chain, "is_origin", False)):
+        return True
+    return os.environ.get("BRN_IS_ORIGIN", "0") == "1"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -116,7 +145,7 @@ def install_accept_block_autosign(chain, logger=None):
     """Wrapper de chain.accept_block: se bloco do pool chega sem sigs,
     auto-assina com o _sign_collector e re-tenta.
 
-    Só age no origin (BRN_IS_ORIGIN=1). Idempotente.
+    Só age no origin. Idempotente.
     Retorna True se instalou agora, False se já estava.
     """
     L = logger or log
@@ -132,8 +161,8 @@ def install_accept_block_autosign(chain, logger=None):
         if ok:
             return ok, msg
 
-        # Só origin
-        if os.environ.get("BRN_IS_ORIGIN", "0") != "1":
+        # [FIX v2.2] usa o helper (env-aware) em vez de env direto
+        if not _chain_is_origin(chain):
             return ok, msg
 
         # Só falha por falta de sigs
@@ -217,7 +246,7 @@ def install_multisig(chain, sk, p2p, trust=None,
       - sk:    Wallet com a SK local já carregada
       - p2p:   P2PManager já startado (discovery ativo)
       - trust: TrustNetwork (opcional — se dado, set_origin_pubkey
-               só se chain.is_origin)
+               só se is_origin)
     """
     L = logger or log
 
@@ -230,19 +259,27 @@ def install_multisig(chain, sk, p2p, trust=None,
         L.error("[multisig] atualize blockchain.py — sem isso multi-sig nunca funciona")
         return None
 
+    # [FIX v2.2] avisa se p2p é None (antes falhava silencioso)
+    if p2p is None:
+        L.warning(
+            "[multisig] p2p é None — collector só vai assinar LOCALMENTE "
+            "(sem coletar sigs de peers). Rede multi-nó NÃO terá quórum."
+        )
+
     # 1) collector PARALELO
     collector = build_collector(chain, sk, p2p, timeout=timeout, logger=L)
     chain.set_sign_collector(collector)
 
     n_peers = 0
-    try:
-        n_peers = len(p2p.discovery.listar_peers())
-    except Exception:
-        pass
+    if p2p is not None:
+        try:
+            n_peers = len(p2p.discovery.listar_peers())
+        except Exception:
+            pass
     L.info("[multisig] sign_collector instalado (%d peer(s) alvo)", n_peers)
 
-    # 2) origin_pubkey — [FIX v2.1] SÓ se for origin
-    is_origin = bool(getattr(chain, "is_origin", False))
+    # 2) origin_pubkey — [FIX v2.2] usa _chain_is_origin (env fallback)
+    is_origin = _chain_is_origin(chain)
     if trust is not None and hasattr(trust, "set_origin_pubkey"):
         if is_origin:
             try:
@@ -339,7 +376,8 @@ def status(chain) -> dict:
     out["accept_block_autosign"] = bool(
         getattr(chain, "_accept_block_autosign_installed", False)
     )
-    out["is_origin"] = bool(getattr(chain, "is_origin", False))
+    # [FIX v2.2] usa o helper (env-aware)
+    out["is_origin"] = _chain_is_origin(chain)
 
     trust = getattr(chain, "trust_net", None)
     if trust is not None:
@@ -380,10 +418,17 @@ if __name__ == "__main__":
         sys.exit(2)
 
     try:
+        # Testa o helper de origin isoladamente
+        print("\n[1] _chain_is_origin() — env={}".format(
+            os.environ.get("BRN_IS_ORIGIN", "não setado")))
+        print(f"    chain.is_origin = {getattr(chain, 'is_origin', 'NÃO EXISTE')}")
+        print(f"    _chain_is_origin(chain) = {_chain_is_origin(chain)}")
+
+        # Status completo
+        print("\n[2] status(chain):")
         s = status(chain)
-        print(f"\nEstado atual:")
         for k, v in s.items():
-            print(f"  {k:<28} = {v}")
+            print(f"    {k:<28} = {v}")
 
         print(f"\nPara ativar no main.py, adicione após p2p.start():")
         print(f"  from brn_multisig import ensure_multisig")
