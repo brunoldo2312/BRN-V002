@@ -1,22 +1,29 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.25)
+server.py — Backend HTTP do nó BRN (v9.9.26)
 ================================================================
-v9.9.25 (2026-11-08) — PATCH DE AUDITORIA:
-  [FIX CRÍTICO] trust_download: recusa servir payload SEM assinatura
-        Ed25519 do Origin.
-  [FIX CRÍTICO] api_wallet_set_validator_sk: se STRICT_MULTISIG=1
-        e ensure_multisig() falhou, retorna HTTP 500 em vez de ok=True.
+v9.9.26 (2026-11-09) — INTEGRAÇÃO AUTOMÁTICA:
+  [NEW] api_wallet_set_validator_sk() agora usa
+        wallet_integrator.integrate() como ponto único. Retorna
+        status detalhado: sk_installed, in_trust, in_top5,
+        multisig_ready, pbft_ready, warnings, errors.
+        A GUI pode mostrar "✓ Multisig: OK" / "✗ Trust: falhou"
+        em vez de um "OK" fake.
+  [NEW] persist_sk_for_reboot(): re-salva current_wallet.enc após
+        integrar, para o próximo boot do main.py já carregar
+        automaticamente. Sem isso, o operador tinha que rodar
+        --fix-wallet a cada restart.
+  [FIX] Retorna HTTP 500 quando STRICT_MULTISIG=1 e multisig não
+        configurou. Antes, retornava 200 com ok=True.
+  [KEEP] v9.9.25: trust_download assinado, proxy timeout 30s,
+        bootstrap_add valida pubkey 66 hex.
+v9.9.25 (2026-11-08):
+  [FIX] trust_download recusa payload sem assinatura.
+  [FIX] api_wallet_set_validator_sk retorna 500 com STRICT.
   [FIX] _proxy_pool_request: timeout 100s → 30s.
-  [FIX] bootstrap_add: valida pubkey com 66 hex antes de enfileirar.
-  [FIX] _notify_bootstrap_peers: parsing do endpoint corrigido.
-  [NEW] /health expõe multisig_configured, pbft_configured,
-        wallet_sk_installed, strict_multisig.
-  [NEW] Aviso no boot quando BRN_ADMIN_TOKEN está vazio.
-  [KEEP] Toda a funcionalidade de v9.9.24.
 v9.9.24 (2026-11-05):
   [FIX] api_wallet_set_validator_sk reconfigura multisig.
 v9.9.23 (2026-11-05):
-  [FIX] Adicionada rota /api/trust/download.
+  [NEW] /api/trust/download.
 ================================================================
 """
 from __future__ import annotations
@@ -161,7 +168,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
                 headers={"Content-Type": "application/json",
-                         "User-Agent": "brn-server/9.9.25"},
+                         "User-Agent": "brn-server/9.9.26"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -170,6 +177,9 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
             log.warning(f"[BOOTSTRAP] Nao foi possivel avisar {b} ({log_prefix}): {e}")
 
 
+# ============================================================
+# CHAIN SINGLETON
+# ============================================================
 _CHAIN = None
 CHAIN_LOCK = threading.RLock()
 
@@ -196,6 +206,9 @@ class _LazyChain:
 CHAIN = _LazyChain()
 
 
+# ============================================================
+# P2P / POOL / SYNC / TRUST / POOL_CLIENT LOCAIS
+# ============================================================
 _P2P_MANAGER = None
 _P2P_LOCK = threading.Lock()
 def set_p2p_manager(p2p) -> None:
@@ -260,6 +273,9 @@ def _register_miner_in_trust(pubkey: str, address: str) -> None:
         log.warning(f"[Trust] Falha ao registrar minerador {pubkey[:12]}: {e}")
 
 
+# ============================================================
+# APP
+# ============================================================
 app = Flask(__name__)
 
 if BEHIND_PROXY:
@@ -273,6 +289,9 @@ if CORS_ORIGINS:
     CORS(app, origins=CORS_ORIGINS)
 
 
+# ============================================================
+# ADMIN AUTH
+# ============================================================
 def _require_admin() -> bool:
     if not ADMIN_TOKEN:
         return True
@@ -291,6 +310,9 @@ def _admin_required(f):
     return wrapper
 
 
+# ============================================================
+# CACHE DE SALDOS E WALLETS
+# ============================================================
 _cache_saldos: dict = {}
 _cache_lock = threading.Lock()
 _faucet_history: dict = {}
@@ -432,6 +454,9 @@ def _pubkey_from_db_or_payload(addr: str, payload_pubkey: str = "",
     return ""
 
 
+# ============================================================
+# CLEANUP LOOP
+# ============================================================
 def _cleanup_loop():
     while True:
         time.sleep(300)
@@ -450,6 +475,9 @@ def _cleanup_loop():
 threading.Thread(target=_cleanup_loop, daemon=True, name="CacheCleanup").start()
 
 
+# ============================================================
+# ROTAS BÁSICAS
+# ============================================================
 @app.route("/api/bootstrap/add", methods=["POST"])
 @require_rate_limit("bootstrap_add")
 def bootstrap_add():
@@ -713,6 +741,9 @@ def transfer():
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
+# ============================================================
+# STATUS E SYNC
+# ============================================================
 @app.route("/api/status", methods=["GET"])
 def status():
     try:
@@ -865,6 +896,9 @@ def sync_status():
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
+# ============================================================
+# MINERADOR
+# ============================================================
 @app.route("/api/miner/start", methods=["POST"])
 @require_rate_limit("miner_start")
 def miner_start():
@@ -1250,144 +1284,89 @@ def pool_stop_local():
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
+# ============================================================
+# WALLET — integração completa [v9.9.26]
+# ============================================================
 @app.route("/api/wallet/set_validator_sk", methods=["POST"])
 def api_wallet_set_validator_sk():
+    """
+    [v9.9.26] Usa wallet_integrator.integrate() — ponto único.
+    Retorna status detalhado: sk_installed, in_trust, in_top5,
+    multisig_ready, pbft_ready, warnings, errors.
+    A GUI pode mostrar cada item (em vez de "OK" fake).
+    """
     try:
         data = request.get_json(force=True) or {}
         sk_hex = (data.get("sk_hex") or "").strip()
         address = (data.get("address") or "").strip()
         pubkey = (data.get("pubkey") or "").strip()
+        password = (data.get("password") or "").strip() or (
+            os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
+            or os.environ.get("BRN_NODE_PASSWORD", "").strip()
+        )
 
         if not sk_hex or len(sk_hex) != 64:
-            return jsonify({"ok": False, "msg": "sk_hex inválido (esperado 64 hex)"}), 400
+            return jsonify({
+                "ok": False,
+                "msg": "sk_hex inválido (esperado 64 hex)",
+            }), 400
         try:
             int(sk_hex, 16)
         except ValueError:
             return jsonify({"ok": False, "msg": "sk_hex não é hex"}), 400
 
+        from wallet_integrator import integrate, persist_sk_for_reboot
+
         chain = _get_chain()
-        chain.set_local_validator_sk(sk_hex)
-
-        installed_pk = ""
-        try:
-            if chain._local_validator_sk is not None:
-                installed_pk = chain._local_validator_sk.pub_hex
-        except Exception:
-            installed_pk = ""
-
-        if not installed_pk:
-            return jsonify({
-                "ok": False,
-                "msg": "chain.set_local_validator_sk não instalou a SK",
-            }), 500
-
-        if not pubkey:
-            pubkey = installed_pk
-
-        trust_synced = False
-        trust = _get_trust_network()
-        if trust is not None:
-            try:
-                if hasattr(trust, "sync_local_validator"):
-                    trust.sync_local_validator(
-                        installed_pk, address or installed_pk[:16], ""
-                    )
-                    trust_synced = True
-                elif hasattr(trust, "register_node"):
-                    trust.register_node(
-                        node_id=installed_pk,
-                        address=address or installed_pk[:16],
-                        public_key=installed_pk,
-                    )
-                    if hasattr(trust, "mark_connected"):
-                        trust.mark_connected(installed_pk)
-                    trust_synced = True
-            except Exception as e:
-                log.warning("[wallet_sk] sync no trust falhou: %s", e)
-
-        multisig_ok = False
         p2p = _get_p2p_manager()
-        if p2p is not None and chain._local_validator_sk is not None:
-            try:
-                from brn_multisig import ensure_multisig
-                ensure_multisig(
-                    chain,
-                    chain._local_validator_sk,
-                    p2p,
-                    trust=trust,
-                    logger=log,
-                )
-                multisig_ok = True
-                log.info("[wallet_sk] multisig reconfigurado com a nova SK")
-            except ImportError as e:
-                log.error(
-                    "[wallet_sk] brn_multisig NÃO ENCONTRADO: %s — "
-                    "nó vai ficar SEM multi-sig", e,
-                )
-            except Exception as e:
-                log.warning("[wallet_sk] falha ao reconfigurar multisig: %s", e)
+        trust = _get_trust_network()
 
-        if STRICT_MULTISIG and not multisig_ok:
-            log.error(
-                "[wallet_sk] STRICT_MULTISIG=1 e multisig_configured=False. "
-                "Retornando 500. Corrija brn_multisig antes de minerar."
-            )
-            return jsonify({
-                "ok": False,
-                "msg": (
-                    "STRICT_MULTISIG=1 mas multi-sig não foi configurado "
-                    "(brn_multisig ausente ou falhou). O nó NÃO vai "
-                    "minerar em modo estrito sem coletor de assinaturas. "
-                    "Verifique o log do main.py."
-                ),
-                "multisig_configured": False,
-                "strict_multisig": True,
-            }), 500
-
-        pbft_ok = False
-        if chain._pbft is None and os.environ.get("BRN_PBFT_ENABLED") == "1":
-            try:
-                from pbft_consensus import PBFTConsensus
-                from p2p_unified import P2PClient
-                from wallet import Wallet
-
-                def _pbft_send(peer_addr, msg):
-                    ip, port_s = peer_addr.rsplit(":", 1)
-                    resp, _ = P2PClient.send_message(ip, int(port_s), msg, timeout=15.0)
-                    return resp
-
-                w_obj = Wallet(private_key_hex=sk_hex)
-                pbft = PBFTConsensus(chain, w_obj, _pbft_send)
-                chain.set_pbft(pbft)
-
-                if p2p and p2p.server:
-                    p2p.server.set_pbft(pbft)
-
-                pbft_ok = True
-                log.info("[wallet_sk] PBFT ativado dinamicamente")
-            except Exception as e:
-                log.warning("[wallet_sk] PBFT dinâmico falhou: %s", e)
-
-        log.info(
-            "[wallet_sk] SK atualizada — pk=%s… trust=%s multisig=%s pbft=%s",
-            installed_pk[:16],
-            "ok" if trust_synced else "skip",
-            "ok" if multisig_ok else "skip",
-            "ok" if pbft_ok else ("already" if chain._pbft else "skip"),
+        r = integrate(
+            chain, sk_hex,
+            address=address, pubkey=pubkey,
+            p2p=p2p, trust=trust, logger=log,
         )
 
-        return jsonify({
-            "ok": True,
-            "pubkey": installed_pk,
-            "trust_synced": trust_synced,
-            "multisig_configured": multisig_ok,
-            "pbft_activated": pbft_ok,
-        })
+        if not r.get("ok"):
+            http_status = 500 if r.get("errors") else 400
+            log.warning(
+                "[wallet_sk] integração FALHOU — errors=%s warnings=%s",
+                r.get("errors"), r.get("warnings"),
+            )
+            return jsonify(r), http_status
+
+        # Persiste SK para o próximo reboot
+        if password:
+            try:
+                r["persisted"] = persist_sk_for_reboot(sk_hex, password)
+                if not r["persisted"]:
+                    r.setdefault("warnings", []).append(
+                        "SK ativa agora, mas pode não recarregar no próximo "
+                        "boot. Verifique se BRN_WALLET_SESSION_PASS no .env "
+                        "é a senha correta."
+                    )
+            except Exception as e:
+                log.warning("[wallet_sk] persist falhou: %s", e)
+                r["persisted"] = False
+
+        log.info(
+            "[wallet_sk] integração OK — pk=%s… sk=%s trust=%s "
+            "top5=%s multisig=%s pbft=%s persisted=%s",
+            r.get("pubkey", "")[:16],
+            r.get("sk_installed"), r.get("in_trust"), r.get("in_top5"),
+            r.get("multisig_ready"), r.get("pbft_ready"),
+            r.get("persisted"),
+        )
+
+        return jsonify(r), 200
     except Exception as e:
         log.exception("api_wallet_set_validator_sk falhou: %s", e)
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
+# ============================================================
+# TRUST NETWORK
+# ============================================================
 @app.route("/api/trust/stats", methods=["GET"])
 @require_rate_limit("trust_stats")
 def trust_stats():
@@ -1526,6 +1505,9 @@ def trust_nodes():
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
+# ============================================================
+# BLOCOS / PEERS / HEALTH
+# ============================================================
 @app.route("/api/blocks", methods=["GET"])
 def api_get_blocks():
     try:
@@ -1609,7 +1591,7 @@ def health():
         return jsonify({
             "ok": True,
             "height": chain.db.height(),
-            "version": "9.9.25",
+            "version": "9.9.26",
             "chain_injected": _CHAIN is not None,
             "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
@@ -1634,6 +1616,9 @@ def _shutdown():
         pass
 
 
+# ============================================================
+# OUTRAS ROTAS
+# ============================================================
 @app.route("/api/faucet", methods=["POST"])
 @require_rate_limit("faucet")
 @_admin_required
@@ -1872,5 +1857,5 @@ def api_tx_status(txid_str):
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print("BRN Server v9.9.25 (trust_download assinado + STRICT_MULTISIG-aware)")
+    print("BRN Server v9.9.26 (wallet_integrator + persistência pós-reboot)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
