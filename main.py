@@ -1,35 +1,30 @@
-"""main.py — Entrypoint do nó BRN (v13.9.1)
+"""main.py — Entrypoint do nó BRN (v13.9.2)
 ================================================================
+v13.9.2 (2026-11-09) — INTEGRAÇÃO AUTOMÁTICA GUI → NÓ:
+  [NEW] _integrate_wallet_at_boot(): usa wallet_integrator.integrate()
+        para instalar SK + trust + multisig + PBFT num único ponto.
+        Antes, era 4 chamadas separadas que podiam falhar em qualquer
+        ordem e deixar o nó sem multi-sig.
+  [NEW] _auto_heal_wallet_loop(): thread que a cada 30s verifica se
+        _local_validator_sk ainda está ativa. Se o servidor HTTP
+        reiniciou em outro processo (ou alguém removeu a SK via API),
+        reinstala automaticamente. Também re-sincroniza o trust se
+        a pubkey sumiu do top5.
+  [NEW] Thread "AutoHeal-Wallet" iniciada após boot, daemon.
+  [FIX] _shutdown() agora sinaliza stop_evt para o auto-heal parar
+        antes de fechar o DB.
+  [KEEP] v13.9.1: identidade sem "gergerger", abortar se corrompida,
+        STRICT_MULTISIG-aware.
+
 v13.9.1 (2026-11-08):
-  [FIX CRÍTICO] _load_or_create_node_identity: se node_identity.enc
-                EXISTE mas a senha está errada, ABORTA o boot com
-                RuntimeError. Antes, recriava a identidade com
-                Ed25519PrivateKey.generate() e sobrescrevia o arquivo
-                — o nó perdia o node_id em silêncio, peers rejeitavam,
-                trust ficava inconsistente. Uma das piores falhas
-                possíveis em produção: você não percebe até ver o
-                handshake P2P falhar com todos os peers.
-  [FIX CRÍTICO] Removido "gergerger" hardcoded de identity_password
-                e de _load_wallet(). Antes, se o .env não carregasse,
-                o nó gerava identidade com senha previsível (e a
-                primeira execução criava node_identity.enc cifrado
-                com "gergerger"). Isso é um vetor de ataque óbvio:
-                qualquer um com o arquivo podia decifrá-lo.
-  [FIX CRÍTICO] _setup_multisig: se brn_multisig não existir E
-                BRN_STRICT_MULTISIG=1, ABORTA o boot. Antes, só
-                logava warning e continuava sem _sign_collector —
-                a rede inteira rejeitava os blocos do minerador
-                (fork silencioso que ninguém percebia).
-  [FIX] _setup_multisig: quando brn_multisig ausente E
-        STRICT_MULTISIG=0, loga ERROR (era warning). Operador
-        precisa saber que a rede está sem multi-sig.
-  [KEEP] Tudo do v13.9.0 (multisig, pbft, trust daemon, broadcast).
+  [FIX] _load_or_create_node_identity: aborta se arquivo existe e
+        senha está errada (não destrói identidade).
+  [FIX] Removido "gergerger" hardcoded.
+  [FIX] _setup_multisig: aborta boot se STRICT_MULTISIG=1 e
+        brn_multisig ausente.
+
 v13.9.0 (2026-11-05):
-  [NEW] _setup_multisig() — configura coletor de assinaturas.
-  [NEW] _setup_pbft() — injeta PBFTConsensus na chain.
-  [NEW] chain.on_block_mined = p2p.broadcast_block.
-  [NEW] _setup_trust_daemon() — auto-gerencia trust.
-  [KEEP] --skip-verify, --headless, --client-mode, --origem, etc.
+  [NEW] _setup_multisig(), _setup_pbft(), _setup_trust_daemon().
 ================================================================
 """
 from __future__ import annotations
@@ -50,8 +45,8 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.1"
-    BUILD_DATE = "2026-11-08"
+    VERSION = "13.9.2"
+    BUILD_DATE = "2026-11-09"
 
 
 # ============================================================
@@ -116,22 +111,17 @@ def _setup_logging(level: str = "INFO"):
 
 
 # ============================================================
-# IDENTITY — [FIX CRÍTICO v13.9.1]
+# IDENTITY
 # ============================================================
 def _load_or_create_node_identity(password: str, path: str = "node_identity.enc"):
     """
     Carrega OU cria a identidade Ed25519 do nó.
 
-    Regras (após v13.9.1):
-      - Se o arquivo EXISTE e a senha decifra:           OK, usa.
-      - Se o arquivo EXISTE e a senha NÃO decifra:       FATAL. Não recria.
-      - Se o arquivo NÃO existe e há senha:              cria.
-      - Se o arquivo NÃO existe e não há senha:          FATAL (não podemos
-        persistir a identidade sem senha — usar senha previsível é inseguro).
-
-    Antes (v13.9.0), o segundo caso recriava a identidade silenciosamente,
-    o que apagava o node_id do nó. Todos os peers rejeitavam o handshake
-    P2P porque o node_id era diferente, e o trust ficava inconsistente.
+    Regras (v13.9.1):
+      - Arquivo EXISTE + senha decifra:      OK, usa.
+      - Arquivo EXISTE + senha NÃO decifra:  FATAL. Não recria.
+      - Arquivo NÃO existe + há senha:       cria.
+      - Arquivo NÃO existe + sem senha:      FATAL.
     """
     try:
         from secure_store import load_node_identity, save_node_identity
@@ -151,8 +141,7 @@ def _load_or_create_node_identity(password: str, path: str = "node_identity.enc"
             )
         raise RuntimeError(
             "[identity] FATAL: sem BRN_NODE_PASSWORD e sem arquivo de "
-            "identidade. NÃO vou criar identidade com senha previsível. "
-            "Configure BRN_NODE_PASSWORD no brn_network.env."
+            "identidade. Configure BRN_NODE_PASSWORD no brn_network.env."
         )
 
     if file_exists:
@@ -165,7 +154,6 @@ def _load_or_create_node_identity(password: str, path: str = "node_identity.enc"
             print(f"[identity] carregada ({p.name}) pub={pub[:16]}…")
             return priv, pub
         except Exception as e:
-            # [FIX CRÍTICO] NÃO recria silenciosamente. Aborta.
             raise RuntimeError(
                 f"[identity] FATAL: não consegui decifrar {p} com a senha "
                 f"configurada. Erro: {e}. "
@@ -174,7 +162,6 @@ def _load_or_create_node_identity(password: str, path: str = "node_identity.enc"
                 f"{p} para outro lugar e reinicie."
             ) from e
 
-    # Arquivo não existe, senha configurada → criar
     priv = Ed25519PrivateKey.generate()
     sk_hex = priv.private_bytes_raw().hex()
     pub = priv.public_key().public_bytes_raw().hex()
@@ -187,28 +174,19 @@ def _load_or_create_node_identity(password: str, path: str = "node_identity.enc"
         print(f"[identity] ⚠ guarde BRN_NODE_PASSWORD — sem ela, o node_id "
               f"é inutilizável.")
     except Exception as e:
-        raise RuntimeError(
-            f"[identity] não consegui salvar {p}: {e}"
-        ) from e
+        raise RuntimeError(f"[identity] não consegui salvar {p}: {e}") from e
     return priv, pub
 
 
 # ============================================================
-# WALLET — [FIX v13.9.1] Removido "gergerger"
+# WALLET
 # ============================================================
 def _load_wallet() -> tuple:
     """
-    Tenta as senhas configuradas no .env para decifrar current_wallet.enc.
+    Tenta as senhas do .env para decifrar current_wallet.enc.
+    Se falhar, tenta WalletManager.load_encrypted_wallet em wallets/*.wallet.
 
     Retorna (wallet_obj | None, address, pub_hex, password_usada).
-
-    Ordem:
-      1. BRN_WALLET_SESSION_PASS
-      2. BRN_NODE_PASSWORD
-
-    Sem fallback hardcoded. Se nenhuma funcionar, retorna (None, "", "", "")
-    e o main() loga aviso claro — o nó roda sem SK local (não minera
-    nem assina).
     """
     try:
         from secure_store import load_current_wallet
@@ -230,6 +208,7 @@ def _load_wallet() -> tuple:
         )
         return None, "", "", ""
 
+    # Tentativa 1: current_wallet.enc
     for pwd in candidates:
         try:
             w = load_current_wallet(pwd)
@@ -245,6 +224,49 @@ def _load_wallet() -> tuple:
             return wallet_obj, wallet_obj.address, wallet_obj.pub_hex, pwd
         except Exception:
             continue
+
+    # Tentativa 2: wallets/*.wallet via WalletManager
+    logging.getLogger("main").info(
+        "[wallet] current_wallet.enc não decifra — tentando wallets/*.wallet"
+    )
+    try:
+        from wallet import WalletManager
+        if hasattr(WalletManager, "list_wallets") and hasattr(WalletManager, "load_encrypted_wallet"):
+            lw = WalletManager.list_wallets()
+            names = []
+            if isinstance(lw, list):
+                for w in lw:
+                    if isinstance(w, dict):
+                        n = w.get("name") or w.get("filename") or ""
+                        if n.endswith(".wallet"):
+                            n = n[:-7]
+                        if n:
+                            names.append(n)
+                    elif isinstance(w, str):
+                        n = w[:-7] if w.endswith(".wallet") else w
+                        names.append(n)
+
+            for pwd in candidates:
+                for name in names:
+                    try:
+                        data = WalletManager.load_encrypted_wallet(name, pwd)
+                    except Exception:
+                        continue
+                    if not data or (isinstance(data, dict) and data.get("ok") is False):
+                        continue
+                    sk_hex = data.get("private_key") or data.get("priv_hex") or data.get("sk") or ""
+                    if not sk_hex:
+                        continue
+                    try:
+                        wallet_obj = Wallet(private_key_hex=sk_hex)
+                        logging.getLogger("main").info(
+                            f"[wallet] decifrada via WalletManager: {name}"
+                        )
+                        return wallet_obj, wallet_obj.address, wallet_obj.pub_hex, pwd
+                    except Exception:
+                        continue
+    except Exception as e:
+        logging.getLogger("main").debug(f"[wallet] WalletManager fallback: {e}")
 
     return None, "", "", ""
 
@@ -297,18 +319,12 @@ def _setup_sync(chain, p2p):
 
 
 # ============================================================
-# MULTISIG — [FIX CRÍTICO v13.9.1]
+# MULTISIG
 # ============================================================
 def _setup_multisig(chain, wallet_obj, p2p, trust):
     """
-    Configura o coletor de assinaturas (brn_multisig).
-
-    [FIX v13.9.1] Se brn_multisig NÃO existir:
-      - STRICT_MULTISIG=1 → aborta o boot (RuntimeError). Não faz sentido
-        subir um nó em modo estrito sem o módulo que faz o multi-sig.
-      - STRICT_MULTISIG=0 → loga ERROR bem visível. Operador precisa
-        saber que o nó está SEM multi-sig (blocos vão sair com 1 sig
-        e serão rejeitados pelos peers).
+    Configura o coletor de assinaturas via brn_multisig.
+    Aborta o boot se STRICT_MULTISIG=1 e o módulo não existir.
     """
     log = logging.getLogger("main")
     strict = os.environ.get("BRN_STRICT_MULTISIG", "0") == "1"
@@ -327,15 +343,12 @@ def _setup_multisig(chain, wallet_obj, p2p, trust):
     except ImportError as e:
         msg = (
             f"[MULTISIG] módulo 'brn_multisig' NÃO ENCONTRADO ({e}). "
-            f"O nó vai rodar SEM coletor de assinaturas. "
-            f"Blocos minerados aqui vão sair com 1 sig e serão "
-            f"REJEITADOS pelos peers em rede multi-nó."
+            f"O nó vai rodar SEM coletor de assinaturas."
         )
         if strict:
             raise RuntimeError(
                 f"[MULTISIG] STRICT_MULTISIG=1 e brn_multisig ausente. "
-                f"Abortando o boot (o nó não pode operar em modo estrito "
-                f"sem este módulo). Erro: {e}"
+                f"Abortando o boot. Erro: {e}"
             ) from e
         log.error(msg)
         return False
@@ -355,7 +368,6 @@ def _setup_multisig(chain, wallet_obj, p2p, trust):
 
 
 def _setup_broadcast(chain, p2p):
-    """Configura chain.on_block_mined = p2p.broadcast_block."""
     log = logging.getLogger("main")
     if not p2p:
         return False
@@ -372,20 +384,13 @@ def _setup_broadcast(chain, p2p):
 # PBFT
 # ============================================================
 def _setup_pbft(chain, wallet_obj, p2p):
-    """
-    Injeta o motor PBFT se BRN_PBFT_ENABLED=1.
-    Chamado APÓS p2p.start() e wallet carregada.
-    """
     log = logging.getLogger("main")
     if os.environ.get("BRN_PBFT_ENABLED", "0") != "1":
         log.info("[PBFT] desligado (BRN_PBFT_ENABLED!=1)")
         return None
-
     if wallet_obj is None:
-        log.warning("[PBFT] wallet ausente — PBFT nao sera ativado agora "
-                    "(pode ser ativado via /api/wallet/set_validator_sk)")
+        log.warning("[PBFT] wallet ausente — PBFT nao sera ativado agora")
         return None
-
     if p2p is None:
         log.warning("[PBFT] p2p ausente — PBFT nao sera ativado")
         return None
@@ -404,7 +409,6 @@ def _setup_pbft(chain, wallet_obj, p2p):
 
         pbft = PBFTConsensus(chain, wallet_obj, _pbft_send)
         chain.set_pbft(pbft)
-
         try:
             if hasattr(p2p, "server") and p2p.server is not None:
                 p2p.server.set_pbft(pbft)
@@ -430,19 +434,12 @@ def _setup_pbft(chain, wallet_obj, p2p):
 # TRUST DAEMON
 # ============================================================
 def _setup_trust_daemon(chain, trust, wallet_obj, p2p):
-    """
-    Tenta importar trust_daemon.TrustDaemon (módulo custom do Bruno).
-    Se não existir, cria versão inline básica que:
-      - a cada 30s renova last_seen da wallet no trust
-      - a cada 60s remove fantasmas (remove_ghosts)
-    """
     log = logging.getLogger("main")
     if trust is None:
         return None
 
-    # 1) Tenta importar módulo custom
     try:
-        from trust_daemon import TrustDaemon  # type: ignore
+        from trust_daemon import TrustDaemon
         try:
             td = TrustDaemon(chain, trust, wallet=wallet_obj, p2p=p2p)
             if hasattr(td, "start"):
@@ -450,7 +447,6 @@ def _setup_trust_daemon(chain, trust, wallet_obj, p2p):
             log.info("[TrustDaemon] Auto-gerenciamento da rede ativado.")
             return td
         except TypeError:
-            # Assinatura diferente — tenta só (chain, trust)
             try:
                 td = TrustDaemon(chain, trust)
                 if hasattr(td, "start"):
@@ -464,7 +460,6 @@ def _setup_trust_daemon(chain, trust, wallet_obj, p2p):
     except Exception as e:
         log.debug(f"[TrustDaemon] import/init falhou: {e}")
 
-    # 2) Fallback inline
     pub = ""
     try:
         pub = wallet_obj.pub_hex if wallet_obj is not None else ""
@@ -499,6 +494,165 @@ def _setup_trust_daemon(chain, trust, wallet_obj, p2p):
     t.start()
     log.info("[TrustDaemon] Auto-gerenciamento da rede ativado. (inline)")
     return t
+
+
+# ============================================================
+# [NOVO v13.9.2] INTEGRAÇÃO AUTOMÁTICA: carteira → nó
+# ============================================================
+def _integrate_wallet_at_boot(chain, wallet_obj, wallet_addr, wallet_pub,
+                                used_pwd, p2p, trust, log) -> bool:
+    """
+    Chama wallet_integrator.integrate() uma vez no boot.
+    Retorna True se integrou (sk_installed + sem errors).
+    """
+    if wallet_obj is None or not used_pwd:
+        log.info("[integrator] boot: sem wallet_obj/used_pwd — pulado")
+        return False
+
+    try:
+        from wallet_integrator import integrate as _integrate
+    except ImportError as e:
+        log.warning(f"[integrator] wallet_integrator ausente: {e}")
+        log.warning("[integrator] nó vai rodar SEM multi-sig configurado")
+        return False
+
+    # Recupera a SK do wallet_obj (pode ser Wallet ou hex)
+    sk_hex = None
+    try:
+        sk_hex = getattr(wallet_obj, "priv_hex", None)
+    except Exception:
+        pass
+    if not sk_hex:
+        # fallback: re-lê do secure_store
+        try:
+            from secure_store import load_current_wallet
+            w = load_current_wallet(used_pwd)
+            if w and w.get("ok"):
+                sk_hex = w.get("private_key") or w.get("priv_hex")
+        except Exception:
+            pass
+
+    if not sk_hex:
+        log.warning("[integrator] não consegui obter sk_hex do wallet_obj")
+        return False
+
+    try:
+        r = _integrate(
+            chain, sk_hex,
+            address=wallet_addr,
+            pubkey=wallet_pub,
+            p2p=p2p,
+            trust=trust,
+            logger=log,
+        )
+        log.info(
+            "[integrator] boot — ok=%s sk=%s trust=%s top5=%s multisig=%s pbft=%s",
+            r.get("ok"), r.get("sk_installed"), r.get("in_trust"),
+            r.get("in_top5"), r.get("multisig_ready"), r.get("pbft_ready"),
+        )
+        for w in r.get("warnings", []):
+            log.warning("[integrator] %s", w)
+        for e in r.get("errors", []):
+            log.error("[integrator] %s", e)
+        return bool(r.get("ok"))
+    except Exception as e:
+        log.warning(f"[integrator] boot falhou: {e}")
+        return False
+
+
+# ============================================================
+# [NOVO v13.9.2] AUTO-HEALING: reinstala SK se o nó perder
+# ============================================================
+def _auto_heal_wallet_loop(chain, p2p, trust, wallet_obj, wallet_addr,
+                            wallet_pub, used_pwd, stop_evt: threading.Event,
+                            interval: int = 30):
+    """
+    Loop a cada `interval` segundos:
+      1. Verifica chain._local_validator_sk
+      2. Se None ou pubkey diferente do esperado, reinstala via
+         wallet_integrator.integrate()
+      3. Se a pubkey sumiu do top5, re-sincroniza o trust
+    """
+    log = logging.getLogger("main")
+    log.info("[auto-heal] iniciado (interval=%ds)", interval)
+
+    while not stop_evt.wait(interval):
+        try:
+            needs_reinstall = False
+            try:
+                sk = chain._local_validator_sk
+                if sk is None:
+                    needs_reinstall = True
+                elif wallet_pub and sk.pub_hex.lower() != wallet_pub.lower():
+                    log.warning(
+                        "[auto-heal] _local_validator_sk (%s) ≠ wallet_pub (%s)",
+                        sk.pub_hex[:16], wallet_pub[:16],
+                    )
+                    needs_reinstall = True
+            except Exception:
+                needs_reinstall = True
+
+            # Se SK ok, verifica só o trust
+            if not needs_reinstall:
+                try:
+                    sk = chain._local_validator_sk
+                    pk = sk.pub_hex.lower()
+                    t = trust or getattr(chain, "trust_net", None)
+                    if t is not None and hasattr(t, "get_top_validators"):
+                        top = t.get_top_validators(count=5)
+                        in_top = pk in [p.lower() for p in top]
+                        if not in_top:
+                            log.warning(
+                                "[auto-heal] %s… sumiu do top5 — re-sincronizando",
+                                pk[:16],
+                            )
+                            if hasattr(t, "sync_local_validator"):
+                                t.sync_local_validator(
+                                    pk, wallet_addr or pk[:16], ""
+                                )
+                                log.info("[auto-heal] trust re-sincronizado")
+                except Exception as e:
+                    log.debug("[auto-heal] verify trust: %s", e)
+                continue
+
+            # Reinstala SK
+            if not wallet_obj or not used_pwd:
+                log.debug("[auto-heal] sem wallet_obj/used_pwd — pulando")
+                continue
+
+            log.warning("[auto-heal] _local_validator_sk perdida — reinstalando")
+            try:
+                from secure_store import load_current_wallet
+                w = load_current_wallet(used_pwd)
+                if not w or not w.get("ok"):
+                    log.warning(
+                        "[auto-heal] load_current_wallet falhou: %s",
+                        w.get("msg") if w else "?",
+                    )
+                    continue
+                _sk_hex = w.get("private_key") or w.get("priv_hex")
+                if not _sk_hex:
+                    continue
+
+                from wallet_integrator import integrate as _integrate
+                r = _integrate(
+                    chain, _sk_hex,
+                    address=wallet_addr, pubkey=wallet_pub,
+                    p2p=p2p, trust=trust, logger=log,
+                )
+                if r.get("ok"):
+                    log.info("[auto-heal] reinstalação OK")
+                else:
+                    log.warning(
+                        "[auto-heal] reinstalação FALHOU: %s",
+                        r.get("errors"),
+                    )
+            except Exception as e:
+                log.warning("[auto-heal] exceção: %s", e)
+        except Exception as e:
+            log.warning("[auto-heal] loop: %s", e)
+
+    log.info("[auto-heal] encerrado")
 
 
 # ============================================================
@@ -626,7 +780,7 @@ def main() -> int:
     except Exception:
         pass
 
-    # 2. Senha para identidade — SEM fallback hardcoded (v13.9.1)
+    # 2. Senha para identidade — SEM fallback hardcoded
     identity_password = (
         os.environ.get("BRN_NODE_PASSWORD", "").strip()
         or os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
@@ -634,11 +788,10 @@ def main() -> int:
     if not identity_password:
         log.warning(
             "[identity] BRN_NODE_PASSWORD e BRN_WALLET_SESSION_PASS vazios. "
-            "A identidade do nó NÃO será persistida. Defina uma senha no "
-            "brn_network.env para operar em produção."
+            "A identidade do nó NÃO será persistida."
         )
 
-    # 3. Node identity — [FIX CRÍTICO] aborta se arquivo existe + senha errada
+    # 3. Node identity — aborta se arquivo existe + senha errada
     node_id_priv, node_id_pub = None, ""
     try:
         node_id_priv, node_id_pub = _load_or_create_node_identity(identity_password)
@@ -661,7 +814,7 @@ def main() -> int:
     if trust is not None:
         log.info("[trust] carregado")
 
-    # 6. Carteira (sem fallback hardcoded) + injeta SK na chain
+    # 6. Carteira + injeta SK na chain
     wallet_obj, wallet_addr, wallet_pub, used_pwd = _load_wallet()
     if wallet_obj is not None:
         try:
@@ -673,8 +826,7 @@ def main() -> int:
         except Exception as e:
             log.warning(f"[wallet] set_local_validator_sk falhou: {e}")
     else:
-        log.warning("[wallet] NAO consegui decifrar current_wallet.enc "
-                    "(nenhuma senha configurada ou todas falharam). "
+        log.warning("[wallet] NAO consegui decifrar a carteira. "
                     "O nó vai rodar sem SK local (não minera nem assina).")
 
     # 7. P2P
@@ -691,7 +843,7 @@ def main() -> int:
         if sync_mgr:
             log.info("[sync] ChainSyncManager iniciado")
 
-    # 9. MULTISIG + BROADCAST — [FIX CRÍTICO] pode abortar com STRICT_MULTISIG=1
+    # 9. MULTISIG + BROADCAST
     if p2p and wallet_obj is not None:
         try:
             _setup_multisig(chain, wallet_obj, p2p, trust)
@@ -716,6 +868,35 @@ def main() -> int:
     if not args.no_explorer:
         _start_explorer(chain)
 
+    # ═══════════════════════════════════════════════════════════
+    # [v13.9.2] INTEGRAÇÃO AUTOMÁTICA: carteira → nó
+    # ═══════════════════════════════════════════════════════════
+    wallet_integrated = False
+    if wallet_obj is not None and p2p is not None:
+        wallet_integrated = _integrate_wallet_at_boot(
+            chain, wallet_obj, wallet_addr, wallet_pub, used_pwd,
+            p2p, trust, log,
+        )
+        if wallet_integrated:
+            log.info("[integrator] integração de boot OK")
+        else:
+            log.warning("[integrator] integração de boot FALHOU "
+                        "(auto-heal vai tentar a cada 30s)")
+
+    # ═══════════════════════════════════════════════════════════
+    # [v13.9.2] AUTO-HEALING loop
+    # ═══════════════════════════════════════════════════════════
+    _stop_autoheal = threading.Event()
+    if wallet_obj is not None:
+        threading.Thread(
+            target=_auto_heal_wallet_loop,
+            args=(chain, p2p, trust, wallet_obj, wallet_addr,
+                  wallet_pub, used_pwd, _stop_autoheal, 30),
+            daemon=True,
+            name="AutoHeal-Wallet",
+        ).start()
+        log.info("[auto-heal] thread iniciada (30s)")
+
     # 15. GUI
     if not args.headless:
         if _start_gui():
@@ -724,6 +905,15 @@ def main() -> int:
     # 16. Shutdown gracioso
     def _shutdown(*_):
         log.info("[shutdown] encerrando...")
+        try:
+            _stop_autoheal.set()
+        except Exception:
+            pass
+        try:
+            if trust is not None:
+                trust.shutdown()
+        except Exception:
+            pass
         try:
             chain.db.close()
         except Exception:
@@ -741,6 +931,7 @@ def main() -> int:
     log.info("   P2P      : :%d", p2p_port)
     log.info("   Wallet   : %s", wallet_addr or "(não carregada)")
     log.info("   PBFT     : %s", "ATIVO" if pbft else "desligado")
+    log.info("   Multisig : %s", "ATIVO" if wallet_integrated else "DEGRADADO")
     log.info("=" * 64)
 
     try:
