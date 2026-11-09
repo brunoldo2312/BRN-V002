@@ -27,7 +27,7 @@ def main():
     print(" ⚠️  ATENÇÃO: VOCÊ ESTÁ USANDO A REDE MAINNET (BITCOIN REAL) ⚠️")
     print("=" * 60)
     
-    if ENDERECO_DESTINO == "bc1qSEU_DESTINO_AQUI...":
+    if ENDERECO_DESTINO == "1BBKio11f87a5f3jD2QHCa6mALw667Liag":
         print("\n[ERRO FATAL] Você esqueceu de preencher o ENDERECO_DESTINO no código.")
         return
 
