@@ -1,56 +1,35 @@
-"""trust_network.py — Rede de confiança e reputação do BRN (v3.10)
+"""trust_network.py — Rede de confiança e reputação do BRN (v3.11)
 ================================================================
+v3.11 (2026-11-09) — AUTO-REGISTRO DE NOVOS CLIENTES:
+  [NEW] NodeRecord.blocks_signed: conta quantos blocos o nó assinou
+        (como co-assinante, não só como minerador).
+  [NEW] record_block_signed(node_id, block_height): chamado por
+        blockchain.accept_block() para cada signatário do bloco.
+        Incrementa blocks_signed e aplica GAIN_BLOCK_SIGNED (+5).
+  [NEW] _maybe_auto_promote(node_id): se score >= 500 E
+        blocks_signed >= BRN_AUTO_PROMOTE_MIN_BLOCKS (default 10),
+        promove score para 1000 e trust_level para "validator".
+        Isso permite que clientes novos subam sozinhos após
+        assinarem N blocos válidos, sem --promote manual.
+  [NEW] register_new_validator(pubkey, address, initial_score=500):
+        método usado pelo server.py::api_trust_register para
+        adicionar um cliente novo com score provisório (500).
+        Valida formato de pubkey e evita duplicata.
+  [KEEP] v3.10: sync_local_validator, remove_ghosts, get_active_validators.
+  [KEEP] v3.9: fallback de top quando active vazio.
+  [KEEP] v3.7: persistência cliente-local em .local.json.
+
 v3.10 (2026-11-03):
-  [NEW] sync_local_validator(pubkey, address, peer_addr) — registra
-        a pubkey local como nó ativo no trust em runtime. Chamado
-        quando a carteira muda via GUI (após /api/wallet/set_validator_sk).
-        Para Origin: persiste no trust_network.json com re-assinatura.
-        Para Cliente: persiste no trust_network.local.json.
-        Sem esse método, a pubkey da carteira nova só entrava no trust
-        no próximo boot (e o main.py não a registrava em runtime).
-  [KEEP] Todas as correções de v3.9.
+  [NEW] sync_local_validator.
 v3.9 (2026-11-03):
-  [FIX CRÍTICO] get_active_validators() agora faz fallback para
-        get_top_validators() em DOIS casos:
-          (a) quando "active" está vazio (active=0, top=N)
-          (b) quando len(active) < count E top tem mais candidatos
-              (ex: active=1 local via origin_pubkey, top=4)
-        Antes, apenas o caso (a) caía em [] e nada mais — o caso (b)
-        retornava 1 validador só, forçando required=1/1 e desligando
-        o multi-sig de fato. Mesmo bug corrigido em blockchain.py
-        v9.4.12 (fallback lá é defesa em profundidade).
-  [KEEP] Todas as correções de v3.8.
-v3.8 (2026-11-03):
-  [NEW] remove_ghosts(max_age_s) — Auto-limpeza de nós inativos.
-        Remove da memória e dos arquivos (.json e .local.json) qualquer
-        nó que não dá sinal de vida há mais de X segundos (default 300s).
-        Chamado no boot pelo main.py para evitar que nós fantasmas
-        (ex: travados na altura 299) entrem no cálculo de quórum.
+  [FIX] get_active_validators com fallback top.
 v3.7 (2026-11-01):
-  [NEW] Persistência cliente-local em trust_network.local.json.
-        Clientes (is_origin=False) NÃO podem assinar o
-        trust_network.json (só o Origin assina). Antes, no flush()
-        salvavam sem assinatura, e no próximo boot _load() rejeitava
-        o arquivo → cliente recomeçava vazio → perdia o self-register
-        do main.py → não assinava sign_block.
-        Agora clientes salvam em .local.json e carregam ambos.
-  [NEW] heartbeat_self(pubkey) — convenience que só chama heartbeat().
-        Chamado pelo run_status_loop do main.py v13.7.12 para
-        renovar last_seen do próprio nó a cada 30s.
-v3.6 (2026-10-30):
-  [FIX] get_active_validators() SEMPRE inclui o Origin, mesmo que
-        ele esteja fora de ACTIVE_TTL_SECONDS.
-        Também removido o fallback para "top score" (que retornava
-        fantasmas quando ninguém estava ativo).
-v3.5 (2026-10-30):
-  [NEW] _prune_inactive(), get_active_validators(), set_origin_pubkey()
-v3.4 (2026-10-29):
-  [FIX] Deduplicação por public_key
+  [NEW] trust_network.local.json para clientes.
 ================================================================
 """
 from __future__ import annotations
 
-__version__ = "3.10"
+__version__ = "3.11"
 
 import json
 import logging
@@ -72,6 +51,7 @@ TRUST_THRESHOLD_VALIDATOR = 150.0
 TRUST_THRESHOLD_ACTIVE = 120.0
 
 GAIN_BLOCK_VALIDATED = 20.0
+GAIN_BLOCK_SIGNED = 5.0        # [v3.11] novo: co-assinatura
 GAIN_ONLINE_HOUR = 0.5
 GAIN_SHARE_SUBMITTED = 0.5
 GAIN_REWARD_DISTRIBUTED = 5.0
@@ -95,6 +75,11 @@ ACTIVE_TTL_SECONDS = int(os.environ.get("BRN_TRUST_ACTIVE_TTL", "300"))
 SCORE_PROTECTED    = int(os.environ.get("BRN_TRUST_PROTECT_SCORE", "500"))
 PRUNE_INTERVAL_S   = 60.0
 
+# [v3.11] auto-promoção de clientes novos
+NEW_CLIENT_INITIAL_SCORE = float(os.environ.get("BRN_NEW_CLIENT_SCORE", "500"))
+AUTO_PROMOTE_MIN_BLOCKS  = int(os.environ.get("BRN_AUTO_PROMOTE_MIN_BLOCKS", "10"))
+AUTO_PROMOTE_SCORE       = float(os.environ.get("BRN_AUTO_PROMOTE_SCORE", "1000"))
+
 
 @dataclass
 class NodeRecord:
@@ -113,6 +98,7 @@ class NodeRecord:
     last_connect_time: Optional[float] = None
 
     blocks_validated: int = 0
+    blocks_signed: int = 0        # [v3.11] co-assinaturas
     blocks_proposed: int = 0
     shares_submitted: int = 0
     valid_shares: int = 0
@@ -154,7 +140,7 @@ class NodeRecord:
             "trust_score", "trust_level",
             "first_seen", "last_seen", "connected",
             "total_online_hours", "last_connect_time",
-            "blocks_validated", "blocks_proposed",
+            "blocks_validated", "blocks_signed", "blocks_proposed",
             "shares_submitted", "valid_shares", "invalid_shares",
             "rewards_distributed", "penalties", "total_penalties",
             "banned", "ban_reason", "is_validator", "validator_since",
@@ -164,9 +150,9 @@ class NodeRecord:
 
 
 class TrustNetwork:
-    def __init__(self, data_file: str = DEFAULT_DATA_FILE, is_origin: bool = False, node_sk=None):
+    def __init__(self, data_file: str = DEFAULT_DATA_FILE,
+                 is_origin: bool = False, node_sk=None):
         self.data_file = Path(data_file)
-        # [v3.7] Cliente-local: trust_network.local.json (ao lado do principal)
         self.local_file = self.data_file.with_suffix(".local.json")
         self.is_origin = is_origin
         self.node_sk = node_sk
@@ -199,22 +185,7 @@ class TrustNetwork:
 
     def sync_local_validator(self, pubkey: str, address: str = "",
                              peer_addr: str = "") -> bool:
-        """
-        [v3.10] Registra a pubkey local como nó ativo no trust em runtime.
-
-        Chamado quando a carteira muda via GUI (após
-        /api/wallet/set_validator_sk, no server.py). Sem isso, a
-        carteira nova só entrava no trust no próximo boot — e o
-        main.py não registrava a pubkey em runtime, então o consenso
-        local ficava com required=1/1 mesmo com a GUI "ativa".
-
-        Comportamento:
-          - Origin: persiste no trust_network.json (re-assina com node_sk).
-          - Cliente: persiste no trust_network.local.json.
-          - Em ambos: marca nó como connected=True e atualiza last_seen.
-
-        Retorna True se registrou/atualizou, False se pubkey vazia.
-        """
+        """[v3.10] Registra pubkey local como nó ativo no trust."""
         if not pubkey:
             return False
         pk = pubkey.strip().lower()
@@ -230,7 +201,6 @@ class TrustNetwork:
                 n.last_connect_time = time.time()
                 n.update_trust_level()
             self._mark_dirty()
-            # Força flush imediato (não esperar FLUSH_INTERVAL_S)
             try:
                 self._last_flush = 0.0
                 self.flush()
@@ -241,26 +211,143 @@ class TrustNetwork:
                  pk[:16], "sim" if self.is_origin else "não")
         return True
 
+    def register_new_validator(self, pubkey: str, address: str = "",
+                               initial_score: float = None) -> dict:
+        """
+        [v3.11] Registra um cliente novo via /api/trust/register.
+
+        Diferente de register_node:
+          - Só o Origin chama (server.py valida antes)
+          - Aplica score provisório (default 500)
+          - Marca como "active" (não "validator" ainda)
+          - Retorna {ok, is_new, score, will_promote_after}
+
+        Se o nó já existe:
+          - Se score < 500: sobe para 500 (corrige cliente antigo com score baixo)
+          - Se score >= 500: só atualiza last_seen
+        """
+        if not pubkey or len(pubkey) != 66:
+            return {"ok": False, "msg": "pubkey inválida (66 hex esperado)"}
+        try:
+            int(pubkey, 16)
+        except ValueError:
+            return {"ok": False, "msg": "pubkey não é hex"}
+
+        pk = pubkey.strip().lower()
+        score = initial_score if initial_score is not None else NEW_CLIENT_INITIAL_SCORE
+
+        with self._lock:
+            existing = self.nodes.get(pk)
+            is_new = existing is None
+
+            if is_new:
+                self.nodes[pk] = NodeRecord(
+                    node_id=pk,
+                    address=address or pk[:16],
+                    public_key=pk,
+                    trust_score=score,
+                    trust_level="active",
+                    last_seen=time.time(),
+                    connected=False,
+                )
+                log.info(
+                    "[TrustNetwork] register_new_validator: NOVO %s… score=%.0f",
+                    pk[:16], score,
+                )
+            else:
+                # Se já existe com score abaixo de 500, sobe
+                if existing.trust_score < score and not existing.banned:
+                    existing.trust_score = score
+                    existing.update_trust_level()
+                    log.info(
+                        "[TrustNetwork] register_new_validator: %s… score %.0f → %.0f",
+                        pk[:16], existing.trust_score, score,
+                    )
+                existing.last_seen = time.time()
+                log.info(
+                    "[TrustNetwork] register_new_validator: %s… já existe, last_seen atualizado",
+                    pk[:16],
+                )
+
+            n = self.nodes[pk]
+            self._mark_dirty()
+            try:
+                self._last_flush = 0.0
+                self.flush()
+            except Exception as e:
+                log.warning("[TrustNetwork] register_new_validator flush falhou: %s", e)
+
+            return {
+                "ok": True,
+                "is_new": is_new,
+                "pubkey": pk,
+                "score": n.trust_score,
+                "trust_level": n.trust_level,
+                "blocks_signed": n.blocks_signed,
+                "will_promote_after": max(0, AUTO_PROMOTE_MIN_BLOCKS - n.blocks_signed),
+            }
+
+    def record_block_signed(self, node_id: str, block_height: int) -> None:
+        """
+        [v3.11] Chamado por blockchain.accept_block() para cada signatário
+        válido de um bloco. Incrementa blocks_signed e aplica
+        GAIN_BLOCK_SIGNED (+5).
+
+        Se o nó atingiu AUTO_PROMOTE_MIN_BLOCKS e ainda está em score
+        provisório (500), auto-promove para AUTO_PROMOTE_SCORE (1000).
+        """
+        if not node_id:
+            return
+        nid = node_id.strip().lower()
+
+        with self._lock:
+            n = self.nodes.get(nid)
+            if n is None:
+                # Não registrado localmente — não é problema,
+                # apenas não podemos pontuar
+                return
+            if n.banned:
+                return
+
+            n.blocks_signed += 1
+            n.last_seen = time.time()
+            self._adjust_score(nid, GAIN_BLOCK_SIGNED,
+                               f"co-assinou #{block_height}")
+
+            # [v3.11] Auto-promoção 500 → 1000 após N blocos
+            if (n.blocks_signed >= AUTO_PROMOTE_MIN_BLOCKS
+                    and n.trust_score < AUTO_PROMOTE_SCORE
+                    and not n.banned):
+                old = n.trust_score
+                n.trust_score = AUTO_PROMOTE_SCORE
+                n.update_trust_level()
+                if not n.validator_since:
+                    n.validator_since = time.time()
+                n.is_validator = True
+                log.warning(
+                    "[TrustNetwork] AUTO-PROMOÇÃO: %s… %.0f → %.0f após "
+                    "%d blocos assinados",
+                    nid[:16], old, AUTO_PROMOTE_SCORE, n.blocks_signed,
+                )
+                self._mark_dirty()
+
     def heartbeat_self(self, pubkey: str) -> None:
-        """[v3.7] Convenience: renova last_seen do próprio nó."""
         self.heartbeat(pubkey)
 
     def remove_ghosts(self, max_age_s: int = 300) -> int:
-        """
-        [v3.8] Remove nós fantasmas (que não dão sinal de vida há mais de X segundos).
-        Salva imediatamente os arquivos .json e .local.json limpos.
-        """
+        """[v3.8] Remove nós fantasmas (inativos há > X segundos)."""
         now = time.time()
         to_remove = []
 
         with self._lock:
             for nid, n in list(self.nodes.items()):
                 age = now - n.last_seen
-
-                # Nunca remove o próprio Origin (a não ser que esteja realmente morto)
                 if self._origin_pubkey and n.public_key.lower() == self._origin_pubkey:
                     continue
-
+                # [v3.11] Não remove quem tem score alto E assinou recentemente
+                if n.trust_score >= SCORE_PROTECTED and n.blocks_signed > 0:
+                    if age < max_age_s * 4:
+                        continue
                 if age > max_age_s:
                     to_remove.append((nid, age))
 
@@ -271,7 +358,7 @@ class TrustNetwork:
 
             if to_remove:
                 self._mark_dirty()
-                self.flush() # Persiste as mudanças imediatamente
+                self.flush()
 
         return len(to_remove)
 
@@ -324,7 +411,6 @@ class TrustNetwork:
                 "last_rotation_height": self._last_rotation_height,
             }
 
-            # [v3.7] Client: salva em .local.json (sem assinatura)
             if not self.is_origin:
                 try:
                     data["saved_at"] = time.time()
@@ -337,7 +423,6 @@ class TrustNetwork:
                     log.error("[TrustNetwork] flush local falhou: %s", e)
                 return
 
-            # Origin: salva main + assinatura (mantém local também)
             try:
                 if self.node_sk is not None:
                     payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -350,7 +435,6 @@ class TrustNetwork:
                 with open(self.data_file, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
 
-                # Origin também atualiza seu próprio local (compat)
                 try:
                     with open(self.local_file, "w", encoding="utf-8") as f:
                         json.dump(data, f, indent=2, ensure_ascii=False)
@@ -367,7 +451,6 @@ class TrustNetwork:
         self.flush()
 
     def _load(self) -> None:
-        # ─── 1. Carrega arquivo principal (Origin-signed) ───
         if self.data_file.exists():
             try:
                 with open(self.data_file, "r", encoding="utf-8") as f:
@@ -388,7 +471,6 @@ class TrustNetwork:
                     except Exception as e:
                         log.error("[TrustNetwork] ASSINATURA INVÁLIDA! O arquivo foi alterado.")
                         if not self.is_origin:
-                            # Cliente: ignora main inválido, mas ainda carrega local abaixo
                             data = {"nodes": {}}
                         else:
                             log.warning("[TrustNetwork] Origem ignorando falha de assinatura.")
@@ -412,7 +494,6 @@ class TrustNetwork:
             except Exception as e:
                 log.error("[TrustNetwork] load main falhou: %s", e)
 
-        # ─── 2. Cliente: carrega local (merge) ───
         if not self.is_origin and self.local_file.exists():
             try:
                 with open(self.local_file, "r", encoding="utf-8") as f:
@@ -429,7 +510,6 @@ class TrustNetwork:
                             except Exception:
                                 pass
                         else:
-                            # Preserva o local (last_seen mais recente ganha)
                             try:
                                 local_rec = NodeRecord.from_dict(nd)
                                 if local_rec.last_seen > self.nodes[nid].last_seen:
@@ -721,7 +801,6 @@ class TrustNetwork:
                 if origin is not None and origin not in active:
                     active.append(origin)
 
-            # [v3.9] Fallback (a): active totalmente vazio → usa top.
             if not active:
                 top = self.get_top_validators(count=n_target)
                 if top:
@@ -751,9 +830,6 @@ class TrustNetwork:
                 if len(out) >= n_target:
                     break
 
-            # [v3.9] Fallback (b): active incompleto (< n_target) e top
-            # tem mais candidatos → usa top para não reduzir o quórum.
-            # Ex.: active=1 (só local), top=4 → retorna os 4.
             if len(out) < n_target:
                 top = self.get_top_validators(count=n_target)
                 if len(top) > len(out):
@@ -781,6 +857,7 @@ class TrustNetwork:
                     "trust_level": self.nodes[nid].trust_level,
                     "uptime_score": round(self.nodes[nid].uptime_score, 1),
                     "blocks_validated": self.nodes[nid].blocks_validated,
+                    "blocks_signed": self.nodes[nid].blocks_signed,
                 }
                 for nid in sorted(ids,
                                   key=lambda x: -self.nodes[x].trust_score)
@@ -819,6 +896,7 @@ class TrustNetwork:
                         "connected": n.connected,
                         "is_validator": n.is_validator,
                         "uptime_hours": round(n.total_online_hours, 1),
+                        "blocks_signed": n.blocks_signed,
                         "last_seen_ago": round((time.time() - n.last_seen) / 60, 1),
                     })
             return out
