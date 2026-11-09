@@ -1,52 +1,43 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.5.6 | Data: 08/11/2026
+Versão: 9.5.7 | Data: 09/11/2026
 ================================================================
+v9.5.7 (2026-11-09) — AUTO-PROMOÇÃO DE CLIENTES:
+  [NEW] accept_block() chama trust_network.record_block_signed()
+        para cada signatário válido do bloco. O trust então:
+          - incrementa blocks_signed do nó
+          - aplica GAIN_BLOCK_SIGNED (+5 no score)
+          - auto-promove 500→1000 quando blocks_signed >= 10
+        Permite que clientes novos subam sozinhos sem --promote
+        manual. Requer trust_network.py v3.11+.
+  [KEEP] v9.5.6: bypass multi-sig, auth_tag env, shutdown
+        timeout, fallback fantasma, PBFT attach.
+  [KEEP] v9.5.5: L2 bridge (l2_mint).
+  [KEEP] v9.5.4: BRN_PBFT_START_HEIGHT.
+  [KEEP] v9.5.3: genesis do peer aceito se DB vazio.
+  [KEEP] v9.5.2: BRN_STRICT_MULTISIG desativa bypasses.
+
 v9.5.6 (2026-11-08) — PATCH DE AUDITORIA:
-  [FIX CRÍTICO] _validate_validators_sig: Bypass 2 (bootstrap local) e
-        Bypass 3 (bootstrap estendido) agora exigem len(validators) < 2.
-        ANTES: em rede 3+ nós, um bloco com 1 assinatura local era
-        aceito por _validate_validators_sig mesmo com required=3, o
-        que fazia o minerador crescer a chain local em FORK. Os peers
-        (sem a pubkey local) rejeitavam, e o nó divergia em silêncio.
-        Esse era o sintoma "co-assinatura falhando" no
-        verify_cosign.py / test_co_sign.py.
-  [FIX] require_auth_tag agora respeita BRN_REQUIRE_AUTH_TAG=0.
-        Antes: com BRN_NETWORK_SECRET setado, o flag virava True
-        sempre. O verify.py (item [12]) detectava isso como
-        "patch auth_tag NÃO aplicado".
-  [FIX] set_network_secret: não força mais require_auth_tag=True
-        por presença de secret. Recomputa a partir da intenção
-        original (env / caller).
-  [FIX] _collect_signatures: SIG_COLLECT_TIMEOUT agora é respeitado
-        de verdade. Antes, `with ThreadPoolExecutor(...)` bloqueava
-        no __exit__ até o _sign_collector retornar, ignorando o
-        timeout. Agora usa `pool.shutdown(wait=False)`.
-  [FIX] _get_active_validators: o fallback duplicado para
-        get_top_validators (quando active == []) agora só dispara
-        se BRN_TRUST_FALLBACK_TO_TOP=1. Default: desligado. Isso
-        evita ressuscitar nós fantasmas por um segundo caminho,
-        mesmo quando o trust_network.py já foi corrigido.
-  [FIX] mine_block_interruptible: fallback defensivo para
-        pbft.attach_proof. Se self.seq avançou entre propose() e
-        attach_proof() (ex.: duas chamadas concorrentes de
-        propose()), busca o estado pelo hash do bloco antes de
-        desistir. Sem isso, BRN_PBFT_ENFORCE=1 travava a mineração.
+  [FIX CRÍTICO] _validate_validators_sig: Bypass 2 e 3 agora exigem
+        len(validators) < 2. Antes, em rede 3+ nós, aceitava bloco
+        com 1 sig local mesmo com required=3 → fork silencioso.
+  [FIX] require_auth_tag respeita BRN_REQUIRE_AUTH_TAG=0.
+  [FIX] set_network_secret: não força require_auth_tag=True.
+  [FIX] _collect_signatures: SIG_COLLECT_TIMEOUT efetivo.
+  [FIX] _get_active_validators: fallback duplicado gated por env.
+  [FIX] mine_block_interruptible: fallback attach_proof por hash.
 
 v9.5.5 (2026-11-08):
-  [NEW] Integração L2 Bridge. Adicionado `add_l2_transaction` e
-        suporte a `l2_mint` no `validate_tx` e `tx_fee`. Permite
-        que o BTCWatcher/L2Manager injetem créditos de BTC->BRN na
-        mempool para serem minerados.
-  [FIX] Correção de import circular (reorg e chain_validator) usando
-        importação lazy no final do arquivo.
+  [NEW] Integração L2 Bridge (add_l2_transaction, l2_mint).
+  [FIX] Import circular (reorg e chain_validator) — lazy import.
+
 v9.5.4 (2026-11-06):
-  [NEW] BRN_PBFT_START_HEIGHT: Permite ativar o modo estrito do PBFT
-        (BRN_PBFT_ENFORCE=1) apenas a partir de uma altura específica.
+  [NEW] BRN_PBFT_START_HEIGHT.
+
 v9.5.3 (2026-11-05):
-  [FIX] validate_block agora aceita o Genesis de um peer se o DB
-        local estiver vazio (height == -1).
+  [FIX] validate_block aceita Genesis de peer se DB vazio.
+
 v9.5.2 (2026-11-05):
-  [NEW] BRN_STRICT_MULTISIG: desativa TODOS os bypasses de multi-sig.
+  [NEW] BRN_STRICT_MULTISIG.
 ================================================================
 """
 from __future__ import annotations
@@ -118,7 +109,7 @@ BRN_CHECKPOINT_AUTO_HEIGHT = int(
 
 # [PBFT] flag de enforcement e altura de ativação
 BRN_PBFT_ENFORCE = os.environ.get("BRN_PBFT_ENFORCE", "0") == "1"
-# [NOVO v9.5.4] A partir de qual altura o PBFT passa a ser obrigatório
+# [v9.5.4] A partir de qual altura o PBFT passa a ser obrigatório
 BRN_PBFT_START_HEIGHT = int(os.environ.get("BRN_PBFT_START_HEIGHT", "0"))
 
 # [v9.5.2] STRICT MULTISIG: desativa TODOS os bypasses de multi-sig.
@@ -129,15 +120,12 @@ BRN_STRICT_MULTISIG = os.environ.get("BRN_STRICT_MULTISIG", "0") == "1"
 BRN_TRUST_FALLBACK_TO_TOP = os.environ.get("BRN_TRUST_FALLBACK_TO_TOP", "0") == "1"
 
 if BRN_STRICT_MULTISIG:
-    # Em modo estrito, ignoramos qualquer bypass configurado
     BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = 0
     BRN_ASSUME_VALID_UNTIL = 0
     log.warning(
         "[STRICT] BRN_STRICT_MULTISIG=1 — TODOS os bypasses de "
         "multi-sig foram desativados. A rede vai travar se os "
-        "validadores não assinarem. Bypasses ignorados: "
-        "BRN_BOOTSTRAP_SKIP_SIGS_UNTIL, BRN_ASSUME_VALID_UNTIL, "
-        "bootstrap local/estrangeiro/estendido."
+        "validadores não assinarem."
     )
 
 if not (0.0 < VALIDATOR_QUORUM <= 1.0):
@@ -158,13 +146,12 @@ if BRN_PBFT_START_HEIGHT < 0:
 if BRN_ASSUME_VALID_UNTIL > 0:
     log.warning(
         "[ASSUME-VALID] Ativo até altura %d — blocos nessa faixa pulam "
-        "validação completa (hash + prev_hash apenas). Rede confia nos peers.",
+        "validação completa.",
         BRN_ASSUME_VALID_UNTIL,
     )
 if BRN_CHECKPOINT_AUTO_HEIGHT > 0:
     log.warning(
-        "[AUTO-CHECKPOINT] Checkpoint automático na altura %d "
-        "(trava hash para sempre).",
+        "[AUTO-CHECKPOINT] Checkpoint automático na altura %d.",
         BRN_CHECKPOINT_AUTO_HEIGHT,
     )
 if BRN_PBFT_ENFORCE:
@@ -207,7 +194,8 @@ except Exception as _e:
 
 def miner_info() -> dict:
     if _HAS_C_MINER and _brn_miner_c is not None:
-        return {"c_available": True, "path": str(_brn_miner_c.library_path()), "python_fallback": True}
+        return {"c_available": True, "path": str(_brn_miner_c.library_path()),
+                "python_fallback": True}
     return {"c_available": False, "path": None, "python_fallback": True}
 
 
@@ -232,8 +220,7 @@ def get_checkpoints() -> dict:
 def _create_auto_checkpoint(block: dict) -> None:
     if _checkpoint_priv is None:
         log.warning(
-            "[CHECKPOINT] #%d NÃO criado: _checkpoint_priv não configurada "
-            "(SK do validador ausente)",
+            "[CHECKPOINT] #%d NÃO criado: _checkpoint_priv não configurada",
             block["height"],
         )
         return
@@ -338,7 +325,8 @@ def compute_auth_tag(height: int, block_hash_hex: str, secret: str = None) -> st
     return hmac.new(sec.encode(), msg, hashlib.sha256).hexdigest()
 
 
-def verify_auth_tag(height: int, block_hash_hex: str, tag: str, secret: str = None) -> bool:
+def verify_auth_tag(height: int, block_hash_hex: str, tag: str,
+                    secret: str = None) -> bool:
     expected = compute_auth_tag(height, block_hash_hex, secret)
     if not expected or not tag:
         return False
@@ -377,9 +365,13 @@ def compute_merkle_root(txids: list) -> str:
 
 
 def _tx_core(tx: dict) -> dict:
-    inputs = [{"txid": i["txid"], "vout": i["vout"], "pubkey": i.get("pubkey", "")} for i in tx["inputs"]]
-    outputs = [{"address": o["address"], "amount": o["amount"], "pubkey": o.get("pubkey", "")} for o in tx["outputs"]]
-    core = {"v": _CORE_V, "inputs": inputs, "outputs": outputs, "timestamp": tx["timestamp"], "locktime": tx.get("locktime", 0), "nonce": tx.get("nonce", 0)}
+    inputs = [{"txid": i["txid"], "vout": i["vout"], "pubkey": i.get("pubkey", "")}
+              for i in tx["inputs"]]
+    outputs = [{"address": o["address"], "amount": o["amount"],
+                "pubkey": o.get("pubkey", "")} for o in tx["outputs"]]
+    core = {"v": _CORE_V, "inputs": inputs, "outputs": outputs,
+            "timestamp": tx["timestamp"], "locktime": tx.get("locktime", 0),
+            "nonce": tx.get("nonce", 0)}
     if "data" in tx and tx["data"] is not None:
         core["data"] = tx["data"]
     if "height" in tx:
@@ -399,7 +391,8 @@ def signing_hash(tx: dict) -> bytes:
     return double_sha256(SIGNING_DOMAIN + _serialize_core(tx))
 
 
-def _pow_search_py(prev_hash, merkle, ts, diff, nonce_start=0, should_continue=None, progress_cb=None):
+def _pow_search_py(prev_hash, merkle, ts, diff, nonce_start=0,
+                   should_continue=None, progress_cb=None):
     prefix = f"{prev_hash}{merkle}{ts}".encode()
     diff_bytes = str(diff).encode()
     target_int = int("0" * int(diff) + "f" * (64 - int(diff)), 16)
@@ -424,18 +417,24 @@ def _pow_search_py(prev_hash, merkle, ts, diff, nonce_start=0, should_continue=N
                 pass
 
 
-def _pow_search_c(prev_hash, merkle, ts, diff, nonce_start, should_continue, progress_cb):
+def _pow_search_c(prev_hash, merkle, ts, diff, nonce_start,
+                  should_continue, progress_cb):
     prefix = f"{prev_hash}{merkle}{ts}"
     diff_str = str(int(diff))
     nonce = nonce_start
     hashes_done = 0
     while True:
         try:
-            result = _brn_miner_c.pow_search(prefix, diff_str, int(diff), nonce_start=nonce, max_iters=HASH_BATCH_SIZE)
+            result = _brn_miner_c.pow_search(
+                prefix, diff_str, int(diff),
+                nonce_start=nonce, max_iters=HASH_BATCH_SIZE,
+            )
         except Exception:
-            return _pow_search_py(prev_hash, merkle, ts, diff, nonce, should_continue, progress_cb)
+            return _pow_search_py(prev_hash, merkle, ts, diff, nonce,
+                                  should_continue, progress_cb)
         if result is None:
-            return _pow_search_py(prev_hash, merkle, ts, diff, nonce, should_continue, progress_cb)
+            return _pow_search_py(prev_hash, merkle, ts, diff, nonce,
+                                  should_continue, progress_cb)
         found_nonce, found_hash, batch_hashes = result
         hashes_done += batch_hashes
         if found_nonce is not None:
@@ -450,13 +449,17 @@ def _pow_search_c(prev_hash, merkle, ts, diff, nonce_start, should_continue, pro
                 pass
 
 
-def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0, should_continue=None, progress_cb=None):
+def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0,
+                should_continue=None, progress_cb=None):
     if _HAS_C_MINER and _brn_miner_c is not None:
-        return _pow_search_c(prev_hash, merkle, ts, diff, nonce_start, should_continue, progress_cb)
-    return _pow_search_py(prev_hash, merkle, ts, diff, nonce_start, should_continue, progress_cb)
+        return _pow_search_c(prev_hash, merkle, ts, diff, nonce_start,
+                             should_continue, progress_cb)
+    return _pow_search_py(prev_hash, merkle, ts, diff, nonce_start,
+                          should_continue, progress_cb)
 
 
-def make_coinbase(address: str, pubkey_hex: str, height: int, reward: int, fila_mineracao: dict = None) -> dict:
+def make_coinbase(address: str, pubkey_hex: str, height: int, reward: int,
+                  fila_mineracao: dict = None) -> dict:
     if not pubkey_hex:
         raise ValueError("make_coinbase: pubkey_hex é obrigatória")
     outputs = []
@@ -464,21 +467,43 @@ def make_coinbase(address: str, pubkey_hex: str, height: int, reward: int, fila_
         valor_validador = int(reward * 0.5)
         valor_restante = reward - valor_validador
         valor_por_cliente = valor_restante // len(fila_mineracao)
-        outputs.append({"address": address, "amount": valor_validador, "pubkey": pubkey_hex})
+        outputs.append({"address": address, "amount": valor_validador,
+                        "pubkey": pubkey_hex})
         for cliente_addr, cliente_pub in fila_mineracao.items():
-            outputs.append({"address": cliente_addr, "amount": valor_por_cliente, "pubkey": cliente_pub})
+            outputs.append({"address": cliente_addr, "amount": valor_por_cliente,
+                            "pubkey": cliente_pub})
         total_pago = sum(o["amount"] for o in outputs)
         if total_pago < reward:
             outputs[0]["amount"] += (reward - total_pago)
     else:
-        outputs.append({"address": address, "amount": int(reward), "pubkey": pubkey_hex})
-    cb = {"txid": "", "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}], "outputs": outputs, "timestamp": int(time.time()), "locktime": 0, "height": int(height), "nonce": 0}
+        outputs.append({"address": address, "amount": int(reward),
+                        "pubkey": pubkey_hex})
+    cb = {
+        "txid": "",
+        "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF,
+                    "pubkey": "", "signature": ""}],
+        "outputs": outputs,
+        "timestamp": int(time.time()),
+        "locktime": 0,
+        "height": int(height),
+        "nonce": 0,
+    }
     cb["txid"] = txid(cb)
     return cb
 
 
 def build_genesis() -> dict:
-    cb = {"txid": "", "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}], "outputs": [{"address": GENESIS_ADDRESS, "amount": GENESIS_REWARD, "pubkey": GENESIS_PUBKEY}], "timestamp": GENESIS_TIMESTAMP, "locktime": 0, "height": 0, "nonce": 0}
+    cb = {
+        "txid": "",
+        "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF,
+                    "pubkey": "", "signature": ""}],
+        "outputs": [{"address": GENESIS_ADDRESS, "amount": GENESIS_REWARD,
+                     "pubkey": GENESIS_PUBKEY}],
+        "timestamp": GENESIS_TIMESTAMP,
+        "locktime": 0,
+        "height": 0,
+        "nonce": 0,
+    }
     cb["txid"] = txid(cb)
     merkle = compute_merkle_root([cb["txid"]])
     nonce = 0
@@ -487,7 +512,12 @@ def build_genesis() -> dict:
         if h.startswith("0"):
             break
         nonce += 1
-    g = {"height": 0, "hash": h, "prev_hash": GENESIS_PREV, "timestamp": GENESIS_TIMESTAMP, "nonce": nonce, "merkle": merkle, "difficulty": 1, "transactions": [cb], "cumulative_work": work_from_difficulty(1), "validators_sig": []}
+    g = {
+        "height": 0, "hash": h, "prev_hash": GENESIS_PREV,
+        "timestamp": GENESIS_TIMESTAMP, "nonce": nonce, "merkle": merkle,
+        "difficulty": 1, "transactions": [cb],
+        "cumulative_work": work_from_difficulty(1), "validators_sig": [],
+    }
     tag = compute_auth_tag(0, h)
     if tag:
         g["auth_tag"] = tag
@@ -498,14 +528,14 @@ GENESIS_BLOCK = build_genesis()
 
 
 class Blockchain:
-    def __init__(self, db_path="brn_v2_chain.db", genesis_address=None, genesis_pubkey=None, auto_genesis=True, network_secret=None, require_auth_tag=None):
+    def __init__(self, db_path="brn_v2_chain.db", genesis_address=None,
+                 genesis_pubkey=None, auto_genesis=True, network_secret=None,
+                 require_auth_tag=None):
         self.db = ChainDB(db_path)
         self.genesis_expected_hash = None
         self.network_secret = network_secret if network_secret is not None else NETWORK_SECRET
 
         # [FIX v9.5.6] require_auth_tag agora respeita BRN_REQUIRE_AUTH_TAG=0
-        # ANTES: bool(self.network_secret) if require_auth_tag is None else bool(require_auth_tag)
-        # Bug: com BRN_NETWORK_SECRET setado, o flag virava True SEMPRE.
         if require_auth_tag is None:
             require_auth_tag = os.environ.get("BRN_REQUIRE_AUTH_TAG", "1") == "1"
         self._auth_tag_requested = bool(require_auth_tag)
@@ -531,14 +561,18 @@ class Blockchain:
         if self.db.height() < 0:
             g = GENESIS_BLOCK
             if genesis_address:
-                g = self._genesis_with_address(genesis_address, genesis_pubkey if genesis_pubkey is not None else GENESIS_PUBKEY)
+                g = self._genesis_with_address(
+                    genesis_address,
+                    genesis_pubkey if genesis_pubkey is not None else GENESIS_PUBKEY,
+                )
             self.db.add_block(g)
             self.db.apply_tx(g["transactions"][0], 0, coinbase=True)
             self.db.set_meta("genesis_hash", g["hash"])
 
     def set_trust_net(self, trust):
         self.trust_net = trust
-        log.info(f"[Blockchain] trust_net injetado ({len(getattr(trust, 'nodes', {}))} nós)")
+        log.info(f"[Blockchain] trust_net injetado "
+                 f"({len(getattr(trust, 'nodes', {}))} nós)")
 
     def set_p2p(self, p2p):
         self.p2p = p2p
@@ -562,7 +596,8 @@ class Blockchain:
                 self._local_validator_sk = Wallet(private_key_hex=h)
                 log.info("[SIG] chave local de validador configurada (hex)")
                 return
-            log.warning(f"[SIG] set_local_validator_sk: tipo não suportado ({type(sk).__name__}); ignorando")
+            log.warning(f"[SIG] set_local_validator_sk: tipo não suportado "
+                        f"({type(sk).__name__}); ignorando")
             self._local_validator_sk = None
         except Exception as e:
             log.warning(f"[SIG] set_local_validator_sk falhou: {e}")
@@ -576,10 +611,8 @@ class Blockchain:
         if pbft is not None:
             enabled = getattr(pbft, "PBFT_ENABLED", "?")
             enforce = getattr(pbft, "PBFT_ENFORCE", "?")
-            log.info(
-                "[PBFT] motor injetado na Blockchain (enabled=%s enforce=%s)",
-                enabled, enforce,
-            )
+            log.info("[PBFT] motor injetado (enabled=%s enforce=%s)",
+                     enabled, enforce)
         else:
             log.info("[PBFT] motor removido da Blockchain")
 
@@ -591,7 +624,8 @@ class Blockchain:
         if address in self.fila_mineracao:
             return
         self.fila_mineracao[address] = pubkey
-        print(f"[BOOTSTRAP] Novo minerador na fila: {address[:12]}... ({len(self.fila_mineracao)}/{FILA_MAX_MINERADORES})")
+        print(f"[BOOTSTRAP] Novo minerador na fila: {address[:12]}... "
+              f"({len(self.fila_mineracao)}/{FILA_MAX_MINERADORES})")
         self.db.set_meta("fila_mineracao", json.dumps(self.fila_mineracao))
         if len(self.fila_mineracao) >= FILA_MAX_MINERADORES:
             self.rede_descentralizada = True
@@ -600,7 +634,17 @@ class Blockchain:
 
     @staticmethod
     def _genesis_with_address(address: str, pubkey_hex: str = "") -> dict:
-        cb = {"txid": "", "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}], "outputs": [{"address": address, "amount": GENESIS_REWARD, "pubkey": pubkey_hex}], "timestamp": GENESIS_TIMESTAMP, "locktime": 0, "height": 0, "nonce": 0}
+        cb = {
+            "txid": "",
+            "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF,
+                        "pubkey": "", "signature": ""}],
+            "outputs": [{"address": address, "amount": GENESIS_REWARD,
+                         "pubkey": pubkey_hex}],
+            "timestamp": GENESIS_TIMESTAMP,
+            "locktime": 0,
+            "height": 0,
+            "nonce": 0,
+        }
         cb["txid"] = txid(cb)
         merkle = compute_merkle_root([cb["txid"]])
         nonce = 0
@@ -609,15 +653,19 @@ class Blockchain:
             if h.startswith("0"):
                 break
             nonce += 1
-        g = {"height": 0, "hash": h, "prev_hash": GENESIS_PREV, "timestamp": GENESIS_TIMESTAMP, "nonce": nonce, "merkle": merkle, "difficulty": 1, "transactions": [cb], "cumulative_work": work_from_difficulty(1), "validators_sig": []}
+        g = {
+            "height": 0, "hash": h, "prev_hash": GENESIS_PREV,
+            "timestamp": GENESIS_TIMESTAMP, "nonce": nonce, "merkle": merkle,
+            "difficulty": 1, "transactions": [cb],
+            "cumulative_work": work_from_difficulty(1), "validators_sig": [],
+        }
         tag = compute_auth_tag(0, h)
         if tag:
             g["auth_tag"] = tag
         return g
 
     def set_network_secret(self, secret: str) -> None:
-        # [FIX v9.5.6] Recomputa a partir da intenção original, em vez de
-        # forçar True por presença de secret (o bug do v9.5.5).
+        # [FIX v9.5.6] Recomputa a partir da intenção original
         self.network_secret = (secret or "").strip()
         self.require_auth_tag = self._auth_tag_requested and bool(self.network_secret)
         if self._auth_tag_requested and not self.network_secret:
@@ -699,10 +747,8 @@ class Blockchain:
             return max(MIN_RELAY_FEE, fees_sorted[idx])
 
     def tx_fee(self, tx: dict) -> int:
-        # [NOVO v9.5.5] L2 mint nao paga taxa (o valor entra na rede pela ponte BTC)
         if tx.get("data", {}).get("type") == "l2_mint":
             return 0
-
         in_sum = 0
         for inp in tx["inputs"]:
             u = self.db.get_utxo(inp["txid"], inp["vout"])
@@ -758,12 +804,14 @@ class Blockchain:
         from contracts import deploy as _deploy, call as _call
         sender = self._contract_sender_address(tx)
         if t == "deploy":
-            r = _deploy(self, sender, tx_data.get("code") or {}, metadata=tx_data.get("metadata"))
+            r = _deploy(self, sender, tx_data.get("code") or {},
+                        metadata=tx_data.get("metadata"))
             if not r.get("ok"):
                 raise ValueError(f"deploy falhou: {r.get('msg')}")
             return r
         if t == "call":
-            r = _call(self, tx_data.get("contract_id", ""), sender, tx_data.get("args"))
+            r = _call(self, tx_data.get("contract_id", ""), sender,
+                      tx_data.get("args"))
             if not r.get("ok"):
                 raise ValueError(f"call falhou: {r.get('msg')}")
             return r
@@ -772,7 +820,6 @@ class Blockchain:
     def validate_tx(self, tx: dict, from_mempool: bool = False) -> tuple:
         from wallet import Wallet
 
-        # [NOVO v9.5.5] Permite L2 Mint na mempool e na mineracao
         if tx.get("data", {}).get("type") == "l2_mint":
             if not from_mempool:
                 return False, "L2 mint nao pode ser validado fora da mempool"
@@ -799,7 +846,8 @@ class Blockchain:
             for inp in tx["inputs"]:
                 key = (inp["txid"], int(inp["vout"]))
                 if key in gastos_mem:
-                    return False, f"UTXO {inp['txid'][:16]}...:{inp['vout']} ja esta sendo gasta por outra tx na mempool"
+                    return False, (f"UTXO {inp['txid'][:16]}...:{inp['vout']} "
+                                   f"ja esta sendo gasta por outra tx na mempool")
         for inp in tx["inputs"]:
             if not inp.get("pubkey"):
                 return False, "input sem pubkey"
@@ -808,7 +856,8 @@ class Blockchain:
             pk = inp["pubkey"]
             expected = self.db.get_nonce_for_pubkey(pk)
             if tx_nonce != expected:
-                return False, f"nonce invalido para {pk[:16]}... (esperado {expected}, recebido {tx_nonce})"
+                return False, (f"nonce invalido para {pk[:16]}... "
+                               f"(esperado {expected}, recebido {tx_nonce})")
         in_sum = 0
         seen = set()
         for inp in tx["inputs"]:
@@ -822,7 +871,8 @@ class Blockchain:
             stored_pk = (u["pubkey"] or "").strip()
             if stored_pk and set(stored_pk) != {"0"}:
                 if inp["pubkey"] != stored_pk:
-                    return False, f"pubkey mismatch: input={inp['pubkey'][:16]}... utxo={stored_pk[:16]}"
+                    return False, (f"pubkey mismatch: input={inp['pubkey'][:16]}... "
+                                   f"utxo={stored_pk[:16]}")
             else:
                 try:
                     from bech32 import address_from_pubkey
@@ -830,7 +880,8 @@ class Blockchain:
                 except Exception:
                     return False, "input pubkey invalida"
                 if derived != u["address"]:
-                    return False, f"address mismatch: deriva {derived[:16]}... utxo {u['address'][:16]}..."
+                    return False, (f"address mismatch: deriva {derived[:16]}... "
+                                   f"utxo {u['address'][:16]}...")
             in_sum += u["amount"]
         out_sum = sum(o["amount"] for o in tx["outputs"])
         if out_sum > in_sum:
@@ -870,15 +921,11 @@ class Blockchain:
         tx = {
             "txid": "",
             "inputs": [{
-                "txid": "0" * 64,
-                "vout": 0xFFFFFFFF,
-                "pubkey": "",
-                "signature": ""
+                "txid": "0" * 64, "vout": 0xFFFFFFFF,
+                "pubkey": "", "signature": ""
             }],
             "outputs": [{
-                "address": buyer,
-                "amount": amount,
-                "pubkey": ""
+                "address": buyer, "amount": amount, "pubkey": ""
             }],
             "timestamp": int(time.time()),
             "locktime": 0,
@@ -886,12 +933,13 @@ class Blockchain:
             "data": {
                 "type": "l2_mint",
                 "btc_txid": l2_tx.get("btc_txid"),
-                "escrow_id": l2_tx.get("escrow_id")
-            }
+                "escrow_id": l2_tx.get("escrow_id"),
+            },
         }
         tx["txid"] = txid(tx)
         self.db.add_mempool(tx, 0)
-        log.info(f"[L2] Transação L2 adicionada à mempool: {tx['txid'][:16]}... (+{amount/1e8} BRN para {buyer[:12]}...)")
+        log.info(f"[L2] Transação L2 adicionada à mempool: "
+                 f"{tx['txid'][:16]}... (+{amount/1e8} BRN para {buyer[:12]}...)")
         return tx["txid"]
 
     def median_time_past(self, height: int) -> int:
@@ -914,21 +962,21 @@ class Blockchain:
         if trust is not None:
             try:
                 if hasattr(trust, "get_active_validators"):
-                    validators = list(trust.get_active_validators(count=MAX_VALIDATORS) or [])
+                    validators = list(trust.get_active_validators(
+                        count=MAX_VALIDATORS) or [])
                 else:
-                    validators = list(trust.get_top_validators(count=MAX_VALIDATORS) or [])
+                    validators = list(trust.get_top_validators(
+                        count=MAX_VALIDATORS) or [])
             except Exception as e:
                 log.warning(f"[VALIDATORS] falhou: {e}")
                 validators = []
 
-            # [FIX v9.5.6] Fallback duplicado agora gated por env.
-            # ANTES: sempre disparava quando get_active_validators() == [].
-            # Isso permitia que fantasmas entrassem no quórum por um segundo
-            # caminho, mesmo com trust_network.py corrigido.
+            # [FIX v9.5.6] Fallback duplicado gated por env.
             if not validators and hasattr(trust, "get_top_validators"):
                 if BRN_TRUST_FALLBACK_TO_TOP:
                     try:
-                        validators = list(trust.get_top_validators(count=MAX_VALIDATORS) or [])
+                        validators = list(trust.get_top_validators(
+                            count=MAX_VALIDATORS) or [])
                         if validators:
                             log.warning(
                                 "[VALIDATORS] active_validators vazio; usando "
@@ -937,7 +985,8 @@ class Blockchain:
                                 len(validators),
                             )
                     except Exception as e:
-                        log.warning(f"[VALIDATORS] fallback get_top_validators falhou: {e}")
+                        log.warning(
+                            f"[VALIDATORS] fallback get_top_validators falhou: {e}")
                         validators = []
                 else:
                     log.warning(
@@ -973,7 +1022,8 @@ class Blockchain:
         log.info(f"[SIG] quorum={VALIDATOR_QUORUM} → {need}/{n} assinaturas")
         return need
 
-    def _validate_validators_sig(self, block: dict, validators: Optional[list] = None) -> tuple:
+    def _validate_validators_sig(self, block: dict,
+                                  validators: Optional[list] = None) -> tuple:
         # [v9.4.10] Bypass por altura (só se STRICT_MULTISIG=0)
         if not BRN_STRICT_MULTISIG and BRN_BOOTSTRAP_SKIP_SIGS_UNTIL > 0:
             try:
@@ -983,8 +1033,10 @@ class Blockchain:
             if 0 < _bh <= BRN_BOOTSTRAP_SKIP_SIGS_UNTIL:
                 log.warning(
                     f"[SIG] EMERGENCIA: bloco #{_bh} aceito SEM multi-sig "
-                    f"(BRN_BOOTSTRAP_SKIP_SIGS_UNTIL={BRN_BOOTSTRAP_SKIP_SIGS_UNTIL}). "
-                    f"REMOVA essa env e reinicie apos altura > {BRN_BOOTSTRAP_SKIP_SIGS_UNTIL}."
+                    f"(BRN_BOOTSTRAP_SKIP_SIGS_UNTIL="
+                    f"{BRN_BOOTSTRAP_SKIP_SIGS_UNTIL}). "
+                    f"REMOVA essa env e reinicie apos altura > "
+                    f"{BRN_BOOTSTRAP_SKIP_SIGS_UNTIL}."
                 )
                 return True, ""
 
@@ -1031,16 +1083,14 @@ class Blockchain:
         # ═══════════════════════════════════════════════════════════
         # BYPASSES (só ativos quando STRICT_MULTISIG=0)
         #
-        # [FIX CRÍTICO v9.5.6] Bypass 2 e Bypass 3 agora exigem
-        # len(validators) < 2, IGUAL ao Bypass 1. Sem esse guard,
-        # em rede 3+ nós o nó aceitava bloco com 1 sig local mesmo
-        # com required=3, fazendo o minerador crescer a chain local
-        # em FORK. Os peers (sem a pubkey local) rejeitavam, e o nó
-        # divergia em silêncio — o sintoma "co-assinatura falhando".
+        # [FIX CRÍTICO v9.5.6] Bypass 2 e 3 exigem len(validators) < 2.
+        # Em rede 3+ nós, aceitar 1 sig local faz o minerador crescer
+        # a chain local em FORK. Peers (sem a pubkey local) rejeitam.
         # ═══════════════════════════════════════════════════════════
 
-        # Bypass 1: bootstrap estrangeiro (1 validador local, 1 assinatura estrangeira)
-        if not BRN_STRICT_MULTISIG and len(validators) < 2 and got == 0 and got_foreign >= 1:
+        # Bypass 1: bootstrap estrangeiro
+        if (not BRN_STRICT_MULTISIG and len(validators) < 2
+                and got == 0 and got_foreign >= 1):
             try:
                 block_h = int(block.get("height", -1))
                 my_height = self.db.height()
@@ -1059,9 +1109,7 @@ class Blockchain:
             )
             return True, ""
 
-        # Bypass 2: bootstrap local (só a própria SK assinou)
-        # [FIX CRÍTICO] exige len(validators) < 2 — senão, em rede 3+ nós,
-        # aceita com 1 sig local e forka.
+        # Bypass 2: bootstrap local (exige len(validators) < 2)
         if (not BRN_STRICT_MULTISIG
                 and len(validators) < 2
                 and got >= 1
@@ -1088,8 +1136,7 @@ class Blockchain:
                     )
                     return True, ""
 
-        # Bypass 3: bootstrap estendido (trust_score >= BOOTSTRAP_TRUST_THRESHOLD)
-        # [FIX CRÍTICO] mesmo guard: exige len(validators) < 2.
+        # Bypass 3: bootstrap estendido (exige len(validators) < 2)
         if (not BRN_STRICT_MULTISIG
                 and len(validators) < 2
                 and got >= 1
@@ -1134,15 +1181,17 @@ class Blockchain:
         missing = [p[:12] + "…" for p in validators if p not in verified_pubkeys]
         prefix = "[STRICT] " if BRN_STRICT_MULTISIG else ""
         return False, (
-            f"{prefix}Bloco #{block['height']} precisa de {required}/{len(validators)} "
-            f"assinaturas do set local, tem {got}. "
-            f"Faltam: {', '.join(missing[:5])}. "
+            f"{prefix}Bloco #{block['height']} precisa de "
+            f"{required}/{len(validators)} assinaturas do set local, "
+            f"tem {got}. Faltam: {', '.join(missing[:5])}. "
             f"({got_foreign} assinatura(s) estrangeira(s) ignorada(s))"
         )
 
-    def validate_block(self, block: dict, prev_block=None, validators: Optional[list] = None) -> tuple:
+    def validate_block(self, block: dict, prev_block=None,
+                        validators: Optional[list] = None) -> tuple:
         if block["height"] == 0 and prev_block is None:
-            if (self.genesis_expected_hash and block["hash"] != self.genesis_expected_hash):
+            if (self.genesis_expected_hash
+                    and block["hash"] != self.genesis_expected_hash):
                 if self.db.height() == -1:
                     log.warning("[Blockchain] DB vazio — aceitando o Genesis do peer")
                     self.genesis_expected_hash = block["hash"]
@@ -1152,13 +1201,14 @@ class Blockchain:
         expected_prev = (prev_block["hash"] if prev_block else self.db.tip_hash())
         if block["prev_hash"] != expected_prev:
             return False, "prev_hash incorreto"
-        expected_height = ((prev_block["height"] + 1) if prev_block else self.db.height() + 1)
+        expected_height = ((prev_block["height"] + 1) if prev_block
+                           else self.db.height() + 1)
         if block["height"] != expected_height:
             return False, "altura invalida"
 
-        # [v9.4.11] ASSUME-VALID (só se STRICT_MULTISIG=0)
         h_int = int(block["height"])
-        if not BRN_STRICT_MULTISIG and BRN_ASSUME_VALID_UNTIL > 0 and 0 < h_int <= BRN_ASSUME_VALID_UNTIL:
+        if (not BRN_STRICT_MULTISIG and BRN_ASSUME_VALID_UNTIL > 0
+                and 0 < h_int <= BRN_ASSUME_VALID_UNTIL):
             try:
                 h_calc = block_hash(
                     block["prev_hash"], block["merkle"], block["timestamp"],
@@ -1179,13 +1229,15 @@ class Blockchain:
             try:
                 mtp = self.median_time_past(block["height"])
                 if block["timestamp"] < mtp:
-                    return False, f"timestamp ({block['timestamp']}) < MTP ({mtp})"
+                    return False, (f"timestamp ({block['timestamp']}) < "
+                                   f"MTP ({mtp})")
             except Exception as e:
                 log.warning(f"[validate_block] Falha no MTP (tolerado): {e}")
 
         if not meets_difficulty(block["hash"], block["difficulty"]):
             return False, "PoW invalido"
-        h = block_hash(block["prev_hash"], block["merkle"], block["timestamp"], block["nonce"], block["difficulty"])
+        h = block_hash(block["prev_hash"], block["merkle"], block["timestamp"],
+                       block["nonce"], block["difficulty"])
         if h != block["hash"]:
             return False, "hash incorreto"
         calc_merkle = compute_merkle_root([t["txid"] for t in block["transactions"]])
@@ -1197,7 +1249,8 @@ class Blockchain:
             return False, msg_cp
 
         if block["height"] > 0:
-            ok_sig, msg_sig = self._validate_validators_sig(block, validators=validators)
+            ok_sig, msg_sig = self._validate_validators_sig(
+                block, validators=validators)
             if not ok_sig:
                 return False, msg_sig
 
@@ -1208,12 +1261,14 @@ class Blockchain:
                 tag = block.get("auth_tag")
                 if not tag:
                     return False, "bloco sem auth_tag"
-                if not verify_auth_tag(block["height"], block["hash"], tag, self.network_secret):
+                if not verify_auth_tag(block["height"], block["hash"], tag,
+                                        self.network_secret):
                     return False, "auth_tag invalido (segredo errado?)"
             else:
                 tag = block.get("auth_tag")
                 if tag:
-                    if not verify_auth_tag(block["height"], block["hash"], tag, self.network_secret):
+                    if not verify_auth_tag(block["height"], block["hash"], tag,
+                                            self.network_secret):
                         return False, "auth_tag invalido em bloco legado"
 
         cb = block["transactions"][0]
@@ -1241,10 +1296,9 @@ class Blockchain:
         if total_cb > reward + fees:
             return False, "coinbase acima do permitido"
 
-        # [NOVO v9.5.4] PBFT com altura de ativação
         if self._pbft is not None:
-            enforce_this_block = BRN_PBFT_ENFORCE and (h_int >= BRN_PBFT_START_HEIGHT)
-
+            enforce_this_block = (BRN_PBFT_ENFORCE
+                                   and h_int >= BRN_PBFT_START_HEIGHT)
             if "pbft_commits" in block:
                 try:
                     ok_pbft, why_pbft = self._pbft.validate_proof(block)
@@ -1259,7 +1313,8 @@ class Blockchain:
 
         return True, "ok"
 
-    def accept_block(self, block: dict, validators: Optional[list] = None) -> tuple:
+    def accept_block(self, block: dict,
+                     validators: Optional[list] = None) -> tuple:
         prev = self.db.get_block_by_hash(block["prev_hash"])
         ok, msg = self.validate_block(block, prev, validators=validators)
         if not ok:
@@ -1277,7 +1332,33 @@ class Blockchain:
         except Exception as e:
             return False, f"Erro ao gravar bloco #{block['height']}: {e}"
 
-        if BRN_CHECKPOINT_AUTO_HEIGHT > 0 and int(block["height"]) == BRN_CHECKPOINT_AUTO_HEIGHT:
+        # ═══════════════════════════════════════════════════════════
+        # [v9.5.7] Auto-promoção de signatários
+        # Após o bloco ser validado e gravado, registra +1 blocks_signed
+        # para cada signatário válido. O trust_network._adjust_score
+        # aplica GAIN_BLOCK_SIGNED (+5) e o auto-promote 500→1000
+        # acontece automaticamente quando blocks_signed >= 10.
+        # ═══════════════════════════════════════════════════════════
+        if self.trust_net is not None and block["height"] > 0:
+            try:
+                sigs = block.get("validators_sig", []) or []
+                seen = set()
+                for entry in sigs:
+                    if not isinstance(entry, dict):
+                        continue
+                    pk = (entry.get("pubkey") or "").strip().lower()
+                    if not pk or pk in seen:
+                        continue
+                    seen.add(pk)
+                    if hasattr(self.trust_net, "record_block_signed"):
+                        self.trust_net.record_block_signed(
+                            pk, block["height"],
+                        )
+            except Exception as e:
+                log.debug(f"[accept_block] record_block_signed falhou: {e}")
+
+        if (BRN_CHECKPOINT_AUTO_HEIGHT > 0
+                and int(block["height"]) == BRN_CHECKPOINT_AUTO_HEIGHT):
             _create_auto_checkpoint(block)
 
         _maybe_sign_checkpoint(block)
@@ -1288,7 +1369,8 @@ class Blockchain:
                 self.db.remove_mempool(t["txid"])
             if not coinbase:
                 tx_data = t.get("data") or {}
-                if (isinstance(tx_data, dict) and tx_data.get("type") in ("deploy", "call")):
+                if (isinstance(tx_data, dict)
+                        and tx_data.get("type") in ("deploy", "call")):
                     try:
                         self._apply_contract_tx(t)
                     except Exception as e:
@@ -1310,7 +1392,8 @@ class Blockchain:
         except Exception as e:
             print(f"[on_block_mined] callback falhou: {e}")
 
-    def _collect_signatures(self, block: dict, validators: Optional[list] = None) -> list:
+    def _collect_signatures(self, block: dict,
+                             validators: Optional[list] = None) -> list:
         if validators is None:
             validators = self._get_active_validators()
         if not validators:
@@ -1334,16 +1417,16 @@ class Blockchain:
                     else:
                         log.warning(f"[SIG] assinatura local inválida ({pk[:16]})")
                 elif pk:
-                    log.info(f"[SIG] pubkey local {pk[:16]} não é validador ativo — assinatura descartada")
+                    log.info(f"[SIG] pubkey local {pk[:16]} não é validador "
+                             f"ativo — assinatura descartada")
 
         if self._sign_collector is not None:
             extra: list = []
-            # [FIX v9.5.6] pool.shutdown(wait=False) para o timeout valer de verdade.
-            # ANTES: `with ThreadPoolExecutor(...)` bloqueava no __exit__ até o
-            # collector retornar, ignorando SIG_COLLECT_TIMEOUT.
+            # [FIX v9.5.6] pool.shutdown(wait=False) para o timeout valer
             try:
                 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
-                _pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sig-collect")
+                _pool = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="sig-collect")
                 try:
                     _fut = _pool.submit(self._sign_collector, block)
                     try:
@@ -1368,7 +1451,8 @@ class Blockchain:
                 if not pk or not sg:
                     continue
                 if pk not in valid_set:
-                    log.warning(f"[SIG] coletor devolveu pubkey desconhecida: {pk[:16]}")
+                    log.warning(f"[SIG] coletor devolveu pubkey desconhecida: "
+                                f"{pk[:16]}")
                     continue
                 if pk in seen:
                     continue
@@ -1376,7 +1460,8 @@ class Blockchain:
                     sigs.append(entry)
                     seen.add(pk)
                 else:
-                    log.warning(f"[SIG] coletor devolveu assinatura inválida: {pk[:16]}")
+                    log.warning(f"[SIG] coletor devolveu assinatura inválida: "
+                                f"{pk[:16]}")
 
         return sigs
 
@@ -1385,7 +1470,8 @@ class Blockchain:
             raise ValueError("mine_block: miner_pubkey é obrigatória")
         return self.mine_block_interruptible(miner_address, miner_pubkey, None)
 
-    def mine_block_interruptible(self, miner_address: str, miner_pubkey: str, should_continue=None, progress_cb=None) -> dict:
+    def mine_block_interruptible(self, miner_address: str, miner_pubkey: str,
+                                  should_continue=None, progress_cb=None) -> dict:
         if not miner_pubkey:
             raise ValueError("mine_block_interruptible: miner_pubkey é obrigatória")
 
@@ -1404,7 +1490,8 @@ class Blockchain:
         fila_para_pagar = None
         if (not self.rede_descentralizada and len(self.fila_mineracao) > 0):
             fila_para_pagar = self.fila_mineracao
-        cb = make_coinbase(miner_address, miner_pubkey, height, reward, fila_mineracao=fila_para_pagar)
+        cb = make_coinbase(miner_address, miner_pubkey, height, reward,
+                           fila_mineracao=fila_para_pagar)
 
         candidatas = self.db.all_mempool(limit=MAX_TX_PER_BLOCK - 1)
         selected = []
@@ -1431,7 +1518,10 @@ class Blockchain:
         merkle = compute_merkle_root([t["txid"] for t in txs])
         prev_hash = self.db.tip_hash()
         ts = int(time.time())
-        nonce, h_hex, _ = _pow_search(prev_hash, merkle, ts, diff, should_continue=should_continue, progress_cb=progress_cb)
+        nonce, h_hex, _ = _pow_search(
+            prev_hash, merkle, ts, diff,
+            should_continue=should_continue, progress_cb=progress_cb,
+        )
         if nonce is None:
             return None
 
@@ -1446,7 +1536,8 @@ class Blockchain:
         sigs = self._collect_signatures(block, validators=validators)
         block["validators_sig"] = sigs
 
-        ok_sig, msg_sig = self._validate_validators_sig(block, validators=validators)
+        ok_sig, msg_sig = self._validate_validators_sig(
+            block, validators=validators)
         if not ok_sig:
             log.warning(f"[MINER] bloco #{height} REJEITADO (multi-sig): {msg_sig}")
             return None
@@ -1456,9 +1547,7 @@ class Blockchain:
                 decided = self._pbft.propose(block)
                 if decided:
                     if not self._pbft.attach_proof(block):
-                        # [FIX v9.5.6] Fallback defensivo: se self.seq avançou
-                        # entre propose() e attach_proof() (duas chamadas
-                        # concorrentes), busca o estado pelo hash do bloco.
+                        # [FIX v9.5.6] Fallback defensivo por hash
                         _matched = False
                         try:
                             _lock = getattr(self._pbft, "lock", None)
@@ -1467,7 +1556,8 @@ class Blockchain:
                                 with _lock:
                                     for (_v, _s), _st in _states.items():
                                         if (getattr(_st, "decided", False)
-                                                and getattr(_st, "block_hash", None) == block.get("hash")):
+                                                and getattr(_st, "block_hash", None)
+                                                == block.get("hash")):
                                             block["pbft_view"] = _st.view
                                             block["pbft_seq"] = _st.seq
                                             block["pbft_commits"] = [
@@ -1480,22 +1570,32 @@ class Blockchain:
                             log.debug("[PBFT] fallback attach_proof falhou: %s", _e)
 
                         if not _matched:
-                            log.warning(f"[PBFT] bloco #{height} decidiu mas attach_proof falhou")
-                            if BRN_PBFT_ENFORCE and (height >= BRN_PBFT_START_HEIGHT):
+                            log.warning(
+                                f"[PBFT] bloco #{height} decidiu mas "
+                                f"attach_proof falhou")
+                            if (BRN_PBFT_ENFORCE
+                                    and height >= BRN_PBFT_START_HEIGHT):
                                 return None
                         else:
-                            log.info(f"[PBFT] bloco #{height} attach via fallback (seq avançou)")
+                            log.info(
+                                f"[PBFT] bloco #{height} attach via fallback "
+                                f"(seq avançou)")
                     else:
-                        log.info("[PBFT] bloco #%d decidido com %d commit(s)", height, len(block.get("pbft_commits", [])))
+                        log.info("[PBFT] bloco #%d decidido com %d commit(s)",
+                                 height, len(block.get("pbft_commits", [])))
                 else:
-                    if BRN_PBFT_ENFORCE and (height >= BRN_PBFT_START_HEIGHT):
-                        log.warning(f"[PBFT] bloco #{height} NÃO decidido — descartando (ENFORCE=1)")
+                    if (BRN_PBFT_ENFORCE
+                            and height >= BRN_PBFT_START_HEIGHT):
+                        log.warning(f"[PBFT] bloco #{height} NÃO decidido — "
+                                    f"descartando (ENFORCE=1)")
                         return None
                     else:
-                        log.warning(f"[PBFT] bloco #{height} sem quórum PBFT — continuando via multi-sig (ENFORCE=0)")
+                        log.warning(f"[PBFT] bloco #{height} sem quórum PBFT — "
+                                    f"continuando via multi-sig (ENFORCE=0)")
             except Exception as e:
                 log.error("[PBFT] propose falhou para #%d: %s", height, e)
-                if BRN_PBFT_ENFORCE and (height >= BRN_PBFT_START_HEIGHT):
+                if (BRN_PBFT_ENFORCE
+                        and height >= BRN_PBFT_START_HEIGHT):
                     return None
 
         ok, msg = self.accept_block(block, validators=validators)
@@ -1540,8 +1640,9 @@ class Blockchain:
         return snap
 
 
-# [FIX CIRCULAR IMPORT] Imports lazy (só carrega quando necessário)
-def _reorg_to_method(self, new_blocks, max_depth=MAX_REORG_DEPTH, allow_genesis_reorg=False):
+# [FIX CIRCULAR IMPORT] Imports lazy
+def _reorg_to_method(self, new_blocks, max_depth=MAX_REORG_DEPTH,
+                     allow_genesis_reorg=False):
     try:
         from reorg import reorg_to as _reorg_to
         res = _reorg_to(self, new_blocks, max_depth, allow_genesis_reorg)
@@ -1549,12 +1650,14 @@ def _reorg_to_method(self, new_blocks, max_depth=MAX_REORG_DEPTH, allow_genesis_
     except ImportError as e:
         return False, f"reorg indisponivel: {e}"
 
+
 def _find_fork_method(self, remote_blocks, max_depth=1000):
     try:
         from reorg import find_fork_point as _find_fork
         return _find_fork(self, remote_blocks, max_depth)
     except ImportError:
         return -1
+
 
 def _verify_chain_method(self, full=True):
     try:
@@ -1567,12 +1670,14 @@ def _verify_chain_method(self, full=True):
             def to_dict(self): return {"valid": False, "errors": self.errors}
         return _FakeResult()
 
+
 def _verify_chain_dict_method(self):
     try:
         from chain_validator import verify_chain as _verify_ext
         return _verify_ext(self).to_dict()
     except ImportError as e:
         return {"valid": False, "errors": [f"chain_validator indisponivel: {e}"]}
+
 
 Blockchain.reorg_to = _reorg_to_method
 Blockchain.find_fork_point = _find_fork_method
