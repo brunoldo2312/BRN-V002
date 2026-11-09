@@ -523,7 +523,6 @@ def _integrate_wallet_at_boot(chain, wallet_obj, wallet_addr, wallet_pub,
     except Exception:
         pass
     if not sk_hex:
-        # fallback: re-lê do secure_store
         try:
             from secure_store import load_current_wallet
             w = load_current_wallet(used_pwd)
