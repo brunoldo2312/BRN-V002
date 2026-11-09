@@ -1,0 +1,585 @@
+#!/usr/bin/env python3
+"""
+test_validator_flow.py — Fluxo completo de validador + assinatura
+
+Simula o que a GUI faz quando o usuário desbloqueia a carteira:
+  1. Decifra current_wallet.enc (ou recria)
+  2. Instala a SK no nó (via /api/wallet/set_validator_sk)
+  3. Verifica se o trust reconhece a pubkey
+  4. Testa assinatura real (via sign_block no próprio nó)
+  5. Verifica se o bloco tip tem assinaturas suficientes
+
+Uso:
+    python test_validator_flow.py                    # diagnóstico + assinatura
+    python test_validator_flow.py --start-main       # sobe main.py se não estiver rodando
+    python test_validator_flow.py --fix-wallet       # recria carteira se estiver corrompida
+    python test_validator_flow.py --start-main --fix-wallet   # tudo
+    python test_validator_flow.py --no-install-sk    # não toca na SK (só verifica)
+
+Pré-requisitos:
+    - .env com BRN_WALLET_SESSION_PASS e BRN_NODE_PASSWORD
+    - current_wallet.enc (ou --fix-wallet para criar)
+    - main.py rodando (ou --start-main para subir)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# ─── Habilita ANSI no Windows cmd ───
+if sys.platform == "win32":
+    os.system("")
+
+# ─── Cores ───
+class C:
+    RESET = "\033[0m"
+    BOLD  = "\033[1m"
+    GREEN = "\033[92m"
+    YELLOW= "\033[93m"
+    RED   = "\033[91m"
+    CYAN  = "\033[96m"
+    GRAY  = "\033[90m"
+
+def ok(msg): print(f"  {C.GREEN}[OK]{C.RESET}   {msg}")
+def err(msg): print(f"  {C.RED}[X]{C.RESET}    {msg}")
+def warn(msg): print(f"  {C.YELLOW}[!]{C.RESET}    {msg}")
+def info(msg): print(f"  {C.CYAN}[i]{C.RESET}    {msg}")
+def skip(msg): print(f"  {C.GRAY}[skip]{C.RESET} {msg}")
+
+def hdr(txt):
+    print()
+    print(f"{C.CYAN}{'=' * 68}{C.RESET}")
+    print(f"{C.BOLD}{txt}{C.RESET}")
+    print(f"{C.CYAN}{'=' * 68}{C.RESET}")
+
+# ─── Bootstrap: cwd + .env ───
+BASE = Path(__file__).resolve().parent
+os.chdir(BASE)
+
+env_file = BASE / "brn_network.env"
+if env_file.exists():
+    for line in env_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+API = f"http://127.0.0.1:{os.environ.get('BRN_WEB_PORT', '5000')}"
+P2P_PORT = int(os.environ.get("BRN_P2P_PORT", "6001"))
+
+# ─── HTTP helpers (urllib sem proxy) ───
+def _http(method: str, path: str, body: dict | None = None, timeout: float = 5.0):
+    import urllib.request
+    url = API + path
+    data = None
+    headers = {"User-Agent": "brn-validator-test/1.0"}
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:
+        return -1, {"_error": str(e)}
+
+def http_get(path, timeout=5.0):
+    return _http("GET", path, timeout=timeout)
+
+def http_post(path, body, timeout=10.0):
+    return _http("POST", path, body, timeout=timeout)
+
+# ═══════════════════════════════════════════════════════════════
+# ETAPA 1 — Diagnóstico da carteira
+# ═══════════════════════════════════════════════════════════════
+def diagnose_wallet():
+    """
+    Retorna dict:
+      {"ok": bool, "password": str, "data": dict, "msg": str}
+    """
+    from secure_store import load_current_wallet
+
+    candidates = []
+    pw_session = os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
+    pw_node = os.environ.get("BRN_NODE_PASSWORD", "").strip()
+    if pw_session:
+        candidates.append(("BRN_WALLET_SESSION_PASS", pw_session))
+    if pw_node and pw_node != pw_session:
+        candidates.append(("BRN_NODE_PASSWORD", pw_node))
+    # Fallback histórico: a carteira pode ter sido criada com "gergerger"
+    candidates.append(("gergerger (legado)", "gergerger"))
+
+    for name, pw in candidates:
+        try:
+            r = load_current_wallet(pw)
+            if r.get("ok"):
+                return {
+                    "ok": True,
+                    "password": pw,
+                    "password_source": name,
+                    "data": r,
+                    "msg": "",
+                }
+        except Exception as e:
+            info(f"{name}: exceção — {e}")
+
+    return {
+        "ok": False,
+        "password": "",
+        "password_source": "",
+        "data": {},
+        "msg": "nenhuma senha do .env decifrou current_wallet.enc",
+    }
+
+def fix_wallet():
+    """Recria current_wallet.enc com a senha do .env (AVISO: muda o endereço)."""
+    from wallet import Wallet
+    from secure_store import (
+        save_current_wallet, CURRENT_WALLET_ENC, _DEFAULT_WALLET_SUB,
+    )
+
+    pw = (os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
+          or os.environ.get("BRN_NODE_PASSWORD", "").strip())
+    if not pw or len(pw) < 8:
+        return {"ok": False, "msg": "BRN_WALLET_SESSION_PASS/BRN_NODE_PASSWORD vazia ou <8 chars"}
+
+    # Backup do arquivo atual
+    backed = []
+    for p in [Path(CURRENT_WALLET_ENC), Path(str(_DEFAULT_WALLET_SUB))]:
+        if p.exists():
+            bak = p.with_name(p.name + ".before_fix.bak")
+            try:
+                shutil.copy2(p, bak)
+                backed.append(str(bak))
+            except Exception:
+                pass
+
+    w = Wallet()
+    data = {
+        "address": w.address,
+        "private_key": w.priv_hex,
+        "public_key": w.pub_hex,
+    }
+    r = save_current_wallet(pw, data)
+    if not r.get("ok"):
+        return {"ok": False, "msg": f"save falhou: {r.get('msg')}"}
+
+    return {
+        "ok": True,
+        "data": data,
+        "password": pw,
+        "backups": backed,
+    }
+
+# ═══════════════════════════════════════════════════════════════
+# ETAPA 2 — main.py: rodando? subir?
+# ═══════════════════════════════════════════════════════════════
+def is_main_running(timeout: float = 3.0) -> bool:
+    status, body = http_get("/health", timeout=timeout)
+    return status == 200 and isinstance(body, dict) and body.get("ok")
+
+def start_main(wait_s: float = 60.0):
+    """
+    Sobe main.py em subprocess e aguarda /health.
+    Retorna (proc, ok).
+    """
+    if is_main_running():
+        info("main.py já está rodando")
+        return None, True
+
+    print(f"  {C.CYAN}[i]{C.RESET}    subindo main.py --headless --client-mode...")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "main.py", "--headless", "--client-mode"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+                if sys.platform == "win32" else 0,
+        )
+    except Exception as e:
+        err(f"falha ao spawnar main.py: {e}")
+        return None, False
+
+    t0 = time.time()
+    while time.time() - t0 < wait_s:
+        if proc.poll() is not None:
+            # Processo morreu — imprime saída
+            out = proc.stdout.read().decode("utf-8", "replace") if proc.stdout else ""
+            err(f"main.py morreu (rc={proc.returncode})")
+            if out:
+                print(out[-2000:])
+            return proc, False
+        if is_main_running(timeout=1.0):
+            ok(f"main.py rodando (PID {proc.pid})")
+            return proc, True
+        time.sleep(1.0)
+
+    err(f"main.py não respondeu /health em {wait_s:.0f}s")
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    return proc, False
+
+def stop_main(proc):
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=10)
+        info(f"main.py encerrado")
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+# ═══════════════════════════════════════════════════════════════
+# ETAPA 3 — Instalar SK no nó (é o que a GUI faz)
+# ═══════════════════════════════════════════════════════════════
+def install_sk(wallet_data: dict):
+    sk_hex = wallet_data.get("private_key", "")
+    address = wallet_data.get("address", "")
+    pubkey = wallet_data.get("public_key", "")
+    if not sk_hex:
+        return {"ok": False, "msg": "wallet sem private_key"}
+    status, body = http_post(
+        "/api/wallet/set_validator_sk",
+        {"sk_hex": sk_hex, "address": address, "pubkey": pubkey},
+        timeout=15.0,
+    )
+    return body
+
+# ═══════════════════════════════════════════════════════════════
+# ETAPA 4 — Verificar trust + validadores ativos
+# ═══════════════════════════════════════════════════════════════
+def verify_trust(pubkey: str):
+    result = {
+        "in_trust": False,
+        "in_top5": False,
+        "is_connected": False,
+        "trust_score": 0,
+        "required_sigs": 0,
+        "validators_count": 0,
+    }
+    status, body = http_get("/api/trust/nodes?limit=50")
+    if status == 200 and isinstance(body, dict):
+        for n in body.get("nodes", []):
+            if (n.get("node_id") or "").lower() == pubkey.lower():
+                result["in_trust"] = True
+                result["trust_score"] = n.get("trust_score", 0)
+                result["is_connected"] = n.get("status") in ("connected", "trusted", "validator")
+                break
+
+    status, body = http_get("/api/consensus/validators")
+    if status == 200 and isinstance(body, dict):
+        result["required_sigs"] = int(body.get("required_sigs", 0) or 0)
+        vals = body.get("validators", [])
+        result["validators_count"] = len(vals)
+        for v in vals:
+            if (v.get("pubkey_full") or "").lower() == pubkey.lower():
+                result["in_top5"] = True
+                break
+
+    return result
+
+# ═══════════════════════════════════════════════════════════════
+# ETAPA 5 — Teste de assinatura real (via P2P loopback)
+# ═══════════════════════════════════════════════════════════════
+def test_sign_via_p2p():
+    """
+    Pede ao próprio nó para assinar o bloco tip via P2P.
+    Retorna dict: {"ok": bool, "pubkey": str, "error": str, "height": int}
+    """
+    # Pega o tip real via HTTP (não precisa abrir DB)
+    status, body = http_get("/api/latest")
+    if status != 200 or not isinstance(body, list) or not body:
+        return {"ok": False, "error": f"não consegui pegar /api/latest (status={status})"}
+
+    tip = body[0]
+    if not isinstance(tip, dict) or "hash" not in tip:
+        return {"ok": False, "error": "tip inválido em /api/latest"}
+
+    try:
+        from p2p_unified import P2PClient
+    except ImportError as e:
+        return {"ok": False, "error": f"p2p_unified: {e}"}
+
+    resp, latency = P2PClient.request_block_signature(
+        "127.0.0.1", P2P_PORT, tip, timeout=8.0,
+    )
+    if resp and resp.get("pubkey") and resp.get("signature"):
+        return {
+            "ok": True,
+            "pubkey": resp["pubkey"],
+            "signature": resp["signature"][:32] + "...",
+            "height": tip.get("height"),
+            "latency_ms": round(latency, 1),
+        }
+
+    # request_block_signature retorna None se recusou — pega o erro bruto
+    raw, _ = P2PClient.send_message(
+        "127.0.0.1", P2P_PORT,
+        {"type": "sign_block", "block": tip},
+        timeout=8.0,
+    )
+    error = (raw or {}).get("error", "sem resposta") if raw else "sem resposta"
+    return {
+        "ok": False,
+        "error": error,
+        "height": tip.get("height"),
+    }
+
+# ═══════════════════════════════════════════════════════════════
+# ETAPA 6 — Bloco tip tem assinaturas?
+# ═══════════════════════════════════════════════════════════════
+def verify_tip_sigs():
+    status, body = http_get("/api/latest")
+    if status != 200 or not isinstance(body, list) or not body:
+        return {"ok": False, "msg": f"/api/latest status={status}"}
+    tip = body[0]
+    sigs = tip.get("validators_sig", []) or []
+    return {
+        "ok": True,
+        "height": tip.get("height"),
+        "sigs_count": len(sigs),
+        "signers": [(s.get("pubkey") or "")[:16] + "..." for s in sigs],
+    }
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="test_validator_flow.py")
+    ap.add_argument("--start-main", action="store_true",
+                    help="sobe main.py --headless se não estiver rodando")
+    ap.add_argument("--fix-wallet", action="store_true",
+                    help="recria current_wallet.enc se não decifrar (muda endereço!)")
+    ap.add_argument("--no-install-sk", action="store_true",
+                    help="não chama /api/wallet/set_validator_sk")
+    ap.add_argument("--stop-after", action="store_true",
+                    help="mata o main.py ao final (se foi iniciado por este teste)")
+    args = ap.parse_args()
+
+    print(f"{C.BOLD}═{C.RESET} " * 34)
+    print(f"{C.BOLD} FLUXO DE VALIDADOR + ASSINATURA — {BASE}{C.RESET}")
+    print(f"{C.BOLD}═{C.RESET} " * 34)
+
+    falhas = 0
+    main_proc = None
+    started_by_us = False
+
+    # ═══════════════════════════════════════════════════════════
+    # ETAPA 1
+    # ═══════════════════════════════════════════════════════════
+    hdr("ETAPA 1 — Diagnóstico da carteira")
+    wdiag = diagnose_wallet()
+
+    if wdiag["ok"]:
+        data = wdiag["data"]
+        ok(f"carteira decifrada com {wdiag['password_source']}")
+        info(f"address: {data.get('address', '?')}")
+        info(f"pubkey:  {data.get('public_key', data.get('pub_hex', '?'))[:48]}...")
+        wallet_data = {
+            "address": data.get("address", ""),
+            "private_key": data.get("private_key", ""),
+            "public_key": data.get("public_key") or data.get("pub_hex", ""),
+        }
+    else:
+        err(wdiag["msg"])
+        falhas += 1
+
+        if not args.fix_wallet:
+            warn("Rode com --fix-wallet para recriar a carteira "
+                 "(⚠ muda o endereço). Abortando.")
+            return 1
+
+        info("Recriando carteira com --fix-wallet...")
+        fixr = fix_wallet()
+        if not fixr["ok"]:
+            err(f"recriação falhou: {fixr['msg']}")
+            return 1
+        ok("carteira recriada")
+        for b in fixr.get("backups", []):
+            info(f"backup: {b}")
+        wallet_data = fixr["data"]
+        info(f"NOVO address: {wallet_data['address']}")
+        info(f"NOVA pubkey:  {wallet_data['public_key']}")
+        warn("A pubkey ANTIGA não pode mais assinar. "
+             "Vai precisar promover a nova no trust.")
+
+    pubkey = wallet_data.get("public_key", "").lower()
+    if not pubkey:
+        err("wallet_data sem public_key")
+        return 1
+
+    # ═══════════════════════════════════════════════════════════
+    # ETAPA 2
+    # ═══════════════════════════════════════════════════════════
+    hdr("ETAPA 2 — main.py")
+
+    if is_main_running():
+        ok("main.py já está rodando")
+    else:
+        err("main.py não está rodando")
+        if not args.start_main:
+            warn("Rode com --start-main para subir automaticamente. Abortando.")
+            return 1
+
+        main_proc, started = start_main()
+        started_by_us = started
+        if not started:
+            err("não consegui subir o main.py")
+            return 1
+
+    status, health = http_get("/health")
+    if status != 200:
+        err(f"/health status={status}")
+        return 1
+
+    info(f"height={health.get('height')}, "
+         f"multisig_configured={health.get('multisig_configured')}, "
+         f"wallet_sk_installed={health.get('wallet_sk_installed')}, "
+         f"strict_multisig={health.get('strict_multisig')}")
+
+    # ═══════════════════════════════════════════════════════════
+    # ETAPA 3
+    # ═══════════════════════════════════════════════════════════
+    hdr("ETAPA 3 — Instalar SK no nó (o que a GUI faz)")
+
+    if args.no_install_sk:
+        skip("--no-install-sk passado")
+    else:
+        r = install_sk(wallet_data)
+        if r.get("ok"):
+            ok("SK instalada via /api/wallet/set_validator_sk")
+            info(f"multisig_configured={r.get('multisig_configured')}, "
+                 f"trust_synced={r.get('trust_synced')}, "
+                 f"pbft_activated={r.get('pbft_activated')}")
+            if health.get("strict_multisig") and not r.get("multisig_configured"):
+                err("STRICT_MULTISIG=1 e multisig_configured=False — servidor "
+                    "retornou ok=True indevidamente? Verifique logs.")
+                falhas += 1
+        else:
+            err(f"falha ao instalar SK: {r.get('msg', r)}")
+            falhas += 1
+
+    # Re-lê /health depois de instalar
+    status, health = http_get("/health")
+    if status == 200:
+        if health.get("wallet_sk_installed") is not True:
+            err("wallet_sk_installed=false após install")
+            falhas += 1
+        else:
+            ok("wallet_sk_installed=true")
+        if health.get("multisig_configured") is not True:
+            err("multisig_configured=false — brn_multisig não está sendo chamado")
+            falhas += 1
+        else:
+            ok("multisig_configured=true")
+
+    # ═══════════════════════════════════════════════════════════
+    # ETAPA 4
+    # ═══════════════════════════════════════════════════════════
+    hdr("ETAPA 4 — Trust + validadores")
+    t = verify_trust(pubkey)
+    info(f"required_sigs={t['required_sigs']}, "
+         f"validators_count={t['validators_count']}, "
+         f"in_trust={t['in_trust']}, in_top5={t['in_top5']}, "
+         f"score={t['trust_score']}, connected={t['is_connected']}")
+
+    if not t["in_trust"]:
+        err(f"pubkey {pubkey[:16]}... NÃO está em /api/trust/nodes")
+        warn("A carteira não está no trust. Vai precisar: ")
+        warn("  - chamar /api/bootstrap/add, ou")
+        warn("  - reiniciar o main.py para o sync_local_validator registrar, ou")
+        warn("  - rodar validator_manager.py --promote")
+        falhas += 1
+    else:
+        ok("pubkey está no trust")
+
+    if not t["in_top5"]:
+        err(f"pubkey NÃO está no top5 de /api/consensus/validators")
+        falhas += 1
+    else:
+        ok("pubkey está no top5 (validador ativo)")
+
+    # ═══════════════════════════════════════════════════════════
+    # ETAPA 5
+    # ═══════════════════════════════════════════════════════════
+    hdr("ETAPA 5 — Assinatura real via P2P loopback")
+
+    s = test_sign_via_p2p()
+    if s["ok"]:
+        ok(f"assinou bloco #{s['height']} em {s['latency_ms']}ms")
+        info(f"pubkey retornada: {s['pubkey'][:32]}...")
+        info(f"signature: {s['signature']}")
+        if s["pubkey"].lower() != pubkey:
+            err(f"pubkey da assinatura ≠ pubkey da carteira")
+            falhas += 1
+        else:
+            ok("pubkey da assinatura == pubkey da carteira")
+    else:
+        err(f"não assinou: {s.get('error')}")
+        falhas += 1
+        info("Possíveis causas:")
+        info("  - 'altura_fora' → race recovery (peers em altura diferente)")
+        info("  - 'sem_config' → _local_validator_sk não chegou")
+        info("  - 'nao_no_top5' → sua pubkey não está em get_top_validators()")
+        info("  - 'header_hash_diverge' → bloco inválido")
+
+    # ═══════════════════════════════════════════════════════════
+    # ETAPA 6
+    # ═══════════════════════════════════════════════════════════
+    hdr("ETAPA 6 — Bloco tip tem assinaturas?")
+    v = verify_tip_sigs()
+    if not v["ok"]:
+        err(v.get("msg"))
+    else:
+        info(f"bloco #{v['height']} tem {v['sigs_count']} sig(s)")
+        if v["sigs_count"] > 0:
+            ok(f"signers: {', '.join(v['signers'])}")
+        else:
+            warn("tip sem assinaturas — esperado se minerou antes da SK estar pronta")
+
+    # ═══════════════════════════════════════════════════════════
+    # VEREDITO
+    # ═══════════════════════════════════════════════════════════
+    hdr("VEREDITO")
+    if falhas == 0:
+        print(f"  {C.GREEN}{C.BOLD}✓ FLUXO COMPLETO OK{C.RESET}")
+        print()
+        print(f"  Carteira:  {wallet_data['address']}")
+        print(f"  Pubkey:    {wallet_data['public_key'][:48]}...")
+        print(f"  Validador: ativo (top5)")
+        print(f"  Assinatura: OK")
+        print()
+        print(f"  {C.GREEN}O nó está PRONTO para ser validador em rede.{C.RESET}")
+    else:
+        print(f"  {C.RED}{C.BOLD}✗ {falhas} falha(s) — o nó NÃO está pronto.{C.RESET}")
+
+    if started_by_us and args.stop_after:
+        stop_main(main_proc)
+    elif started_by_us:
+        print()
+        print(f"  {C.YELLOW}main.py ainda rodando (PID {main_proc.pid}).{C.RESET}")
+        print(f"  Para parar: {C.GRAY}Ctrl+C na janela do main ou `taskkill /F /PID {main_proc.pid}`{C.RESET}")
+    elif main_proc is None:
+        skip("main.py já estava rodando antes — não será encerrado")
+
+    return 0 if falhas == 0 else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print(f"\n{C.YELLOW}[!] Cancelado.{C.RESET}")
+        sys.exit(130)
