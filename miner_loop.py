@@ -1,11 +1,11 @@
 """
-miner_loop.py — Loop de mineração do BRN (v7.1)
+miner_loop.py — Loop de mineração do BRN (v7.2)
 ================================================================
-v7.1 (2026-11-08):
-  [NEW] _network_is_ready(): O minerador agora pausa se estiver
-        atrasado (esperando sync) ou se não houver quórum de
-        validadores online no Trust Network.
-  [KEEP] Toda a lógica de v7.0 (bootstrap, backoff, fila, forks).
+v7.2 (2026-11-09):
+  [NEW] Adicionado cálculo de Hashrate para Mineração Solo (Local).
+        Agora a GUI consegue exibir a velocidade (kH/s) baseada no
+        tempo gasto para encontrar o bloco e na dificuldade.
+  [KEEP] Toda a lógica de v7.1 (sync check, quórum, bootstrap, forks).
 ================================================================
 """
 import os
@@ -144,6 +144,10 @@ class Miner:
         self._bootstrap_lock = threading.Lock()
         self._last_queue_log = 0.0
         self._last_queue_value = -1
+        
+        # [NOVO v7.2] Variáveis de Hashrate
+        self.hashrate = 0.0
+        self.last_block_dt = 0.0
 
     def start(self, address, pubkey_hex="", is_origin: Optional[bool] = None):
         if self.running: return False, "ja rodando"
@@ -168,6 +172,8 @@ class Miner:
         self._fork_aborts_for_signal = False
         self._stop_evt.clear()
         self.running = True
+        self.hashrate = 0.0
+        self.last_block_dt = 0.0
 
         self._thread = threading.Thread(target=self._loop, daemon=True, name="Miner")
         self._thread.start()
@@ -207,18 +213,15 @@ class Miner:
             "fork_in_progress": forking, "bootstrap_status": status_msg,
             "rede_descentralizada": self.chain.rede_descentralizada, "is_origin": self.is_origin,
             "bootstrap_peers_tracked": n_peers, "bootstrap_peers_blocked": n_blocked,
+            # [NOVO v7.2] Hashrate no status
+            "hashrate_khs": round(self.hashrate / 1000.0, 2),
+            "hashrate": round(self.hashrate, 2),
         }
 
-    # ============================================================
-    # [NOVO v7.1] Verificação de Sincronização e Quórum
-    # ============================================================
     def _network_is_ready(self) -> tuple[bool, str]:
-        # 1. Verifica se a rede está sincronizada (não está atrasado)
         try:
             local_h = self.chain.db.height()
             max_peer_h = local_h
-
-            # Tenta obter a altura dos peers via P2P
             p2p = getattr(self.chain, "p2p", None)
             if p2p and hasattr(p2p, "discovery"):
                 peers = p2p.discovery.listar_peers_com_altura()
@@ -226,20 +229,15 @@ class Miner:
                     for p in peers:
                         h = int(p.get("height", 0) or 0)
                         if h > max_peer_h: max_peer_h = h
-
-            # Se estiver mais de 2 blocos atrás do maior peer, pausa a mineração
             if max_peer_h > local_h + 2:
                 return False, f"Sincronizando (Local: {local_h}, Rede: {max_peer_h})"
         except Exception as e:
             _log_dbg(f"Falha ao checar altura dos peers: {e}")
 
-        # 2. Verifica se há validadores suficientes online para atingir o quórum
         try:
             validators = self.chain._get_active_validators()
             if validators:
                 required = self.chain._required_signatures(validators)
-                
-                # Conta quantos validadores estão marcados como connected na Trust
                 trust = getattr(self.chain, "trust_net", None)
                 if trust and hasattr(trust, "nodes"):
                     online_validators = 0
@@ -247,7 +245,6 @@ class Miner:
                         node = trust.nodes.get(pk)
                         if node and getattr(node, "connected", False):
                             online_validators += 1
-                    
                     if online_validators < required:
                         return False, f"Sem quórum para minerar (Validadores online: {online_validators}/{required})"
         except Exception as e:
@@ -398,7 +395,6 @@ class Miner:
                     if self._stop_evt.is_set(): break
                     continue
 
-                # [NOVO v7.1] Verifica sincronização e quórum antes de minerar
                 ready, reason = self._network_is_ready()
                 if not ready:
                     self.last_error = reason
@@ -406,11 +402,24 @@ class Miner:
                     if self._stop_evt.wait(5.0): break
                     continue
 
-                # Se chegou aqui, a rede está pronta
-                self.last_error = "" # Limpa o erro se estava pausado
+                self.last_error = ""
+                
+                # [NOVO v7.2] Início da contagem de tempo para o Hashrate
+                _t0 = time.time()
+                
                 block = self.chain.mine_block_interruptible(
                     self.address, self.pubkey, should_continue=self._should_continue,
                 )
+                
+                # [NOVO v7.2] Cálculo do Hashrate após minerar
+                if block is not None:
+                    _dt = time.time() - _t0
+                    self.last_block_dt = _dt
+                    if _dt > 0:
+                        diff = block.get("difficulty", self.chain.current_difficulty())
+                        # 16^diff é a média de tentativas para achar o bloco
+                        expected_hashes = 16 ** diff
+                        self.hashrate = expected_hashes / _dt
 
                 if block is None:
                     if self._stop_evt.is_set(): break
