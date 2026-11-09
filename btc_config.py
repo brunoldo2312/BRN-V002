@@ -1,10 +1,9 @@
 # ============================================================
 # btc_config.py — Configuração da ponte BTC ↔ BRN
-# v3 (2026-11-05):
+# v3.1 (2026-11-09):
+#   - Lê o brn_network.env automaticamente se rodado via terminal.
+#   - Define as RPCs (APIs da rede Bitcoin) baseadas na rede escolhida.
 #   - Nenhum endereço BTC/BRN hardcoded no arquivo.
-#   - Endereços vêm de (em ordem de prioridade):
-#       1. Variável de ambiente (BRN_BTC_RECEIVE_ADDRESS / BRN_TREASURY_ADDRESS)
-#       2. Arquivo btc_config_local.json (fora do git)
 #   - WIF NUNCA é hardcoded. Vem de btc_wif.enc (cifrado) ou env.
 # ============================================================
 from __future__ import annotations
@@ -15,10 +14,23 @@ from pathlib import Path
 BASE_DIR       = Path(__file__).resolve().parent
 _CONFIG_FILE   = BASE_DIR / "btc_config_local.json"
 _WIF_FILE      = BASE_DIR / "btc_wif.enc"
-
+_ENV_FILE      = BASE_DIR / "brn_network.env"
 
 # ============================================================
-# Carregar btc_config_local.json (se existir)
+# 0. Carrega o .env automaticamente (caso rode o script direto)
+# ============================================================
+if _ENV_FILE.exists():
+    try:
+        for line in _ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    except Exception as e:
+        print(f"[btc_config] aviso: falha ao ler .env ({e})")
+
+# ============================================================
+# 1. Carregar btc_config_local.json (se existir)
 # ============================================================
 def _load_local() -> dict:
     if not _CONFIG_FILE.exists():
@@ -31,9 +43,7 @@ def _load_local() -> dict:
         print(f"[btc_config] aviso: {_CONFIG_FILE.name} invalido ({e})")
         return {}
 
-
 _LOCAL = _load_local()
-
 
 def _get(name: str, local_key: str, default: str = "") -> str:
     """
@@ -47,9 +57,8 @@ def _get(name: str, local_key: str, default: str = "") -> str:
         return v
     return default
 
-
 # ============================================================
-# Endereços (sem hardcode — vêm de env ou JSON)
+# 2. Endereços (sem hardcode — vêm de env ou JSON)
 # ============================================================
 BTC_RECEIVE_ADDRESS = _get(
     "BRN_BTC_RECEIVE_ADDRESS",
@@ -72,9 +81,8 @@ BTC_NETWORK = _get(
 if BTC_NETWORK not in ("mainnet", "testnet"):
     BTC_NETWORK = "testnet"
 
-
 # ============================================================
-# WIF (SECRETA — nunca hardcoded)
+# 3. WIF (SECRETA — nunca hardcoded)
 # ============================================================
 def _load_wif() -> str:
     # 1) env var (compat)
@@ -101,21 +109,18 @@ def _load_wif() -> str:
 
     return ""
 
-
 BTC_WIF = _load_wif()
 
-
 # ============================================================
-# OFFRAMP (BRN → BTC)
+# 4. OFFRAMP (BRN → BTC)
 # ============================================================
 MIN_OFFRAMP_BRN_SATS = int(_get("BRN_OFFRAMP_MIN_BRN_SATS", "_", "10000000"))
 MAX_OFFRAMP_BRN_SATS = int(_get("BRN_OFFRAMP_MAX_BRN_SATS", "_", "10000000000"))
 MIN_OFFRAMP_BTC_SATS = int(_get("BRN_OFFRAMP_MIN_BTC_SATS", "_", "5000"))
 OFFRAMP_TTL_S        = int(_get("BRN_OFFRAMP_TTL_S",        "_", "1800"))
 
-
 # ============================================================
-# ONRAMP (BTC → BRN)
+# 5. ONRAMP (BTC → BRN)
 # ============================================================
 BRN_PER_BTC           = int(_get("BRN_PER_BTC",              "_", "10000"))
 FEE_PERCENT           = float(_get("BRN_L2_FEE_PERCENT",     "_", "2.0"))
@@ -126,14 +131,19 @@ MAX_BTC_SATS          = int(_get("BRN_L2_MAX_BTC_SATS",      "_", "100000000"))
 # Poll do watcher (segundos)
 BTC_POLL_INTERVAL     = int(_get("BRN_BTC_POLL_INTERVAL",    "_", "30"))
 
-
 # ============================================================
-# RPCs (endpoints públicos — não são segredo)
+# 6. RPCs (Endpoints públicos — dependem da rede)
 # ============================================================
-_default_rpcs = (
-    "https://blockstream.info/testnet/api,"
-    "https://mempool.space/testnet/api"
-)
+if BTC_NETWORK == "mainnet":
+    _default_rpcs = (
+        "https://blockstream.info/api,"
+        "https://mempool.space/api"
+    )
+else:
+    _default_rpcs = (
+        "https://blockstream.info/testnet/api,"
+        "https://mempool.space/testnet/api"
+    )
 
 BTC_RPCS = [
     x.strip()
@@ -141,9 +151,8 @@ BTC_RPCS = [
     if x.strip()
 ]
 
-
 # ============================================================
-# Validação de config no import (falha cedo se algo crítico falta)
+# 7. Validação de config no import (falha cedo se algo crítico falta)
 # ============================================================
 def validate() -> dict:
     """
@@ -183,10 +192,12 @@ def validate() -> dict:
 
     return {"ok": not errors, "errors": errors, "warnings": warnings}
 
-
+# ============================================================
+# 8. Execução direta (diagnóstico)
+# ============================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print(" btc_config.py — status")
+    print(" btc_config.py — status (v3.1)")
     print("=" * 60)
     print(f"BTC_RECEIVE_ADDRESS : {BTC_RECEIVE_ADDRESS or '(VAZIO)'}")
     print(f"BRN_TREASURY_ADDRESS: {BRN_TREASURY_ADDRESS or '(VAZIO)'}")
