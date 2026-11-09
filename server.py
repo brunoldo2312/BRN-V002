@@ -1,27 +1,38 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.26)
+server.py — Backend HTTP do nó BRN (v9.9.27)
 ================================================================
-v9.9.26 (2026-11-09) — INTEGRAÇÃO AUTOMÁTICA:
-  [NEW] api_wallet_set_validator_sk() agora usa
-        wallet_integrator.integrate() como ponto único. Retorna
-        status detalhado: sk_installed, in_trust, in_top5,
-        multisig_ready, pbft_ready, warnings, errors.
-        A GUI pode mostrar "✓ Multisig: OK" / "✗ Trust: falhou"
-        em vez de um "OK" fake.
-  [NEW] persist_sk_for_reboot(): re-salva current_wallet.enc após
-        integrar, para o próximo boot do main.py já carregar
-        automaticamente. Sem isso, o operador tinha que rodar
-        --fix-wallet a cada restart.
-  [FIX] Retorna HTTP 500 quando STRICT_MULTISIG=1 e multisig não
-        configurou. Antes, retornava 200 com ok=True.
+v9.9.27 (2026-11-09) — AUTO-REGISTER DE CLIENTES NOVOS:
+  [NEW] /api/trust/register — cliente novo auto-registra no Origin
+        com prova de posse (assinatura sobre
+        BRN-TRUST-REGISTER|pubkey|timestamp). Origin valida e
+        adiciona com score=500 (provisório). Se o cliente não
+        estiver no Origin, retorna 307 redirect com a URL correta.
+  [NEW] /api/trust/promote_self — cliente pede ao Origin para
+        subir 500→1000 após atingir BRN_AUTO_PROMOTE_MIN_BLOCKS
+        (default 10) blocos assinados. Fallback caso o Origin
+        não tenha trust_network.py v3.11 (que promove no
+        record_block_signed).
+  [KEEP] v9.9.26: wallet_integrator, persist_sk_for_reboot.
   [KEEP] v9.9.25: trust_download assinado, proxy timeout 30s,
         bootstrap_add valida pubkey 66 hex.
+  [KEEP] v9.9.24: api_wallet_set_validator_sk reconfigura multisig.
+  [KEEP] v9.9.23: /api/trust/download.
+
+v9.9.26 (2026-11-09):
+  [NEW] api_wallet_set_validator_sk usa wallet_integrator.integrate()
+        como ponto único. Retorna status detalhado.
+  [NEW] persist_sk_for_reboot() re-salva current_wallet.enc.
+
 v9.9.25 (2026-11-08):
   [FIX] trust_download recusa payload sem assinatura.
   [FIX] api_wallet_set_validator_sk retorna 500 com STRICT.
-  [FIX] _proxy_pool_request: timeout 100s → 30s.
+  [FIX] _proxy_pool_request timeout 100s → 30s.
+  [FIX] bootstrap_add valida pubkey 66 hex.
+  [FIX] _notify_bootstrap_peers parsing do endpoint.
+
 v9.9.24 (2026-11-05):
   [FIX] api_wallet_set_validator_sk reconfigura multisig.
+
 v9.9.23 (2026-11-05):
   [NEW] /api/trust/download.
 ================================================================
@@ -168,7 +179,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
                 headers={"Content-Type": "application/json",
-                         "User-Agent": "brn-server/9.9.26"},
+                         "User-Agent": "brn-server/9.9.27"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -1285,15 +1296,18 @@ def pool_stop_local():
 
 
 # ============================================================
-# WALLET — integração completa [v9.9.26]
+# WALLET — integração completa
 # ============================================================
 @app.route("/api/wallet/set_validator_sk", methods=["POST"])
 def api_wallet_set_validator_sk():
     """
-    [v9.9.26] Usa wallet_integrator.integrate() — ponto único.
+    [v9.9.26+] Usa wallet_integrator.integrate() — ponto único.
     Retorna status detalhado: sk_installed, in_trust, in_top5,
-    multisig_ready, pbft_ready, warnings, errors.
-    A GUI pode mostrar cada item (em vez de "OK" fake).
+    multisig_ready, pbft_ready, warnings, errors, persisted.
+
+    [v9.9.27] wallet_integrator.integrate() agora chama
+    /api/trust/register internamente, fazendo o auto-register
+    no Origin se necessário.
     """
     try:
         data = request.get_json(force=True) or {}
@@ -1335,7 +1349,6 @@ def api_wallet_set_validator_sk():
             )
             return jsonify(r), http_status
 
-        # Persiste SK para o próximo reboot
         if password:
             try:
                 r["persisted"] = persist_sk_for_reboot(sk_hex, password)
@@ -1351,11 +1364,11 @@ def api_wallet_set_validator_sk():
 
         log.info(
             "[wallet_sk] integração OK — pk=%s… sk=%s trust=%s "
-            "top5=%s multisig=%s pbft=%s persisted=%s",
+            "top5=%s multisig=%s pbft=%s registered=%s persisted=%s",
             r.get("pubkey", "")[:16],
             r.get("sk_installed"), r.get("in_trust"), r.get("in_top5"),
             r.get("multisig_ready"), r.get("pbft_ready"),
-            r.get("persisted"),
+            r.get("trust_registered"), r.get("persisted"),
         )
 
         return jsonify(r), 200
@@ -1389,6 +1402,264 @@ def trust_stats():
             return jsonify({"ok": True, **trust.get_network_stats()})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+# ============================================================
+# [v9.9.27] NOVO: /api/trust/register
+# ============================================================
+@app.route("/api/trust/register", methods=["POST"])
+def trust_register():
+    """
+    [v9.9.27] Cliente novo auto-registra no trust do Origin.
+
+    Prova de posse: cliente assina (BRN-TRUST-REGISTER|pubkey|timestamp)
+    com a SK correspondente à pubkey. Origin verifica antes de aceitar.
+
+    Body:
+      {
+        "pubkey": "0..." (66 hex),
+        "address": "brn1...",
+        "timestamp": <unix>,
+        "signature": "<sig hex da payload>"
+      }
+
+    Retorna:
+      - 200 {ok: True, is_new, score, will_promote_after} se Origin aceitou
+      - 307 {redirect: <origin_url>} se este nó não é Origin
+      - 400/403 em erro de validação
+      - 500 em erro interno
+    """
+    import time as _time
+
+    try:
+        data = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({"ok": False, "msg": "JSON inválido"}), 400
+
+    pubkey = (data.get("pubkey") or "").strip().lower()
+    address = (data.get("address") or "").strip()
+    ts_raw = data.get("timestamp")
+    sig = (data.get("signature") or "").strip()
+
+    # ─── 1. Valida formato ───
+    if not pubkey or len(pubkey) != 66:
+        return jsonify({
+            "ok": False,
+            "msg": "pubkey deve ser 66 hex",
+        }), 400
+    try:
+        int(pubkey, 16)
+    except ValueError:
+        return jsonify({"ok": False, "msg": "pubkey não é hex"}), 400
+
+    if not sig or len(sig) != 128:
+        return jsonify({
+            "ok": False,
+            "msg": "signature deve ser 128 hex",
+        }), 400
+    try:
+        int(sig, 16)
+    except ValueError:
+        return jsonify({"ok": False, "msg": "signature não é hex"}), 400
+
+    try:
+        ts = int(ts_raw)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "msg": "timestamp inválido"}), 400
+
+    # ─── 2. Anti-replay: timestamp nos últimos 5 min ───
+    now = int(_time.time())
+    if abs(now - ts) > 300:
+        return jsonify({
+            "ok": False,
+            "msg": f"timestamp expirado (diferença {abs(now-ts)}s, máx 300s)",
+        }), 400
+
+    # ─── 3. Verifica prova de posse ───
+    payload = f"BRN-TRUST-REGISTER|{pubkey}|{ts}".encode()
+    try:
+        if not Wallet.verify(payload, sig, pubkey):
+            log.warning(
+                "[trust_register] assinatura INVÁLIDA de %s (timestamp=%d)",
+                pubkey[:16], ts,
+            )
+            return jsonify({
+                "ok": False,
+                "msg": "assinatura não corresponde à pubkey",
+            }), 403
+    except Exception as e:
+        log.warning("[trust_register] verify exceção: %s", e)
+        return jsonify({"ok": False, "msg": f"verify: {e}"}), 400
+
+    # ─── 4. Este nó é Origin? ───
+    trust = _get_trust_network()
+    if trust is None:
+        return jsonify({"ok": False, "msg": "trust indisponível"}), 503
+
+    is_origin = bool(getattr(trust, "is_origin", False))
+    if not is_origin:
+        pool_url = (os.environ.get("BRN_POOL_URL", "") or "").rstrip("/")
+        if pool_url and pool_url.startswith("http"):
+            log.info(
+                "[trust_register] cliente redirecionando para Origin %s",
+                pool_url,
+            )
+            return jsonify({
+                "ok": False,
+                "msg": f"este nó não é Origin — registre em {pool_url}",
+                "redirect": pool_url,
+            }), 307
+        return jsonify({
+            "ok": False,
+            "msg": "este nó não é Origin e BRN_POOL_URL não está configurada",
+        }), 503
+
+    # ─── 5. Registra no trust ───
+    try:
+        if not hasattr(trust, "register_new_validator"):
+            log.error(
+                "[trust_register] trust_network.py não tem "
+                "register_new_validator — atualize para v3.11+"
+            )
+            return jsonify({
+                "ok": False,
+                "msg": "trust_network.py antigo (v3.11+ necessário)",
+            }), 500
+
+        r = trust.register_new_validator(
+            pubkey=pubkey,
+            address=address,
+            initial_score=float(os.environ.get("BRN_NEW_CLIENT_SCORE", "500")),
+        )
+        if not r.get("ok"):
+            return jsonify(r), 400
+
+        log.info(
+            "[trust_register] OK — pubkey=%s… is_new=%s score=%.0f "
+            "blocks_signed=%d will_promote_after=%d",
+            pubkey[:16],
+            r.get("is_new"), r.get("score", 0),
+            r.get("blocks_signed", 0),
+            r.get("will_promote_after", 0),
+        )
+        return jsonify(r), 200
+    except Exception as e:
+        log.exception("[trust_register] register_new_validator falhou: %s", e)
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+# ============================================================
+# [v9.9.27] NOVO: /api/trust/promote_self
+# ============================================================
+@app.route("/api/trust/promote_self", methods=["POST"])
+def trust_promote_self():
+    """
+    [v9.9.27] Cliente pede ao Origin para subir o próprio score.
+
+    Útil quando o cliente já assinou >= 10 blocos mas o Origin ainda
+    não auto-promoveu (ex: trust_network.py antigo no Origin).
+
+    Valida prova de posse como /api/trust/register.
+
+    Body:
+      {
+        "pubkey": "0..." (66 hex),
+        "timestamp": <unix>,
+        "signature": "<sig hex de BRN-TRUST-PROMOTE|pubkey|timestamp>"
+      }
+
+    Retorna:
+      - 200 {ok: True, old_score, new_score, blocks_signed}
+      - 400 se blocks_signed < threshold
+      - 403 se assinatura inválida ou nó não é Origin
+      - 404 se pubkey não registrada
+    """
+    import time as _time
+
+    data = request.get_json(force=True) or {}
+    pubkey = (data.get("pubkey") or "").strip().lower()
+    sig = (data.get("signature") or "").strip()
+    try:
+        ts = int(data.get("timestamp", 0))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "msg": "timestamp inválido"}), 400
+
+    if not pubkey or len(pubkey) != 66:
+        return jsonify({"ok": False, "msg": "pubkey inválida"}), 400
+    try:
+        int(pubkey, 16)
+    except ValueError:
+        return jsonify({"ok": False, "msg": "pubkey não é hex"}), 400
+
+    now = int(_time.time())
+    if abs(now - ts) > 300:
+        return jsonify({"ok": False, "msg": "timestamp expirado"}), 400
+
+    payload = f"BRN-TRUST-PROMOTE|{pubkey}|{ts}".encode()
+    try:
+        if not Wallet.verify(payload, sig, pubkey):
+            return jsonify({
+                "ok": False,
+                "msg": "assinatura inválida",
+            }), 403
+    except Exception as e:
+        return jsonify({"ok": False, "msg": f"verify: {e}"}), 400
+
+    trust = _get_trust_network()
+    if trust is None:
+        return jsonify({"ok": False, "msg": "trust indisponível"}), 503
+
+    if not bool(getattr(trust, "is_origin", False)):
+        return jsonify({
+            "ok": False,
+            "msg": "só o Origin pode promover",
+        }), 403
+
+    n = trust.nodes.get(pubkey)
+    if n is None:
+        return jsonify({
+            "ok": False,
+            "msg": "pubkey não registrada — chame /api/trust/register primeiro",
+        }), 404
+
+    try:
+        from trust_network import AUTO_PROMOTE_MIN_BLOCKS, AUTO_PROMOTE_SCORE
+    except ImportError:
+        AUTO_PROMOTE_MIN_BLOCKS = 10
+        AUTO_PROMOTE_SCORE = 1000.0
+
+    if n.blocks_signed < AUTO_PROMOTE_MIN_BLOCKS:
+        return jsonify({
+            "ok": False,
+            "msg": f"precisa de {AUTO_PROMOTE_MIN_BLOCKS} blocos assinados, "
+                   f"tem {n.blocks_signed}",
+            "blocks_signed": n.blocks_signed,
+            "required": AUTO_PROMOTE_MIN_BLOCKS,
+        }), 400
+
+    old = n.trust_score
+    n.trust_score = AUTO_PROMOTE_SCORE
+    n.update_trust_level()
+    n.is_validator = True
+    if not n.validator_since:
+        n.validator_since = _time.time()
+    trust._mark_dirty()
+    try:
+        trust.flush()
+    except Exception:
+        pass
+
+    log.info(
+        "[trust_promote_self] %s… promovido %.0f → %.0f (blocks_signed=%d)",
+        pubkey[:16], old, AUTO_PROMOTE_SCORE, n.blocks_signed,
+    )
+    return jsonify({
+        "ok": True,
+        "pubkey": pubkey,
+        "old_score": old,
+        "new_score": n.trust_score,
+        "blocks_signed": n.blocks_signed,
+    })
 
 
 @app.route("/api/trust/download", methods=["GET"])
@@ -1487,6 +1758,7 @@ def trust_nodes():
                     "trust_score": getattr(n, "trust_score", 0),
                     "status": status,
                     "last_seen": getattr(n, "last_seen", 0),
+                    "blocks_signed": getattr(n, "blocks_signed", 0),
                 })
         else:
             for pubkey, data in trust.peers.items():
@@ -1497,6 +1769,7 @@ def trust_nodes():
                     "trust_score": data.get("score", 0),
                     "status": data.get("status", "new"),
                     "last_seen": 0,
+                    "blocks_signed": 0,
                 })
 
         nodes.sort(key=lambda x: x.get("trust_score", 0), reverse=True)
@@ -1591,7 +1864,7 @@ def health():
         return jsonify({
             "ok": True,
             "height": chain.db.height(),
-            "version": "9.9.26",
+            "version": "9.9.27",
             "chain_injected": _CHAIN is not None,
             "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
@@ -1764,6 +2037,7 @@ def consensus_validators():
                     "trust_score": round(getattr(n, "trust_score", 0), 1),
                     "trust_level": getattr(n, "trust_level", "new"),
                     "connected": getattr(n, "connected", False),
+                    "blocks_signed": getattr(n, "blocks_signed", 0),
                 })
         validators.sort(key=lambda x: -x["trust_score"])
 
@@ -1857,5 +2131,5 @@ def api_tx_status(txid_str):
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print("BRN Server v9.9.26 (wallet_integrator + persistência pós-reboot)")
+    print("BRN Server v9.9.27 (auto-register trust + promote_self)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
