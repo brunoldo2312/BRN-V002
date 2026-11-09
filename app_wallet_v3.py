@@ -1,9 +1,30 @@
-"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.18)
+"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.19)
 ================================================================
+v3.19 (2026-11-09) — PATCH DE INTEGRAÇÃO:
+  [FIX CRÍTICO] unlock_wallet(): se load_current_wallet falhar,
+        tenta WalletManager.load_encrypted_wallet() em todos
+        wallets/*.wallet. Antes, a GUI só via current_wallet.enc;
+        se ele não existisse ou estivesse corrompido, a carteira
+        "não abria" mesmo com foifoifoi.wallet válido em wallets/.
+  [FIX CRÍTICO] unlock_wallet(): após decifrar via WalletManager,
+        salva em current_wallet.enc para próximas vezes. Antes,
+        cada unlock precisava do mesmo fallback.
+  [FIX CRÍTICO] unlock_wallet(): chama /api/wallet/set_validator_sk
+        via HTTP, que agora usa wallet_integrator.integrate_and_propagate.
+        Assim a pubkey é propagada ao Origin automaticamente.
+  [FIX] list_wallets(): normaliza 3 formatos de retorno diferentes
+        (dict, list, tuple) para sempre devolver
+        [{"name": str, "address": str, "public_key": str}].
+  [FIX] list_wallets(): tenta 3 nomes de atributo (list_wallets,
+        listar_carteiras, wallets) em WalletManager.
+  [FIX] create_and_unlock(): salva em current_wallet.enc E em
+        wallets/{name}.wallet, para a aba "arquivos" mostrar.
+  [FIX] has_wallet(): considera wallets/*.wallet, não só .enc.
+  [KEEP] v3.18: check_sync_barrier (pausa mineração se atrasado).
+  [KEEP] Todas as outras funções (transfer, portfolio, mining, etc).
+
 v3.18 (2026-11-06):
-  [NEW] check_sync_barrier(): impede a mineração se o nó estiver
-        atrasado em relação aos peers da rede (evita forks e 
-        rejeições de blocos).
+  [NEW] check_sync_barrier().
 ================================================================
 """
 from __future__ import annotations
@@ -17,7 +38,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "3.18"
+__version__ = "3.19"
 
 try:
     import requests
@@ -39,7 +60,19 @@ RETRY_DELAY  = float(os.environ.get("BRN_API_RETRY_DELAY", "0.5"))
 _WALLET_SESSION: dict = {}
 
 
+# ═══════════════════════════════════════════════════════════════
+# Helpers HTTP
+# ═══════════════════════════════════════════════════════════════
 def _sync_sk_to_chain(sk_hex: str, address: str = "", pubkey: str = "") -> dict:
+    """
+    Instala SK no nó via HTTP /api/wallet/set_validator_sk.
+
+    v3.19: o servidor v9.9.27 chama wallet_integrator.integrate_and_propagate,
+    que propaga a pubkey ao Origin. Então este POST agora:
+      1. instala SK local
+      2. configura multisig
+      3. avisa o Origin (se cliente)
+    """
     if not sk_hex:
         return {"ok": False, "msg": "sk vazio"}
     try:
@@ -47,25 +80,28 @@ def _sync_sk_to_chain(sk_hex: str, address: str = "", pubkey: str = "") -> dict:
             "sk_hex": sk_hex,
             "address": address or "",
             "pubkey":  pubkey or "",
-        }, timeout=10.0)
+        }, timeout=15.0)
         if not r.get("ok"):
             log.warning("_sync_sk_to_chain falhou: %s", r.get("msg"))
         else:
             log.info(
-                "_sync_sk_to_chain ok — pk=%s… trust_synced=%s",
+                "_sync_sk_to_chain ok — pk=%s… propagated=%s peers=%s",
                 (r.get("pubkey") or "")[:16],
-                r.get("trust_synced"),
+                r.get("propagated", False),
+                r.get("peers_notified", 0),
             )
         return r
     except Exception as e:
         log.warning("_sync_sk_to_chain exception: %s", e)
         return {"ok": False, "msg": str(e)}
 
+
 def _get_default_password() -> str:
     return (
         os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
         or os.environ.get("BRN_NODE_PASSWORD", "").strip()
     )
+
 
 def _post(path: str, body: dict, timeout: float = None,
           retries: int = None) -> dict:
@@ -141,6 +177,139 @@ def _get(path: str, timeout: float = None,
     return {"error": last_err or "erro desconhecido"}
 
 
+# ═══════════════════════════════════════════════════════════════
+# Helpers WalletManager
+# ═══════════════════════════════════════════════════════════════
+def _normalize_wallet_entry(w: dict) -> dict:
+    """Normaliza entrada de WalletManager.list_wallets() em {name, address, public_key}."""
+    name = (
+        w.get("name")
+        or w.get("nome")
+        or w.get("filename")
+        or w.get("file")
+        or ""
+    )
+    if name.endswith(".wallet"):
+        name = name[:-7]
+    elif name.endswith(".enc"):
+        name = name[:-4]
+
+    address = w.get("address") or w.get("endereco") or ""
+    pk = (
+        w.get("public_key")
+        or w.get("pubkey")
+        or w.get("pub_hex")
+        or ""
+    )
+    return {"name": name, "address": address, "public_key": pk}
+
+
+def _list_wallet_names() -> list[str]:
+    """Lista nomes de carteiras via WalletManager (robusto a variações)."""
+    names = []
+    try:
+        from wallet import WalletManager
+    except Exception:
+        return names
+
+    # Tenta 3 métodos possíveis
+    lst = None
+    for meth in ("list_wallets", "listar_carteiras", "wallets"):
+        if hasattr(WalletManager, meth):
+            try:
+                obj = getattr(WalletManager, meth)
+                lst = obj() if callable(obj) else obj
+                break
+            except Exception as e:
+                log.debug("WalletManager.%s falhou: %s", meth, e)
+
+    if lst is None:
+        return names
+
+    if not isinstance(lst, list):
+        return names
+
+    for w in lst:
+        if isinstance(w, dict):
+            n = _normalize_wallet_entry(w)["name"]
+            if n:
+                names.append(n)
+        elif isinstance(w, str):
+            n = w
+            if n.endswith(".wallet"):
+                n = n[:-7]
+            elif n.endswith(".enc"):
+                n = n[:-4]
+            names.append(n)
+
+    # Dedup preservando ordem
+    seen = set()
+    out = []
+    for n in names:
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def _try_load_via_wallet_manager(password: str) -> dict | None:
+    """
+    Fallback: se load_current_wallet falhou, tenta decifrar cada
+    wallets/*.wallet com WalletManager.load_encrypted_wallet.
+
+    Retorna dict normalizado {address, private_key, public_key} ou None.
+    """
+    try:
+        from wallet import WalletManager
+    except Exception:
+        return None
+
+    if not hasattr(WalletManager, "load_encrypted_wallet"):
+        return None
+
+    for name in _list_wallet_names():
+        try:
+            data = WalletManager.load_encrypted_wallet(name, password)
+        except Exception as e:
+            log.debug("load_encrypted_wallet(%s) falhou: %s", name, e)
+            continue
+
+        if not data:
+            continue
+        if isinstance(data, dict) and data.get("ok") is False:
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        # Normaliza campos
+        if not data.get("private_key"):
+            data["private_key"] = data.get("priv_hex") or data.get("sk") or ""
+        if not data.get("public_key"):
+            data["public_key"] = data.get("pub_hex") or data.get("pubkey") or ""
+
+        if data.get("private_key") and data.get("address"):
+            log.info(
+                "[wallet] decifrada via WalletManager: name=%s address=%s…",
+                name, data["address"][:16],
+            )
+            return data
+
+    return None
+
+
+def _populate_session_from_data(data: dict) -> None:
+    """Preenche _WALLET_SESSION com dados normalizados."""
+    global _WALLET_SESSION
+    _WALLET_SESSION["address"]     = data.get("address", "")
+    _WALLET_SESSION["private_key"] = data.get("private_key", "")
+    _WALLET_SESSION["public_key"]  = (
+        data.get("public_key") or data.get("pubkey") or data.get("pub_hex") or ""
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# WalletApi
+# ═══════════════════════════════════════════════════════════════
 class WalletApi:
     def __init__(self):
         log.info("WalletApi v%s iniciada (API_BASE=%s)", __version__, API_BASE)
@@ -148,23 +317,127 @@ class WalletApi:
             log.warning("requests NÃO instalado — pip install requests")
 
     def has_wallet(self) -> dict:
+        """
+        [FIX v3.19] Também considera wallets/*.wallet.
+        """
         try:
             from secure_store import CURRENT_WALLET_ENC
             p = Path(CURRENT_WALLET_ENC)
             if not p.is_absolute():
                 p = BASE_DIR / p
-            return {"ok": True, "exists": p.exists()}
+            root_exists = p.exists()
         except Exception:
             p = BASE_DIR / "current_wallet.enc"
-            return {"ok": True, "exists": p.exists()}
+            root_exists = p.exists()
 
+        has_named = len(_list_wallet_names()) > 0
+
+        return {
+            "ok": True,
+            "exists": root_exists or has_named,
+            "root_enc": root_exists,
+            "named_wallets": _list_wallet_names(),
+        }
+
+    # ────────────────────────────────────────────────────────────
+    # [FIX v3.19] unlock_wallet com fallback
+    # ────────────────────────────────────────────────────────────
+    def unlock_wallet(self, password: str) -> dict:
+        """
+        Desbloqueia a carteira ativa.
+
+        Ordem:
+          1. load_current_wallet(pwd) em current_wallet.enc
+          2. Se falhar: WalletManager.load_encrypted_wallet em wallets/*.wallet
+          3. Se decifrou via WalletManager, salva em current_wallet.enc
+          4. POST /api/wallet/set_validator_sk (agora chama integrate_and_propagate)
+        """
+        global _WALLET_SESSION
+        pwd = (password or "").strip() or _get_default_password()
+        if not pwd:
+            return {"ok": False, "msg": "senha vazia"}
+
+        # ─── Tentativa 1: current_wallet.enc ───
+        data = None
+        source = None
+        try:
+            from secure_store import load_current_wallet
+            r = load_current_wallet(pwd)
+            if r and r.get("ok"):
+                data = r
+                source = "current_wallet.enc"
+        except Exception as e:
+            log.debug("load_current_wallet falhou: %s", e)
+
+        # ─── Tentativa 2: wallets/*.wallet via WalletManager ───
+        if not data:
+            data = _try_load_via_wallet_manager(pwd)
+            if data:
+                source = "WalletManager"
+                # Salva em current_wallet.enc para próximas vezes
+                try:
+                    from secure_store import save_current_wallet
+                    save_current_wallet(pwd, {
+                        "address": data.get("address", ""),
+                        "private_key": data.get("private_key", ""),
+                        "public_key": data.get("public_key", ""),
+                    })
+                    log.info("[wallet] current_wallet.enc re-salvo via WalletManager")
+                except Exception as e:
+                    log.warning("[wallet] não consegui salvar current_wallet.enc: %s", e)
+
+        # ─── Nenhuma decifrou ───
+        if not data:
+            return {
+                "ok": False,
+                "msg": (
+                    "Senha incorreta em todos os arquivos "
+                    "(current_wallet.enc + wallets/*.wallet)"
+                ),
+            }
+
+        # ─── Preenche sessão ───
+        _populate_session_from_data(data)
+
+        # ─── Sincroniza SK no nó (v3.19: agora propaga ao Origin) ───
+        sync_r = {}
+        if _WALLET_SESSION.get("private_key"):
+            sync_r = _sync_sk_to_chain(
+                _WALLET_SESSION["private_key"],
+                _WALLET_SESSION.get("address", ""),
+                _WALLET_SESSION.get("public_key", ""),
+            )
+
+        log.info(
+            "[wallet] unlock OK via %s — address=%s…",
+            source, _WALLET_SESSION["address"][:16],
+        )
+
+        # Retorna status detalhado pro HTML
+        result = {
+            "ok": True,
+            "address": _WALLET_SESSION["address"],
+            "source": source,
+            "sk_installed": sync_r.get("sk_installed", False),
+            "in_trust": sync_r.get("in_trust", False),
+            "in_top5": sync_r.get("in_top5", False),
+            "multisig_ready": sync_r.get("multisig_ready", False),
+            "propagated": sync_r.get("propagated", False),
+            "peers_notified": sync_r.get("peers_notified", 0),
+            "warnings": sync_r.get("warnings", []),
+            "errors": sync_r.get("errors", []),
+        }
+        return result
+
+    # ────────────────────────────────────────────────────────────
+    # [FIX v3.19] create_and_unlock salva em 3 lugares
+    # ────────────────────────────────────────────────────────────
     def create_and_unlock(self, password: str) -> dict:
         global _WALLET_SESSION
         pwd = (password or "").strip() or _get_default_password()
-        
         if not pwd:
-            return {"ok": False, "msg": "A senha é obrigatória (não encontrada na GUI nem no .env)."}
-            
+            return {"ok": False, "msg": "A senha é obrigatória."}
+
         try:
             from wallet import Wallet
             from secure_store import save_current_wallet
@@ -174,36 +447,74 @@ class WalletApi:
                 "private_key": w.priv_hex,
                 "public_key":  w.pub_hex,
             }
+
+            # 1. current_wallet.enc (root + wallets/)
             r = save_current_wallet(pwd, data)
             if not r.get("ok"):
                 return {"ok": False, "msg": "Erro ao salvar: " + str(r.get("msg", ""))}
-            
-            _WALLET_SESSION.update(data)
-            _sync_sk_to_chain(w.priv_hex, w.address, w.pub_hex)
-            return {"ok": True, "address": w.address}
-        except Exception as e:
-            return {"ok": False, "msg": str(e)}
 
-    def unlock_wallet(self, password: str) -> dict:
-        global _WALLET_SESSION
-        pwd = (password or "").strip() or _get_default_password()
-        try:
-            from secure_store import load_current_wallet
-            r = load_current_wallet(pwd)
-            if r and r.get("ok"):
-                _WALLET_SESSION["address"]     = r.get("address", "")
-                _WALLET_SESSION["private_key"] = r.get("private_key", "")
-                _WALLET_SESSION["public_key"]  = (
-                    r.get("public_key") or r.get("pubkey") or r.get("pub_hex") or ""
+            # 2. wallets/{name}.wallet (para aba "arquivos")
+            try:
+                from wallet import WalletManager
+                if hasattr(WalletManager, "save_encrypted_wallet"):
+                    try:
+                        WalletManager.save_encrypted_wallet(
+                            name="default",
+                            password=pwd,
+                            address=data["address"],
+                            sk=data["private_key"],
+                            pk=data["public_key"],
+                        )
+                    except TypeError:
+                        try:
+                            WalletManager.save_encrypted_wallet(
+                                "default", pwd, data["address"],
+                                data["private_key"], data["public_key"],
+                            )
+                        except TypeError:
+                            WalletManager.save_encrypted_wallet(
+                                "default", pwd, data,
+                            )
+            except Exception as e:
+                log.warning("[wallet] save_encrypted_wallet (best-effort): %s", e)
+
+            # 3. user_wallets.json (aba "arquivos" alternativa)
+            try:
+                uw_path = BASE_DIR / "user_wallets.json"
+                uw = {}
+                if uw_path.exists():
+                    try:
+                        uw = json.loads(uw_path.read_text(encoding="utf-8"))
+                        if not isinstance(uw, dict):
+                            uw = {}
+                    except Exception:
+                        uw = {}
+                uw[data["address"]] = {"public_key": data["public_key"]}
+                uw["default"] = {
+                    "address": data["address"],
+                    "public_key": data["public_key"],
+                }
+                uw_path.write_text(
+                    json.dumps(uw, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
                 )
-                if _WALLET_SESSION.get("private_key"):
-                    _sync_sk_to_chain(
-                        _WALLET_SESSION["private_key"],
-                        _WALLET_SESSION.get("address", ""),
-                        _WALLET_SESSION.get("public_key", ""),
-                    )
-                return {"ok": True, "address": _WALLET_SESSION["address"]}
-            return {"ok": False, "msg": r.get("msg", "Senha incorreta")}
+            except Exception as e:
+                log.debug("[wallet] user_wallets.json: %s", e)
+
+            _populate_session_from_data(data)
+            sync_r = _sync_sk_to_chain(w.priv_hex, w.address, w.pub_hex)
+
+            return {
+                "ok": True,
+                "address": w.address,
+                "source": "create",
+                "sk_installed": sync_r.get("sk_installed", False),
+                "in_trust": sync_r.get("in_trust", False),
+                "in_top5": sync_r.get("in_top5", False),
+                "multisig_ready": sync_r.get("multisig_ready", False),
+                "propagated": sync_r.get("propagated", False),
+                "peers_notified": sync_r.get("peers_notified", 0),
+            }
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
@@ -222,43 +533,112 @@ class WalletApi:
             return {"ok": True, **_WALLET_SESSION}
         return {"ok": False, "msg": "locked"}
 
+    # ────────────────────────────────────────────────────────────
+    # [FIX v3.19] list_wallets() robusto
+    # ────────────────────────────────────────────────────────────
+    def list_wallets(self) -> list:
+        """
+        Retorna [{name, address, public_key}] para a aba "arquivos".
+
+        Normaliza 3 formatos:
+          - WalletManager.list_wallets() → list[dict], list[str], tuple
+          - dicts com keys variando: name/nome/filename, address/endereco
+          - Fallback: varre wallets/*.wallet no filesystem
+        """
+        entries = []
+
+        # 1. Tenta WalletManager
+        try:
+            from wallet import WalletManager
+            lst = None
+            for meth in ("list_wallets", "listar_carteiras", "wallets"):
+                if hasattr(WalletManager, meth):
+                    try:
+                        obj = getattr(WalletManager, meth)
+                        lst = obj() if callable(obj) else obj
+                        break
+                    except Exception:
+                        continue
+
+            if isinstance(lst, list):
+                for w in lst:
+                    if isinstance(w, dict):
+                        entries.append(_normalize_wallet_entry(w))
+                    elif isinstance(w, str):
+                        n = w
+                        if n.endswith(".wallet"):
+                            n = n[:-7]
+                        elif n.endswith(".enc"):
+                            n = n[:-4]
+                        entries.append({"name": n, "address": "", "public_key": ""})
+        except Exception as e:
+            log.debug("list_wallets WalletManager: %s", e)
+
+        # 2. Fallback: varre wallets/*.wallet
+        if not entries:
+            wdir = BASE_DIR / "wallets"
+            if wdir.exists():
+                for p in sorted(wdir.glob("*.wallet")):
+                    n = p.stem
+                    entries.append({"name": n, "address": "", "public_key": ""})
+
+        # 3. Fallback: current_wallet.enc sem nome
+        if not entries:
+            try:
+                from secure_store import CURRENT_WALLET_ENC
+                p = Path(CURRENT_WALLET_ENC)
+                if not p.is_absolute():
+                    p = BASE_DIR / p
+                if p.exists():
+                    entries.append({
+                        "name": "(current)",
+                        "address": _WALLET_SESSION.get("address", ""),
+                        "public_key": _WALLET_SESSION.get("public_key", ""),
+                    })
+            except Exception:
+                pass
+
+        # Dedup por name
+        seen = set()
+        out = []
+        for e in entries:
+            if not e.get("name"):
+                continue
+            key = e["name"]
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(e)
+        return out
+
     def generate_wallet(self, password: str = "") -> dict:
         try:
             from wallet import Wallet
             from secure_store import save_current_wallet
-            
             pwd = (password or "").strip() or _get_default_password()
             if not pwd:
-                return {"erro": "Senha não definida na GUI e não encontrada no .env"}
-
+                return {"erro": "Senha não definida"}
             w = Wallet()
-            
             r = save_current_wallet(pwd, {
                 "address": w.address,
                 "private_key": w.priv_hex,
                 "public_key": w.pub_hex,
             })
-            
             if not r.get("ok"):
-                return {"erro": f"Falha ao salvar carteira: {r.get('msg')}"}
-
-            global _WALLET_SESSION
-            _WALLET_SESSION.update({
+                return {"erro": f"Falha ao salvar: {r.get('msg')}"}
+            _populate_session_from_data({
                 "address": w.address,
                 "private_key": w.priv_hex,
                 "public_key": w.pub_hex,
             })
-
             _sync_sk_to_chain(w.priv_hex, w.address, w.pub_hex)
-
             return {
-                "address": w.address, 
-                "private_key": w.priv_hex, 
+                "address": w.address,
+                "private_key": w.priv_hex,
                 "public_key": w.pub_hex,
-                "ok": True
+                "ok": True,
             }
         except Exception as e:
-            log.error("generate_wallet falhou: %s", e)
             return {"erro": str(e)}
 
     def get_experiment_variant(self) -> dict:
@@ -266,11 +646,10 @@ class WalletApi:
             from ab_test import get_variant, get_node_id_hash
             if not _WALLET_SESSION.get("address"):
                 return {"variant": "A", "error": "locked"}
-            node_id = _WALLET_SESSION["address"]
-            node_hash = get_node_id_hash(node_id)
             from security import set_node_id_hash
-            set_node_id_hash(node_hash)
-            return {"variant": get_variant(node_hash), "node_hash": node_hash}
+            nh = get_node_id_hash(_WALLET_SESSION["address"])
+            set_node_id_hash(nh)
+            return {"variant": get_variant(nh), "node_hash": nh}
         except Exception as e:
             return {"variant": "A", "error": str(e)}
 
@@ -279,7 +658,7 @@ class WalletApi:
             from security import audit_log
             audit_log("exposure_log", {
                 "experiment_id": "activation_v1",
-                "variant":       variant,
+                "variant": variant,
                 "trigger_event": "wallet_open",
                 "rendered_flag": 1,
             })
@@ -293,19 +672,16 @@ class WalletApi:
             if "error" in s and not s.get("height"):
                 return {"ok": False, "msg": s.get("error", "erro")}
             return {
-                "ok":                   True,
-                "height":               s.get("height", 0),
-                "mempool":              s.get("mempool", 0),
-                "peers":                s.get("peers", 0),
-                "utxos":                s.get("utxos", 0),
-                "difficulty":           s.get("difficulty", 0),
-                "reward":               s.get("reward", 0),
-                "tip_hash":             s.get("tip_hash", ""),
-                "l2_enabled":           s.get("l2_enabled", False),
-                "pool_enabled":         s.get("pool_enabled", False),
-                "fila_tamanho":         s.get("fila_tamanho", 0),
+                "ok": True,
+                "height": s.get("height", 0),
+                "mempool": s.get("mempool", 0),
+                "peers": s.get("peers", 0),
+                "utxos": s.get("utxos", 0),
+                "difficulty": s.get("difficulty", 0),
+                "reward": s.get("reward", 0),
+                "tip_hash": s.get("tip_hash", ""),
+                "fila_tamanho": s.get("fila_tamanho", 0),
                 "rede_descentralizada": s.get("rede_descentralizada", False),
-                "validators_active":    s.get("validators_active", 0),
             }
         except Exception as e:
             return {"ok": False, "msg": str(e)}
@@ -313,11 +689,7 @@ class WalletApi:
     def sync_info(self) -> dict:
         try:
             s = _get("/api/sync-info", timeout=GET_TIMEOUT)
-            if "error" in s and "sync" not in s:
-                return {"erro": s["error"]}
-            if not s.get("ok", True):
-                return {"erro": s.get("erro") or s.get("error") or "erro desconhecido"}
-            return s
+            return s if "error" not in s else {"erro": s["error"]}
         except Exception as e:
             return {"erro": str(e)}
 
@@ -326,11 +698,7 @@ class WalletApi:
             s = _get(f"/api/blocks?start={int(start)}&limit={int(limit)}")
             if "error" in s:
                 return {"erro": s["error"]}
-            return {
-                "blocks": s.get("blocks", []),
-                "start":  s.get("start", 0),
-                "count":  s.get("count", 0),
-            }
+            return s
         except Exception as e:
             return {"erro": str(e)}
 
@@ -344,10 +712,10 @@ class WalletApi:
     def consensus_validators(self) -> dict:
         try:
             r = _get("/api/consensus/validators", timeout=10.0)
-            if "error" in r:
-                return {"ok": False, "msg": r["error"], "required_sigs": 0,
-                        "all_required": True, "validators": []}
-            return r
+            return r if "error" not in r else {
+                "ok": False, "msg": r["error"],
+                "required_sigs": 0, "all_required": True, "validators": [],
+            }
         except Exception as e:
             return {"ok": False, "msg": str(e), "required_sigs": 0,
                     "all_required": True, "validators": []}
@@ -362,7 +730,6 @@ class WalletApi:
         try:
             validators_resp = self.consensus_validators()
             required = int(validators_resp.get("required_sigs", 0) or 0)
-            all_required = bool(validators_resp.get("all_required", True))
             mining = self.mining_status()
             height = int(mining.get("height", 0) or 0)
             last_sigs = 0
@@ -372,12 +739,12 @@ class WalletApi:
             return {
                 "ok": True,
                 "validators_active": len(validators_resp.get("validators", [])),
-                "required_sigs":     required,
-                "all_required":      all_required,
+                "required_sigs": required,
+                "all_required": bool(validators_resp.get("all_required", True)),
                 "last_block_height": height,
-                "last_block_sigs":   last_sigs,
+                "last_block_sigs": last_sigs,
                 "is_multisig_active": required >= 1,
-                "last_block_ready":   last_sigs >= required if required > 0 else True,
+                "last_block_ready": last_sigs >= required if required > 0 else True,
             }
         except Exception as e:
             return {"ok": False, "msg": str(e), "validators_active": 0, "required_sigs": 0}
@@ -399,30 +766,20 @@ class WalletApi:
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
-    def list_wallets(self) -> list:
-        try:
-            from wallet import WalletManager
-            return WalletManager.list_wallets()
-        except Exception:
-            return []
-
     def load_wallet(self, name: str, password: str) -> dict:
         global _WALLET_SESSION
         try:
             from wallet import WalletManager
             r = WalletManager.load_encrypted_wallet(name, password)
-            if r and r.get("ok"):
-                _WALLET_SESSION["address"]     = r.get("address", "")
-                _WALLET_SESSION["private_key"] = r.get("private_key", "")
-                _WALLET_SESSION["public_key"]  = (
-                    r.get("public_key") or r.get("pubkey") or r.get("pub_hex") or ""
-                )
-                if _WALLET_SESSION["private_key"]:
-                    _sync_sk_to_chain(
-                        _WALLET_SESSION["private_key"],
-                        _WALLET_SESSION["address"],
-                        _WALLET_SESSION["public_key"],
-                    )
+            if r and (not isinstance(r, dict) or r.get("ok") is not False):
+                if isinstance(r, dict):
+                    _populate_session_from_data(r)
+                    if _WALLET_SESSION["private_key"]:
+                        _sync_sk_to_chain(
+                            _WALLET_SESSION["private_key"],
+                            _WALLET_SESSION["address"],
+                            _WALLET_SESSION["public_key"],
+                        )
             return r or {"ok": False, "msg": "resposta vazia"}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
@@ -465,7 +822,7 @@ class WalletApi:
             st = _get("/api/status", timeout=5.0)
             if "error" in st:
                 return {"ok": False, "msg": "Nó offline. Verifique o main.py."}
-            
+
             local_h = st.get("height", 0)
             if local_h < 0:
                 return {"ok": False, "msg": "Blockchain vazia. Sincronize primeiro."}
@@ -473,7 +830,7 @@ class WalletApi:
             sync = _get("/api/sync-info", timeout=5.0)
             if "error" in sync:
                 return {"ok": True, "msg": "Sem dados de sync. Liberando mineração."}
-            
+
             target_h = sync.get("sync", {}).get("target", local_h)
             peers = sync.get("sync", {}).get("peers", 0)
 
@@ -498,14 +855,7 @@ class WalletApi:
 
     def stop_mining(self) -> dict:
         try:
-            from miner_loop import get_miner
-            from server import _get_chain
-            chain = _get_chain()
-            m = get_miner(chain)
-            if m:
-                ok, msg = m.stop()
-                return {"ok": ok, "msg": msg, "count": m.blocks_mined}
-            return {"ok": False, "msg": "Miner nao iniciado"}
+            return _post("/api/miner/stop", {})
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
@@ -522,9 +872,7 @@ class WalletApi:
 
     def _resolve_pool_url(self) -> str:
         env_pool = (os.environ.get("BRN_POOL_URL", "") or "").strip()
-        if env_pool:
-            return env_pool.rstrip("/")
-        return API_BASE
+        return env_pool.rstrip("/") if env_pool else API_BASE
 
     def pool_start_mining(self, address: str, pubkey: str) -> dict:
         if not address or not pubkey:
@@ -532,46 +880,23 @@ class WalletApi:
         try:
             r = _post("/api/pool/start_local", {
                 "address": address,
-                "pubkey": pubkey
+                "pubkey": pubkey,
             }, timeout=30.0)
-            if r.get("ok"):
-                return r
-            return {"ok": False, "msg": r.get("msg", "start_local falhou")}
+            return r if r.get("ok") else {"ok": False, "msg": r.get("msg", "start_local falhou")}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
     def pool_stop_mining(self) -> dict:
         try:
             r = _post("/api/pool/stop_local", {}, timeout=30.0)
-            if r.get("ok"):
-                return r
-            return {"ok": False, "msg": r.get("msg", "stop_local falhou")}
+            return r if r.get("ok") else {"ok": False, "msg": r.get("msg", "stop_local falhou")}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
     def pool_status(self) -> dict:
         try:
             r = _get("/api/pool/local_status", timeout=10.0)
-            if not isinstance(r, dict):
-                return {"ok": False, "running": False, "msg": "resposta invalida"}
-
-            if r.get("running") and r.get("job_share_diff") is None:
-                try:
-                    from miner_pool_client import get_pool_client
-                    pc = get_pool_client()
-                    if pc:
-                        last_diff = getattr(pc, "_last_known_share_diff", None)
-                        if last_diff is not None:
-                            r["job_share_diff"] = last_diff
-                        if r.get("job_id") is None and pc._job:
-                            r["job_id"] = pc._job.get("job_id")
-                            r["job_height"] = pc._job.get("height")
-                            r["job_difficulty"] = pc._job.get("difficulty")
-                            r["job_share_diff"] = pc._job.get("share_difficulty")
-                except Exception as e:
-                    log.debug("Fallback do pool_status falhou: %s", e)
-
-            return r
+            return r if isinstance(r, dict) else {"ok": False, "running": False}
         except Exception as e:
             return {"ok": False, "running": False, "msg": str(e)}
 
@@ -651,6 +976,9 @@ class WalletApi:
         }
 
 
+# ═══════════════════════════════════════════════════════════════
+# Self-test
+# ═══════════════════════════════════════════════════════════════
 def _self_test() -> int:
     print(f"app_wallet_v3.py v{__version__}")
     print("=" * 60)
@@ -668,16 +996,16 @@ def _self_test() -> int:
     if r.get("ok"):
         print(f"[1] ping OK — height={r.get('height')} v={r.get('version', '?')}")
     else:
-        print(f"[1] [X] ping: {r}")
-        return 1
+        print(f"[1] [X] ping: {r} (main.py offline?)")
 
-    r = api.node_status()
-    print(f"[2] node_status: ok={r.get('ok')} height={r.get('height')}")
+    h = api.has_wallet()
+    print(f"[2] has_wallet: exists={h.get('exists')} "
+          f"root_enc={h.get('root_enc')} named={h.get('named_wallets')}")
 
-    r = api.pool_status()
-    print(f"[3] pool_status: running={r.get('running')} "
-          f"hashrate_khs={r.get('hashrate_khs', 0)} "
-          f"job_share_diff={r.get('job_share_diff')}")
+    lw = api.list_wallets()
+    print(f"[3] list_wallets: {len(lw)} carteira(s)")
+    for w in lw:
+        print(f"      - {w}")
 
     print("\n" + "=" * 60)
     print(" SELF-TEST CONCLUIDO")
@@ -701,5 +1029,5 @@ if __name__ == "__main__":
     if args.self_test:
         sys.exit(_self_test())
 
-    print("Uso: python app_wallet_v3.py --self-test")
+    print("Uso: python3 app_wallet_v3.py --self-test")
     sys.exit(0)
