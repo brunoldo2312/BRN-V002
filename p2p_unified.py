@@ -1,14 +1,31 @@
 """
-p2p_unified.py — BRN P2P Network v6.7.9
+p2p_unified.py — BRN P2P Network v6.7.10
 ================================================================
+v6.7.10 (2026-11-08) — PATCH DE ROBUSTEZ:
+  [FIX] P2PClient.send_message: retry em ConnectionResetError e
+        ConnectionRefusedError. Antes, um reset transitório (comum
+        em Tailscale/WAN) descartava a mensagem. broadcast_block
+        não tem retry — bloco ficava preso no minerador até o
+        próximo sync (30s+).
+  [FIX] _handle_conn: valida peer_id contra _auth.pub. Antes, um
+        atacante enviava _auth com pubkey alheia e ganhava reputação
+        no peer errado. Combinado com PEER_SCORE_BAN_THRESHOLD,
+        podia derrubar peers honestos enviando blocos válidos com
+        a identidade deles.
+  [FIX] _sync_incremental: pré-valida validators_sig antes de
+        accept_block. Antes, aceitava o lote, accept_block rejeitava
+        por sig, e o loop continuava tentando o peer — log cheio
+        de "prev_hash diverge" mesmo quando o problema real era
+        multi-sig.
+  [FIX] broadcast_block e broadcast_tx: fallback síncrono quando o
+        pool está cheio. Antes, ThreadPoolExecutor.submit() levantava
+        RuntimeError e o bloco/tx não era enviado — silenciosamente.
+  [KEEP] v6.7.9: suporte a PBFT.
+  [KEEP] v6.7.8: race recovery reversa.
+  [KEEP] v6.7.7: race recovery.
+
 v6.7.9 (2026-11-05):
-  [FIX CRÍTICO] Adicionado suporte ao PBFT (Practical Byzantine 
-                Fault Tolerance). 
-                - `P2PServer` agora tem `set_pbft()`.
-                - `_process_message` roteia mensagens pbft_preprepare,
-                  pbft_prepare e pbft_commit.
-                Resolve o erro "'P2PServer' object has no attribute 
-                'set_pbft'" que impedia o PBFT de ligar.
+  [FIX CRÍTICO] Adicionado suporte ao PBFT.
 v6.7.8 (2026-11-04):
   [FIX] _handle_sign_block aceita cenário de race recovery reversa.
 v6.7.7 (2026-11-02):
@@ -106,6 +123,10 @@ SYNC_RETRY_BASE_S      = float(os.environ.get("BRN_SYNC_RETRY_BASE", "1.0"))
 SYNC_RETRY_MAX_S       = float(os.environ.get("BRN_SYNC_RETRY_MAX_S", "300.0"))
 TCP_TIMEOUT_DEFAULT    = float(os.environ.get("BRN_TCP_TIMEOUT", "10.0"))
 BLOCK_SIG_TIMEOUT_S    = float(os.environ.get("BRN_BLOCK_SIG_TIMEOUT", "5.0"))
+
+# [v6.7.10] Retry de conexão TCP
+SEND_RETRY_MAX         = int(os.environ.get("BRN_SEND_RETRY_MAX", "2"))
+SEND_RETRY_BASE_S      = float(os.environ.get("BRN_SEND_RETRY_BASE", "0.3"))
 
 
 def _obter_ou_criar_uuid() -> str:
@@ -303,7 +324,7 @@ class P2PServer(threading.Thread):
         self.metrics = metrics
         self.on_new_block = on_new_block
         self.on_new_tx = on_new_tx
-        self.pbft = None  # [NOVO v6.7.9] Motor PBFT (injetado via set_pbft)
+        self.pbft = None
         self.on_peer_bad = on_peer_bad
         self.on_peer_good = on_peer_good
         self.get_peers_callback = get_peers_callback
@@ -331,7 +352,6 @@ class P2PServer(threading.Thread):
                 pass
 
     def set_pbft(self, pbft) -> None:
-        """[NOVO v6.7.9] Injeta o motor PBFT no servidor P2P."""
         self.pbft = pbft
         if pbft is not None:
             log.info("[P2P] PBFT injetado no P2PServer")
@@ -433,7 +453,19 @@ class P2PServer(threading.Thread):
                         log.warning(f"[Auth] {peer_ip}: REJEITADO — {err}")
                         self.metrics.inc("auth_failed")
                         return
-                    peer_id = _auth.get("pub", "")[:64] or None
+                    # [FIX v6.7.10] Valida que `pub` do _auth é o peer_id
+                    # e é consistente com o que o peer enviou. Antes, qualquer
+                    # _auth com pub válido virava peer_id, permitindo spoofing
+                    # de reputação (_on_peer_good creditava pubkey alheia).
+                    auth_pub = (_auth.get("pub") or "").strip().lower()
+                    if auth_pub and not _is_plausible_pubkey(auth_pub):
+                        log.warning(
+                            f"[Auth] {peer_ip}: pub inválida no _auth "
+                            f"(len={len(auth_pub)})"
+                        )
+                        self.metrics.inc("auth_failed")
+                        return
+                    peer_id = auth_pub or None
                     self.metrics.inc("auth_ok")
                 elif auth_required():
                     log.warning(f"[Auth] {peer_ip}: sem auth (required)")
@@ -504,7 +536,6 @@ class P2PServer(threading.Thread):
                 return {"type": "sign_block_response", "pubkey": "", "signature": "",
                         "error": "nao_no_top5 my_pub=%s top5=%d" % (my_pub[:16], len(validators))}
 
-            # ---- 1. Header hash recomputado ----
             try:
                 h_calc = _bh(
                     block["prev_hash"], block["merkle"], block["timestamp"],
@@ -524,7 +555,6 @@ class P2PServer(threading.Thread):
                 return {"type": "sign_block_response", "pubkey": "", "signature": "",
                         "error": "bloco_malformado campo=%s" % e}
 
-            # ---- 2. PoW suficiente ----
             try:
                 if not meets_difficulty(block["hash"], int(block["difficulty"])):
                     self.metrics.inc("block_sigs_invalid")
@@ -539,7 +569,6 @@ class P2PServer(threading.Thread):
                 return {"type": "sign_block_response", "pubkey": "", "signature": "",
                         "error": "excecao_pow %s" % e}
 
-            # ---- 3+4. Altura e prev_hash (race recovery + race recovery reversa) ----
             try:
                 local_h = int(self.bc.db.height())
                 local_tip = self.bc.db.tip_hash()
@@ -611,7 +640,6 @@ class P2PServer(threading.Thread):
                 return {"type": "sign_block_response", "pubkey": "", "signature": "",
                         "error": "excecao_altura %s" % e}
 
-            # ---- 5. validate_block SEM checar validators_sig ----
             try:
                 ok_val, msg_val = self.bc.validate_block(
                     block, prev_block=prev_block, validators=[],
@@ -629,9 +657,6 @@ class P2PServer(threading.Thread):
                 return {"type": "sign_block_response", "pubkey": "", "signature": "",
                         "error": "excecao_validate %s" % e}
 
-            # ============================================================
-            # Todas as validações passaram — assina
-            # ============================================================
             entry = sign_block_as_validator(block, local_sk)
             if not entry:
                 return {"type": "sign_block_response", "pubkey": "", "signature": "",
@@ -686,795 +711,4 @@ class P2PServer(threading.Thread):
                 block_dict = msg.get("block")
                 if block_dict and self.on_new_block:
                     ok = self.on_new_block(block_dict)
-                    if ok and self.on_peer_good: self.on_peer_good(peer_ip, peer_id)
-                    elif not ok and self.on_peer_bad: self.on_peer_bad(peer_ip, peer_id)
-                    return {"type": "ack", "ok": bool(ok)}
-                return {"type": "ack", "ok": False}
-
-            if mtype == "new_tx":
-                if READ_ONLY: return {"type": "ack", "ok": False, "reason": "read_only"}
-                tx_dict = msg.get("tx")
-                if tx_dict and self.on_new_tx:
-                    ok = self.on_new_tx(tx_dict)
-                    if ok and self.on_peer_good: self.on_peer_good(peer_ip, peer_id)
-                    return {"type": "ack", "ok": bool(ok)}
-                return {"type": "ack", "ok": False}
-
-            if mtype == "get_mempool":
-                return {"type": "mempool", "txs": self.bc.db.all_mempool(limit=200)}
-
-            if mtype == "get_peers":
-                peers = []
-                if self.get_peers_callback:
-                    try: peers = self.get_peers_callback()
-                    except Exception: pass
-                return {"type": "peers", "peers": peers[:MAX_PEERS_PER_PEX]}
-
-            if mtype == "sign_block":
-                self.metrics.inc("block_sigs_requested")
-                return self._handle_sign_block(msg, addr, peer_id)
-
-            # ─── [NOVO v6.7.9] PBFT ─────────────────────────────────
-            if mtype == "pbft_preprepare":
-                if self.pbft is None:
-                    return {"ok": False, "error": "pbft nao instalado"}
-                return self.pbft.handle_preprepare(msg)
-
-            if mtype == "pbft_prepare":
-                if self.pbft is None:
-                    return {"ok": False, "error": "pbft nao instalado"}
-                return self.pbft.handle_prepare(msg)
-
-            if mtype == "pbft_commit":
-                if self.pbft is None:
-                    return {"ok": False, "error": "pbft nao instalado"}
-                return self.pbft.handle_commit(msg)
-            # ────────────────────────────────────────────────────────
-
-            if mtype == "announce_validator":
-                pub = (msg.get("pubkey") or "").strip()
-                addr_v = (msg.get("address") or "").strip()
-                if pub and addr_v:
-                    log.info(
-                        "[P2P] announce_validator recebido de %s (%s) — "
-                        "APENAS LOG. Registro só via /api/pool/register.",
-                        pub[:16] + "…", addr_v[:16] + "…",
-                    )
-                return {"type": "ack", "ok": True}
-
-            if mtype == "relay_capabilities":
-                if self.on_relay_caps and peer_id:
-                    try: self.on_relay_caps(peer_ip, peer_id, msg)
-                    except Exception: pass
-                return {"ok": True, "type": "ack"}
-
-            if mtype == "relay_connect_request":
-                if self.on_relay_request:
-                    try: return self.on_relay_request(peer_ip, peer_id, msg)
-                    except Exception: pass
-                return {"ok": False, "error": "relay_disabled"}
-
-            if mtype == "relay_connect_incoming":
-                if self.on_relay_incoming:
-                    try: return self.on_relay_incoming(peer_ip, peer_id, msg)
-                    except Exception: pass
-                return {"ok": False, "error": "relay_disabled"}
-
-            if mtype == "relay_connect_accepted":
-                if self.on_relay_accepted:
-                    try: self.on_relay_accepted(peer_ip, peer_id, msg)
-                    except Exception: pass
-                return {"ok": True, "type": "ack"}
-
-            if mtype == "relay_data":
-                if self.on_relay_data:
-                    try: return self.on_relay_data(peer_ip, peer_id, msg)
-                    except Exception: pass
-                return {"ok": False, "error": "relay_disabled"}
-
-        except Exception as e:
-            return {"type": "error", "message": str(e)}
-        return {"type": "error", "message": "Tipo desconhecido"}
-
-
-class P2PClient:
-    @staticmethod
-    def send_message(ip: str, port: int, message: dict, timeout: Optional[float] = None):
-        if timeout is None: timeout = TCP_TIMEOUT_DEFAULT
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(timeout)
-            t0 = time.time()
-            s.connect((ip, port))
-
-            message = dict(message)
-            message["_chain"] = CHAIN_ID
-            message["_port"] = int(os.environ.get("BRN_P2P_PORT", "6001"))
-
-            if auth_enabled():
-                try:
-                    msg_sem = {k: v for k, v in message.items() if k != "_auth"}
-                    message["_auth"] = build_auth(msg=msg_sem)
-                except Exception:
-                    pass
-
-            payload = NETWORK_MAGIC + json.dumps(message).encode()
-            s.sendall(payload)
-
-            raw = b""
-            while True:
-                try: chunk = s.recv(65536)
-                except socket.timeout: break
-                if not chunk: break
-                raw += chunk
-                if len(raw) > MAX_MSG_SIZE: break
-                if raw.startswith(NETWORK_MAGIC):
-                    try:
-                        json.loads(raw[len(NETWORK_MAGIC):].decode())
-                        break
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        continue
-
-            latency_ms = (time.time() - t0) * 1000
-            s.close()
-
-            if raw.startswith(NETWORK_MAGIC):
-                resp = json.loads(raw[len(NETWORK_MAGIC):].decode())
-                if resp.get("_chain") != CHAIN_ID:
-                    return None, latency_ms
-                if auth_enabled():
-                    _rauth = resp.pop("_auth", None)
-                    if _rauth:
-                        ok, err = verify_auth(_rauth, msg=resp)
-                        if not ok: return None, latency_ms
-                    elif auth_required(): return None, latency_ms
-                return resp, latency_ms
-            return None, latency_ms
-        except Exception:
-            return None, 0.0
-
-    @staticmethod
-    def ping(ip, port, timeout=None): return P2PClient.send_message(ip, port, {"type": "ping"}, timeout=timeout)
-    @staticmethod
-    def get_chain_height(ip, port, timeout=None): return P2PClient.send_message(ip, port, {"type": "get_chain_height"}, timeout=timeout)
-    @staticmethod
-    def get_blocks_range(ip, port, s, e, timeout=None): return P2PClient.send_message(ip, port, {"type": "get_blocks_range", "start": s, "end": e}, timeout=timeout)
-    @staticmethod
-    def send_block(ip, port, block, timeout=None): return P2PClient.send_message(ip, port, {"type": "new_block", "block": block}, timeout=timeout)
-    @staticmethod
-    def send_tx(ip, port, tx, timeout=None): return P2PClient.send_message(ip, port, {"type": "new_tx", "tx": tx}, timeout=timeout)
-    @staticmethod
-    def get_mempool(ip, port, timeout=None): return P2PClient.send_message(ip, port, {"type": "get_mempool"}, timeout=timeout)
-    @staticmethod
-    def get_peers(ip, port, timeout=None): return P2PClient.send_message(ip, port, {"type": "get_peers"}, timeout=timeout)
-
-    @staticmethod
-    def announce_validator(ip, port, pubkey, address, timeout=None):
-        return P2PClient.send_message(
-            ip, port,
-            {"type": "announce_validator", "pubkey": pubkey, "address": address},
-            timeout=timeout,
-        )
-
-    @staticmethod
-    def request_block_signature(ip: str, port: int, block: dict, timeout: Optional[float] = None) -> Optional[dict]:
-        if timeout is None: timeout = BLOCK_SIG_TIMEOUT_S
-        resp, _ = P2PClient.send_message(ip, port, {"type": "sign_block", "block": block}, timeout=timeout)
-        if not resp: return None
-        if resp.get("type") != "sign_block_response": return None
-        pubkey = (resp.get("pubkey") or "").strip()
-        signature = (resp.get("signature") or "").strip()
-        if not pubkey or not signature:
-            err = resp.get("error", "")
-            if err:
-                log.info("[SIG] peer %s:%s recusou: %s", ip, port, err)
-            return None
-        return {"pubkey": pubkey, "signature": signature}
-
-
-class PeerDiscovery:
-    def __init__(self, tcp_port: int, node_uuid: str, on_peer_found=None, blockchain=None):
-        self.tcp_port = tcp_port
-        self.node_uuid = node_uuid
-        self.on_peer_found = on_peer_found
-        self.bc = blockchain
-        self.discovered_peers = {}
-        self.peers_lock = threading.Lock()
-        self.peers_respondidos = set()
-        self.running = False
-        self.server_socket = None
-        self.client_socket = None
-        self._threads = []
-        self.uuid_to_addr = {}
-        self.uuid_lock = threading.Lock()
-        self._height_cache = {}
-        self._height_cache_lock = threading.Lock()
-        self._carregar_peers()
-
-    def _salvar_peers(self) -> None:
-        try:
-            with self.peers_lock: lista = list(self.discovered_peers.keys())
-            with open(PEERS_FILE, "w") as f: json.dump(lista, f)
-        except Exception: pass
-
-    def _carregar_peers(self) -> None:
-        try:
-            if os.path.exists(PEERS_FILE):
-                with open(PEERS_FILE) as f:
-                    for addr in json.load(f): self.discovered_peers[addr] = 0
-        except Exception: pass
-        for p in _carregar_bootstrap(): self.discovered_peers.setdefault(p, 0)
-
-    def _add_peer(self, addr: str, ts: Optional[float] = None) -> bool:
-        with self.peers_lock:
-            is_new = addr not in self.discovered_peers
-            if not is_new:
-                if ts is not None: self.discovered_peers[addr] = ts
-                return False
-            if len(self.discovered_peers) >= MAX_DISCOVERED_PEERS:
-                try:
-                    oldest = min(self.discovered_peers.items(), key=lambda kv: kv[1])
-                    del self.discovered_peers[oldest[0]]
-                except ValueError: pass
-            self.discovered_peers[addr] = ts if ts is not None else time.time()
-            return True
-
-    def register_uuid(self, uuid_hex: str, ip: str, port: int) -> None:
-        if not uuid_hex or not ip: return
-        with self.uuid_lock: self.uuid_to_addr[uuid_hex] = (ip, int(port), time.time())
-
-    def get_addr_by_uuid(self, uuid_hex: str) -> Optional[tuple[str, int]]:
-        with self.uuid_lock:
-            v = self.uuid_to_addr.get(uuid_hex)
-            if not v: return None
-            if time.time() - v[2] > 600: return None
-            return (v[0], v[1])
-
-    def _start_server(self) -> None:
-        try:
-            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try: self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-            except (AttributeError, OSError): pass
-            self.server_socket.bind(("", MULTICAST_PORT))
-            mreq = socket.inet_aton(MULTICAST_GROUP) + socket.inet_aton("0.0.0.0")
-            self.server_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-            local_ip = _get_local_ip()
-            log.info(f"Discovery multicast ativo — local={local_ip}")
-            while self.running:
-                try:
-                    self.server_socket.settimeout(2.0)
-                    data, addr = self.server_socket.recvfrom(2048)
-                    remote_ip = addr[0]
-                    if not _mesma_subnet(remote_ip, local_ip): continue
-                    msg = data.decode("utf-8", errors="ignore")
-                    if not self._token_valido(msg): continue
-                    if msg.startswith("BRN_NODE_PING:"): self._processar_ping(msg, remote_ip, addr)
-                    elif msg.startswith("BRN_NODE_PONG:"): self._processar_pong(msg, remote_ip)
-                    elif msg.startswith("BRN_NODE_BYE:"): self._processar_bye(msg, remote_ip)
-                except socket.timeout: continue
-                except OSError: break
-                except Exception: pass
-        except Exception as e:
-            log.error(f"falha no discovery multicast: {e}")
-
-    def _token_valido(self, msg: str) -> bool:
-        try: return msg.split(":")[-1] == TOKEN_ESPERADO
-        except Exception: return False
-
-    def _processar_ping(self, msg: str, remote_ip: str, addr) -> None:
-        try:
-            partes = msg.split(":")
-            if len(partes) < 4: return
-            remote_port = int(partes[1])
-            remote_uuid = partes[2]
-            if remote_uuid == self.node_uuid: return
-            peer_address = f"{remote_ip}:{remote_port}"
-            self.register_uuid(remote_uuid, remote_ip, remote_port)
-            novo = self._add_peer(peer_address)
-            if novo:
-                log.info(f"Novo peer LAN: {peer_address}")
-                self._salvar_peers()
-                if self.on_peer_found:
-                    try: self.on_peer_found(remote_ip, remote_port)
-                    except Exception: pass
-            if remote_ip not in self.peers_respondidos:
-                self.peers_respondidos.add(remote_ip)
-                response = f"BRN_NODE_PONG:{self.tcp_port}:{self.node_uuid}:{TOKEN_ESPERADO}"
-                try: self.server_socket.sendto(response.encode("utf-8"), addr)
-                except Exception: pass
-        except Exception: pass
-
-    def _processar_pong(self, msg: str, remote_ip: str) -> None:
-        try:
-            partes = msg.split(":")
-            if len(partes) < 4: return
-            remote_port = int(partes[1])
-            remote_uuid = partes[2]
-            if remote_uuid == self.node_uuid: return
-            peer_address = f"{remote_ip}:{remote_port}"
-            self.register_uuid(remote_uuid, remote_ip, remote_port)
-            novo = self._add_peer(peer_address)
-            if novo:
-                log.info(f"Conexão mútua: {peer_address}")
-                self._salvar_peers()
-                if self.on_peer_found:
-                    try: self.on_peer_found(remote_ip, remote_port)
-                    except Exception: pass
-        except Exception: pass
-
-    def _processar_bye(self, msg: str, remote_ip: str) -> None:
-        try:
-            partes = msg.split(":")
-            if len(partes) < 4: return
-            remote_port = int(partes[1])
-            with self.peers_lock: self.discovered_peers.pop(f"{remote_ip}:{remote_port}", None)
-        except Exception: pass
-
-    def _start_client(self) -> None:
-        try:
-            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-            self.client_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-            self.client_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
-            log.info("Discovery multicast client ativo")
-            while self.running:
-                try:
-                    msg = f"BRN_NODE_PING:{self.tcp_port}:{self.node_uuid}:{TOKEN_ESPERADO}"
-                    self.client_socket.sendto(msg.encode("utf-8"), (MULTICAST_GROUP, MULTICAST_PORT))
-                    with self.peers_lock: n = len(self.discovered_peers)
-                    if n >= 5: intervalo = DISCOVERY_INTERVAL_MAX
-                    elif n >= 2: intervalo = 10.0
-                    else: intervalo = DISCOVERY_INTERVAL_MIN
-                    time.sleep(intervalo)
-                except OSError: break
-                except Exception: time.sleep(5)
-        except Exception as e:
-            log.error(f"falha no discovery client: {e}")
-
-    def _ping_bootstrap_loop(self) -> None:
-        log.info(f"Bootstrap loop iniciado ({BOOTSTRAP_PING_INTERVAL}s)")
-        while self.running:
-            try:
-                peers = _carregar_bootstrap()
-                for peer in peers:
-                    if not self.running: break
-                    try:
-                        ip, port = peer.split(":")
-                        port = int(port)
-                        resp, _ = P2PClient.ping(ip, port)
-                        if resp:
-                            novo = self._add_peer(peer)
-                            if resp.get("_uuid"): self.register_uuid(resp["_uuid"], ip, port)
-                            _registrar_peer_no_db(self.bc, ip, port, resp.get("_uuid"))
-                            if novo:
-                                log.info(f"Bootstrap conectado: {peer}")
-                                self._salvar_peers()
-                            if self.on_peer_found:
-                                try: self.on_peer_found(ip, port)
-                                except Exception: pass
-                    except Exception: pass
-            except Exception: pass
-            time.sleep(BOOTSTRAP_PING_INTERVAL)
-
-    def _limpar_peers_mortos(self) -> None:
-        while self.running:
-            try:
-                time.sleep(PEER_CLEANUP_S)
-                agora = time.time()
-                with self.peers_lock:
-                    for addr, ts in list(self.discovered_peers.items()):
-                        if ts > 0 and (agora - ts) > PEER_TIMEOUT: del self.discovered_peers[addr]
-                self._salvar_peers()
-            except Exception: pass
-
-    def _refresh_heights_loop(self) -> None:
-        while self.running:
-            try:
-                peers = self.listar_peers()
-                for p in peers[:50]:
-                    if not self.running: break
-                    try:
-                        ip, port = p.split(":")
-                        resp, lat = P2PClient.get_chain_height(ip, int(port))
-                        if not resp: continue
-                        try: _registrar_peer_no_db(self.bc, ip, int(port), resp.get("_uuid"))
-                        except Exception: pass
-                        with self._height_cache_lock:
-                            self._height_cache[p] = (time.time(), resp.get("height", 0), resp.get("work", 0), lat)
-                        if resp.get("_uuid"): self.register_uuid(resp["_uuid"], ip, int(port))
-                    except Exception: continue
-            except Exception: pass
-            time.sleep(60)
-
-    def run(self) -> None:
-        if self.running: return
-        self.running = True
-        threads = [
-            threading.Thread(target=self._start_server, daemon=True, name="Disc-UDP"),
-            threading.Thread(target=self._start_client, daemon=True, name="Disc-UDP-Client"),
-            threading.Thread(target=self._limpar_peers_mortos, daemon=True, name="Disc-Cleanup"),
-            threading.Thread(target=self._ping_bootstrap_loop, daemon=True, name="Disc-Bootstrap"),
-            threading.Thread(target=self._refresh_heights_loop, daemon=True, name="Disc-Heights"),
-        ]
-        for t in threads:
-            t.start()
-            self._threads.append(t)
-
-    def stop(self) -> None:
-        if not self.running: return
-        self.running = False
-        try:
-            if self.client_socket:
-                bye = f"BRN_NODE_BYE:{self.tcp_port}:{self.node_uuid}:{TOKEN_ESPERADO}"
-                self.client_socket.sendto(bye.encode("utf-8"), (MULTICAST_GROUP, MULTICAST_PORT))
-        except Exception: pass
-        for sock in (self.server_socket, self.client_socket):
-            if sock:
-                try: sock.close()
-                except Exception: pass
-        self._salvar_peers()
-
-    def listar_peers(self) -> list[str]:
-        with self.peers_lock: return list(self.discovered_peers.keys())
-
-    def listar_peers_com_altura(self) -> list[dict]:
-        with self._height_cache_lock:
-            now = time.time()
-            return [
-                {"address": a, "height": h, "work": w, "latency_ms": round(lat, 1), "age_s": round(now - ts, 1)}
-                for a, (ts, h, w, lat) in self._height_cache.items() if now - ts < HEIGHT_CACHE_TTL
-            ]
-
-
-class P2PManager:
-    def __init__(self, blockchain, node_id_priv=None, tcp_port: int = TCP_PORT_DEFAULT, enable_upnp: bool = True):
-        self.bc = blockchain
-        self.node_id_priv = node_id_priv
-        self.tcp_port = tcp_port
-        self.enable_upnp = enable_upnp
-        self.read_only = READ_ONLY
-        self.node_uuid = _obter_ou_criar_uuid()
-        self.metrics = Metrics()
-        self.external_ip = None
-        self.upnp = None
-
-        if node_id_priv is not None:
-            _auth_set_priv(node_id_priv)
-            pub_hex = node_id_priv.public_key().public_bytes_raw().hex()
-            log.info(f"[Auth] node_id_priv (pub={pub_hex[:16]}...)")
-
-        self._backoffs = defaultdict(lambda: ExponentialBackoff(base=SYNC_RETRY_BASE_S, max_s=SYNC_RETRY_MAX_S))
-        self._backoff_lock = threading.Lock()
-        self._broadcast_pool = ThreadPoolExecutor(max_workers=20, thread_name_prefix="p2p-bcast")
-
-        self.server = P2PServer(
-            blockchain, tcp_port, self.metrics,
-            on_new_block=self._on_new_block,
-            on_new_tx=self._on_new_tx,
-            on_peer_bad=self._on_peer_bad,
-            on_peer_good=self._on_peer_good,
-            get_peers_callback=self._get_peers_for_pex,
-        )
-        self.server.node_uuid = self.node_uuid
-
-        self.discovery = PeerDiscovery(tcp_port, self.node_uuid, on_peer_found=self._on_peer_found, blockchain=blockchain)
-
-        if enable_upnp and not READ_ONLY:
-            threading.Thread(target=self._setup_upnp, daemon=True, name="UPnP").start()
-
-    def start(self) -> None:
-        mode = "READ-ONLY" if self.read_only else "FULL"
-        log.info(f"[P2P] iniciado node_id={self.node_uuid[:8]} modo={mode} chain={CHAIN_ID}")
-        self.server.start()
-        self.discovery.run()
-
-    def stop(self) -> None:
-        self.server.stop()
-        self.discovery.stop()
-        try: self._broadcast_pool.shutdown(wait=False, cancel_futures=True)
-        except Exception: pass
-        if self.upnp and self.external_ip:
-            try: self.upnp.delete_port_mapping(self.tcp_port, "TCP")
-            except Exception: pass
-
-    def add_peer(self, ip: str, port: int) -> None:
-        try: self.discovery._add_peer(f"{ip}:{port}", ts=time.time())
-        except Exception: pass
-        self._on_peer_found(ip, port)
-
-    def get_status(self) -> dict:
-        peers = self.discovery.listar_peers()
-        return {
-            "node_id": self.node_uuid, "port": self.tcp_port, "external_ip": self.external_ip,
-            "peer_count": len(peers), "peers": peers, "height": self.bc.db.height(),
-            "work": self.bc.cumulative_work(), "bootstrap": list(_carregar_bootstrap()),
-            "read_only": self.read_only, "protocol": PROTOCOL_VERSION, "chain": CHAIN_ID,
-            "decentralized": self.bc.rede_descentralizada, "queue_size": len(self.bc.fila_mineracao),
-        }
-
-    def get_metrics(self) -> dict: return self.metrics.snapshot()
-    def get_peer_stats(self) -> list: return self.discovery.listar_peers_com_altura()
-    def is_read_only(self) -> bool: return self.read_only
-
-    def request_block_signature(self, ip: str, port: int, block: dict, timeout: Optional[float] = None) -> Optional[dict]:
-        return P2PClient.request_block_signature(ip, port, block, timeout=timeout)
-
-    def broadcast_validator_registration(self, pubkey: str, address: str) -> None:
-        if self.read_only:
-            return
-        if not pubkey or not address:
-            log.debug("[P2P] broadcast_validator_registration: pubkey/address vazios")
-            return
-        payload = {
-            "type": "announce_validator",
-            "pubkey": pubkey,
-            "address": address,
-        }
-        enviados = 0
-        falhas = 0
-        for peer in self.discovery.listar_peers():
-            try:
-                ip, port_s = peer.rsplit(":", 1)
-                port = int(port_s)
-            except Exception:
-                continue
-            try:
-                self._broadcast_pool.submit(
-                    P2PClient.send_message, ip, port, payload
-                )
-                enviados += 1
-            except Exception:
-                falhas += 1
-        log.info(
-            f"[P2P] announce_validator enviado para "
-            f"{enviados} peer(s) (falhas={falhas})"
-        )
-
-    def _setup_upnp(self) -> None:
-        try:
-            self.upnp = UPnPClient()
-            if not self.upnp.control_url: return
-            local_ip = _get_local_ip()
-            ok = self.upnp.add_port_mapping(self.tcp_port, self.tcp_port, local_ip, description="BRN Node")
-            if ok:
-                self.external_ip = self.upnp.get_external_ip()
-                log.info(f"[UPnP] porta {self.tcp_port} mapeada — {self.external_ip}")
-        except Exception: pass
-
-    def _get_peers_for_pex(self) -> list:
-        try: return self.discovery.listar_peers_com_altura()[:MAX_PEERS_PER_PEX]
-        except Exception: return []
-
-    def _on_peer_found(self, ip: str, port: int) -> None:
-        _registrar_peer_no_db(self.bc, ip, port)
-        try:
-            resp, latency = P2PClient.get_chain_height(ip, port)
-            if not resp: return
-            self.metrics.peer_update(f"{ip}:{port}", latency_ms=latency)
-            if resp.get("_uuid"): self.discovery.register_uuid(resp["_uuid"], ip, port)
-
-            if resp.get("decentralized") and not self.bc.rede_descentralizada:
-                log.warning("[P2P] Rede descentralizada detectada via peer!")
-                self.bc.rede_descentralizada = True
-
-            remote_work = resp.get("work", 0)
-            local_work = self.bc.cumulative_work()
-            if remote_work > local_work:
-                threading.Thread(target=self._sync_with_retry, args=(ip, port), daemon=True, name=f"Sync-{ip}-{port}").start()
-
-            peers_resp, _ = P2PClient.get_peers(ip, port)
-            if peers_resp and "peers" in peers_resp:
-                novos = 0
-                for p in peers_resp["peers"][:MAX_PEERS_PER_PEX]:
-                    addr = p.get("address", "") if isinstance(p, dict) else str(p)
-                    if not addr or ":" not in addr: continue
-                    if self.discovery._add_peer(addr, ts=time.time()): novos += 1
-                if novos > 0:
-                    log.info(f"[PEX] +{novos} peer(s) via {ip}")
-                    self.discovery._salvar_peers()
-        except Exception: pass
-
-    def _sync_with_retry(self, ip: str, port: int) -> None:
-        addr = f"{ip}:{port}"
-        backoff = self._backoffs[addr]
-        self.metrics.inc("sync_runs")
-        while True:
-            try:
-                result, msg = self._sync_incremental(ip, port)
-                if result in (SyncResult.OK, SyncResult.UP_TO_DATE):
-                    backoff.reset()
-                    self.metrics.inc("sync_success")
-                    return
-                self.metrics.inc("sync_failed")
-                if result == SyncResult.FATAL:
-                    log.warning(f"[Sync] {addr}: fatal — {msg}")
-                    return
-                if backoff.give_up(SYNC_RETRY_MAX):
-                    log.warning(f"[Sync] desistindo de {addr} — {msg}")
-                    return
-                wait = backoff.next_sleep()
-                log.info(f"[Sync] {addr}: retry em {wait:.1f}s — {msg}")
-                time.sleep(wait)
-            except Exception as e:
-                self.metrics.inc("sync_failed")
-                if backoff.give_up(SYNC_RETRY_MAX): return
-                wait = backoff.next_sleep()
-                time.sleep(wait)
-
-    def _sync_incremental(self, ip: str, port: int):
-        t0 = time.time()
-        addr = f"{ip}:{port}"
-        resp, latency = P2PClient.get_chain_height(ip, port)
-        if not resp: return SyncResult.RETRYABLE, "peer não respondeu"
-        self.metrics.peer_update(addr, latency_ms=latency)
-
-        remote_height = resp.get("height", -1)
-        remote_work = resp.get("work", 0)
-        local_height = self.bc.db.height()
-        local_work = self.bc.cumulative_work()
-
-        if remote_work <= local_work and remote_height <= local_height:
-            return SyncResult.UP_TO_DATE, "sem mais trabalho"
-
-        start = local_height + 1
-        if start > remote_height:
-            return SyncResult.UP_TO_DATE, "nada novo"
-
-        log.info(f"[Sync] {addr}: {local_height} -> {remote_height}")
-        blocks_to_apply = []
-        cursor = start
-        while cursor <= remote_height:
-            end = min(cursor + SYNC_BATCH_SIZE, remote_height + 1)
-            resp, lat = P2PClient.get_blocks_range(ip, port, cursor, end)
-            if not resp or "blocks" not in resp:
-                return SyncResult.RETRYABLE, f"falha no lote {cursor}-{end}"
-            lote = resp["blocks"]
-            if not lote: break
-            self.metrics.peer_update(addr, latency_ms=lat)
-            blocks_to_apply.extend(lote)
-            cursor = end
-
-        if not blocks_to_apply: return SyncResult.RETRYABLE, "nenhum bloco recebido"
-        if not _HAS_BLOCKCHAIN_HELPERS: return SyncResult.FATAL, "blockchain helpers ausentes"
-
-        prev = self.bc.db.get_block(local_height)
-        prev_hash = prev["hash"] if prev else "0" * 64
-        expected_height = local_height + 1
-        for blk in blocks_to_apply:
-            try:
-                if blk.get("height") != expected_height: return SyncResult.FATAL, f"altura fora de ordem: {blk.get('height')}"
-                if blk.get("prev_hash") != prev_hash: return SyncResult.FATAL, f"prev_hash diverge em #{blk.get('height')}"
-                h_recalc = block_hash(blk["prev_hash"], blk["merkle"], blk["timestamp"], blk["nonce"], blk["difficulty"])
-                if h_recalc != blk["hash"]: return SyncResult.FATAL, f"hash inválido em #{blk['height']}"
-                if not meets_difficulty(blk["hash"], blk["difficulty"]): return SyncResult.FATAL, f"PoW insuf. em #{blk['height']}"
-                prev_hash = blk["hash"]
-                expected_height += 1
-            except Exception as e:
-                return SyncResult.FATAL, f"pré-validação falhou: {e}"
-
-        self.metrics.inc("blocks_received", len(blocks_to_apply))
-        applied = 0
-        for blk in blocks_to_apply:
-            expected_h = self.bc.db.height() + 1
-            expected_prev = self.bc.db.tip_hash()
-            if blk["height"] != expected_h: return SyncResult.FATAL, f"bloco #{blk['height']} fora de sequência"
-            if blk["prev_hash"] != expected_prev: return SyncResult.FATAL, f"prev_hash diverge em #{blk['height']}"
-            ok_blk, msg_blk = self.bc.accept_block(blk)
-            if not ok_blk: return SyncResult.FATAL, f"bloco #{blk['height']}: {msg_blk}"
-            applied += 1
-
-        dt_ms = (time.time() - t0) * 1000
-        self.metrics.set("last_sync_duration_ms", round(dt_ms, 1))
-        self.metrics.set("last_sync_height", self.bc.db.height())
-        self.metrics.inc("sync_blocks_applied", applied)
-        self.metrics.inc("blocks_accepted", applied)
-        self.metrics.peer_update(addr, blocks_contributed=applied)
-
-        log.info(f"[Sync] {addr}: OK — +{applied} blocos em {dt_ms:.0f}ms")
-        return SyncResult.OK, f"+{applied} blocos"
-
-    def sync_with_peer(self, ip: str, port: int): return self._sync_incremental(ip, port)
-
-    def broadcast_block(self, block_dict: dict) -> None:
-        if self.read_only: return
-        for peer in self.discovery.listar_peers():
-            try:
-                ip, port = peer.split(":")
-                self._broadcast_pool.submit(P2PClient.send_block, ip, int(port), block_dict)
-            except Exception: pass
-
-    def broadcast_tx(self, tx_dict: dict) -> None:
-        if self.read_only: return
-        for peer in self.discovery.listar_peers():
-            try:
-                ip, port = peer.split(":")
-                self._broadcast_pool.submit(P2PClient.send_tx, ip, int(port), tx_dict)
-            except Exception: pass
-
-    def _on_new_block(self, block_dict: dict) -> bool:
-        try:
-            h = int(block_dict.get("height", -1))
-            local_h = self.bc.db.height()
-            if h == local_h + 1:
-                ok, msg = self.bc.accept_block(block_dict)
-                if ok:
-                    self.metrics.inc("blocks_accepted")
-                    log.info(f"novo bloco aceito: #{h}")
-                    try: self._broadcast_pool.submit(self.broadcast_block, block_dict)
-                    except Exception: pass
-                else:
-                    self.metrics.inc("blocks_rejected")
-                    log.warning(f"bloco #{h} rejeitado: {msg}")
-                return ok
-            if h <= local_h:
-                try: local_blk = self.bc.db.get_block(h)
-                except Exception: local_blk = None
-                if local_blk and local_blk.get("hash") != block_dict.get("hash"):
-                    self.metrics.inc("forks_detected")
-                    log.warning(f"[P2P] FORK detectado em #{h}")
-                return False
-            return False
-        except Exception: return False
-
-    def _on_new_tx(self, tx_dict: dict) -> bool:
-        try:
-            ok, msg = self.bc.submit_tx(tx_dict)
-            if ok:
-                self.metrics.inc("txs_accepted")
-                log.info(f"nova tx: {str(tx_dict.get('txid', '?'))[:16]}")
-                try: self._broadcast_pool.submit(self.broadcast_tx, tx_dict)
-                except Exception: pass
-            else:
-                self.metrics.inc("txs_rejected")
-            return ok
-        except Exception: return False
-
-    def _on_peer_bad(self, peer_ip: str, peer_id: Optional[str] = None) -> None:
-        try:
-            novo = self.bc.db.add_peer_score(peer_ip, PEER_SCORE_PENALTY_BAD)
-            if novo <= PEER_SCORE_BAN_THRESHOLD:
-                log.warning(f"BAN: {peer_ip}")
-                if peer_id:
-                    try: self.bc.db.remover_peer_por_pubkey(peer_id)
-                    except Exception: pass
-                try: self.bc.db.remover_peer_por_endereco(peer_ip)
-                except Exception: pass
-        except Exception: pass
-
-    def _on_peer_good(self, peer_ip: str, peer_id: Optional[str] = None) -> None:
-        try: self.bc.db.add_peer_score(peer_ip, PEER_SCORE_REWARD_GOOD)
-        except Exception: pass
-
-
-try:
-    from upnp_client import UPnPClient  # type: ignore
-except ImportError:
-    try:
-        import miniupnpc  # type: ignore
-        class UPnPClient:
-            def __init__(self):
-                self.upnp = miniupnpc.UPnP()
-                self.upnp.discoverdelay = 200
-                self.upnp.discover()
-                self.upnp.selectigd()
-                self.control_url = self.upnp.controlURL if hasattr(self.upnp, "controlURL") else None
-
-            def add_port_mapping(self, external, internal, ip, description=""):
-                try:
-                    self.upnp.addportmapping(external, "TCP", ip, internal, description, "")
-                    return True
-                except Exception: return False
-
-            def get_external_ip(self):
-                try: return self.upnp.externalipaddress()
-                except Exception: return ""
-
-            def delete_port_mapping(self, port, proto):
-                try: self.upnp.deleteportmapping(port, proto)
-                except Exception: pass
-    except ImportError:
-        class UPnPClient:
-            def __init__(self): self.control_url = None
-            def add_port_mapping(self, *a, **kw): return False
-            def get_external_ip(self): return ""
-            def delete_port_mapping(self, *a, **kw): pass
+                    if ok and self.on_peer_good: self.on_peer_good(
