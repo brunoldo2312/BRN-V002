@@ -1,35 +1,21 @@
-"""trust_network.py — Rede de confiança e reputação do BRN (v3.11)
+"""trust_network.py — Rede de confiança e reputação do BRN (v3.12)
 ================================================================
-v3.11 (2026-11-09) — AUTO-REGISTRO DE NOVOS CLIENTES:
-  [NEW] NodeRecord.blocks_signed: conta quantos blocos o nó assinou
-        (como co-assinante, não só como minerador).
-  [NEW] record_block_signed(node_id, block_height): chamado por
-        blockchain.accept_block() para cada signatário do bloco.
-        Incrementa blocks_signed e aplica GAIN_BLOCK_SIGNED (+5).
-  [NEW] _maybe_auto_promote(node_id): se score >= 500 E
-        blocks_signed >= BRN_AUTO_PROMOTE_MIN_BLOCKS (default 10),
-        promove score para 1000 e trust_level para "validator".
-        Isso permite que clientes novos subam sozinhos após
-        assinarem N blocos válidos, sem --promote manual.
-  [NEW] register_new_validator(pubkey, address, initial_score=500):
-        método usado pelo server.py::api_trust_register para
-        adicionar um cliente novo com score provisório (500).
-        Valida formato de pubkey e evita duplicata.
-  [KEEP] v3.10: sync_local_validator, remove_ghosts, get_active_validators.
-  [KEEP] v3.9: fallback de top quando active vazio.
-  [KEEP] v3.7: persistência cliente-local em .local.json.
-
-v3.10 (2026-11-03):
-  [NEW] sync_local_validator.
-v3.9 (2026-11-03):
-  [FIX] get_active_validators com fallback top.
-v3.7 (2026-11-01):
-  [NEW] trust_network.local.json para clientes.
+v3.12 (2026-11-10) — PATCH DE ESTABILIDADE:
+  [FIX] remove_ghosts e _prune_inactive agora PROTEGEM nós com
+        trust_score >= 500 (SCORE_PROTECTED). O Origin não vai mais
+        deletar a Mayra (ou qualquer validador) por inatividade.
+  [FIX] flush() de cliente agora salva também no trust_network.json
+        principal (com a flag client_written). Permite que a GUI e
+        scripts locais (validator_manager.py) leiam os dados.
+  [FIX] _load() de cliente aceita o arquivo principal se ele tiver
+        a flag client_written, evitando que o cliente se auto-apague
+        ao reiniciar.
+  [KEEP] v3.11: auto-promoção, record_block_signed, register_new.
 ================================================================
 """
 from __future__ import annotations
 
-__version__ = "3.11"
+__version__ = "3.12"
 
 import json
 import logging
@@ -214,17 +200,7 @@ class TrustNetwork:
     def register_new_validator(self, pubkey: str, address: str = "",
                                initial_score: float = None) -> dict:
         """
-        [v3.11] Registra um cliente novo via /api/trust/register.
-
-        Diferente de register_node:
-          - Só o Origin chama (server.py valida antes)
-          - Aplica score provisório (default 500)
-          - Marca como "active" (não "validator" ainda)
-          - Retorna {ok, is_new, score, will_promote_after}
-
-        Se o nó já existe:
-          - Se score < 500: sobe para 500 (corrige cliente antigo com score baixo)
-          - Se score >= 500: só atualiza last_seen
+        [v3.11] Registra um cliente novo via /api/trust/register ou /announce.
         """
         if not pubkey or len(pubkey) != 66:
             return {"ok": False, "msg": "pubkey inválida (66 hex esperado)"}
@@ -255,7 +231,6 @@ class TrustNetwork:
                     pk[:16], score,
                 )
             else:
-                # Se já existe com score abaixo de 500, sobe
                 if existing.trust_score < score and not existing.banned:
                     existing.trust_score = score
                     existing.update_trust_level()
@@ -289,12 +264,7 @@ class TrustNetwork:
 
     def record_block_signed(self, node_id: str, block_height: int) -> None:
         """
-        [v3.11] Chamado por blockchain.accept_block() para cada signatário
-        válido de um bloco. Incrementa blocks_signed e aplica
-        GAIN_BLOCK_SIGNED (+5).
-
-        Se o nó atingiu AUTO_PROMOTE_MIN_BLOCKS e ainda está em score
-        provisório (500), auto-promove para AUTO_PROMOTE_SCORE (1000).
+        [v3.11] Chamado por blockchain.accept_block() para cada signatário válido.
         """
         if not node_id:
             return
@@ -303,8 +273,6 @@ class TrustNetwork:
         with self._lock:
             n = self.nodes.get(nid)
             if n is None:
-                # Não registrado localmente — não é problema,
-                # apenas não podemos pontuar
                 return
             if n.banned:
                 return
@@ -314,7 +282,6 @@ class TrustNetwork:
             self._adjust_score(nid, GAIN_BLOCK_SIGNED,
                                f"co-assinou #{block_height}")
 
-            # [v3.11] Auto-promoção 500 → 1000 após N blocos
             if (n.blocks_signed >= AUTO_PROMOTE_MIN_BLOCKS
                     and n.trust_score < AUTO_PROMOTE_SCORE
                     and not n.banned):
@@ -335,7 +302,7 @@ class TrustNetwork:
         self.heartbeat(pubkey)
 
     def remove_ghosts(self, max_age_s: int = 300) -> int:
-        """[v3.8] Remove nós fantasmas (inativos há > X segundos)."""
+        """[v3.12] Remove nós fantasmas, mas protege quem tem score alto."""
         now = time.time()
         to_remove = []
 
@@ -344,10 +311,9 @@ class TrustNetwork:
                 age = now - n.last_seen
                 if self._origin_pubkey and n.public_key.lower() == self._origin_pubkey:
                     continue
-                # [v3.11] Não remove quem tem score alto E assinou recentemente
-                if n.trust_score >= SCORE_PROTECTED and n.blocks_signed > 0:
-                    if age < max_age_s * 4:
-                        continue
+                # [v3.12] Proteção absoluta
+                if n.trust_score >= SCORE_PROTECTED:
+                    continue
                 if age > max_age_s:
                     to_remove.append((nid, age))
 
@@ -374,6 +340,7 @@ class TrustNetwork:
                 pk = (n.public_key or "").strip().lower()
                 if pk and pk == self._origin_pubkey:
                     continue
+                # [v3.12] Proteção absoluta
                 if n.trust_score >= SCORE_PROTECTED:
                     continue
                 if (now - n.last_seen) > NODE_TTL_SECONDS:
@@ -417,6 +384,11 @@ class TrustNetwork:
                     data["client_written"] = True
                     with open(self.local_file, "w", encoding="utf-8") as f:
                         json.dump(data, f, indent=2, ensure_ascii=False)
+                    
+                    # [FIX v3.12] Salva também no principal para a GUI/scripts lerem
+                    with open(self.data_file, "w", encoding="utf-8") as f:
+                        json.dump(data, f, indent=2, ensure_ascii=False)
+                        
                     self._dirty_local = False
                     self._last_flush = time.time()
                 except Exception as e:
@@ -458,8 +430,8 @@ class TrustNetwork:
 
                 sig_hex = data.pop("signature", None)
                 origin_pub_hex = data.pop("origin_pubkey", None)
+                client_written = data.pop("client_written", None)
                 data.pop("saved_at", None)
-                data.pop("client_written", None)
 
                 if sig_hex and origin_pub_hex:
                     payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -476,8 +448,12 @@ class TrustNetwork:
                             log.warning("[TrustNetwork] Origem ignorando falha de assinatura.")
                 else:
                     if not self.is_origin:
-                        log.info("[TrustNetwork] main sem assinatura — cliente carrega só local")
-                        data = {"nodes": {}}
+                        # [FIX v3.12] Aceita se foi escrito por cliente
+                        if client_written:
+                            log.info("[TrustNetwork] main carregado (escrito por cliente)")
+                        else:
+                            log.info("[TrustNetwork] main sem assinatura — cliente carrega só local")
+                            data = {"nodes": {}}
                     else:
                         log.info("[TrustNetwork] Origin iniciando sem assinatura (normal)")
 
