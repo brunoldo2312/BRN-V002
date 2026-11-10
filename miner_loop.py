@@ -1,11 +1,14 @@
 """
 miner_loop.py — Loop de mineração do BRN (v7.2)
 ================================================================
-v7.2 (2026-11-09):
+v7.2 (2026-11-10):
   [NEW] Adicionado cálculo de Hashrate para Mineração Solo (Local).
         Agora a GUI consegue exibir a velocidade (kH/s) baseada no
         tempo gasto para encontrar o bloco e na dificuldade.
-  [KEEP] Toda a lógica de v7.1 (sync check, quórum, bootstrap, forks).
+  [NEW] _network_is_ready(): O minerador pausa se estiver
+        atrasado (esperando sync) ou se não houver quórum de
+        validadores online no Trust Network.
+  [KEEP] Toda a lógica de bootstrap, backoff, fila e forks.
 ================================================================
 """
 import os
@@ -145,7 +148,7 @@ class Miner:
         self._last_queue_log = 0.0
         self._last_queue_value = -1
         
-        # [NOVO v7.2] Variáveis de Hashrate
+        # Variáveis de Hashrate
         self.hashrate = 0.0
         self.last_block_dt = 0.0
 
@@ -213,7 +216,7 @@ class Miner:
             "fork_in_progress": forking, "bootstrap_status": status_msg,
             "rede_descentralizada": self.chain.rede_descentralizada, "is_origin": self.is_origin,
             "bootstrap_peers_tracked": n_peers, "bootstrap_peers_blocked": n_blocked,
-            # [NOVO v7.2] Hashrate no status
+            # Hashrate
             "hashrate_khs": round(self.hashrate / 1000.0, 2),
             "hashrate": round(self.hashrate, 2),
         }
@@ -404,20 +407,19 @@ class Miner:
 
                 self.last_error = ""
                 
-                # [NOVO v7.2] Início da contagem de tempo para o Hashrate
+                # Início da contagem de tempo para o Hashrate
                 _t0 = time.time()
                 
                 block = self.chain.mine_block_interruptible(
                     self.address, self.pubkey, should_continue=self._should_continue,
                 )
                 
-                # [NOVO v7.2] Cálculo do Hashrate após minerar
+                # Cálculo do Hashrate após minerar
                 if block is not None:
                     _dt = time.time() - _t0
                     self.last_block_dt = _dt
                     if _dt > 0:
                         diff = block.get("difficulty", self.chain.current_difficulty())
-                        # 16^diff é a média de tentativas para achar o bloco
                         expected_hashes = 16 ** diff
                         self.hashrate = expected_hashes / _dt
 
