@@ -16,7 +16,6 @@ waitress
 
 # Mineração e Carteira
 mnemonic
-p2webview
 
 # Banco de dados e Métricas
 pymongo
