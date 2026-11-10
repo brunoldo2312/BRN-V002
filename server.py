@@ -1,17 +1,12 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.28)
+server.py — Backend HTTP do nó BRN (v9.9.29)
 ================================================================
-v9.9.28 (2026-11-09) — CARTEIRA SÓ VIA GUI:
-  [BREAKING] api_wallet_set_validator_sk NÃO usa mais .env para
-        senha. Removeu password=... e persist_sk_for_reboot().
-        A carteira vem exclusivamente do POST do GUI (via
-        app_wallet_v3.unlock_wallet), que passa sk_hex/address/pubkey
-        já decifrados.
-  [BREAKING] Removida persist_sk_for_reboot do import — não é mais
-        chamada. O GUI já salvou current_wallet.enc antes de POSTar.
-  [KEEP] v9.9.27: /api/validator/announce, integrate_and_propagate
-        no api_wallet_set_validator_sk, trust_download assinado.
-  [KEEP] v9.9.26: STRICT_MULTISIG-aware, proxy pool timeout 30s.
+v9.9.29 (2026-11-10) — BRIDGE INTEGRADA:
+  [NEW] /api/sync-info agora lê btc_config em tempo real
+        para exibir Onramp/Offramp/Endereço na GUI.
+  [NEW] Adicionada rota GET /api/bridge/status para a GUI.
+  [KEEP] v9.9.28: Carteira SÓ VIA GUI, sem .env para wallet.
+  [KEEP] v9.9.27: /api/validator/announce.
 ================================================================
 """
 from __future__ import annotations
@@ -156,7 +151,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
                 headers={"Content-Type": "application/json",
-                         "User-Agent": "brn-server/9.9.28"},
+                         "User-Agent": "brn-server/9.9.29"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -793,8 +788,22 @@ def sync_info():
         "ok": True,
         "sync": {"percent": 100.0, "height": 0, "target": 0, "peers": 0, "work": 0},
         "miner_target": "",
-        "bridge": {"onramp_ativo": False, "taxa": 0, "btc_cofre": ""},
+        "bridge": {"onramp_ativo": False, "taxa": 0, "btc_cofre": "", "offramp_ativo": False},
     }
+    
+    # [INTEGRAÇÃO BRIDGE] Injeta status real da bridge lendo o btc_config
+    try:
+        import btc_config
+        result["bridge"] = {
+            "onramp_ativo": bool(btc_config.BTC_RECEIVE_ADDRESS),
+            "offramp_ativo": bool(btc_config.BTC_WIF),
+            "taxa": btc_config.FEE_PERCENT,
+            "btc_cofre": btc_config.BTC_RECEIVE_ADDRESS,
+            "btc_network": btc_config.BTC_NETWORK,
+        }
+    except Exception as e:
+        log.warning(f"[sync_info] erro ao ler btc_config: {e}")
+
     chain = _get_chain()
     try:
         local_h = chain.db.height()
@@ -837,6 +846,24 @@ def sync_info():
         pass
 
     return jsonify(result), 200
+
+
+@app.route("/api/bridge/status", methods=["GET"])
+def bridge_status():
+    try:
+        import btc_config
+        return jsonify({
+            "ok": True,
+            "onramp_ativo": bool(btc_config.BTC_RECEIVE_ADDRESS),
+            "offramp_ativo": bool(btc_config.BTC_WIF),
+            "taxa": btc_config.FEE_PERCENT,
+            "btc_cofre": btc_config.BTC_RECEIVE_ADDRESS,
+            "btc_network": btc_config.BTC_NETWORK,
+            "processados": 0,
+            "ultima_sync": int(time.time())
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
 
 
 @app.route("/api/sync/status", methods=["GET"])
@@ -1292,17 +1319,6 @@ def api_wallet_set_validator_sk():
     [v9.9.28] SÓ aceita carteira vinda do GUI (via app_wallet_v3).
     NÃO usa .env para senha. NÃO persiste .enc (GUI já salvou antes).
     NÃO tenta recarregar em caso de erro.
-
-    Body (do GUI):
-      {
-        "sk_hex":  "abc...",   # 64 hex
-        "address": "brn1...",
-        "pubkey":  "02..."
-      }
-
-    Retorno:
-      {ok, pubkey, sk_installed, in_trust, in_top5, multisig_ready,
-       pbft_ready, propagated, peers_notified, warnings, errors}
     """
     try:
         data = request.get_json(force=True) or {}
@@ -1320,7 +1336,6 @@ def api_wallet_set_validator_sk():
         except ValueError:
             return jsonify({"ok": False, "msg": "sk_hex não é hex"}), 400
 
-        # ─── Wallet integrator (ponto único) ───
         try:
             from wallet_integrator import (
                 integrate as _integrate_local,
@@ -1705,7 +1720,7 @@ def health():
         return jsonify({
             "ok": True,
             "height": chain.db.height(),
-            "version": "9.9.28",
+            "version": "9.9.29",
             "chain_injected": _CHAIN is not None,
             "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
@@ -1971,5 +1986,5 @@ def api_tx_status(txid_str):
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print("BRN Server v9.9.28 (carteira SÓ via GUI; sem .env para wallet)")
+    print("BRN Server v9.9.29 (Bridge Integrada)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
