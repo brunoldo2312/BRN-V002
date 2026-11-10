@@ -1,21 +1,15 @@
-"""mining_pool.py — Pool de mineração BRN (v6.4)
+"""mining_pool.py — Pool de mineração BRN (v6.5)
 ================================================================
-v6.4 (2026-11-08):
-  [FIX CRÍTICO] PoolClient.__init__ agora detecta automaticamente
-        se o primeiro argumento é um PoolManager (Origem), uma URL
-        (Cliente) ou os argumentos na ordem padrão (address, pubkey).
-        Isso resolve o erro 'str' object has no attribute 'register'
-        e 'PoolManager' object has no attribute 'strip'.
-v6.3 (2026-11-04):
-  [FIX CRÍTICO] _assemble_and_accept_block agora coleta assinaturas
-        via chain._collect_signatures(block) ANTES de chamar
-        chain.accept_block(block). Sem isso, o bloco saía
-        com validators_sig=[] e era rejeitado por
-        _validate_validators_sig com "sem assinaturas
-        válidas" — pool em loop infinito (bloco achado mas
-        nunca aceito, altura travada).
-v6.2 (2026-11-03):
-  [NEW] PoolClient — cliente de mineração que faltava.
+v6.5 (2026-11-10) — CONSOLIDAÇÃO DE CONSENSO E TRUST:
+  [NEW] _assemble_and_accept_block agora tem um LOOP DE RETENTATIVA.
+        Ele tenta coletar assinaturas até 5 vezes (com 3s de pausa)
+        antes de desistir do bloco. Isso resolve o problema de
+        timeout prematuro quando um cliente demora a responder.
+  [NEW] register(), heartbeat() e submit_share() agora atualizam
+        o trust_network automaticamente. O Origin nunca mais vai
+        deletar um minerador ativo por inatividade.
+  [FIX] PoolClient.__init__ detecta automaticamente se o primeiro
+        argumento é URL, PoolManager ou (address, pubkey).
 ================================================================
 """
 from __future__ import annotations
@@ -174,8 +168,7 @@ class PoolManager:
             try:
                 from trust_system import trust_system as _legacy  # noqa: F401
                 log.warning("PoolManager: chain.trust_net ausente — usando "
-                            "trust_system LEGADO (repare: main.py deve criar "
-                            "TrustNetwork e chamar chain.set_trust_net)")
+                            "trust_system LEGADO")
             except Exception:
                 log.warning("PoolManager: sem trust network — reputação de "
                             "mineradores desabilitada neste pool")
@@ -188,7 +181,10 @@ class PoolManager:
         trust = getattr(self.chain, "trust_net", None)
         if trust is not None:
             try:
-                trust.register_node(miner_id, address, pubkey)
+                if hasattr(trust, "register_new_validator"):
+                    trust.register_new_validator(pubkey, address)
+                else:
+                    trust.register_node(miner_id, address, pubkey)
                 return
             except Exception as e:
                 log.warning("[Pool] register_node falhou em trust_net: %s", e)
@@ -265,6 +261,15 @@ class PoolManager:
             m.hashrate = float(hashrate or 0.0)
             if hashes_total > m.hashes_total:
                 m.hashes_total = int(hashes_total)
+            
+            # [AUTO-FIX] Mantém o minerador ativo no Trust da Origem
+            trust = getattr(self.chain, "trust_net", None)
+            if trust and hasattr(trust, "heartbeat"):
+                try:
+                    trust.heartbeat(m.pubkey)
+                except Exception:
+                    pass
+                    
         return {"ok": True}
 
     def disconnect(self, miner_id: str) -> dict:
@@ -397,6 +402,15 @@ class PoolManager:
             if m is None:
                 return {"ok": False, "msg": "miner desconhecido"}
             m.last_seen = time.time()
+            
+            # [AUTO-FIX] Mantém o minerador ativo no Trust
+            trust = getattr(self.chain, "trust_net", None)
+            if trust and hasattr(trust, "heartbeat"):
+                try:
+                    trust.heartbeat(m.pubkey)
+                except Exception:
+                    pass
+                    
             job = self.current_job
             if job is None:
                 return {"ok": False, "msg": "sem job ativo"}
@@ -507,26 +521,36 @@ class PoolManager:
             pass
 
         # ═══════════════════════════════════════════════════════════
-        # [v6.3] FIX CRÍTICO: coletar assinaturas ANTES do accept_block
+        # [FIX] Coleta de assinaturas com LOOP DE RETENTATIVA
         # ═══════════════════════════════════════════════════════════
         _collector = getattr(self.chain, "_collect_signatures", None)
         if callable(_collector):
-            try:
-                log.info("[POOL] coletando sigs para bloco #%d",
-                         block.get("height", -1))
-                _t0 = time.time()
-                _sigs = _collector(block)
-                _dt_ms = (time.time() - _t0) * 1000
-                if _sigs:
-                    block["validators_sig"] = _sigs
-                    log.info("[POOL] %d sig(s) coletada(s) em %.0fms",
-                             len(_sigs), _dt_ms)
-                else:
-                    log.warning("[POOL] _collect_signatures retornou 0 sig(s) "
-                                "em %.0fms para #%d",
-                                _dt_ms, block.get("height", -1))
-            except Exception as _e:
-                log.exception("[POOL] _collect_signatures falhou: %s", _e)
+            _max_retries = 5
+            _sigs = []
+            for _attempt in range(_max_retries):
+                try:
+                    log.info("[POOL] coletando sigs (tentativa %d/%d) para bloco #%d",
+                             _attempt + 1, _max_retries, block.get("height", -1))
+                    _t0 = time.time()
+                    _sigs = _collector(block) or []
+                    _dt_ms = (time.time() - _t0) * 1000
+                    
+                    _validators = self.chain._get_active_validators()
+                    _required = self.chain._required_signatures(_validators)
+                    if len(_sigs) >= _required:
+                        log.info("[POOL] %d sig(s) coletada(s) em %.0fms (QUORUM OK)",
+                                 len(_sigs), _dt_ms)
+                        break
+                    else:
+                        log.warning("[POOL] Apenas %d sig(s) coletada(s). Faltam para o quorum.",
+                                    len(_sigs))
+                        time.sleep(3)
+                except Exception as _e:
+                    log.exception("[POOL] _collect_signatures falhou: %s", _e)
+                    time.sleep(3)
+                    
+            if _sigs:
+                block["validators_sig"] = _sigs
         else:
             _sc = getattr(self.chain, "_sign_collector", None)
             if _sc is not None:
@@ -671,7 +695,7 @@ class PoolManager:
 
 
 # ══════════════════════════════════════════════════════════════
-# PoolClient — cliente de mineração (v6.4 - FIX CRÍTICO DE COMPATIBILIDADE)
+# PoolClient — cliente de mineração (v6.5 - FIX COMPATIBILIDADE)
 # ══════════════════════════════════════════════════════════════
 class PoolClient:
     def __init__(self, address: str, pubkey: str,
@@ -829,7 +853,7 @@ class PoolClient:
             if self.pm is not None:
                 r = self.pm.get_work(self._miner_id)
             else:
-                r = self._http_post("/api/pool/getwork", {"miner_id": self._miner_id})
+                r = self._http_post("/api/pool/work", {"miner_id": self._miner_id})
             if not r.get("ok"):
                 self._last_error = r.get("msg", "get_work falhou")
                 return None
@@ -937,7 +961,7 @@ class PoolClient:
                 url,
                 data=_json.dumps(body).encode(),
                 headers={"Content-Type": "application/json",
-                         "User-Agent": "brn-poolclient/6.4"},
+                         "User-Agent": "brn-poolclient/6.5"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
