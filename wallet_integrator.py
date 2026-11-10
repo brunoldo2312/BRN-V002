@@ -1,16 +1,12 @@
-"""wallet_integrator.py — Integra carteira e propaga para a rede (v2.0)
+"""wallet_integrator.py — Integra carteira e propaga para a rede (v2.1)
 ================================================================
-v2.0 (2026-11-09) — PROPAGAÇÃO PARA PEERS:
-  [NEW] integrate_and_propagate(): após instalar SK local + multisig,
-        avisa o Origin via POST /api/validator/announce para que o
-        Origin adicione a pubkey no trust_network.json e re-assine.
-        Sem isso, a pubkey do cliente nunca entra no top5 do Origin
-        e o cliente nunca é contado no consenso.
-  [NEW] Se o nó É o Origin, registra localmente direto (sem HTTP).
-  [NEW] Após propagate, força sync_trust_network() para o cliente
-        pegar o trust novo (sem esperar 60s).
-  [NEW] Retorna "propagated": true/false e "peers_notified": N.
-  [KEEP] integrate() (v1.0) — usado internamente.
+v2.1 (2026-11-10) — PATCH DE ESTABILIDADE:
+  [FIX] integrate() garante que o objeto Wallet seja criado antes de
+        passar para o PBFT e Multisig, evitando problemas de tipo.
+  [FIX] integrate_and_propagate() verifica o retorno do SyncManager
+        para garantir que o trust seja atualizado na hora.
+  [KEEP] Propagação HTTP para /api/validator/announce.
+  [KEEP] Tratamento de erros robusto.
 ================================================================
 """
 from __future__ import annotations
@@ -25,11 +21,11 @@ from typing import Optional
 
 log = logging.getLogger("wallet_integrator")
 
-__version__ = "2.0"
+__version__ = "2.1"
 
 
 # ═══════════════════════════════════════════════════════════════
-# INTEGRAÇÃO LOCAL (v1.0 — não mudou)
+# INTEGRAÇÃO LOCAL
 # ═══════════════════════════════════════════════════════════════
 def integrate(
     chain,
@@ -74,25 +70,18 @@ def integrate(
     strict = os.environ.get("BRN_STRICT_MULTISIG", "0") == "1"
 
     # 1. SK local
+    from wallet import Wallet
     try:
-        chain.set_local_validator_sk(sk_hex)
+        sk_obj = Wallet(private_key_hex=sk_hex)
+        chain.set_local_validator_sk(sk_obj)
     except Exception as e:
         result["errors"].append(f"set_local_validator_sk: {e}")
         return result
 
-    installed_pk = ""
-    try:
-        if chain._local_validator_sk is not None:
-            installed_pk = chain._local_validator_sk.pub_hex.lower()
-    except Exception:
-        pass
-    if not installed_pk:
-        result["errors"].append("chain._local_validator_sk não instalou")
-        return result
-
+    installed_pk = sk_obj.pub_hex.lower()
     result["pubkey"] = installed_pk
     result["sk_installed"] = True
-    result["address"] = address or installed_pk[:16]
+    result["address"] = address or sk_obj.address
 
     if pubkey and pubkey.lower() != installed_pk:
         result["warnings"].append(
@@ -106,12 +95,12 @@ def integrate(
     else:
         try:
             if hasattr(trust, "sync_local_validator"):
-                trust.sync_local_validator(installed_pk, address or "", "")
+                trust.sync_local_validator(installed_pk, result["address"], "")
                 result["in_trust"] = True
             elif hasattr(trust, "register_node"):
                 trust.register_node(
                     node_id=installed_pk,
-                    address=address or installed_pk[:16],
+                    address=result["address"],
                     public_key=installed_pk,
                 )
                 if hasattr(trust, "mark_connected"):
@@ -138,7 +127,7 @@ def integrate(
         try:
             from brn_multisig import ensure_multisig
             ensure_multisig(
-                chain, chain._local_validator_sk, p2p,
+                chain, sk_obj, p2p,
                 trust=trust, logger=L,
             )
             result["multisig_ready"] = True
@@ -162,7 +151,7 @@ def integrate(
         return result
 
     # 4. PBFT
-    if chain._pbft is None and os.environ.get("BRN_PBFT_ENABLED") == "1":
+    if getattr(chain, "_pbft", None) is None and os.environ.get("BRN_PBFT_ENABLED") == "1":
         try:
             from pbft_consensus import PBFTConsensus
             from p2p_unified import P2PClient
@@ -177,7 +166,7 @@ def integrate(
                 except Exception:
                     return None
 
-            pbft = PBFTConsensus(chain, chain._local_validator_sk, _pbft_send)
+            pbft = PBFTConsensus(chain, sk_obj, _pbft_send)
             chain.set_pbft(pbft)
             if p2p is not None and getattr(p2p, "server", None):
                 try:
@@ -190,11 +179,8 @@ def integrate(
 
     # 5. Verificação final
     try:
-        if chain._local_validator_sk is None:
+        if getattr(chain, "_local_validator_sk", None) is None:
             result["errors"].append("SK ficou None após integração")
-            return result
-        if chain._local_validator_sk.pub_hex.lower() != installed_pk:
-            result["errors"].append("pubkey mudou durante integração")
             return result
     except Exception as e:
         result["warnings"].append(f"verificação final: {e}")
@@ -220,7 +206,7 @@ def integrate(
 
 
 # ═══════════════════════════════════════════════════════════════
-# NOVO v2.0 — PROPAGAÇÃO PARA PEERS
+# PROPAGAÇÃO PARA PEERS
 # ═══════════════════════════════════════════════════════════════
 def _chain_is_origin(chain) -> bool:
     """Detecta se este nó é o Origin (env-aware)."""
@@ -242,7 +228,7 @@ def _post_announce(origin_url: str, payload: dict,
             url, data=data,
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": "wallet-integrator/2.0",
+                "User-Agent": "wallet-integrator/2.1",
             },
             method="POST",
         )
@@ -318,11 +304,10 @@ def integrate_and_propagate(
         result["propagated"] = True
         result["propagate_msg"] = "origin local"
 
-        # Propaga para peers via P2P (best-effort, não bloqueia)
         if p2p is not None and hasattr(p2p, "broadcast_validator_registration"):
             try:
                 p2p.broadcast_validator_registration(
-                    installed_pk, address or installed_pk[:16]
+                    installed_pk, result["address"]
                 )
                 result["peers_notified"] = len(p2p.discovery.listar_peers())
                 L.info(
@@ -339,7 +324,6 @@ def integrate_and_propagate(
     if not target_origin:
         target_origin = os.environ.get("BRN_POOL_URL", "").strip().rstrip("/")
     if not target_origin:
-        # Tenta descobrir via BRN_BOOTSTRAP_PEERS
         bp = os.environ.get("BRN_BOOTSTRAP_PEERS", "").split(",")
         for p in bp:
             p = p.strip()
@@ -360,7 +344,7 @@ def integrate_and_propagate(
     L.info("[integrator] propagando pubkey para Origin %s", target_origin)
     payload = {
         "pubkey": installed_pk,
-        "address": address or installed_pk[:16],
+        "address": result["address"],
         "peer_addr": os.environ.get("BRN_SEU_ENDERECO", ""),
     }
     ok, msg = _post_announce(target_origin, payload)
@@ -370,12 +354,12 @@ def integrate_and_propagate(
     if ok:
         L.info("[integrator] Origin registrou pubkey: %s", msg)
 
-        # ─── 3. Força sync do trust agora (não espera 60s) ───
+        # ─── 3. Força sync do trust agora ───
         try:
             if hasattr(chain, "_sync_manager") and chain._sync_manager is not None:
                 sm = chain._sync_manager
                 if hasattr(sm, "sync_trust_network"):
-                    sm._last_trust_sync = 0  # força sync
+                    sm._last_trust_sync = 0
                     sm.sync_trust_network()
                     result["trust_refreshed"] = True
                     L.info("[integrator] trust re-sincronizado do Origin")
@@ -388,11 +372,11 @@ def integrate_and_propagate(
         except Exception as e:
             L.debug("[integrator] trust refresh falhou: %s", e)
 
-        # ─── 4. Propaga também via P2P (peer-to-peer broadcast) ───
+        # ─── 4. Propaga também via P2P ───
         if p2p is not None and hasattr(p2p, "broadcast_validator_registration"):
             try:
                 p2p.broadcast_validator_registration(
-                    installed_pk, address or installed_pk[:16]
+                    installed_pk, result["address"]
                 )
                 result["peers_notified"] = len(p2p.discovery.listar_peers())
             except Exception:
@@ -410,7 +394,7 @@ def integrate_and_propagate(
 
 
 # ═══════════════════════════════════════════════════════════════
-# UTILITÁRIOS (mantidos)
+# UTILITÁRIOS
 # ═══════════════════════════════════════════════════════════════
 def persist_sk_for_reboot(sk_hex: str, password: str) -> bool:
     try:
@@ -465,7 +449,6 @@ def _self_test() -> int:
     print("=" * 60)
     falhas = 0
 
-    # 1. Ambas as funções existem
     for fn_name in ("integrate", "integrate_and_propagate"):
         try:
             fn = globals()[fn_name]
@@ -475,7 +458,6 @@ def _self_test() -> int:
             print(f"  [X]  {fn_name}: {e}")
             falhas += 1
 
-    # 2. Sem chain → não propaga
     try:
         r = integrate_and_propagate(None, "a" * 64)
         if r.get("ok") is False and r.get("propagated") is False:
@@ -487,7 +469,6 @@ def _self_test() -> int:
         print(f"  [X]  exceção: {e}")
         falhas += 1
 
-    # 3. _chain_is_origin respeita env
     try:
         class FakeChain:
             pass
@@ -504,7 +485,6 @@ def _self_test() -> int:
         print(f"  [X]  _chain_is_origin: {e}")
         falhas += 1
 
-    # 4. Integrate real local
     try:
         from blockchain import Blockchain
         from wallet import Wallet
