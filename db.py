@@ -1,4 +1,4 @@
-"""db.py — Banco SQLite do BRN (v7.3 - Batch seguro)
+"""db.py — Banco SQLite do BRN (v7.3 - Batch seguro + DB Otimizado)
 ================================================================
 v7.3 (2026-11-08) — PATCH DE AUDITORIA:
   [FIX CRÍTICO] _flush_batch: futures só são marcadas como done
@@ -14,17 +14,13 @@ v7.3 (2026-11-08) — PATCH DE AUDITORIA:
         self.conn (mesma transação), retornando o valor correto.
   [FIX] _flush_batch: log warning explícito com nº de ops e motivo
         quando um batch inteiro é desfeito. Antes, o log era genérico.
-  [KEEP] v7.2: leitura separada (read_conn + WAL).
-  [KEEP] v7.1: locks de leitura.
-  [KEEP] v7.0: Writer Queue + Batch Commits.
 
 v7.2 (2026-11-05):
   [ARCH] Conexão SQLite separada para LEITURAS (read_conn) e
          ESCRITAS (conn). Ambas usam WAL.
-v7.1 (2026-11-05):
-  [FIX] InterfaceError por falta de lock em leituras.
-v7.0:
-  Writer Queue + Batch Commits.
+  [MELHORIA] Read-only mode para o READER, durabilidade separada
+             (synchronous FULL writer, NORMAL reader) e whitelist
+             na função _count_table.
 ================================================================
 """
 from __future__ import annotations
@@ -41,6 +37,7 @@ import concurrent.futures
 import orjson
 import json
 import logging
+import pathlib
 
 log = logging.getLogger("db")
 
@@ -77,26 +74,54 @@ class ChainDB:
         self.lock = threading.RLock()
 
         # ─── [v7.2] Conexão do READER (separada) ───
-        self.read_conn = sqlite3.connect(
-            path, check_same_thread=False, isolation_level=None,
-            timeout=5.0,
-        )
+        path_uri = pathlib.Path(path).resolve().as_posix()
+        try:
+            # [MELHORIA] Modo read-only (quando o DB já existe).
+            self.read_conn = sqlite3.connect(
+                f"file:///{path_uri}?mode=ro", check_same_thread=False,
+                isolation_level=None, timeout=5.0, uri=True,
+            )
+        except sqlite3.OperationalError:
+            # Fallback normal na primeira execução (arquivo ainda não criado).
+            self.read_conn = sqlite3.connect(
+                path, check_same_thread=False, isolation_level=None,
+                timeout=5.0,
+            )
         self.read_conn.row_factory = sqlite3.Row
         self.read_lock = threading.RLock()
 
-        # PRAGMAs nas duas conexões
-        pragmas = (
-            "PRAGMA journal_mode=WAL",
-            "PRAGMA synchronous=NORMAL",
+        # [MELHORIA] PRAGMAs comuns + durabilidade separada.
+        # writer = FULL (dinheiro — não pode perder bloco em queda de energia)
+        # reader = NORMAL (não escreve, FULL é desperdício)
+        common_pragmas = (
             "PRAGMA temp_store=MEMORY",
             "PRAGMA cache_size=-64000",
             "PRAGMA mmap_size=268435456",
             "PRAGMA foreign_keys=ON",
             "PRAGMA busy_timeout=5000",
+            "PRAGMA wal_autocheckpoint=1000",
+            "PRAGMA journal_size_limit=67108864",
         )
-        for p in pragmas:
+
+        # Journal mode SÓ no writer (o reader é read-only)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        try:
+            self.read_conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError:
+            pass  # Ignora se o reader for read-only
+
+        for p in common_pragmas:
             self.conn.execute(p)
-            self.read_conn.execute(p)
+            try:
+                self.read_conn.execute(p)
+            except sqlite3.OperationalError:
+                pass
+
+        self.conn.execute("PRAGMA synchronous=FULL")
+        try:
+            self.read_conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.OperationalError:
+            pass
 
         # Schema + backfill rodam ANTES do Writer thread começar
         # (usam self.conn, sem concorrência ainda)
@@ -1248,7 +1273,17 @@ class ChainDB:
             "l2_txs": self._count_table("l2_txs"),
         }
 
+    # [MELHORIA] Whitelist de tabelas — evita SQL injection se `table`
+    # um dia vier de entrada do usuário (hoje vem hardcoded, mas é defesa em profundidade).
+    _COUNT_TABLES = frozenset({
+        "blocks", "transactions", "utxos", "mempool", "meta", "peers",
+        "network_events", "contracts", "contract_state", "contract_events",
+        "l2_escrows", "btc_used", "l2_blocks", "l2_txs",
+    })
+
     def _count_table(self, table: str) -> int:
+        if table not in self._COUNT_TABLES:
+            return 0
         with self.read_lock:
             try:
                 return self.read_conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"]
@@ -1352,6 +1387,14 @@ class ChainDB:
             self._writer_thread.join(timeout=5.0)
         except Exception:
             pass
+        
+        # [MELHORIA] PRAGMA optimize = ANALYZE seletivo baseado em query history.
+        # Faz o planner usar os índices certos quando a base cresce.
+        try:
+            self.conn.execute("PRAGMA optimize")
+        except Exception:
+            pass
+            
         for conn in (self.conn, self.read_conn):
             try:
                 conn.close()
