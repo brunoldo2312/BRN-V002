@@ -1630,4 +1630,402 @@ async function minerarPool() {
       if (r && r.ok) {
         msg("mPool", "🌐 Ligado ao pool! Minerando com a pool da rede.", "ok", 6000);
       } else {
-        msg("mPool", "❌ " + ((
+        msg("mPool", "❌ " + ((r && r.msg) || "falha ao ligar ao pool"), "err");
+      }
+    } catch (e) {
+      msg("mPool", "❌ " + e.message, "err");
+    } finally {
+      miningBusy = false;
+      await updateMiningUI();
+    }
+  }
+}
+
+// ============================================================
+// ATUALIZAR UI DE MINERAÇÃO
+// ============================================================
+async function updateMiningUI() {
+  try {
+    const st = await api("mining_status");
+    const btn = $("bMinerar");
+    const box = $("miningInfo");
+    miningRunning = !!(st && st.running);
+
+    if (!miningBusy) {
+      btn.disabled = false;
+      if (miningRunning) {
+        btn.className = "btn danger";
+        btn.textContent = "⏹️ Parar Local";
+      } else {
+        btn.className = "btn p";
+        btn.textContent = "⛏️ Minerar Local";
+      }
+    }
+
+    if (miningRunning) {
+      box.classList.add("show");
+      $("miningAddr").textContent   = (st.address || "—").slice(0, 20) + "…";
+      $("miningCount").textContent  = st.count || 0;
+      $("miningLast").textContent   = st.last_height != null ? "#" + st.last_height : "—";
+      $("miningUptime").textContent = fmtUptime(st.uptime || 0);
+      const hr = (st.hashrate_khs != null) ? st.hashrate_khs : ((st.hashrate || 0) / 1000);
+      $("miningHashrate").textContent = Number(hr).toFixed(2);
+    } else {
+      box.classList.remove("show");
+    }
+  } catch (e) { /* silencioso */ }
+
+  try {
+    const pst = await api("pool_status");
+    const btn = $("bMinerarPool");
+    const box = $("poolInfo");
+    const poolRunning = !!(pst && pst.running);
+
+    if (!miningBusy) {
+      btn.disabled = false;
+      if (poolRunning) {
+        btn.className = "btn danger";
+        btn.style.background = "";
+        btn.style.borderColor = "";
+        btn.textContent = "⏹️ Parar Pool";
+      } else {
+        btn.className = "btn p";
+        btn.style.background = "#1f6feb";
+        btn.style.borderColor = "#388bfd";
+        btn.textContent = "🌐 Minerar Pool";
+      }
+    }
+
+    if (poolRunning) {
+      box.classList.add("show");
+      $("poolUrl").textContent        = pst.pool_url || "—";
+      $("poolMinerId").textContent    = (pst.miner_id || "—").slice(0, 12);
+      $("poolJobH").textContent       = pst.job_height != null ? "#" + pst.job_height : "—";
+      $("poolSharesOk").textContent   = pst.shares_accepted || 0;
+      $("poolSharesTotal").textContent = pst.shares_submitted || 0;
+      $("poolBlocks").textContent     = pst.blocks_found || 0;
+      $("poolShareDiff").textContent  = pst.job_share_diff != null ? pst.job_share_diff : "—";
+      const hr = pst.hashrate_khs != null ? pst.hashrate_khs : ((pst.hashrate || 0) / 1000);
+      $("poolHashrate").textContent   = Number(hr).toFixed(2);
+    } else {
+      box.classList.remove("show");
+    }
+  } catch (e) { /* silencioso */ }
+}
+
+// ============================================================
+// VERIFICAÇÃO
+// ============================================================
+async function verificarTx() {
+  clearMsg("mVerificar");
+  $("verResult").style.display = "none";
+  const txid = $("verTxid").value.trim();
+  const addr = $("verAddr").value.trim();
+  if (!txid) { msg("mVerificar", "❌ Cole o TXID.", "err"); return; }
+  if (!addr) { msg("mVerificar", "❌ Informe o endereço BRN.", "err"); return; }
+
+  const btn = $("bVerificar");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span>Verificando…';
+  try {
+    const r = await api("verificar_recebimento", addr, txid);
+    if (!r.ok) throw new Error(r.msg || "falha");
+    $("verResult").style.display = "block";
+    $("vrChegou").textContent = r.chegou ? "✅ SIM" : "❌ NÃO";
+    $("vrChegou").style.color = r.chegou ? "#7ee787" : "#ffa198";
+    $("vrStatus").textContent = r.status || "—";
+    $("vrValor").textContent  = r.valor ? fmtBRN(r.valor / 1e8) : "0 BRN";
+    $("vrConf").textContent   = r.confirmacoes != null ? r.confirmacoes : "—";
+    $("vrBloco").textContent  = r.block_height != null ? "#" + r.block_height : "—";
+    $("vrMsg").textContent    = r.msg || "—";
+
+    if (r.chegou) {
+      msg("mVerificar",
+          "✅ CHEGOU! " + fmtBRN(r.valor / 1e8) +
+          " · " + r.status + " · " + (r.confirmacoes || 0) + " confirmações",
+          "ok", 8000);
+    } else {
+      const tipo = r.status === "pending" ? "info" : "err";
+      msg("mVerificar", "❌ Não chegou ainda · status: " + r.status, tipo, 8000);
+    }
+  } catch (e) {
+    msg("mVerificar", "❌ " + e.message, "err");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "🔎 Verificar";
+  }
+}
+
+async function consultarTxStatus() {
+  clearMsg("mTxStatus");
+  const txid = $("txStatusId").value.trim();
+  if (!txid) { msg("mTxStatus", "❌ Cole o TXID.", "err"); return; }
+  const btn = $("bTxStatus");
+  btn.disabled = true;
+  try {
+    const r = await api("tx_status", txid);
+    if (!r.ok) throw new Error(r.msg || "falha");
+    let txt = "Status: " + r.status;
+    if (r.status === "confirmed") {
+      txt += " · bloco #" + r.block_height + " · " + r.confirmations + " confirmações";
+    } else if (r.status === "pending") {
+      txt += " · aguardando mineração";
+    }
+    msg("mTxStatus", txt, r.status === "confirmed" ? "ok" : (r.status === "pending" ? "info" : "err"), 8000);
+  } catch (e) {
+    msg("mTxStatus", "❌ " + e.message, "err");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ============================================================
+// BRIDGE
+// ============================================================
+async function bridgeRefresh() {
+  clearMsg("mBridge");
+  await refreshSyncInfo();
+}
+
+// ============================================================
+// SALVAR / CARREGAR (localStorage)
+// ============================================================
+async function salvar() {
+  clearMsg("mSalvar");
+  if (!wallet.address) { msg("mSalvar", "❌ Sem carteira.", "err"); return; }
+  const name = $("svName").value.trim();
+  const pass = $("svPass").value;
+  if (!name) { msg("mSalvar", "❌ Informe o nome.", "err"); return; }
+  if (!pass || pass.length < 8) { msg("mSalvar", "❌ Senha mín. 8 caracteres.", "err"); return; }
+  try {
+    const r = await api("save_wallet",
+      name, pass, wallet.address, wallet.private_key, wallet.public_key);
+    if (r.ok) {
+      msg("mSalvar", "✅ " + (r.msg || "Salvo."), "ok", 5000);
+      $("svPass").value = "";
+      await listarWallets();
+    } else {
+      msg("mSalvar", "❌ " + (r.msg || "falha"), "err");
+    }
+  } catch (e) { msg("mSalvar", "❌ " + e.message, "err"); }
+}
+
+async function listarWallets() {
+  try {
+    const lista = await api("list_wallets");
+    const sel = $("ldList");
+    sel.innerHTML = '<option value="">— selecione —</option>';
+    (lista || []).forEach(function(w) {
+      const fname = w.name || "";
+      if (!fname) return;
+      const o = document.createElement("option");
+      o.value = fname;
+      o.textContent = fname;
+      sel.appendChild(o);
+    });
+  } catch (e) { /* silencioso */ }
+}
+
+async function carregar() {
+  clearMsg("mCarregar");
+  let name = $("ldList").value || $("ldName").value.trim();
+  const pass = $("ldPass").value;
+  if (!name) { msg("mCarregar", "❌ Escolha/digite o nome.", "err"); return; }
+  if (!pass) { msg("mCarregar", "❌ Informe a senha.", "err"); return; }
+  try {
+    const r = await api("load_wallet", name, pass);
+    if (r.ok) {
+      wallet = { address: r.address, private_key: r.private_key, public_key: r.public_key };
+      renderCarteira();
+      msg("mCarregar", "✅ Carteira carregada.", "ok", 5000);
+      await atualizarSaldo();
+      await carregarMinhasTxs();
+      await refreshSyncInfo();
+      await updateMiningUI();
+      $("ldPass").value = "";
+    } else {
+      msg("mCarregar", "❌ " + (r.msg || "falha"), "err");
+    }
+  } catch (e) { msg("mCarregar", "❌ " + e.message, "err"); }
+}
+
+// ============================================================
+// BACKUP EM ARQUIVO
+// ============================================================
+async function downloadWallet() {
+  clearMsg("mBackup");
+  if (!wallet.address) { msg("mBackup", "❌ Sem carteira.", "err"); return; }
+  const pass = $("svPass").value || prompt("Senha para criptografar o backup (mín. 8):");
+  if (!pass || pass.length < 8) { msg("mBackup", "❌ Senha inválida.", "err"); return; }
+  try {
+    const enc = await encryptWallet({
+      address: wallet.address,
+      private_key: wallet.private_key,
+      public_key: wallet.public_key,
+    }, pass);
+    const blob = new Blob([JSON.stringify(enc, null, 2)], {type: "application/json"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "brn_wallet_" + wallet.address.slice(0, 12) + ".json";
+    a.click();
+    URL.revokeObjectURL(url);
+    msg("mBackup", "✅ Backup baixado. Guarde em local seguro.", "ok", 5000);
+  } catch (e) {
+    msg("mBackup", "❌ " + e.message, "err");
+  }
+}
+
+async function importWalletFile(file) {
+  clearMsg("mBackup");
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const enc = JSON.parse(text);
+    const pass = $("ldPass").value || prompt("Senha do arquivo:");
+    if (!pass) { msg("mBackup", "❌ Senha necessária.", "err"); return; }
+    const data = await decryptWallet(enc, pass);
+    wallet = {
+      address: data.address,
+      private_key: data.private_key,
+      public_key: data.public_key,
+    };
+    renderCarteira();
+    msg("mBackup", "✅ Carteira importada do arquivo!", "ok", 5000);
+    await atualizarSaldo();
+    await carregarMinhasTxs();
+    await refreshSyncInfo();
+    await updateMiningUI();
+  } catch (e) {
+    msg("mBackup", "❌ Falha ao importar: " + e.message, "err");
+  }
+}
+
+// ============================================================
+// TABS
+// ============================================================
+function switchTab(tabName) {
+  document.querySelectorAll(".tab").forEach(function(x) {
+    x.classList.toggle("active", x.dataset.tab === tabName);
+  });
+  document.querySelectorAll(".panel").forEach(function(x) {
+    x.classList.toggle("active", x.id === "p-" + tabName);
+  });
+  try { localStorage.setItem(TAB_KEY, tabName); } catch (_) {}
+  if (tabName === "bridge") {
+    refreshSyncInfo();
+    $("brToBrn").value = wallet.address || "";
+  }
+}
+
+function configTabs() {
+  document.querySelectorAll(".tab").forEach(function(t) {
+    t.addEventListener("click", function() { switchTab(t.dataset.tab); });
+  });
+  let initial = DEFAULT_TAB;
+  try {
+    const saved = localStorage.getItem(TAB_KEY);
+    if (saved) initial = saved;
+  } catch (_) {}
+  switchTab(initial);
+}
+
+function configEventos() {
+  $("bSyncCheck").onclick = syncCheckConnection;
+  $("bSyncStart").onclick = syncStart;
+  $("bSyncStop").onclick  = syncStop;
+
+  $("bRefreshExp").onclick = () => carregarBlocos(true);
+  $("bRefreshPeers").onclick = refreshPeers;
+
+  $("bVerMaisBlocos").onclick = () => carregarBlocos(false);
+  $("bVerTodosBlocos").onclick = carregarTodosBlocos;
+
+  $("bGerar").onclick      = gerarCarteira;
+  $("bAtualizar").onclick  = atualizarSaldo;
+  $("bMyTxs").onclick      = () => carregarMinhasTxs();
+  $("bMyTxs50").onclick    = () => carregarMinhasTxs(50);
+  $("bMyTxs200").onclick   = () => carregarMinhasTxs(200);
+  $("bMyTxs500").onclick   = () => carregarMinhasTxs(500);
+  $("bEnviar").onclick     = enviar;
+  $("bMinerar").onclick    = minerar;
+  $("bMinerarPool").onclick = minerarPool;
+  $("bVerificar").onclick  = verificarTx;
+  $("bVerificarMeu").onclick = function() {
+    if (wallet.address) {
+      $("verAddr").value = wallet.address;
+      msg("mVerificar", "Endereço preenchido.", "info", 3000);
+    } else {
+      msg("mVerificar", "❌ Sem carteira carregada.", "err");
+    }
+  };
+  $("bVerificarUltimo").onclick = function() {
+    if (lastSentTxid) {
+      $("verTxid").value = lastSentTxid;
+      msg("mVerificar", "Último TXID preenchido.", "info", 3000);
+    } else {
+      msg("mVerificar", "Nenhum TX enviado nesta sessão.", "info", 4000);
+    }
+  };
+  $("bTxStatus").onclick   = consultarTxStatus;
+  $("bBridgeRefresh").onclick = bridgeRefresh;
+  $("bSalvar").onclick     = salvar;
+  $("bListar").onclick     = listarWallets;
+  $("bCarregar").onclick   = carregar;
+  $("bDownload").onclick   = downloadWallet;
+  $("bImportBtn").onclick  = () => $("bImportFile").click();
+  $("bImportFile").onchange = (e) => importWalletFile(e.target.files[0]);
+
+  $("wPriv").onclick = function() {
+    const el = $("wPriv");
+    el.style.filter = el.style.filter === "none" ? "blur(4px)" : "none";
+  };
+  $("ldList").onchange = function(e) {
+    if (e.target.value) $("ldName").value = "";
+  };
+}
+
+// ============================================================
+// BOOTSTRAP
+// ============================================================
+async function boot() {
+  configTabs();
+  configEventos();
+  $("apiLbl").textContent = window.location.host;
+
+  await refreshStatus();
+  await refreshSyncInfo();
+  await refreshPeers();
+  await carregarBlocos(true);
+  await listarWallets();
+  await updateMiningUI();
+
+  setInterval(refreshStatus,     10000);
+  setInterval(refreshSyncInfo,    6000);
+  setInterval(refreshPeers,      15000);
+  setInterval(() => carregarBlocos(true), 20000);
+  setInterval(updateMiningUI,     2000);
+  setInterval(function() { if (wallet.address) atualizarSaldo(); }, 20000);
+  setInterval(function() { if (wallet.address) carregarMinhasTxs(); }, 30000);
+
+  setInterval(async () => {
+    try {
+      const d = await api("sync_info");
+      const forking = !!(d && d.sync && d.syncing === false && d.sync.forking);
+      $("forkBanner").classList.toggle("show", forking);
+      if (forking) {
+        $("dot").className = "dot fork";
+        $("statusTxt").textContent = "FORK";
+      }
+    } catch (_) {}
+  }, 5000);
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", boot);
+} else {
+  boot();
+}
+</script>
+</body>
+</html>
