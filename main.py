@@ -1,19 +1,18 @@
-"""main.py — Entrypoint do nó BRN (v13.9.7)
+"""main.py — Entrypoint do nó BRN (v13.9.8)
 ================================================================
-v13.9.7 (2026-11-11) — VALIDAÇÃO DE SK EMBUTIDA:
-  [NEW] _validate_sk_env(): valida BRN_VALIDATOR_SK_HEX contra
-        BRN_VALIDATOR_ADDRESS e BRN_VALIDATOR_PUBKEY antes de
-        tentar instalar. Verifica:
-          1. sk_hex tem 64 chars hex
-          2. address começa com brn1
-          3. pubkey tem 66 chars hex
-          4. Wallet(sk).address == BRN_VALIDATOR_ADDRESS
-          5. Wallet(sk).pub_hex == BRN_VALIDATOR_PUBKEY
-        Se qualquer check falhar, loga o motivo EXATO e NÃO tenta
-        instalar. Resultado visível em /health e no log do Render,
-        sem precisar de Shell.
-  [NEW] /health agora expõe "sk_validation" com o resultado
-        (ok/erro) para consulta via HTTP sem Shell.
+v13.9.8 (2026-11-11) — SEED DETERMINÍSTICO:
+  [NEW] _resolve_validator_sk() resolve a SK em cascata:
+          1. BRN_VALIDATOR_SK_HEX (64 hex explícito)
+          2. BRN_VALIDATOR_SEED   (SHA256(seed) → SK determinística)
+          3. .validator_sk        (arquivo em disco)
+          4. gera nova + salva + loga prominentemente
+        Permite configurar UMA senha (BRN_VALIDATOR_SEED) e o
+        programa deriva sempre a mesma carteira. Sobrevive a
+        hibernações do Render free (15min), sem scripts manuais.
+  [NEW] /health.sk_validation agora expõe "source" (de onde veio).
+  [NEW] SK resolvida é logada prominentemente se for gerada nova
+        (usuário pode copiar para BRN_VALIDATOR_SEED).
+  [KEEP] v13.9.7: validação de SK no boot + /health
   [KEEP] v13.9.6: auto-config (SK + mine via env vars)
   [KEEP] v13.9.5: isolation_detector no watchdog
   [KEEP] v13.9.4: boot sem senha no env (.node_password)
@@ -22,6 +21,7 @@ v13.9.7 (2026-11-11) — VALIDAÇÃO DE SK EMBUTIDA:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import signal
 import sys
@@ -38,10 +38,10 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.7"
+    VERSION = "13.9.8"
     BUILD_DATE = "2026-11-11"
 
-# [AI v13.9.5] Detector de isolamento (opcional)
+# [AI v13.9.5] Detector de isolamento
 try:
     from isolation_detector import IsolationDetector
     _HAS_ISOLATION = True
@@ -77,6 +77,7 @@ SK_VALIDATION_STATE = {
     "checked": False,
     "ok": False,
     "error": "",
+    "source": "",
     "address_configured": "",
     "address_derived": "",
     "pubkey_configured": "",
@@ -450,7 +451,6 @@ def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int):
         except Exception as e:
             log.error("[server] %s falhou: %s", fn_name, e)
 
-    # [v13.9.7] Injeta o estado da validação de SK no server
     try:
         if hasattr(srv, "set_sk_validation_state"):
             srv.set_sk_validation_state(SK_VALIDATION_STATE)
@@ -515,72 +515,150 @@ def _start_gui() -> bool:
 
 
 # ============================================================
-# [VALIDAÇÃO v13.9.7] Validar SK vs address vs pubkey
+# [v13.9.8] Resolve SK por seed / env / arquivo / geração
 # ============================================================
-def _validate_sk_env() -> tuple:
+def _resolve_validator_sk() -> tuple:
     """
-    Valida BRN_VALIDATOR_SK_HEX, ADDRESS e PUBKEY.
-    Retorna (ok: bool, erro: str). Se ok=True, erro="".
-    Também atualiza SK_VALIDATION_STATE global.
+    Resolve (sk_hex, address, pubkey, source) nesta ordem:
+
+      1. BRN_VALIDATOR_SK_HEX (64 hex explícito)
+      2. BRN_VALIDATOR_SEED   (SHA256(seed) → SK determinística)
+      3. .validator_sk        (arquivo salvo em disco, se persistente)
+      4. gera aleatória e tenta salvar em .validator_sk
+
+    Retorna ("", "", "", "error") se tudo falhar.
     """
     log = logging.getLogger("main")
 
+    if not _HAS_WALLET:
+        log.error("[SK] wallet.Wallet indisponível")
+        return "", "", "", "error"
+
+    # ─── 1. SK explícita ───
+    sk_env = os.environ.get("BRN_VALIDATOR_SK_HEX", "").strip()
+    if sk_env:
+        if len(sk_env) != 64 or any(c not in "0123456789abcdefABCDEF" for c in sk_env):
+            log.warning(
+                "[SK] BRN_VALIDATOR_SK_HEX inválida (len=%d) — ignorando",
+                len(sk_env),
+            )
+        else:
+            try:
+                w = _Wallet(private_key_hex=sk_env)
+                log.info("[SK] fonte: env:BRN_VALIDATOR_SK_HEX")
+                return sk_env, w.address, w.pub_hex, "env:sk_hex"
+            except Exception as e:
+                log.warning("[SK] Wallet(sk_env) falhou: %s", e)
+
+    # ─── 2. Seed determinístico ───
+    seed = os.environ.get("BRN_VALIDATOR_SEED", "").strip()
+    if seed:
+        try:
+            sk_hex = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+            w = _Wallet(private_key_hex=sk_hex)
+            log.info(
+                "[SK] fonte: env:BRN_VALIDATOR_SEED → sha256(seed) = %s…",
+                sk_hex[:16],
+            )
+            return sk_hex, w.address, w.pub_hex, "env:seed"
+        except Exception as e:
+            log.warning("[SK] derivação de seed falhou: %s", e)
+
+    # ─── 3. Arquivo .validator_sk em disco ───
+    sk_file = BASE_DIR / ".validator_sk"
+    if sk_file.exists():
+        try:
+            content = sk_file.read_text(encoding="utf-8").strip()
+            sk_hex = content.split("|")[0].strip()
+            if len(sk_hex) == 64 and all(c in "0123456789abcdefABCDEF" for c in sk_hex):
+                w = _Wallet(private_key_hex=sk_hex)
+                log.info("[SK] fonte: arquivo %s", sk_file.name)
+                return sk_hex, w.address, w.pub_hex, "file"
+            else:
+                log.warning("[SK] %s corrompido — ignorando", sk_file.name)
+        except Exception as e:
+            log.warning("[SK] leitura de %s falhou: %s", sk_file.name, e)
+
+    # ─── 4. Gera nova e tenta salvar ───
+    try:
+        w = _Wallet()
+        sk_hex = w.priv_hex
+        address = w.address
+        pubkey = w.pub_hex
+        source = "generated:volatile"
+        try:
+            sk_file.write_text(sk_hex + "\n", encoding="utf-8")
+            try:
+                os.chmod(sk_file, 0o600)
+            except Exception:
+                pass
+            source = "generated:file"
+        except Exception as e:
+            log.warning("[SK] não gravei .validator_sk: %s (volátil)", e)
+
+        log.warning("=" * 64)
+        log.warning(" [SK] NOVA CARTEIRA GERADA — GUARDE PARA RECUPERAR")
+        log.warning("=" * 64)
+        log.warning("   address: %s", address)
+        log.warning("   pubkey : %s", pubkey)
+        log.warning("   sk_hex : %s", sk_hex)
+        log.warning("")
+        log.warning("   Para reusar esta carteira em outros boots, sete:")
+        log.warning("     BRN_VALIDATOR_SEED=<qualquer-senha-memoravel>")
+        log.warning("   Ou copie a sk_hex acima para:")
+        log.warning("     BRN_VALIDATOR_SK_HEX=%s", sk_hex)
+        log.warning("=" * 64)
+
+        return sk_hex, address, pubkey, source
+    except Exception as e:
+        log.error("[SK] geração falhou: %s", e)
+        return "", "", "", "error"
+
+
+# ============================================================
+# [v13.9.7] Validação de SK (helpers)
+# ============================================================
+def _validate_sk_env() -> tuple:
+    """
+    Valida BRN_VALIDATOR_SK_HEX, ADDRESS e PUBKEY (se setados).
+    Retorna (ok: bool, erro: str). Se ok=True, erro="".
+    """
     sk_hex  = os.environ.get("BRN_VALIDATOR_SK_HEX", "").strip()
     address = os.environ.get("BRN_VALIDATOR_ADDRESS", "").strip()
     pubkey  = os.environ.get("BRN_VALIDATOR_PUBKEY", "").strip()
 
-    # ─── 1. SK vazia ───
     if not sk_hex:
         return False, "BRN_VALIDATOR_SK_HEX vazio (env não setada)"
 
-    # ─── 2. SK tamanho ───
     if len(sk_hex) != 64:
-        return False, (
-            f"BRN_VALIDATOR_SK_HEX tem {len(sk_hex)} chars (esperado 64). "
-            f"Você colou com espaço/quebra de linha?"
-        )
+        return False, f"BRN_VALIDATOR_SK_HEX tem {len(sk_hex)} chars (esperado 64)"
 
-    # ─── 3. SK hex ───
     bad_chars = [c for c in sk_hex if c not in "0123456789abcdefABCDEF"]
     if bad_chars:
-        return False, (
-            f"BRN_VALIDATOR_SK_HEX tem chars inválidos: {bad_chars[:5]}. "
-            f"Remova '0x', espaços, etc."
-        )
+        return False, f"BRN_VALIDATOR_SK_HEX tem chars inválidos: {bad_chars[:5]}"
 
-    # ─── 4. Address ───
-    if not address.startswith("brn1"):
-        return False, f"BRN_VALIDATOR_ADDRESS inválido: '{address[:30]}...' (deve começar com brn1)"
+    if address and not address.startswith("brn1"):
+        return False, f"BRN_VALIDATOR_ADDRESS inválido: '{address[:30]}...'"
 
-    # ─── 5. Pubkey tamanho ───
-    if len(pubkey) != 66:
+    if pubkey and len(pubkey) != 66:
         return False, f"BRN_VALIDATOR_PUBKEY tem {len(pubkey)} chars (esperado 66)"
 
-    # ─── 6. Pubkey hex ───
-    bad_pk = [c for c in pubkey if c not in "0123456789abcdefABCDEF"]
-    if bad_pk:
-        return False, f"BRN_VALIDATOR_PUBKEY tem chars inválidos: {bad_pk[:5]}"
-
-    # ─── 7. Wallet disponível? ───
     if not _HAS_WALLET:
-        return False, "wallet.Wallet indisponível (wallet.py não importável)"
+        return False, "wallet.Wallet indisponível"
 
-    # ─── 8. Deriva Wallet da SK ───
     try:
         w = _Wallet(private_key_hex=sk_hex)
     except Exception as e:
         return False, f"Wallet(private_key_hex=sk) falhou: {e}"
 
-    # ─── 9. Compara address ───
-    if w.address != address:
+    if address and w.address != address:
         return False, (
             f"ADDRESS MISMATCH — a SK não corresponde a este address\n"
             f"  configurado: {address}\n"
             f"  derivado:    {w.address}"
         )
 
-    # ─── 10. Compara pubkey ───
-    if w.pub_hex.lower() != pubkey.lower():
+    if pubkey and w.pub_hex.lower() != pubkey.lower():
         return False, (
             f"PUBKEY MISMATCH — a SK não corresponde a esta pubkey\n"
             f"  configurado: {pubkey}\n"
@@ -590,86 +668,48 @@ def _validate_sk_env() -> tuple:
     return True, ""
 
 
-def _validate_and_log_sk() -> bool:
-    """Valida a SK, loga resultado detalhado, atualiza SK_VALIDATION_STATE."""
-    log = logging.getLogger("main")
-
-    sk_hex  = os.environ.get("BRN_VALIDATOR_SK_HEX", "").strip()
-    address = os.environ.get("BRN_VALIDATOR_ADDRESS", "").strip()
-    pubkey  = os.environ.get("BRN_VALIDATOR_PUBKEY", "").strip()
-
-    # Atualiza estado global (para /health)
-    SK_VALIDATION_STATE["checked"] = True
-    SK_VALIDATION_STATE["address_configured"] = address[:40] if address else ""
-    SK_VALIDATION_STATE["pubkey_configured"] = pubkey[:40] if pubkey else ""
-
-    if not sk_hex:
-        SK_VALIDATION_STATE["ok"] = False
-        SK_VALIDATION_STATE["error"] = "SK_HEX vazio"
-        return False
-
-    ok, err = _validate_sk_env()
-
-    SK_VALIDATION_STATE["ok"] = ok
-    SK_VALIDATION_STATE["error"] = err
-
-    # Log detalhado
-    log.info("=" * 64)
-    log.info(" [SK VALIDATION v13.9.7]")
-    log.info("=" * 64)
-    log.info("  SK_HEX len       : %d %s", len(sk_hex), "✅" if len(sk_hex) == 64 else "❌")
-    log.info("  ADDRESS          : %s...", address[:30] if address else "(vazio)")
-    log.info("  PUBKEY           : %s...", pubkey[:30] if pubkey else "(vazio)")
-
-    if ok:
-        try:
-            w = _Wallet(private_key_hex=sk_hex)
-            SK_VALIDATION_STATE["address_derived"] = w.address
-            SK_VALIDATION_STATE["pubkey_derived"] = w.pub_hex
-            log.info("  Address derivado : %s... ✅", w.address[:30])
-            log.info("  Pubkey derivado  : %s... ✅", w.pub_hex[:30])
-        except Exception:
-            pass
-        log.info("  RESULTADO        : ✅ SK VÁLIDA")
-    else:
-        log.error("  RESULTADO        : ❌ SK INVÁLIDA")
-        for line in err.split("\n"):
-            log.error("    %s", line)
-
-    log.info("=" * 64)
-    return ok
-
-
 # ============================================================
-# AUTO-CONFIG (v13.9.7: + validação)
+# [v13.9.8] AUTO-CONFIG (com resolve)
 # ============================================================
 def _auto_configure(chain, p2p, trust, web_port: int) -> None:
     log = logging.getLogger("main")
 
-    address = os.environ.get("BRN_VALIDATOR_ADDRESS", "").strip()
-    pubkey  = os.environ.get("BRN_VALIDATOR_PUBKEY", "").strip()
     auto_mine = os.environ.get("BRN_AUTO_MINE", "0") == "1"
 
-    # ─── 1. Valida SK ANTES de qualquer coisa ───
-    sk_ok = _validate_and_log_sk()
+    # ─── 1. Resolve SK (env / seed / arquivo / gera) ───
+    sk_hex, address, pubkey, source = _resolve_validator_sk()
 
-    if not sk_ok:
-        log.error(
-            "[AUTO-CONFIG] ❌ SK inválida — NÃO vou tentar instalar. "
-            "Corrija BRN_VALIDATOR_SK_HEX/ADDRESS/PUBKEY no Render."
-        )
-        log.error(
-            "[AUTO-CONFIG] Consulte /health para ver o erro detalhado: "
-            "GET https://brn-v002.onrender.com/health"
-        )
+    SK_VALIDATION_STATE["checked"] = True
+    SK_VALIDATION_STATE["ok"] = bool(sk_hex)
+    SK_VALIDATION_STATE["error"] = "" if sk_hex else "não foi possível resolver SK"
+    SK_VALIDATION_STATE["source"] = source
+    SK_VALIDATION_STATE["address_configured"] = address[:40] if address else ""
+    SK_VALIDATION_STATE["address_derived"] = address
+    SK_VALIDATION_STATE["pubkey_configured"] = pubkey[:40] if pubkey else ""
+    SK_VALIDATION_STATE["pubkey_derived"] = pubkey
+
+    # Log detalhado
+    log.info("=" * 64)
+    log.info(" [SK RESOLUTION v13.9.8]")
+    log.info("=" * 64)
+    log.info("  source           : %s", source or "(nenhum)")
+    log.info("  SK_HEX len       : %d", len(sk_hex) if sk_hex else 0)
+    log.info("  ADDRESS          : %s", (address[:40] + "…") if address else "(vazio)")
+    log.info("  PUBKEY           : %s", (pubkey[:40] + "…") if pubkey else "(vazio)")
+
+    if not sk_hex:
+        log.error("  RESULTADO        : ❌ não foi possível resolver SK")
+        log.error("=" * 64)
         return
+
+    log.info("  RESULTADO        : ✅ SK resolvida")
+    log.info("=" * 64)
 
     # ─── 2. Instala SK ───
     if not _HAS_WI:
         log.error("[AUTO-CONFIG] wallet_integrator indisponível")
         return
 
-    sk_hex = os.environ.get("BRN_VALIDATOR_SK_HEX", "").strip()
     log.info("[AUTO-CONFIG] instalando SK via wallet_integrator...")
     try:
         r = _wi.integrate_and_propagate(
@@ -707,7 +747,6 @@ def _auto_configure(chain, p2p, trust, web_port: int) -> None:
         log.warning("[AUTO-CONFIG] 'requests' não instalado")
         return
 
-    # Aguarda SK estar no chain (até 30s)
     for _ in range(30):
         if getattr(chain, "_local_validator_sk", None) is not None:
             break
@@ -838,7 +877,7 @@ def main() -> int:
     else:
         log.info("[trust] carregado (origin=%s)", is_origin)
 
-    log.info("[wallet] boot sem carteira (design v13.9.7)")
+    log.info("[wallet] boot sem carteira (design v13.9.8)")
 
     # [6] P2P
     p2p = None
@@ -882,7 +921,7 @@ def main() -> int:
     if not ok_http:
         log.error("[server] HTTP não subiu")
 
-    # [11.5] [AUTO-CONFIG v13.9.7] SK + auto-mine (com validação)
+    # [11.5] [AUTO-CONFIG v13.9.8] resolve + valida + instala + mine
     if not args.no_pool_client:
         threading.Thread(
             target=_delayed_auto_configure,
@@ -890,7 +929,7 @@ def main() -> int:
             daemon=True,
             name="AutoConfig",
         ).start()
-        log.info("[AUTO-CONFIG] agendado (3s para validar SK + instalar + mine)")
+        log.info("[AUTO-CONFIG] agendado (3s para resolver SK + instalar + mine)")
 
     # [12] Explorer
     if not args.no_explorer:
@@ -941,6 +980,9 @@ def main() -> int:
     log.info("   P2P      : :%d", p2p_port)
     log.info("   Bootstrap: %s", os.environ.get("BRN_BOOTSTRAP_PEERS", "(vazio)"))
     log.info("   Pool URL : %s", os.environ.get("BRN_POOL_URL", "(vazio)"))
+    log.info("   SK source: %s",
+             os.environ.get("BRN_VALIDATOR_SEED") and "env:seed"
+             or (os.environ.get("BRN_VALIDATOR_SK_HEX") and "env:sk_hex" or "(resolve no boot)"))
     log.info("=" * 64)
 
     try:
