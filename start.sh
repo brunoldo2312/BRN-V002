@@ -1,5 +1,4 @@
 #!/bin/bash
-# set -e REMOVIDO — cada comando tem seu próprio || true ou checagem
 
 echo "[start.sh] iniciando..."
 
@@ -8,7 +7,6 @@ echo "[start.sh] iniciando..."
 # ─────────────────────────────────────────────────────────────
 if [ -z "${TAILSCALE_AUTHKEY}" ]; then
   echo "[start.sh] ⚠️  TAILSCALE_AUTHKEY vazio — P2P via tailnet DESATIVADO"
-  echo "[start.sh]    o nó vai rodar apenas em HTTP local ($PORT)"
   TS_ENABLED=0
 else
   TS_ENABLED=1
@@ -22,11 +20,10 @@ fi
 cd /opt/render/project/src
 
 # ─────────────────────────────────────────────────────────────
-# 1-5. Tailscale (só se TAILSCALE_AUTHKEY estiver setado)
+# 1-5. Tailscale
 # ─────────────────────────────────────────────────────────────
 if [ "$TS_ENABLED" = "1" ]; then
   echo "[start.sh] configurando Tailscale..."
-
   pkill tailscaled 2>/dev/null || true
 
   mkdir -p /tmp/ts
@@ -38,15 +35,12 @@ if [ "$TS_ENABLED" = "1" ]; then
 
   if [ "$TS_ENABLED" = "1" ]; then
     chmod +x /tmp/ts/tailscale /tmp/ts/tailscaled
-
-    # Daemon SEM socks5-server (Correção 1)
     /tmp/ts/tailscaled \
       --tun=userspace-networking \
       --state=/tmp/ts/tailscaled.state \
       --socket=/tmp/ts/tailscaled.sock \
       >/tmp/ts/tailscaled.log 2>&1 &
 
-    # Espera o socket ficar pronto (até 15s)
     echo "[start.sh] aguardando socket do tailscaled..."
     for i in $(seq 1 15); do
       if [ -S /tmp/ts/tailscaled.sock ]; then
@@ -62,7 +56,6 @@ if [ "$TS_ENABLED" = "1" ]; then
     fi
   fi
 
-  # Autentica com retry (3 tentativas)
   if [ "$TS_ENABLED" = "1" ]; then
     TS_OK=0
     for i in 1 2 3; do
@@ -78,19 +71,15 @@ if [ "$TS_ENABLED" = "1" ]; then
     done
 
     if [ "$TS_OK" = "0" ]; then
-      echo "[start.sh] ⚠️  tailscale up falhou 3x — seguindo sem Tailscale"
+      echo "[start.sh] ⚠️  tailscale up falhou — seguindo sem Tailscale"
       TS_ENABLED=0
     fi
   fi
 
-  # Serve (só expõe P2P 6001)
   if [ "$TS_ENABLED" = "1" ]; then
-    /tmp/ts/tailscale --socket=/tmp/ts/tailscaled.sock \
-      serve reset 2>/dev/null || true
-
+    /tmp/ts/tailscale --socket=/tmp/ts/tailscaled.sock serve reset 2>/dev/null || true
     /tmp/ts/tailscale --socket=/tmp/ts/tailscaled.sock \
       serve --bg --tcp 6001 tcp://localhost:6001 2>/dev/null || true
-
     echo "[start.sh] ✅ serve: 6001 → localhost:6001"
     /tmp/ts/tailscale --socket=/tmp/ts/tailscaled.sock ip -4 2>/dev/null \
       | head -1 | xargs -I{} echo "[start.sh]    IP Tailscale: {}"
@@ -98,7 +87,7 @@ if [ "$TS_ENABLED" = "1" ]; then
 fi
 
 # ─────────────────────────────────────────────────────────────
-# 6. Limpa proxy herdado do Render (Correção 1b)
+# 6. Limpa proxy herdado
 # ─────────────────────────────────────────────────────────────
 unset ALL_PROXY HTTP_PROXY HTTPS_PROXY all_proxy http_proxy https_proxy
 unset NO_PROXY no_proxy
@@ -107,7 +96,20 @@ export no_proxy="*"
 export PYTHONUNBUFFERED=1
 
 # ─────────────────────────────────────────────────────────────
-# 7. Roda o nó
+# 7. Força bootstrap peers se não vier do env
 # ─────────────────────────────────────────────────────────────
-echo "[start.sh] iniciando main.py (TS_ENABLED=$TS_ENABLED PORT=$PORT)..."
+if [ -z "${BRN_BOOTSTRAP_PEERS}" ]; then
+  export BRN_BOOTSTRAP_PEERS="100.111.253.8:6001"
+  echo "[start.sh] BRN_BOOTSTRAP_PEERS setado: ${BRN_BOOTSTRAP_PEERS}"
+fi
+
+if [ -z "${BRN_POOL_URL}" ]; then
+  export BRN_POOL_URL="http://100.111.253.8:5000"
+  echo "[start.sh] BRN_POOL_URL setado: ${BRN_POOL_URL}"
+fi
+
+# ─────────────────────────────────────────────────────────────
+# 8. Inicia o nó com auto-configure
+# ─────────────────────────────────────────────────────────────
+echo "[start.sh] iniciando main.py (TS=$TS_ENABLED PORT=$PORT)..."
 exec python3 main.py --headless --no-explorer --web-port "$PORT"
