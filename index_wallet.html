@@ -2,7 +2,8 @@
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
-<title>BRN Wallet v3.20</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BRN Wallet v3.21 (Web)</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -62,6 +63,13 @@
     animation: pulse 1.5s infinite;
   }
   .fork-banner.show { display: block; }
+
+  .web-banner {
+    display: block; padding: 10px 14px; margin-bottom: 14px;
+    background: #0d1d2f; border: 1px solid #1f6feb; border-radius: 6px;
+    font-size: .82rem; color: #79c0ff;
+  }
+  .web-banner b { color: #58a6ff; }
 
   .tabs { display:flex; gap:4px; margin-bottom:14px;
           border-bottom:1px solid #30363d; flex-wrap: wrap; }
@@ -229,25 +237,24 @@
   .peers-summary .pill.warn { background: #2d2200; color: #e3b341; }
   .peers-summary .pill.err { background: #2d1416; color: #ffa198; }
 
-  /* [v3.20] Hint para arquivos .wallet */
   .wallet-hint {
     font-size: .72rem; color: #8b949e; margin-top: 4px;
     font-style: italic;
+  }
+
+  .unavailable {
+    background: #2d1416; border: 1px solid #8b2424; color: #ffa198;
+    padding: 10px 14px; border-radius: 6px; font-size: .85rem;
+    margin-top: 10px;
   }
 </style>
 </head>
 <body>
 <div class="wrap">
 
-  <div id="abBanner" style="display:none; background: linear-gradient(90deg, #238636 0%, #2ea043 100%); padding: 16px; border-radius: 8px; margin-bottom: 20px; text-align: center; border: 2px solid #3fb950; box-shadow: 0 4px 12px rgba(46,160,67,0.3);">
-    <h2 style="color: #fff; margin: 0 0 10px 0;">⛏️ Ajude a rede a crescer!</h2>
-    <p style="color: #e6edf3; margin: 0 0 15px 0; font-size: 0.9rem;">
-      Estamos na Fase Bootstrap (<span id="abQueueCount">1</span>/20 mineradores).
-      Minerar em pool garante <b>50% da recompensa</b> para você enquanto a rede não descentraliza.
-    </p>
-    <button id="abBtnMine" class="btn p big" style="background: #fff; color: #238636; font-weight: bold; border: none; padding: 10px 24px; font-size: 1rem; cursor: pointer;">
-      ▶️ Iniciar Mineração em Pool
-    </button>
+  <div class="web-banner">
+    🌐 <b>Versão Web</b> · A carteira fica apenas no seu navegador (criptografada).
+    A SK nunca é armazenada no servidor Render. Faça backup em <b>💾 Arquivo</b>.
   </div>
 
   <div id="forkBanner" class="fork-banner">
@@ -255,7 +262,7 @@
   </div>
 
   <header>
-    <h1>🔷 <span>BRN</span> Wallet</h1>
+    <h1>🔷 <span>BRN</span> Wallet <span style="font-size:.7rem;color:#8b949e;">v3.21 web</span></h1>
     <div class="topbar">
       <div class="topbar-item">
         <span class="dot" id="dot"></span>
@@ -482,7 +489,6 @@
       <label>Valor (BRN) — até 8 casas decimais (ex: 0.29)</label>
       <input id="txAmount" type="text"
              inputmode="decimal"
-             pattern="[0-9]*[.,]?[0-9]*"
              placeholder="1.5"
              autocomplete="off">
       <div class="row">
@@ -594,40 +600,46 @@
 
     <div class="card">
       <h2>Converter BTC → BRN</h2>
-      <p style="color:#8b949e;font-size:.82rem;margin-bottom:8px;">
-        Envie BTC para o cofre, cole o TXID e clique em Converter.
-      </p>
+      <div class="unavailable">
+        ⚠️ <b>Indisponível no servidor web.</b> O endpoint <code>/api/bridge/claim</code>
+        não está implementado no <code>server.py</code>. Use a GUI desktop
+        (<code>main.py</code>) para converter BTC→BRN.
+      </div>
       <label>TXID BTC recebido</label>
-      <input id="brTxid" placeholder="ex: 3f4a…">
+      <input id="brTxid" placeholder="ex: 3f4a…" disabled>
       <label>Meu endereço BRN (destino)</label>
       <input id="brToBrn" readonly placeholder="brn1...">
       <div class="row">
-        <button class="btn p" id="bBridgeClaim">💱 Converter para BRN</button>
+        <button class="btn" id="bBridgeClaim" disabled style="opacity:.5;cursor:not-allowed;">
+          💱 Converter para BRN (indisponível)
+        </button>
       </div>
-      <div class="msg" id="mBridgeClaim"></div>
     </div>
   </div>
 
   <!-- ============ ARQUIVO ============ -->
   <div class="panel" id="p-arquivo">
     <div class="card">
-      <h2>Salvar carteira criptografada</h2>
-      <label>Nome do arquivo</label>
+      <h2>💾 Salvar na sessão (localStorage)</h2>
+      <p style="color:#8b949e;font-size:.82rem;margin-bottom:8px;">
+        Criptografa a carteira com sua senha e guarda no navegador.
+        <b>Não sincroniza entre navegadores.</b> Para backup portátil, use .json abaixo.
+      </p>
+      <label>Nome</label>
       <input id="svName" placeholder="minha_carteira">
-      <div class="wallet-hint">Ex: "minha_carteira" → salva como wallets/minha_carteira.wallet</div>
-      <label>Senha</label>
+      <label>Senha (mín. 8 caracteres)</label>
       <input id="svPass" type="password" placeholder="••••••••">
       <div class="row"><button class="btn p" id="bSalvar">💾 Salvar</button></div>
       <div class="msg" id="mSalvar"></div>
     </div>
 
     <div class="card">
-      <h2>Carregar carteira</h2>
+      <h2>📂 Carregar da sessão</h2>
       <label>Arquivos salvos</label>
       <select id="ldList"><option value="">— carregando —</option></select>
-      <div class="wallet-hint">Selecione na lista ou digite o nome abaixo (com ou sem .wallet)</div>
-      <label>Ou digite o nome</label>
-      <input id="ldName" placeholder="minha_carteira ou minha_carteira.wallet">
+      <div class="wallet-hint">Ou digite o nome abaixo</div>
+      <label>Nome</label>
+      <input id="ldName" placeholder="minha_carteira">
       <label>Senha</label>
       <input id="ldPass" type="password" placeholder="••••••••">
       <div class="row">
@@ -636,9 +648,24 @@
       </div>
       <div class="msg" id="mCarregar"></div>
     </div>
+
+    <div class="card">
+      <h2>📥 Backup em arquivo .json</h2>
+      <p style="color:#8b949e;font-size:.82rem;margin-bottom:8px;">
+        Baixe um arquivo criptografado. Use em qualquer navegador/máquina
+        com a mesma senha. <b>Guarde bem</b> — sem ele, você perde a carteira
+        se o navegador for limpo.
+      </p>
+      <div class="row">
+        <button class="btn" id="bDownload">⬇️ Baixar .json</button>
+        <button class="btn" id="bImportBtn">⬆️ Importar .json</button>
+        <input type="file" id="bImportFile" accept=".json,application/json" style="display:none;">
+      </div>
+      <div class="msg" id="mBackup"></div>
+    </div>
   </div>
 
-  <div class="footer">BRN Wallet v3.20 · ponte pywebview · <span id="apiLbl">—</span></div>
+  <div class="footer">BRN Wallet v3.21 (web) · <span id="apiLbl">—</span></div>
 </div>
 
 <script>
@@ -648,7 +675,6 @@
 // ESTADO GLOBAL
 // ============================================================
 let wallet = { address:"", private_key:"", public_key:"" };
-let ready = false;
 let miningRunning = false;
 let miningBusy = false;
 let lastSentTxid = "";
@@ -660,12 +686,10 @@ let _blockCursor = null;
 let _allBlocksLoaded = false;
 let _blocksLoading = false;
 
-let _lastStatus = null;
-let _lastSyncInfo = null;
-let _lastPeers = [];
-
 const TAB_KEY = "brn_wallet_last_tab";
 const DEFAULT_TAB = "explorer";
+const LS_LIST_KEY = "brn_wallet_list_v1";
+const LS_WALLET_PREFIX = "brn_wallet_v1_";
 
 // ============================================================
 // HELPERS
@@ -680,13 +704,6 @@ function msg(id, text, type = "info", autoHideMs = 0) {
   if (autoHideMs) setTimeout(() => { el.className = "msg"; }, autoHideMs);
 }
 function clearMsg(id) { const el = $(id); if (el) el.className = "msg"; }
-
-async function api(method, ...args) {
-  if (!ready) throw new Error("Ponte pywebview ainda não pronta");
-  const fn = window.pywebview && window.pywebview.api && window.pywebview.api[method];
-  if (typeof fn !== "function") throw new Error("Método não exposto: " + method);
-  return await fn(...args);
-}
 
 function fmtBRN(v) {
   const n = Number(v) || 0;
@@ -711,48 +728,264 @@ function fmtAgo(ts) {
 }
 
 // ============================================================
-// TESTE A/B
+// HTTP HELPERS
 // ============================================================
-async function checkABTest() {
+async function getJSON(url, timeoutMs = 8000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await api("get_experiment_variant");
-    if (res.error) return;
-
-    await api("log_exposure", res.variant);
-
-    if (res.variant === "B") {
-      const banner = $("abBanner");
-      banner.style.display = "block";
-
-      const st = await api("node_status");
-      if (st.ok) $("abQueueCount").textContent = st.fila_tamanho || 1;
-
-      $("abBtnMine").onclick = function() {
-        document.querySelector('.tab[data-tab="enviar"]').click();
-        setTimeout(() => {
-          $("bMinerarPool").click();
-          banner.style.display = "none";
-        }, 300);
-      };
+    const r = await fetch(url, {signal: ctrl.signal});
+    if (!r.ok) {
+      let errMsg = `HTTP ${r.status}`;
+      try { const e = await r.json(); if (e.msg) errMsg = e.msg; } catch(_) {}
+      throw new Error(errMsg);
     }
+    return await r.json();
+  } finally { clearTimeout(timer); }
+}
+
+async function postJSON(url, body, timeoutMs = 20000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body || {}),
+      signal: ctrl.signal,
+    });
+    let data;
+    try { data = await r.json(); } catch { data = {}; }
+    if (!r.ok) {
+      throw new Error(data.msg || data.error || `HTTP ${r.status}`);
+    }
+    return data;
+  } finally { clearTimeout(timer); }
+}
+
+// ============================================================
+// CRIPTOGRAFIA (Web Crypto API)
+// ============================================================
+async function _deriveKey(password, salt) {
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]
+  );
+  return await crypto.subtle.deriveKey(
+    {name: "PBKDF2", salt, iterations: 200000, hash: "SHA-256"},
+    keyMaterial,
+    {name: "AES-GCM", length: 256},
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+async function encryptWallet(data, password) {
+  const enc = new TextEncoder();
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await _deriveKey(password, salt);
+  const ct = await crypto.subtle.encrypt(
+    {name: "AES-GCM", iv}, key, enc.encode(JSON.stringify(data))
+  );
+  return {
+    v: 1,
+    algo: "AES-256-GCM/PBKDF2-SHA256",
+    salt: _b64(salt),
+    iv: _b64(iv),
+    ct: _b64(new Uint8Array(ct)),
+  };
+}
+
+async function decryptWallet(encrypted, password) {
+  if (encrypted.v !== 1) throw new Error("Formato desconhecido (v" + encrypted.v + ")");
+  const salt = _unb64(encrypted.salt);
+  const iv = _unb64(encrypted.iv);
+  const ct = _unb64(encrypted.ct);
+  const key = await _deriveKey(password, salt);
+  const pt = await crypto.subtle.decrypt({name: "AES-GCM", iv}, key, ct);
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+
+function _b64(u8) {
+  let s = "";
+  for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+  return btoa(s);
+}
+function _unb64(s) {
+  const bin = atob(s);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8;
+}
+
+// ============================================================
+// LOCALSTORAGE WALLET MANAGEMENT
+// ============================================================
+function listWalletsLocal() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(LS_LIST_KEY) || "[]");
+    return Array.isArray(arr) ? arr.map(n => ({name: n})) : [];
+  } catch { return []; }
+}
+
+function _saveWalletListLocal(names) {
+  localStorage.setItem(LS_LIST_KEY, JSON.stringify(Array.from(new Set(names))));
+}
+
+async function saveWalletLocal(name, password, data) {
+  if (!name || !password) return {ok: false, msg: "Nome/senha vazios"};
+  if (password.length < 8) return {ok: false, msg: "Senha muito curta (min 8)"};
+  try {
+    const enc = await encryptWallet(data, password);
+    localStorage.setItem(LS_WALLET_PREFIX + name, JSON.stringify(enc));
+    const list = listWalletsLocal().map(w => w.name);
+    if (!list.includes(name)) {
+      list.push(name);
+      _saveWalletListLocal(list);
+    }
+    return {ok: true, name, msg: "Salvo localmente"};
   } catch (e) {
-    console.error("Erro AB test:", e);
+    return {ok: false, msg: "Erro ao criptografar: " + e.message};
+  }
+}
+
+async function loadWalletLocal(name, password) {
+  const raw = localStorage.getItem(LS_WALLET_PREFIX + name);
+  if (!raw) return {ok: false, msg: "Carteira '" + name + "' não encontrada"};
+  try {
+    const enc = JSON.parse(raw);
+    const data = await decryptWallet(enc, password);
+    return {ok: true, address: data.address, private_key: data.private_key, public_key: data.public_key};
+  } catch (e) {
+    return {ok: false, msg: "Senha incorreta ou dados corrompidos"};
   }
 }
 
 // ============================================================
-// STATUS DO NÓ + MODO + FORK + PEERS
+// SHIM — mapeia métodos pywebview para endpoints HTTP
 // ============================================================
-function setDotState(cls) {
-  const dot = $("dot");
-  dot.className = "dot " + cls;
+async function api(method, ...args) {
+  try {
+    switch (method) {
+      case "get_experiment_variant": return {variant: "A"};
+      case "log_exposure": return {ok: true};
+
+      case "node_status": {
+        const r = await getJSON("/api/status");
+        return {...r, ok: r.success !== false && !r.error, pool_enabled: false};
+      }
+
+      case "sync_info":
+        return await getJSON("/api/sync-info");
+
+      case "get_trust_nodes":
+        return await getJSON("/api/trust/nodes");
+
+      case "peers_score": {
+        const r = await getJSON("/api/peers");
+        return {peers: r.peers || []};
+      }
+
+      case "generate_wallet": {
+        const r = await postJSON("/api/nova-carteira", {});
+        if (r.success) {
+          return {ok: true, address: r.address, private_key: r.private_key, public_key: r.public_key};
+        }
+        return {ok: false, erro: r.error || "falha"};
+      }
+
+      case "portfolio": {
+        const r = await getJSON("/api/portfolio/" + encodeURIComponent(args[0]));
+        const p = r.portfolio || {};
+        return {ok: true, BRN: p.BRN || 0, KYC: p.KYC || 0};
+      }
+
+      case "minhas_txs": {
+        const limit = args[1] || 50;
+        return await getJSON("/api/minhas-txs/" + encodeURIComponent(args[0]) + "?limit=" + limit);
+      }
+
+      case "transfer": {
+        // args: [from, to, "BRN", amount, private_key, public_key]
+        return await postJSON("/api/transfer", {
+          from: args[0], to: args[1], amount: args[3], private_key: args[4],
+        });
+      }
+
+      case "mining_status":
+        return await getJSON("/api/miner/status");
+
+      case "start_mining":
+        return await postJSON("/api/miner/start", {
+          address: args[0], miner_pubkey: args[1],
+        });
+
+      case "stop_mining":
+        return await postJSON("/api/miner/stop", {});
+
+      case "pool_status":
+        return await getJSON("/api/pool/local_status");
+
+      case "pool_start_mining":
+        return await postJSON("/api/pool/start_local", {
+          address: args[0], pubkey: args[1],
+        });
+
+      case "pool_stop_mining":
+        return await postJSON("/api/pool/stop_local", {});
+
+      case "verificar_recebimento": {
+        const [addr, txid] = args;
+        return await getJSON("/api/verificar-recebimento/"
+          + encodeURIComponent(addr) + "/" + encodeURIComponent(txid));
+      }
+
+      case "tx_status":
+        return await getJSON("/api/tx-status/" + encodeURIComponent(args[0]));
+
+      case "bridge_claim":
+        return {ok: false, msg: "Bridge claim não disponível no servidor web. Use a GUI desktop."};
+
+      case "save_wallet":
+        return await saveWalletLocal(args[0], args[1], {
+          address: args[2], private_key: args[3], public_key: args[4],
+        });
+
+      case "load_wallet":
+        return await loadWalletLocal(args[0], args[1]);
+
+      case "list_wallets":
+        return listWalletsLocal();
+
+      case "get_active_wallet":
+        return {ok: false};
+
+      case "list_blocks":
+        return await getJSON("/api/blocks?start=" + args[0] + "&limit=" + args[1]);
+
+      case "get_block": {
+        const r = await getJSON("/api/block/" + args[0]);
+        return {ok: true, block: r};
+      }
+
+      default:
+        return {ok: false, msg: "Método não mapeado: " + method};
+    }
+  } catch (e) {
+    return {ok: false, msg: e.message, erro: e.message};
+  }
 }
+
+// ============================================================
+// STATUS DO NÓ
+// ============================================================
+function setDotState(cls) { $("dot").className = "dot " + cls; }
 
 async function refreshStatus() {
   try {
     const s = await api("node_status");
     if (!s.ok) throw new Error(s.msg || "offline");
-    _lastStatus = s;
 
     const badge = $("modeBadge");
     if (s.rede_descentralizada === true) {
@@ -782,19 +1015,16 @@ async function refreshStatus() {
 }
 
 // ============================================================
-// SYNC INFO (topbar + bridge)
+// SYNC INFO
 // ============================================================
 async function refreshSyncInfo() {
   try {
     const d = await api("sync_info");
     if (d.erro) throw new Error(d.erro);
-    _lastSyncInfo = d;
 
     const sync = d.sync || {};
     const pct = Number(sync.percent != null ? sync.percent : 100);
     const peers = sync.peers || 0;
-    const local_h = sync.height || 0;
-    const target_h = sync.target || local_h;
 
     $("syncBar").style.width = pct + "%";
     $("syncPct").textContent = pct.toFixed(2) + "%";
@@ -825,9 +1055,7 @@ async function refreshSyncInfo() {
       $("brProc").textContent     = (d.bridge_onramp && d.bridge_onramp.processados) || 0;
       $("brSync").textContent     = (d.bridge_onramp && d.bridge_onramp.ultima_sync) || "—";
     }
-  } catch (e) {
-    // silencioso
-  }
+  } catch (e) { /* silencioso */ }
 }
 
 // ============================================================
@@ -836,35 +1064,26 @@ async function refreshSyncInfo() {
 async function refreshPeers() {
   try {
     const s = await api("get_trust_nodes");
-
-    let peers = [];
-    if (s && s.nodes) {
-      peers = s.nodes;
-    } else {
+    let peers = (s && s.nodes) ? s.nodes : [];
+    if (!peers.length) {
       const old = await api("peers_score");
       peers = old.peers || [];
     }
-
-    _lastPeers = peers;
 
     const summary = $("peerScoreSummary");
     if (peers.length === 0) {
       summary.innerHTML = "";
     } else {
-      let trusted = 0, banned = 0;
-      let maxScore = 0;
-
+      let trusted = 0, banned = 0, maxScore = 0;
       for (const p of peers) {
         if (p.status === "trusted") trusted++;
         else if (p.status === "banned") banned++;
-
         const sc = p.trust_score != null ? p.trust_score : (p.score || 0);
         if (sc > maxScore) maxScore = sc;
       }
-
-      let html = `<span class="pill" style="background:#1f2d1f;color:#7ee787;" title="Maior pontuação da rede">Top: ${maxScore.toFixed(1)} pts</span>`;
-      if (trusted > 0) html += `<span class="pill" style="background:#0d2818;color:#7ee787;">${trusted} confiável(eis)</span>`;
-      if (banned > 0) html += `<span class="pill err">${banned} banido(s)</span>`;
+      let html = `<span class="pill" style="background:#1f2d1f;color:#7ee787;">Top: ${maxScore.toFixed(1)} pts</span>`;
+      if (trusted > 0) html += `<span class="pill" style="background:#0d2818;color:#7ee787;">${trusted} ✓</span>`;
+      if (banned > 0) html += `<span class="pill err">${banned} ✗</span>`;
       summary.innerHTML = html;
     }
 
@@ -872,29 +1091,22 @@ async function refreshPeers() {
     const tbody = $("tbodyPeers");
     $("peersTableCount").textContent = peers.length;
 
-    if (peers.length === 0) {
-      card.style.display = "none";
-      return;
-    }
+    if (peers.length === 0) { card.style.display = "none"; return; }
 
     tbody.innerHTML = "";
-
     for (const p of peers.slice(0, 100)) {
       const tr = document.createElement("tr");
-
       const addr = p.address || "?";
       const h = p.height || 0;
       const status = p.status || "new";
       const score = p.trust_score != null ? p.trust_score : (p.score || 0);
-
       let statusHtml = `<span class="badge">${status.toUpperCase()}</span>`;
       if (status === "trusted") statusHtml = `<span class="badge trusted">✓ CONFIÁVEL</span>`;
       else if (status === "banned") statusHtml = `<span class="badge banned">✗ BANIDO</span>`;
-
       tr.innerHTML = `
         <td><code>${addr}</code></td>
         <td>${h}</td>
-        <td><b style="color:#e3b341; font-size: 1.1em;">${Number(score).toFixed(1)} pts</b></td>
+        <td><b style="color:#e3b341;">${Number(score).toFixed(1)} pts</b></td>
         <td>${statusHtml}</td>
         <td>${fmtAgo(p.last_seen)}</td>
       `;
@@ -907,25 +1119,21 @@ async function refreshPeers() {
 }
 
 // ============================================================
-// SINCRONIZAÇÃO (ações manuais)
+// SINCRONIZAÇÃO MANUAL
 // ============================================================
 async function syncCheckConnection() {
   syncMode = "checking";
   msg("mSync", "🔍 Verificando conexão com o nó...", "info");
-
   try {
     const s = await api("node_status");
     if (!s.ok) throw new Error(s.msg || "nó offline");
-
     const peers = s.peers || 0;
     const height = s.height || 0;
-
     if (peers === 0) {
-      msg("mSync", "⚠️ Nó online, mas sem peers. Não é possível sincronizar.", "warn", 6000);
+      msg("mSync", "⚠️ Nó online, mas sem peers.", "warn", 6000);
       syncMode = "error";
       return false;
     }
-
     msg("mSync", "✅ Nó online | altura=" + height + " | peers=" + peers, "ok", 5000);
     syncMode = "idle";
     return true;
@@ -941,9 +1149,7 @@ async function syncStart() {
   $("syncProgress").classList.add("show");
   $("syncBadgeOk").classList.remove("show");
   $("bSyncStop").style.display = "inline-block";
-
   msg("mSync", "🔄 Verificando conexão com o nó...", "info");
-
   const connected = await syncCheckConnection();
   if (!connected) {
     $("syncStatusText").textContent = "Falha na conexão";
@@ -951,7 +1157,6 @@ async function syncStart() {
     $("bSyncStop").style.display = "none";
     return;
   }
-
   if (syncTimer) clearInterval(syncTimer);
   syncTimer = setInterval(syncUpdateProgress, 3000);
   await syncUpdateProgress();
@@ -961,7 +1166,6 @@ async function syncUpdateProgress() {
   try {
     const d = await api("sync_info");
     if (d.erro) throw new Error(d.erro);
-
     const sync = d.sync || {};
     const height = sync.height || 0;
     const target = sync.target || 0;
@@ -975,40 +1179,28 @@ async function syncUpdateProgress() {
     const bar = $("syncProgressBar");
     const pctEl = $("syncPercent");
     const statusEl = $("syncStatusText");
-
-    let statusText = "";
-    let barColor = "#58a6ff";
+    let statusText = "", barColor = "#58a6ff";
 
     if (peers === 0) {
       statusText = "🔌 Sem peers conectados";
       barColor = "#f85149";
-      bar.style.width = "0%";
-      pctEl.textContent = "0%";
-      msg("mSync", "❌ Nenhum peer conectado. Verifique a rede.", "err", 6000);
+      bar.style.width = "0%"; pctEl.textContent = "0%";
+      msg("mSync", "❌ Nenhum peer conectado.", "err", 6000);
       syncMode = "error";
     } else if (target === 0) {
       statusText = "⏳ Aguardando dados do peer...";
       barColor = "#d29922";
-      bar.style.width = "0%";
-      pctEl.textContent = "0%";
-      msg("mSync", "⏳ Peer(s) conectado(s), aguardando altura alvo...", "info");
+      bar.style.width = "0%"; pctEl.textContent = "0%";
     } else if (height >= target) {
       statusText = "✅ Sincronizado";
       barColor = "#3fb950";
-      bar.style.width = "100%";
-      pctEl.textContent = "100%";
-
+      bar.style.width = "100%"; pctEl.textContent = "100%";
       if (syncMode !== "synced") {
         syncMode = "synced";
         $("syncBadgeOk").classList.add("show");
-        $("syncCompleteInfo").textContent =
-          "Altura final: " + height + " · " + peers + " peer(s)";
-        msg("mSync", "✅ Blockchain sincronizada com sucesso!", "ok", 8000);
-
-        if (syncTimer) {
-          clearInterval(syncTimer);
-          syncTimer = null;
-        }
+        $("syncCompleteInfo").textContent = "Altura: " + height + " · " + peers + " peer(s)";
+        msg("mSync", "✅ Blockchain sincronizada!", "ok", 8000);
+        if (syncTimer) { clearInterval(syncTimer); syncTimer = null; }
       }
     } else {
       const falta = target - height;
@@ -1016,9 +1208,6 @@ async function syncUpdateProgress() {
       barColor = "#58a6ff";
       bar.style.width = percent + "%";
       pctEl.textContent = percent.toFixed(2) + "%";
-      msg("mSync",
-          "📥 Baixando " + height + "/" + target + " (" + percent.toFixed(1) + "%)",
-          "info");
     }
 
     bar.style.background = barColor;
@@ -1030,7 +1219,6 @@ async function syncUpdateProgress() {
     $("syncPct").textContent = percent.toFixed(2) + "%";
     $("syncPct").style.color = barColor;
     $("peerCount").textContent = peers;
-
   } catch (e) {
     msg("mSync", "❌ " + e.message, "err");
     syncMode = "error";
@@ -1038,10 +1226,7 @@ async function syncUpdateProgress() {
 }
 
 function syncStop() {
-  if (syncTimer) {
-    clearInterval(syncTimer);
-    syncTimer = null;
-  }
+  if (syncTimer) { clearInterval(syncTimer); syncTimer = null; }
   syncMode = "idle";
   $("bSyncStop").style.display = "none";
   msg("mSync", "⏹️ Monitoramento parado.", "info", 3000);
@@ -1053,21 +1238,17 @@ function syncStop() {
 async function carregarBlocos(reset) {
   if (_blocksLoading) return;
   _blocksLoading = true;
-
   const tb = $("tbodyBlocks");
   if (reset) {
     tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Carregando…</td></tr>';
     _blockCursor = null;
     _allBlocksLoaded = false;
   }
-
   try {
     const _st = await api("node_status");
     if (!_st.ok) throw new Error(_st.msg || "node offline");
-
     const _currentHeight = _st.height;
     let _start, _end;
-
     if (reset || _blockCursor === null) {
       _end = _currentHeight + 1;
       _start = Math.max(0, _end - 50);
@@ -1075,26 +1256,21 @@ async function carregarBlocos(reset) {
       _end = _blockCursor;
       _start = Math.max(0, _end - 50);
     }
-
     if (_start >= _end) {
       _allBlocksLoaded = true;
       _renderBlockButtons();
       _blocksLoading = false;
       return;
     }
-
     const r = await api("list_blocks", _start, _end - _start);
     if (r.erro) throw new Error(r.erro);
-
     const blocos = (r.blocks || []).slice().sort((a,b) => b.height - a.height);
-
     if (reset) tb.innerHTML = "";
     if (!blocos.length && reset) {
       tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Sem blocos</td></tr>';
       _blocksLoading = false;
       return;
     }
-
     for (const b of blocos) {
       const tr = document.createElement("tr");
       tr.className = "clickable";
@@ -1108,7 +1284,6 @@ async function carregarBlocos(reset) {
       tr.onclick = function() { detalharBloco(b.height); };
       tb.appendChild(tr);
     }
-
     _blockCursor = _start;
     if (_start === 0) _allBlocksLoaded = true;
     _renderBlockButtons();
@@ -1126,17 +1301,12 @@ function _renderBlockButtons() {
   const bm = document.getElementById("bVerMaisBlocos");
   const ba = document.getElementById("bVerTodosBlocos");
   if (!bm || !ba) return;
-
   if (_allBlocksLoaded) {
-    bm.disabled = true;
-    bm.textContent = "Todos carregados";
-    ba.disabled = true;
-    ba.textContent = "Todos carregados";
+    bm.disabled = true; bm.textContent = "Todos carregados";
+    ba.disabled = true; ba.textContent = "Todos carregados";
   } else {
-    bm.disabled = false;
-    bm.textContent = "⬇ Carregar mais 50 blocos";
-    ba.disabled = false;
-    ba.textContent = "Carregar TODOS os blocos";
+    bm.disabled = false; bm.textContent = "⬇ Carregar mais 50 blocos";
+    ba.disabled = false; ba.textContent = "Carregar TODOS os blocos";
   }
 }
 
@@ -1146,9 +1316,7 @@ async function carregarTodosBlocos() {
   const st = await api("node_status");
   if (!st.ok) { alert("Node offline"); return; }
   const total = st.height + 1;
-  if (total > 5000) {
-    if (!confirm("Carregar TODOS os " + total + " blocos? Pode demorar. Continuar?")) return;
-  }
+  if (total > 5000 && !confirm("Carregar TODOS os " + total + " blocos?")) return;
   tb.innerHTML = '<tr id="loadingRow"><td colspan="5" style="color:#8b949e;">Preparando...</td></tr>';
   let loaded = 0;
   for (let start = st.height; start >= 0; start -= BATCH) {
@@ -1184,7 +1352,7 @@ async function carregarTodosBlocos() {
 async function detalharBloco(height) {
   try {
     const r = await api("get_block", height);
-    if (r.erro || !r.block) throw new Error(r.erro || "bloco não encontrado");
+    if (!r.block) throw new Error("bloco não encontrado");
     const b = r.block;
     $("cardDetail").style.display = "block";
     $("dHeight").textContent = "#" + b.height;
@@ -1204,8 +1372,7 @@ async function detalharBloco(height) {
       }).join("<br>");
       tr.innerHTML = '<td><code>' + shortHash(t.txid, 20) + '</code>' +
                      (isCoinbase ? ' <span class="badge received">COINBASE</span>' : '') +
-                     '</td>' +
-                     '<td>' + (outStr || "—") + '</td>';
+                     '</td><td>' + (outStr || "—") + '</td>';
       tb.appendChild(tr);
     }
   } catch (e) {
@@ -1218,17 +1385,22 @@ async function detalharBloco(height) {
 // ============================================================
 async function gerarCarteira() {
   clearMsg("mCart");
+  if (!confirm("⚠️ Gerar uma carteira NOVA?\n\nSe você já tem uma, ANOTE a chave privada ANTES de continuar (botão 💾 Salvar).")) {
+    return;
+  }
   try {
     const w = await api("generate_wallet");
     if (w.erro || !w.address) throw new Error(w.erro || "falha ao gerar");
     wallet = { address: w.address, private_key: w.private_key, public_key: w.public_key };
     renderCarteira();
-    msg("mCart", "✅ Carteira criada. Minerador aponta para ela.", "ok", 5000);
+    msg("mCart", "✅ Carteira criada. ⚠️ SALVE IMEDIATAMENTE em 💾 Arquivo.", "warn", 10000);
     await atualizarSaldo();
     await carregarMinhasTxs();
     await refreshSyncInfo();
     await updateMiningUI();
-  } catch (e) { msg("mCart", "❌ " + e.message, "err"); }
+  } catch (e) {
+    msg("mCart", "❌ " + e.message, "err");
+  }
 }
 
 function renderCarteira() {
@@ -1248,7 +1420,9 @@ async function atualizarSaldo() {
     const p = await api("portfolio", wallet.address);
     if (p.erro) throw new Error(p.erro);
     $("wSaldo").textContent = fmtBRN(p.BRN || 0);
-  } catch (e) { msg("mCart", "❌ " + e.message, "err"); }
+  } catch (e) {
+    msg("mCart", "❌ " + e.message, "err");
+  }
 }
 
 // ============================================================
@@ -1261,27 +1435,25 @@ async function carregarMinhasTxs(limit) {
   const tb = $("tbodyMyTxs");
   tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Carregando…</td></tr>';
 
-  let txs = [];
-  let ok = false;
+  let txs = [], ok = false;
   try {
     const r = await api("minhas_txs", wallet.address, myTxsLimit);
     if (r && r.ok) { txs = r.transactions || []; ok = true; }
-  } catch (e) { /* método nao exposto ou timeout */ }
+  } catch (e) { /* ignora */ }
 
   if (!ok) {
     tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Erro ao carregar (tente Atualizar)</td></tr>';
     return;
   }
-
   if (txs.length === 0) {
-    tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Nenhuma transação recente encontrada</td></tr>';
+    tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Nenhuma transação recente</td></tr>';
     return;
   }
 
   tb.innerHTML = "";
   for (const t of txs) {
     const tr = document.createElement("tr");
-    const direcaoBadge = t.direction === "sent"
+    const dirBadge = t.direction === "sent"
       ? '<span class="badge sent">↑ Enviada</span>'
       : t.direction === "received"
         ? '<span class="badge received">↓ Recebida</span>'
@@ -1298,12 +1470,11 @@ async function carregarMinhasTxs(limit) {
     const bloco = t.block_height != null ? "#" + t.block_height : "—";
     const valor = ((t.amount || 0) / 1e8).toFixed(8);
 
-    tr.innerHTML = '<td>' + direcaoBadge + '</td>' +
+    tr.innerHTML = '<td>' + dirBadge + '</td>' +
       '<td><code title="' + t.txid + '">' + shortHash(t.txid, 18) + '</code></td>' +
       '<td>' + valor + '</td>' +
       '<td>' + statusBadge + '</td>' +
       '<td>' + bloco + '</td>';
-
     tr.style.cursor = "pointer";
     tr.title = "Clique para verificar";
     tr.onclick = function() {
@@ -1322,20 +1493,16 @@ async function carregarMinhasTxs(limit) {
 async function enviar() {
   clearMsg("mEnviar");
   if (!wallet.address) { msg("mEnviar", "❌ Gere/carregue uma carteira.", "err"); return; }
-
   const to = $("txTo").value.trim();
   const amtStr = $("txAmount").value.trim().replace(",", ".");
-
   if (!to) { msg("mEnviar", "❌ Informe o destinatário.", "err"); return; }
   if (!amtStr) { msg("mEnviar", "❌ Informe o valor.", "err"); return; }
-
   const amtNum = Number(amtStr);
   if (!isFinite(amtNum) || amtNum <= 0) { msg("mEnviar", "❌ Valor inválido.", "err"); return; }
   if (!/^\d+(\.\d{1,8})?$/.test(amtStr)) {
-    msg("mEnviar", "❌ Formato inválido (use ponto, até 8 casas: ex 0.29).", "err");
+    msg("mEnviar", "❌ Formato inválido (use ponto, até 8 casas).", "err");
     return;
   }
-
   const btn = $("bEnviar");
   btn.disabled = true;
   btn.innerHTML = '<span class="spin"></span>Enviando…';
@@ -1343,7 +1510,6 @@ async function enviar() {
     const r = await api("transfer",
       wallet.address, to, "BRN", amtStr,
       wallet.private_key, wallet.public_key);
-
     if (r.ok) {
       lastSentTxid = r.txid || "";
       const enviado = r.amount_brn || amtStr;
@@ -1407,9 +1573,6 @@ async function minerar() {
       if (r && r.ok) {
         msg("mMine", "⛏️ Mineração LOCAL iniciada.", "ok", 6000);
         miningRunning = true;
-      } else if (r && r.assumed) {
-        msg("mMine", "⛏️ " + (r.msg || "Mineração iniciada em background."), "info", 6000);
-        miningRunning = true;
       } else {
         msg("mMine", "❌ " + ((r && r.msg) || "falha ao iniciar"), "err");
       }
@@ -1467,411 +1630,4 @@ async function minerarPool() {
       if (r && r.ok) {
         msg("mPool", "🌐 Ligado ao pool! Minerando com a pool da rede.", "ok", 6000);
       } else {
-        msg("mPool", "❌ " + ((r && r.msg) || "falha ao ligar ao pool"), "err");
-      }
-    } catch (e) {
-      msg("mPool", "❌ " + e.message, "err");
-    } finally {
-      miningBusy = false;
-      await updateMiningUI();
-    }
-  }
-}
-
-// ============================================================
-// ATUALIZAR UI DE MINERAÇÃO (com Vardiff)
-// ============================================================
-async function updateMiningUI() {
-  try {
-    const st = await api("mining_status");
-    const btn = $("bMinerar");
-    const box = $("miningInfo");
-
-    miningRunning = !!(st && st.running);
-
-    if (!miningBusy) {
-      btn.disabled = false;
-      if (miningRunning) {
-        btn.className = "btn danger";
-        btn.textContent = "⏹️ Parar Local";
-      } else {
-        btn.className = "btn p";
-        btn.textContent = "⛏️ Minerar Local";
-      }
-    }
-
-    if (miningRunning) {
-      box.classList.add("show");
-      $("miningAddr").textContent   = (st.address || "—").slice(0, 20) + "…";
-      $("miningCount").textContent  = st.count || 0;
-      $("miningLast").textContent   = st.last_height != null ? "#" + st.last_height : "—";
-      $("miningUptime").textContent = fmtUptime(st.uptime || 0);
-      const hr = (st.hashrate_khs != null)
-        ? st.hashrate_khs
-        : ((st.hashrate || 0) / 1000);
-      $("miningHashrate").textContent = Number(hr).toFixed(2);
-    } else {
-      box.classList.remove("show");
-    }
-  } catch (e) { /* silencioso */ }
-
-  try {
-    const pst = await api("pool_status");
-    const btn = $("bMinerarPool");
-    const box = $("poolInfo");
-
-    const poolRunning = !!(pst && pst.running);
-
-    if (!miningBusy) {
-      btn.disabled = false;
-      if (poolRunning) {
-        btn.className = "btn danger";
-        btn.style.background = "";
-        btn.style.borderColor = "";
-        btn.textContent = "⏹️ Parar Pool";
-      } else {
-        btn.className = "btn p";
-        btn.style.background = "#1f6feb";
-        btn.style.borderColor = "#388bfd";
-        btn.textContent = "🌐 Minerar Pool";
-      }
-    }
-
-    if (poolRunning) {
-      box.classList.add("show");
-      $("poolUrl").textContent        = pst.pool_url || "—";
-      $("poolMinerId").textContent    = (pst.miner_id || "—").slice(0, 12);
-      $("poolJobH").textContent       = pst.job_height != null ? "#" + pst.job_height : "—";
-      $("poolSharesOk").textContent   = pst.shares_accepted || 0;
-      $("poolSharesTotal").textContent = pst.shares_submitted || 0;
-      $("poolBlocks").textContent     = pst.blocks_found || 0;
-
-      const sd = pst.job_share_diff != null ? pst.job_share_diff : "—";
-      $("poolShareDiff").textContent  = sd;
-
-      const hr = pst.hashrate_khs != null
-        ? pst.hashrate_khs
-        : ((pst.hashrate || 0) / 1000);
-      $("poolHashrate").textContent   = Number(hr).toFixed(2);
-    } else {
-      box.classList.remove("show");
-    }
-  } catch (e) { /* silencioso */ }
-}
-
-// ============================================================
-// VERIFICAÇÃO
-// ============================================================
-async function verificarTx() {
-  clearMsg("mVerificar");
-  $("verResult").style.display = "none";
-
-  const txid = $("verTxid").value.trim();
-  const addr = $("verAddr").value.trim();
-  if (!txid) { msg("mVerificar", "❌ Cole o TXID.", "err"); return; }
-  if (!addr) { msg("mVerificar", "❌ Informe o endereço BRN.", "err"); return; }
-
-  const btn = $("bVerificar");
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spin"></span>Verificando…';
-  try {
-    const r = await api("verificar_recebimento", addr, txid);
-    if (!r.ok) throw new Error(r.msg || "falha");
-
-    $("verResult").style.display = "block";
-    $("vrChegou").textContent = r.chegou ? "✅ SIM" : "❌ NÃO";
-    $("vrChegou").style.color = r.chegou ? "#7ee787" : "#ffa198";
-    $("vrStatus").textContent = r.status || "—";
-    $("vrValor").textContent  = r.valor ? fmtBRN(r.valor / 1e8) : "0 BRN";
-    $("vrConf").textContent   = r.confirmacoes != null ? r.confirmacoes : "—";
-    $("vrBloco").textContent  = r.block_height != null ? "#" + r.block_height : "—";
-    $("vrMsg").textContent    = r.msg || "—";
-
-    if (r.chegou) {
-      msg("mVerificar",
-          "✅ CHEGOU! " + fmtBRN(r.valor / 1e8) +
-          " · " + r.status + " · " + (r.confirmacoes || 0) + " confirmações",
-          "ok", 8000);
-    } else {
-      const tipo = r.status === "pending" ? "info" : "err";
-      msg("mVerificar", "❌ Não chegou ainda · status: " + r.status, tipo, 8000);
-    }
-  } catch (e) {
-    msg("mVerificar", "❌ " + e.message, "err");
-  } finally {
-    btn.disabled = false;
-    btn.textContent = "🔎 Verificar";
-  }
-}
-
-async function consultarTxStatus() {
-  clearMsg("mTxStatus");
-  const txid = $("txStatusId").value.trim();
-  if (!txid) { msg("mTxStatus", "❌ Cole o TXID.", "err"); return; }
-  const btn = $("bTxStatus");
-  btn.disabled = true;
-  try {
-    const r = await api("tx_status", txid);
-    if (!r.ok) throw new Error(r.msg || "falha");
-    let txt = "Status: " + r.status;
-    if (r.status === "confirmed") {
-      txt += " · bloco #" + r.block_height + " · " + r.confirmations + " confirmações";
-    } else if (r.status === "pending") {
-      txt += " · aguardando mineração";
-    }
-    msg("mTxStatus", txt, r.status === "confirmed" ? "ok" : (r.status === "pending" ? "info" : "err"), 8000);
-  } catch (e) {
-    msg("mTxStatus", "❌ " + e.message, "err");
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-// ============================================================
-// BRIDGE
-// ============================================================
-async function bridgeRefresh() {
-  clearMsg("mBridge");
-  await refreshSyncInfo();
-}
-
-async function bridgeClaim() {
-  clearMsg("mBridgeClaim");
-  const txid = $("brTxid").value.trim();
-  if (!txid)           { msg("mBridgeClaim", "❌ Informe o TXID.", "err"); return; }
-  if (!wallet.address) { msg("mBridgeClaim", "❌ Gere uma carteira primeiro.", "err"); return; }
-
-  const btn = $("bBridgeClaim");
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spin"></span>Convertendo…';
-  try {
-    const r = await api("bridge_claim", txid, wallet.address);
-    if (r.ok) {
-      msg("mBridgeClaim",
-          "✅ +" + fmtBRN(r.brn_recebido) + " (bloco #" + r.bloco + ")",
-          "ok", 8000);
-      $("brTxid").value = "";
-      await atualizarSaldo();
-      await refreshSyncInfo();
-    } else {
-      msg("mBridgeClaim", "❌ " + (r.msg || "falha"), "err");
-    }
-  } catch (e) {
-    msg("mBridgeClaim", "❌ " + e.message, "err");
-  } finally {
-    btn.disabled = false;
-    btn.textContent = "💱 Converter para BRN";
-  }
-}
-
-// ============================================================
-// SALVAR / CARREGAR — [FIX v3.20] aceita w.name e .wallet
-// ============================================================
-async function salvar() {
-  clearMsg("mSalvar");
-  if (!wallet.address) { msg("mSalvar", "❌ Sem carteira.", "err"); return; }
-  const name = $("svName").value.trim();
-  const pass = $("svPass").value;
-  if (!name) { msg("mSalvar", "❌ Informe o nome.", "err"); return; }
-  if (!pass) { msg("mSalvar", "❌ Informe a senha.", "err"); return; }
-  try {
-    const r = await api("save_wallet",
-      name, pass, wallet.address, wallet.private_key, wallet.public_key);
-    if (r.ok) {
-      msg("mSalvar", "✅ " + (r.msg || "Salvo."), "ok", 5000);
-      $("svPass").value = "";
-      await listarWallets();
-    } else {
-      msg("mSalvar", "❌ " + (r.msg || "falha"), "err");
-    }
-  } catch (e) { msg("mSalvar", "❌ " + e.message, "err"); }
-}
-
-// [FIX v3.20] app_wallet_v3.py v3.19 retorna {name, address, public_key}
-// (antes era {filename}). Aceita ambos por segurança.
-async function listarWallets() {
-  try {
-    const lista = await api("list_wallets");
-    const sel = $("ldList");
-    sel.innerHTML = '<option value="">— selecione —</option>';
-    (lista || []).forEach(function(w) {
-      const fname = w.name || w.filename || w.nome || w.file || "";
-      if (!fname) return;
-      const o = document.createElement("option");
-      o.value = fname;
-      o.textContent = fname;
-      sel.appendChild(o);
-    });
-  } catch (e) { /* silent */ }
-}
-
-// [FIX v3.20] strip de .wallet para tolerar tanto "masmas" quanto "masmas.wallet"
-async function carregar() {
-  clearMsg("mCarregar");
-  let name = $("ldList").value || $("ldName").value.trim();
-  const pass = $("ldPass").value;
-  if (!name) { msg("mCarregar", "❌ Escolha/digite o arquivo.", "err"); return; }
-  if (!pass) { msg("mCarregar", "❌ Informe a senha.", "err"); return; }
-  // strip .wallet (Python também faz, mas aqui garantimos)
-  if (name.toLowerCase().endsWith(".wallet")) {
-    name = name.slice(0, -7);
-  }
-  try {
-    const r = await api("load_wallet", name, pass);
-    if (r.ok) {
-      wallet = { address: r.address, private_key: r.private_key, public_key: r.public_key };
-      renderCarteira();
-      msg("mCarregar", "✅ Carteira carregada. Minerador aponta para ela.", "ok", 5000);
-      await atualizarSaldo();
-      await carregarMinhasTxs();
-      await refreshSyncInfo();
-      await updateMiningUI();
-      $("ldPass").value = "";
-    } else {
-      msg("mCarregar", "❌ " + (r.msg || "falha"), "err");
-    }
-  } catch (e) { msg("mCarregar", "❌ " + e.message, "err"); }
-}
-
-// ============================================================
-// UI / TABS
-// ============================================================
-function switchTab(tabName) {
-  document.querySelectorAll(".tab").forEach(function(x) {
-    x.classList.toggle("active", x.dataset.tab === tabName);
-  });
-  document.querySelectorAll(".panel").forEach(function(x) {
-    x.classList.toggle("active", x.id === "p-" + tabName);
-  });
-  try { localStorage.setItem(TAB_KEY, tabName); } catch (_) {}
-  if (tabName === "bridge") {
-    refreshSyncInfo();
-    $("brToBrn").value = wallet.address || "";
-  }
-}
-
-function configTabs() {
-  document.querySelectorAll(".tab").forEach(function(t) {
-    t.addEventListener("click", function() { switchTab(t.dataset.tab); });
-  });
-
-  let initial = DEFAULT_TAB;
-  try {
-    const saved = localStorage.getItem(TAB_KEY);
-    if (saved) initial = saved;
-  } catch (_) {}
-  switchTab(initial);
-}
-
-function configEventos() {
-  $("bSyncCheck").onclick = syncCheckConnection;
-  $("bSyncStart").onclick = syncStart;
-  $("bSyncStop").onclick  = syncStop;
-
-  $("bRefreshExp").onclick = () => carregarBlocos(true);
-  $("bRefreshPeers").onclick = refreshPeers;
-
-  $("bVerMaisBlocos").onclick = () => carregarBlocos(false);
-  $("bVerTodosBlocos").onclick = carregarTodosBlocos;
-
-  $("bGerar").onclick      = gerarCarteira;
-  $("bAtualizar").onclick  = atualizarSaldo;
-  $("bMyTxs").onclick      = () => carregarMinhasTxs();
-  $("bMyTxs50").onclick    = () => carregarMinhasTxs(50);
-  $("bMyTxs200").onclick   = () => carregarMinhasTxs(200);
-  $("bMyTxs500").onclick   = () => carregarMinhasTxs(500);
-  $("bEnviar").onclick     = enviar;
-  $("bMinerar").onclick    = minerar;
-  $("bMinerarPool").onclick = minerarPool;
-  $("bVerificar").onclick  = verificarTx;
-  $("bVerificarMeu").onclick = function() {
-    if (wallet.address) {
-      $("verAddr").value = wallet.address;
-      msg("mVerificar", "Endereço do usuário preenchido.", "info", 3000);
-    } else {
-      msg("mVerificar", "❌ Sem carteira carregada.", "err");
-    }
-  };
-  $("bVerificarUltimo").onclick = function() {
-    if (lastSentTxid) {
-      $("verTxid").value = lastSentTxid;
-      msg("mVerificar", "Último TXID preenchido.", "info", 3000);
-    } else {
-      msg("mVerificar", "Nenhum TX enviado nesta sessão.", "info", 4000);
-    }
-  };
-  $("bTxStatus").onclick   = consultarTxStatus;
-  $("bBridgeRefresh").onclick = bridgeRefresh;
-  $("bBridgeClaim").onclick   = bridgeClaim;
-  $("bSalvar").onclick     = salvar;
-  $("bListar").onclick     = listarWallets;
-  $("bCarregar").onclick   = carregar;
-
-  $("wPriv").onclick = function() {
-    const el = $("wPriv");
-    el.style.filter = el.style.filter === "none" ? "blur(4px)" : "none";
-  };
-  $("ldList").onchange = function(e) {
-    if (e.target.value) $("ldName").value = "";
-  };
-}
-
-// ============================================================
-// BOOTSTRAP
-// ============================================================
-async function boot() {
-  ready = true;
-  configTabs();
-  configEventos();
-  $("apiLbl").textContent = "127.0.0.1:5000 · 8080";
-
-  await checkABTest();
-
-  try {
-    const w = await api("get_active_wallet");
-    if (w.ok && w.address) {
-      wallet = {
-        address: w.address,
-        private_key: w.private_key || "",
-        public_key: w.public_key || "",
-      };
-      renderCarteira();
-      await atualizarSaldo();
-      await carregarMinhasTxs();
-    }
-  } catch (e) { /* primeira vez */ }
-
-  await refreshStatus();
-  await refreshSyncInfo();
-  await refreshPeers();
-  await carregarBlocos(true);
-  await listarWallets();
-  await updateMiningUI();
-
-  setInterval(refreshStatus,     10000);
-  setInterval(refreshSyncInfo,    6000);
-  setInterval(refreshPeers,      15000);
-  setInterval(() => carregarBlocos(true), 20000);
-  setInterval(updateMiningUI,     2000);
-  setInterval(function() { if (wallet.address) atualizarSaldo(); }, 20000);
-  setInterval(function() { if (wallet.address) carregarMinhasTxs(); }, 30000);
-
-  setInterval(async () => {
-    try {
-      const d = await api("sync_info");
-      const forking = !!(d && d.sync && d.syncing === false && d.sync.forking) || false;
-      $("forkBanner").classList.toggle("show", forking);
-      const dot = $("dot");
-      if (forking) {
-        dot.className = "dot fork";
-        $("statusTxt").textContent = "FORK";
-      }
-    } catch (_) {}
-  }, 5000);
-}
-
-window.addEventListener("pywebviewready", boot);
-if (window.pywebview && window.pywebview.api) { boot(); }
-</script>
-</body>
-</html>
+        msg("mPool", "❌ " + ((
