@@ -1,11 +1,15 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.29)
+server.py — Backend HTTP do nó BRN (v9.9.30)
 ================================================================
-v9.9.29 (2026-11-11) — WALLET WEB:
-  [NEW] Rota /wallet serve index_wallet.html (versão web pura,
-        sem pywebview) na porta pública $PORT.
-  [KEEP] v9.9.28: carteira via API (set_validator_sk), sem .env.
-  [KEEP] v9.9.28: /dashboard, /monitor, /panel servindo HTMLs.
+v9.9.30 (2026-11-11) — SK VALIDATION STATE:
+  [NEW] set_sk_validation_state(state): recebe dict do main.py
+        com o resultado da validação de BRN_VALIDATOR_SK_HEX
+        (checked, ok, error, address_derived, pubkey_derived).
+  [NEW] /health expõe "sk_validation": dict(...) — permite ver
+        o motivo EXATO da SK ter falhado, via navegador, sem Shell.
+  [KEEP] v9.9.29: rota /wallet (index_wallet.html web)
+  [KEEP] v9.9.28: carteira via API, sem .env
+  [KEEP] v9.9.28: /dashboard, /monitor, /panel
 ================================================================
 """
 from __future__ import annotations
@@ -150,7 +154,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
                 headers={"Content-Type": "application/json",
-                         "User-Agent": "brn-server/9.9.29"},
+                         "User-Agent": "brn-server/9.9.30"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -186,6 +190,38 @@ class _LazyChain:
     def __getattr__(self, name): return getattr(_get_chain(), name)
 
 CHAIN = _LazyChain()
+
+
+# ============================================================
+# [v9.9.30] SK VALIDATION STATE (injetado pelo main.py)
+# ============================================================
+_SK_VALIDATION_STATE: dict = {}
+
+def set_sk_validation_state(state: dict) -> None:
+    """
+    Recebe o resultado da validação de BRN_VALIDATOR_SK_HEX
+    feita pelo main.py v13.9.7. Exposto em /health.sk_validation.
+
+    Estrutura esperada:
+      {
+        "checked": True,
+        "ok": True/False,
+        "error": "" ou "ADDRESS MISMATCH...",
+        "address_configured": "brn1...",
+        "address_derived": "brn1...",
+        "pubkey_configured": "03...",
+        "pubkey_derived": "03...",
+      }
+    """
+    global _SK_VALIDATION_STATE
+    if state and isinstance(state, dict):
+        _SK_VALIDATION_STATE = dict(state)
+        log.info(
+            "server: sk_validation_state injetado (ok=%s, error=%r)",
+            state.get("ok"), (state.get("error") or "")[:60],
+        )
+    else:
+        _SK_VALIDATION_STATE = {}
 
 
 # ============================================================
@@ -1321,7 +1357,7 @@ def pool_stop_local():
 
 
 # ============================================================
-# WALLET — integração completa
+# WALLET — integração
 # ============================================================
 @app.route("/api/wallet/set_validator_sk", methods=["POST"])
 def api_wallet_set_validator_sk():
@@ -1701,7 +1737,7 @@ def root():
         return jsonify({
             "ok": True,
             "name": "BRN Node",
-            "version": "9.9.29",
+            "version": "9.9.30",
             "height": chain.db.height(),
             "health": "/health",
             "status": "/api/status",
@@ -1714,13 +1750,13 @@ def root():
         return jsonify({
             "ok": True,
             "name": "BRN Node",
-            "version": "9.9.29",
+            "version": "9.9.30",
             "error": str(e),
         })
 
 
 # ============================================================
-# DASHBOARD / MONITOR / PANEL / WALLET (HTMLs na porta pública)
+# DASHBOARD / MONITOR / PANEL / WALLET (HTMLs)
 # ============================================================
 @app.route("/dashboard", methods=["GET"])
 def serve_dashboard():
@@ -1752,7 +1788,6 @@ def serve_panel():
 
 @app.route("/wallet", methods=["GET"])
 def serve_wallet():
-    """[NOVO v9.9.29] Serve index_wallet.html (versão web pura)."""
     p = BASE_DIR / "index_wallet.html"
     if p.exists():
         return send_file(p)
@@ -1763,6 +1798,9 @@ def serve_wallet():
     }), 404
 
 
+# ============================================================
+# HEALTH — com sk_validation (v9.9.30)
+# ============================================================
 @app.route("/health", methods=["GET"])
 def health():
     try:
@@ -1789,7 +1827,7 @@ def health():
         return jsonify({
             "ok": True,
             "height": chain.db.height(),
-            "version": "9.9.29",
+            "version": "9.9.30",
             "chain_injected": _CHAIN is not None,
             "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
@@ -1800,6 +1838,8 @@ def health():
             "pbft_configured": has_pbft,
             "strict_multisig": STRICT_MULTISIG,
             "trust_download_require_sig": TRUST_DOWNLOAD_REQUIRE_SIG,
+            # [v9.9.30] Estado detalhado da validação de SK
+            "sk_validation": dict(_SK_VALIDATION_STATE),
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -2073,5 +2113,5 @@ def bridge_status():
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print("BRN Server v9.9.29 (wallet web + dashboard + monitor + panel)")
+    print("BRN Server v9.9.30 (wallet web + dashboard + sk_validation)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
