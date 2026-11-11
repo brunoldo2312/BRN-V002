@@ -1,35 +1,11 @@
 """
-p2p_unified.py — BRN P2P Network v6.7.10
+p2p_unified.py — BRN P2P Network v6.7.11
 ================================================================
-v6.7.10 (2026-11-08) — PATCH DE ROBUSTEZ:
-  [FIX] P2PClient.send_message: retry em ConnectionResetError e
-        ConnectionRefusedError. Antes, um reset transitório (comum
-        em Tailscale/WAN) descartava a mensagem. broadcast_block
-        não tem retry — bloco ficava preso no minerador até o
-        próximo sync (30s+).
-  [FIX] _handle_conn: valida peer_id contra _auth.pub. Antes, um
-        atacante enviava _auth com pubkey alheia e ganhava reputação
-        no peer errado. Combinado com PEER_SCORE_BAN_THRESHOLD,
-        podia derrubar peers honestos enviando blocos válidos com
-        a identidade deles.
-  [FIX] _sync_incremental: pré-valida validators_sig antes de
-        accept_block. Antes, aceitava o lote, accept_block rejeitava
-        por sig, e o loop continuava tentando o peer — log cheio
-        de "prev_hash diverge" mesmo quando o problema real era
-        multi-sig.
-  [FIX] broadcast_block e broadcast_tx: fallback síncrono quando o
-        pool está cheio. Antes, ThreadPoolExecutor.submit() levantava
-        RuntimeError e o bloco/tx não era enviado — silenciosamente.
-  [KEEP] v6.7.9: suporte a PBFT.
-  [KEEP] v6.7.8: race recovery reversa.
-  [KEEP] v6.7.7: race recovery.
-
-v6.7.9 (2026-11-05):
-  [FIX CRÍTICO] Adicionado suporte ao PBFT.
-v6.7.8 (2026-11-04):
-  [FIX] _handle_sign_block aceita cenário de race recovery reversa.
-v6.7.7 (2026-11-02):
-  [FIX] _handle_sign_block aceita race recovery.
+v6.7.11 (2026-11-10) — SUPORTE A PROXY SOCKS5 (RENDER/TAILSCALE):
+  [NEW] _create_socket() detecta a env ALL_PROXY e usa PySocks.
+        Isso permite que o nó no Render (headless/userspace) consiga
+        iniciar conexões TCP para a rede Tailscale.
+  [KEEP] v6.7.10: retry de conexão, validação de pubkey, sync checks.
 ================================================================
 """
 from __future__ import annotations
@@ -50,6 +26,12 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from typing import Optional
+
+try:
+    import socks
+    _HAS_SOCKS = True
+except ImportError:
+    _HAS_SOCKS = False
 
 log = logging.getLogger("p2p")
 
@@ -124,20 +106,38 @@ SYNC_RETRY_MAX_S       = float(os.environ.get("BRN_SYNC_RETRY_MAX_S", "300.0"))
 TCP_TIMEOUT_DEFAULT    = float(os.environ.get("BRN_TCP_TIMEOUT", "10.0"))
 BLOCK_SIG_TIMEOUT_S    = float(os.environ.get("BRN_BLOCK_SIG_TIMEOUT", "5.0"))
 
-# [v6.7.10] Retry de conexão TCP
 SEND_RETRY_MAX         = int(os.environ.get("BRN_SEND_RETRY_MAX", "2"))
 SEND_RETRY_BASE_S      = float(os.environ.get("BRN_SEND_RETRY_BASE", "0.3"))
 
 
+def _create_socket() -> socket.socket:
+    """
+    [NEW v6.7.11] Cria um socket, aplicando proxy SOCKS5 se ALL_PROXY estiver setado.
+    Essencial para o Tailscale userspace networking (Render/Cloud).
+    """
+    proxy_url = os.environ.get("ALL_PROXY", os.environ.get("BRN_SOCKS5_PROXY", "")).strip()
+    if proxy_url and _HAS_SOCKS:
+        # Remove "socks5://" ou "socks5h://" se existir
+        url = proxy_url
+        if "://" in url:
+            url = url.split("://", 1)[1]
+        
+        if ":" in url:
+            host, port_str = url.rsplit(":", 1)
+            try:
+                port = int(port_str)
+                s = socks.socksocket(socket.AF_INET, socket.SOCK_STREAM)
+                # rdns=True resolve DNS no lado do proxy (importante p/ Tailscale)
+                s.set_proxy(socks.SOCKS5, host, port, rdns=True)
+                return s
+            except ValueError:
+                pass
+                
+    # Fallback para socket normal se não houver proxy ou der erro
+    return socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+
 def _is_plausible_pubkey(pk: str) -> bool:
-    """
-    [FIX v6.7.10] Valida formato mínimo de pubkey antes de usar como
-    peer_id. Aceita:
-      - 66 hex (secp256k1 comprimida, formato BRN)
-      - 64 hex (x-only / ed25519 raw)
-      - >= 32 chars alfanuméricos (tolerância para formatos futuros)
-    Rejeita strings vazias, curtas, ou com caracteres estranhos.
-    """
     if not isinstance(pk, str):
         return False
     s = pk.strip().lower()
@@ -412,6 +412,8 @@ class P2PServer(threading.Thread):
         return raw
 
     def run(self) -> None:
+        # O servidor escuta na interface local. 
+        # No Render com Tailscale serve, a mágica de expor isso pra rede é feita via CLI do tailscale.
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -472,10 +474,6 @@ class P2PServer(threading.Thread):
                         log.warning(f"[Auth] {peer_ip}: REJEITADO — {err}")
                         self.metrics.inc("auth_failed")
                         return
-                    # [FIX v6.7.10] Valida que `pub` do _auth tem formato
-                    # plausível ANTES de usá-lo como peer_id. Antes,
-                    # qualquer string virava peer_id, permitindo spoofing
-                    # de reputação (_on_peer_good creditava pubkey alheia).
                     auth_pub = (_auth.get("pub") or "").strip().lower()
                     if auth_pub and not _is_plausible_pubkey(auth_pub):
                         log.warning(
@@ -518,12 +516,6 @@ class P2PServer(threading.Thread):
                 pass
 
     def _handle_sign_block(self, msg: dict, addr, peer_id) -> dict:
-        """
-        Valida o bloco antes de assinar. Aceita 3 cenários:
-          a) block_h == local_h + 1 (normal)
-          b) block_h == local_h     (RACE RECOVERY — bloco já é o tip)
-          c) block_h < local_h      (RACE RECOVERY REVERSA)
-        """
         block = msg.get("block")
         if not block or not isinstance(block, dict):
             return {"type": "sign_block_response", "pubkey": "", "signature": "",
@@ -822,20 +814,6 @@ class P2PServer(threading.Thread):
 class P2PClient:
     @staticmethod
     def send_message(ip: str, port: int, message: dict, timeout: Optional[float] = None):
-        """
-        [FIX v6.7.10] Retry em ConnectionResetError/ConnectionRefusedError.
-
-        Antes, um reset transitório (comum em Tailscale/WAN) descartava
-        a mensagem. broadcast_block não tem retry — bloco ficava preso
-        no minerador até o próximo sync (30s+).
-
-        Estratégia:
-          - 3 tentativas totais (1 + SEND_RETRY_MAX)
-          - backoff linear: 0.3s, 0.6s
-          - só retenta erros de conexão (reset, refused); timeout de
-            leitura NÃO retenta (pode ser peer lento, não offline)
-          - retorna (None, 0.0) no final, mantendo compatibilidade
-        """
         if timeout is None:
             timeout = TCP_TIMEOUT_DEFAULT
 
@@ -861,17 +839,15 @@ class P2PClient:
                         ip, port, attempts, e,
                     )
             except socket.timeout:
-                # Timeout de leitura: peer respondeu TCP mas não JSON.
-                # Não retenta — pode ser peer lento, não offline.
                 return None, 0.0
-        # Se chegou aqui, todas as tentativas de conexão falharam
         return None, 0.0
 
     @staticmethod
     def _send_message_once(ip: str, port: int, message: dict, timeout: float):
         """Uma tentativa de envio — sem retry interno."""
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # [PATCH v6.7.11] Usa o wrapper que detecta ALL_PROXY
+            s = _create_socket()
             s.settimeout(timeout)
             t0 = time.time()
             s.connect((ip, port))
@@ -1461,13 +1437,6 @@ class P2PManager:
             except Exception as e:
                 return SyncResult.FATAL, f"pré-validação falhou: {e}"
 
-        # ─── [FIX v6.7.10] Pré-validar validators_sig ANTES de accept_block ──
-        # Antes, aceitávamos o lote, accept_block rejeitava por multi-sig,
-        # e o loop continuava tentando o mesmo peer. Log cheio de
-        # "prev_hash diverge" mesmo quando o problema real era sig.
-        # Agora detectamos cedo e retornamos RETRYABLE (o peer pode
-        # estar desatualizado e precisa de mais tempo) ou FATAL (se o
-        # bloco do peer é genuinamente inválido em multi-sig).
         try:
             validators = self.bc._get_active_validators() if hasattr(self.bc, "_get_active_validators") else []
             if validators:
@@ -1514,15 +1483,6 @@ class P2PManager:
         return self._sync_incremental(ip, port)
 
     def broadcast_block(self, block_dict: dict) -> None:
-        """
-        [FIX v6.7.10] Fallback síncrono se o pool está cheio.
-
-        Antes, ThreadPoolExecutor.submit() levantava RuntimeError
-        quando o pool (20 workers) estava saturado, e o bloco NÃO
-        era enviado para o peer — silenciosamente. Em rede 5+ peers
-        com broadcast_block chamado por on_block_mined, isso
-        significava fork local até o próximo sync.
-        """
         if self.read_only:
             return
         for peer in self.discovery.listar_peers():
@@ -1534,7 +1494,6 @@ class P2PManager:
             try:
                 self._broadcast_pool.submit(P2PClient.send_block, ip, port, block_dict)
             except Exception as e:
-                # Pool cheio — fallback síncrono (mais lento, mas garante envio)
                 log.warning(
                     "[P2P] broadcast_block pool cheio — fallback síncrono para %s:%s (%s)",
                     ip, port, type(e).__name__,
@@ -1545,7 +1504,6 @@ class P2PManager:
                     log.warning("[P2P] broadcast_block síncrono também falhou: %s", e2)
 
     def broadcast_tx(self, tx_dict: dict) -> None:
-        """[FIX v6.7.10] Mesmo fallback síncrono de broadcast_block."""
         if self.read_only:
             return
         for peer in self.discovery.listar_peers():
