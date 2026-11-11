@@ -1,31 +1,42 @@
-"""main.py — Entrypoint do nó BRN (v13.9.5)
+"""main.py — Entrypoint do nó BRN (v13.9.6)
 ================================================================
-v13.9.5 (2026-11-11) — AI ISOLATION DETECTOR:
-  [NEW] _wallet_watchdog_loop agora integra isolation_detector.py.
-        Detecta automaticamente:
-          - Zero peers ativos por 5+ min → CRITICAL
-          - Altura travada por 10+ min → WARNING
-          - Apenas 1 peer ativo → INFO
-        Emite log com sugestões de correção. Se isolation_detector.py
-        não existir, watchdog funciona exatamente como v13.9.4.
-  [KEEP] Tudo de v13.9.4 (boot sem senha no env, identidade Ed25519,
-        trust, P2P, sync, pool, web server, explorer, GUI/headless).
-  [KEEP] v13.9.4: _get_identity_password via .node_password local.
-  [KEEP] v13.9.3: carteira só via GUI (POST /api/wallet/set_validator_sk).
-  [KEEP] v13.9.2: identidade segura.
+v13.9.6 (2026-11-11) — AUTO-CONFIG VIA ENV VARS:
+  [NEW] _auto_configure(): instala SK e inicia mineração no pool
+        automaticamente no boot, lendo:
+          - BRN_VALIDATOR_SK_HEX       (64 hex)
+          - BRN_VALIDATOR_ADDRESS      (brn1...)
+          - BRN_VALIDATOR_PUBKEY       (66 hex)
+          - BRN_AUTO_MINE              ("1" = inicia PoolClient)
+        Resolve o problema de SK perdida quando o Render hiberna
+        (free tier reinicia a cada 15min sem tráfego). Após cada
+        restart, o nó se reconfigura sozinho, sem precisar de Shell.
+  [NEW] Defaults automáticos:
+          - BRN_BOOTSTRAP_PEERS=100.111.253.8:6001 (se vazio)
+          - BRN_POOL_URL=http://100.111.253.8:5000 (se vazio)
+        Resolve peers_known=0 quando o env var não foi setada.
+  [KEEP] v13.9.5: isolation_detector no watchdog
+  [KEEP] v13.9.4: boot sem senha no env (.node_password)
+  [KEEP] v13.9.3: carteira via API (GUI/curl)
+  [KEEP] v13.9.2: identidade segura
 
-FLUXO DE BOOT (v13.9.5):
+FLUXO DE BOOT (v13.9.6):
   1. main.py sobe → senha resolvida (env OU .node_password local)
   2. node_identity.enc carregado/criado
   3. blockchain.py validado
-  4. chain + trust + p2p + sync + pool + web sobem
-  5. GUI abre (ou modo --headless)
-  6. Usuário desbloqueia carteira → POST /api/wallet/set_validator_sk
-  7. server.py → wallet_integrator.integrate_and_propagate()
-  8. Nó começa a assinar
-  9. Watchdog monitora isolamento, SK, trust a cada 30s
+  4. Defaults de BOOTSTRAP_PEERS e POOL_URL aplicados
+  5. chain + trust + p2p + sync + pool + web sobem
+  6. GUI abre (ou modo --headless)
+  7. [AUTO-CONFIG] após 3s, instala SK via env BRN_VALIDATOR_SK_HEX
+  8. [AUTO-CONFIG] após SK ok, inicia PoolClient via env BRN_AUTO_MINE=1
+  9. Watchdog monitora isolamento + SK + trust a cada 30s
 
-Em --headless, instale a SK via curl (ver mensagem final do boot).
+VARIÁVEIS DE AMBIENTE (opcionais, mas recomendadas no Render):
+  BRN_BOOTSTRAP_PEERS=100.111.253.8:6001
+  BRN_POOL_URL=http://100.111.253.8:5000
+  BRN_VALIDATOR_SK_HEX=<64 hex>
+  BRN_VALIDATOR_ADDRESS=brn1qw0mdf08qlzl9l8t0zps6rhqm4xul7jvdz39jv
+  BRN_VALIDATOR_PUBKEY=03b992d788c15470143a69651c05587e5483cc8344166d0ecb4f6e18dc981d3626
+  BRN_AUTO_MINE=1
 ================================================================
 """
 from __future__ import annotations
@@ -47,7 +58,7 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.5"
+    VERSION = "13.9.6"
     BUILD_DATE = "2026-11-11"
 
 # [AI v13.9.5] Detector de isolamento (opcional)
@@ -57,6 +68,21 @@ try:
 except ImportError:
     IsolationDetector = None
     _HAS_ISOLATION = False
+
+# [AUTO-CONFIG v13.9.6] SK + mineração automáticas
+try:
+    import wallet_integrator as _wi
+    _HAS_WI = True
+except ImportError:
+    _wi = None
+    _HAS_WI = False
+
+try:
+    import requests as _requests
+    _HAS_REQUESTS = True
+except ImportError:
+    _requests = None
+    _HAS_REQUESTS = False
 
 
 # ============================================================
@@ -123,15 +149,6 @@ def _setup_logging(level: str = "INFO"):
 # IDENTITY PASSWORD
 # ============================================================
 def _get_identity_password() -> str:
-    """
-    Resolve a senha da IDENTIDADE DO NÓ (Ed25519 do P2P — NÃO é carteira).
-
-    Ordem:
-      1. BRN_NODE_PASSWORD  (se configurada)
-      2. BRN_WALLET_SESSION_PASS (compat)
-      3. .node_password  (arquivo local 0600, gerado na 1ª execução)
-      4. gera secrets.token_hex(16) e grava .node_password
-    """
     log = logging.getLogger("main")
 
     pw = (os.environ.get("BRN_NODE_PASSWORD", "").strip()
@@ -255,7 +272,7 @@ def _check_blockchain_version() -> bool:
         log.error("[version] não consegui importar blockchain: %s", e)
         return os.environ.get("BRN_STRICT_MULTISIG") != "1"
 
-    ok = ver.startswith("9.4") or (ver >= "9.4.10")
+    ok = ver.startswith("9.4") or (ver >= "9.4.10") or (ver.startswith("9.5"))
     if ok:
         log.info("[version] blockchain.py v%s (multi-sig OK)", ver)
         return True
@@ -342,7 +359,6 @@ def _wallet_watchdog_loop(chain, p2p, trust, stop_evt: threading.Event,
     log = logging.getLogger("main")
     log.info("[watchdog] iniciado (interval=%ds)", interval)
 
-    # [AI v13.9.5] Detector de isolamento
     detector = IsolationDetector() if _HAS_ISOLATION else None
     if detector is not None:
         log.info("[watchdog] isolation_detector ativo")
@@ -350,9 +366,7 @@ def _wallet_watchdog_loop(chain, p2p, trust, stop_evt: threading.Event,
         log.info("[watchdog] isolation_detector ausente — modo padrão")
 
     while not stop_evt.wait(interval):
-        # ═══════════════════════════════════════════════════════════
-        # [AI v13.9.5] Check de isolamento (roda SEMPRE, antes da SK)
-        # ═══════════════════════════════════════════════════════════
+        # [AI v13.9.5] Check de isolamento
         if detector is not None and p2p is not None:
             try:
                 peers = p2p.discovery.listar_peers()
@@ -369,9 +383,7 @@ def _wallet_watchdog_loop(chain, p2p, trust, stop_evt: threading.Event,
             except Exception as _e:
                 log.debug("[ISOLATION] check falhou: %s", _e)
 
-        # ═══════════════════════════════════════════════════════════
         # Bloco original do watchdog (SK + collector + trust)
-        # ═══════════════════════════════════════════════════════════
         try:
             sk = getattr(chain, "_local_validator_sk", None)
             if sk is None:
@@ -579,6 +591,119 @@ def _start_gui() -> bool:
 
 
 # ============================================================
+# AUTO-CONFIG (v13.9.6)
+# ============================================================
+def _auto_configure(chain, p2p, trust, web_port: int) -> None:
+    """
+    Executa auto-SK e auto-mine baseado em env vars.
+    Chamada automaticamente no boot após o web server subir.
+
+    Envs lidas:
+      BRN_VALIDATOR_SK_HEX       (64 hex — chave privada)
+      BRN_VALIDATOR_ADDRESS      (brn1... — endereço)
+      BRN_VALIDATOR_PUBKEY       (66 hex — chave pública)
+      BRN_AUTO_MINE              ("1" = inicia PoolClient no pool)
+    """
+    log = logging.getLogger("main")
+
+    sk_hex  = os.environ.get("BRN_VALIDATOR_SK_HEX", "").strip()
+    address = os.environ.get("BRN_VALIDATOR_ADDRESS", "").strip()
+    pubkey  = os.environ.get("BRN_VALIDATOR_PUBKEY", "").strip()
+    auto_mine = os.environ.get("BRN_AUTO_MINE", "0") == "1"
+
+    if not sk_hex:
+        log.info("[AUTO-CONFIG] BRN_VALIDATOR_SK_HEX vazio — SK não instalada automaticamente")
+        log.info("[AUTO-CONFIG] (instale via /wallet ou POST /api/wallet/set_validator_sk)")
+    else:
+        # ─── 1. Auto-instalar SK ───
+        if not _HAS_WI:
+            log.warning("[AUTO-CONFIG] wallet_integrator indisponível — SK não instalada")
+        else:
+            log.info("[AUTO-CONFIG] instalando SK via wallet_integrator...")
+            try:
+                r = _wi.integrate_and_propagate(
+                    chain, sk_hex,
+                    address=address, pubkey=pubkey,
+                    p2p=p2p, trust=trust, logger=log,
+                )
+                if r.get("ok"):
+                    log.info(
+                        "[AUTO-CONFIG] ✅ SK instalada (sk=%s ms=%s pbft=%s)",
+                        r.get("sk_installed"),
+                        r.get("multisig_ready"),
+                        r.get("pbft_ready"),
+                    )
+                else:
+                    log.warning(
+                        "[AUTO-CONFIG] ⚠️ SK falhou: %s",
+                        r.get("errors") or r.get("msg"),
+                    )
+            except Exception as e:
+                log.exception("[AUTO-CONFIG] integrate falhou: %s", e)
+
+    # ─── 2. Auto-mine ───
+    if not auto_mine:
+        return
+
+    if not address or not pubkey:
+        log.warning("[AUTO-CONFIG] BRN_AUTO_MINE=1 mas faltam BRN_VALIDATOR_ADDRESS/PUBKEY")
+        return
+
+    if not _HAS_REQUESTS:
+        log.warning("[AUTO-CONFIG] BRN_AUTO_MINE=1 mas 'requests' não instalado")
+        return
+
+    # Aguarda SK estar de fato no chain (até 30s)
+    for _ in range(30):
+        if getattr(chain, "_local_validator_sk", None) is not None:
+            break
+        time.sleep(1)
+
+    if getattr(chain, "_local_validator_sk", None) is None:
+        log.warning("[AUTO-CONFIG] SK ainda ausente após 30s — abortando auto-mine")
+        return
+
+    log.info("[AUTO-CONFIG] iniciando mineração no pool...")
+    for attempt in range(1, 4):
+        try:
+            r = _requests.post(
+                f"http://127.0.0.1:{web_port}/api/pool/start_local",
+                json={"address": address, "pubkey": pubkey},
+                timeout=30,
+            )
+            try:
+                data = r.json() if r.content else {}
+            except Exception:
+                data = {"ok": False, "msg": f"HTTP {r.status_code} sem JSON"}
+
+            if data.get("ok"):
+                log.info(
+                    "[AUTO-CONFIG] ✅ PoolClient iniciado (miner_id=%s)",
+                    data.get("miner_id", "?"),
+                )
+                return
+            else:
+                log.warning(
+                    "[AUTO-CONFIG] ⚠️ PoolClient tentativa %d: %s",
+                    attempt, data.get("msg", "?"),
+                )
+        except Exception as e:
+            log.warning("[AUTO-CONFIG] PoolClient tentativa %d: %s", attempt, e)
+        time.sleep(5)
+
+    log.warning("[AUTO-CONFIG] PoolClient não iniciou após 3 tentativas")
+
+
+def _delayed_auto_configure(chain, p2p, trust, web_port: int) -> None:
+    """Aguarda 3s (web server subir) e chama _auto_configure."""
+    try:
+        time.sleep(3)
+        _auto_configure(chain, p2p, trust, web_port)
+    except Exception as e:
+        logging.getLogger("main").exception("[AUTO-CONFIG] falhou: %s", e)
+
+
+# ============================================================
 # MAIN
 # ============================================================
 def main() -> int:
@@ -607,6 +732,19 @@ def main() -> int:
     log.info(" BRN Node v%s (build %s) is_origin=%s", VERSION, BUILD_DATE, is_origin)
     log.info(" base=%s env_loaded=%d", BASE_DIR, loaded)
     log.info("=" * 64)
+
+    # [v13.9.6] Defaults de bootstrap e pool (antes do P2P)
+    if not os.environ.get("BRN_BOOTSTRAP_PEERS"):
+        os.environ["BRN_BOOTSTRAP_PEERS"] = "100.111.253.8:6001"
+        log.info("[config] BRN_BOOTSTRAP_PEERS default: 100.111.253.8:6001")
+    else:
+        log.info("[config] BRN_BOOTSTRAP_PEERS: %s", os.environ.get("BRN_BOOTSTRAP_PEERS"))
+
+    if not os.environ.get("BRN_POOL_URL"):
+        os.environ["BRN_POOL_URL"] = "http://100.111.253.8:5000"
+        log.info("[config] BRN_POOL_URL default: http://100.111.253.8:5000")
+    else:
+        log.info("[config] BRN_POOL_URL: %s", os.environ.get("BRN_POOL_URL"))
 
     # [1] Version gate
     if not _check_blockchain_version():
@@ -650,7 +788,7 @@ def main() -> int:
     else:
         log.info("[trust] carregado (origin=%s)", is_origin)
 
-    log.info("[wallet] boot sem carteira (design v13.9.5) — "
+    log.info("[wallet] boot sem carteira (design v13.9.6) — "
              "instale SK via API (GUI ou curl)")
 
     # [6] P2P
@@ -695,6 +833,16 @@ def main() -> int:
     if not ok_http:
         log.error("[server] HTTP não subiu — a GUI não vai conseguir instalar SK")
 
+    # [11.5] [AUTO-CONFIG v13.9.6] SK + auto-mine
+    if not args.no_pool_client:
+        threading.Thread(
+            target=_delayed_auto_configure,
+            args=(chain, p2p, trust, web_port),
+            daemon=True,
+            name="AutoConfig",
+        ).start()
+        log.info("[AUTO-CONFIG] agendado (executa em 3s, após HTTP subir)")
+
     # [12] Explorer
     if not args.no_explorer:
         _start_explorer(chain)
@@ -706,12 +854,13 @@ def main() -> int:
             return 0
     else:
         log.info("=" * 64)
-        log.info(" MODO HEADLESS — instale a SK via curl:")
-        log.info("   curl -X POST http://127.0.0.1:%d/api/wallet/set_validator_sk \\", web_port)
-        log.info("        -H 'Content-Type: application/json' \\")
-        log.info("        -d '{\"password\":\"<senha-da-carteira>\"}'")
-        log.info("")
-        log.info(" Sem isso o nó fica PARADO (sem assinar, sem minerar).")
+        log.info(" MODO HEADLESS")
+        log.info("   - SK: instale via POST /api/wallet/set_validator_sk")
+        log.info("         ou defina BRN_VALIDATOR_SK_HEX nas env vars")
+        log.info("   - Mine: POST /api/pool/start_local")
+        log.info("          ou defina BRN_AUTO_MINE=1 nas env vars")
+        log.info("   - Wallet web: http://%s:%d/wallet",
+                 os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
         log.info("=" * 64)
 
     # [14] Shutdown gracioso
@@ -740,8 +889,11 @@ def main() -> int:
     if not args.no_explorer:
         log.info("   Explorer : http://0.0.0.0:%s",
                  os.environ.get("BRN_EXPLORER_PORT", "8080"))
+    log.info("   Wallet   : http://%s:%d/wallet",
+             os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
     log.info("   P2P      : :%d", p2p_port)
-    log.info("   SK       : NÃO INSTALADA (instale via GUI/curl)")
+    log.info("   Bootstrap: %s", os.environ.get("BRN_BOOTSTRAP_PEERS", "(vazio)"))
+    log.info("   Pool URL : %s", os.environ.get("BRN_POOL_URL", "(vazio)"))
     log.info("=" * 64)
 
     try:
