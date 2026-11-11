@@ -1,17 +1,11 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.28)
+server.py — Backend HTTP do nó BRN (v9.9.29)
 ================================================================
-v9.9.28 (2026-11-09) — CARTEIRA SÓ VIA GUI:
-  [BREAKING] api_wallet_set_validator_sk NÃO usa mais .env para
-        senha. Removeu password=... e persist_sk_for_reboot().
-        A carteira vem exclusivamente do POST do GUI (via
-        app_wallet_v3.unlock_wallet), que passa sk_hex/address/pubkey
-        já decifrados.
-  [BREAKING] Removida persist_sk_for_reboot do import — não é mais
-        chamada. O GUI já salvou current_wallet.enc antes de POSTar.
-  [KEEP] v9.9.27: /api/validator/announce, integrate_and_propagate
-        no api_wallet_set_validator_sk, trust_download assinado.
-  [KEEP] v9.9.26: STRICT_MULTISIG-aware, proxy pool timeout 30s.
+v9.9.29 (2026-11-11) — WALLET WEB:
+  [NEW] Rota /wallet serve index_wallet.html (versão web pura,
+        sem pywebview) na porta pública $PORT.
+  [KEEP] v9.9.28: carteira via API (set_validator_sk), sem .env.
+  [KEEP] v9.9.28: /dashboard, /monitor, /panel servindo HTMLs.
 ================================================================
 """
 from __future__ import annotations
@@ -156,7 +150,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
                 url,
                 data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
                 headers={"Content-Type": "application/json",
-                         "User-Agent": "brn-server/9.9.28"},
+                         "User-Agent": "brn-server/9.9.29"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -796,7 +790,6 @@ def sync_info():
         "bridge": {"onramp_ativo": False, "taxa": 0, "btc_cofre": "", "offramp_ativo": False},
     }
     
-    # [AUTO-FIX] Injeta status real da bridge lendo o btc_config
     try:
         import btc_config
         result["bridge"] = {
@@ -1198,7 +1191,6 @@ def pool_local_status():
 def pool_start_local():
     pc = _get_pool_client_local()
     if pc is None:
-        # [FIX] Tenta miner_pool_client (v7.0) primeiro, depois mining_pool (v6.4).
         PoolClient = None
         _source = ""
         try:
@@ -1329,26 +1321,10 @@ def pool_stop_local():
 
 
 # ============================================================
-# WALLET — integração completa [v9.9.28: SÓ GUI]
+# WALLET — integração completa
 # ============================================================
 @app.route("/api/wallet/set_validator_sk", methods=["POST"])
 def api_wallet_set_validator_sk():
-    """
-    [v9.9.28] SÓ aceita carteira vinda do GUI (via app_wallet_v3).
-    NÃO usa .env para senha. NÃO persiste .enc (GUI já salvou antes).
-    NÃO tenta recarregar em caso de erro.
-
-    Body (do GUI):
-      {
-        "sk_hex":  "abc...",   # 64 hex
-        "address": "brn1...",
-        "pubkey":  "02..."
-      }
-
-    Retorno:
-      {ok, pubkey, sk_installed, in_trust, in_top5, multisig_ready,
-       pbft_ready, propagated, peers_notified, warnings, errors}
-    """
     try:
         data = request.get_json(force=True) or {}
         sk_hex  = (data.get("sk_hex")  or "").strip()
@@ -1365,7 +1341,6 @@ def api_wallet_set_validator_sk():
         except ValueError:
             return jsonify({"ok": False, "msg": "sk_hex não é hex"}), 400
 
-        # ─── Wallet integrator (ponto único) ───
         try:
             from wallet_integrator import (
                 integrate as _integrate_local,
@@ -1424,7 +1399,7 @@ def api_wallet_set_validator_sk():
 
 
 # ============================================================
-# [v9.9.27] PROPAGAÇÃO DE VALIDADORES
+# PROPAGAÇÃO DE VALIDADORES
 # ============================================================
 @app.route("/api/validator/announce", methods=["POST"])
 def api_validator_announce():
@@ -1504,14 +1479,6 @@ def api_validator_announce():
             total_nodes = len(getattr(trust, "nodes", {}) or {})
         except Exception:
             pass
-
-        log.info(
-            "[announce] pubkey=%s… address=%s… in_top5=%s "
-            "peers_notified=%d total_nodes=%d",
-            pubkey[:16],
-            address[:16] if address else "?",
-            in_top5, peers_notified, total_nodes,
-        )
 
         return jsonify({
             "ok": True,
@@ -1725,27 +1692,21 @@ def peers_discovered():
 
 
 # ============================================================
-# ROTA RAIZ — usada pelo Render health check e por humanos
+# ROTA RAIZ
 # ============================================================
 @app.route("/", methods=["GET", "HEAD"])
 def root():
-    """
-    Rota raiz — usada pelo Render health check e por humanos
-    que abrem https://brn-v002.onrender.com no navegador.
-
-    Sempre retorna 200 mesmo se o DB estiver em erro, para evitar
-    que o health check do Render reinicie o container.
-    """
     try:
         chain = _get_chain()
         return jsonify({
             "ok": True,
             "name": "BRN Node",
-            "version": "9.9.28",
+            "version": "9.9.29",
             "height": chain.db.height(),
             "health": "/health",
             "status": "/api/status",
             "dashboard": "/dashboard",
+            "wallet": "/wallet",
             "monitor": "/monitor",
             "panel": "/panel",
         })
@@ -1753,21 +1714,16 @@ def root():
         return jsonify({
             "ok": True,
             "name": "BRN Node",
-            "version": "9.9.28",
+            "version": "9.9.29",
             "error": str(e),
         })
 
 
 # ============================================================
-# DASHBOARD — serve o explorer.html pela porta pública ($PORT)
+# DASHBOARD / MONITOR / PANEL / WALLET (HTMLs na porta pública)
 # ============================================================
 @app.route("/dashboard", methods=["GET"])
 def serve_dashboard():
-    """
-    Serve o explorer.html público na porta $PORT (10000 no Render).
-    Antes, o explorer.html só era servido na 8080 (interna),
-    inacessível publicamente no Render.
-    """
     p = BASE_DIR / "explorer.html"
     if p.exists():
         return send_file(p)
@@ -1780,7 +1736,6 @@ def serve_dashboard():
 
 @app.route("/monitor", methods=["GET"])
 def serve_monitor():
-    """Serve monitor.html na porta $PORT."""
     p = BASE_DIR / "monitor.html"
     if p.exists():
         return send_file(p)
@@ -1789,11 +1744,23 @@ def serve_monitor():
 
 @app.route("/panel", methods=["GET"])
 def serve_panel():
-    """Serve panel.html na porta $PORT."""
     p = BASE_DIR / "panel.html"
     if p.exists():
         return send_file(p)
     return jsonify({"ok": False, "msg": "panel.html não encontrado"}), 404
+
+
+@app.route("/wallet", methods=["GET"])
+def serve_wallet():
+    """[NOVO v9.9.29] Serve index_wallet.html (versão web pura)."""
+    p = BASE_DIR / "index_wallet.html"
+    if p.exists():
+        return send_file(p)
+    return jsonify({
+        "ok": False,
+        "msg": "index_wallet.html não encontrado",
+        "path_esperado": str(p),
+    }), 404
 
 
 @app.route("/health", methods=["GET"])
@@ -1822,7 +1789,7 @@ def health():
         return jsonify({
             "ok": True,
             "height": chain.db.height(),
-            "version": "9.9.28",
+            "version": "9.9.29",
             "chain_injected": _CHAIN is not None,
             "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
@@ -2086,7 +2053,6 @@ def api_tx_status(txid_str):
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
-
 @app.route("/api/bridge/status", methods=["GET"])
 def bridge_status():
     try:
@@ -2104,7 +2070,8 @@ def bridge_status():
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
+
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print("BRN Server v9.9.28 (carteira SÓ via GUI; sem .env para wallet)")
+    print("BRN Server v9.9.29 (wallet web + dashboard + monitor + panel)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
