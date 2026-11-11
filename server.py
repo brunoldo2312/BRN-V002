@@ -1194,12 +1194,44 @@ def pool_local_status():
         return jsonify({"ok": False, "running": False, "msg": str(e)}), 200
 
 
+# ============================================================
+# [FIX] pool_start_local — import com fallback + kwargs
+# ============================================================
 @app.route("/api/pool/start_local", methods=["POST"])
 def pool_start_local():
     pc = _get_pool_client_local()
     if pc is None:
+        # [FIX] Tenta miner_pool_client (v7.0) primeiro, depois mining_pool (v6.4).
+        # O erro anterior era:
+        #   "cannot import name 'PoolClient' from 'mining_pool'"
+        # porque o mining_pool.py deployado no Render era antigo (< v6.4).
+        PoolClient = None
+        _source = ""
         try:
-            from mining_pool import PoolClient
+            from miner_pool_client import PoolClient as _PC
+            PoolClient = _PC
+            _source = "miner_pool_client"
+        except ImportError:
+            try:
+                from mining_pool import PoolClient as _PC
+                PoolClient = _PC
+                _source = "mining_pool"
+            except ImportError as _e:
+                log.error(
+                    "[pool_client] PoolClient indisponível: "
+                    "miner_pool_client E mining_pool sem a classe (%s)", _e,
+                )
+                return jsonify({
+                    "ok": False,
+                    "msg": (
+                        "PoolClient indisponível: nem miner_pool_client nem "
+                        f"mining_pool exportam a classe ({_e})"
+                    ),
+                }), 503
+
+        log.info("[pool_client] importando PoolClient de %s", _source)
+
+        try:
             data = request.get_json(force=True) or {}
             address = (data.get("address") or "").strip()
             pubkey = (data.get("pubkey") or "").strip()
@@ -1215,26 +1247,35 @@ def pool_start_local():
                 pool_url = (os.environ.get("BRN_POOL_URL_LOCAL", "").strip()
                             or "http://127.0.0.1:5000")
 
-            log.info("[pool_client] Inicializando com pool_url=%s", pool_url)
+            log.info(
+                "[pool_client] Inicializando via %s (pool_url=%s)",
+                _source, pool_url,
+            )
 
+            # [FIX] kwargs nomeados — funciona em ambos:
+            #   miner_pool_client.PoolClient(address, pubkey, pool_url=None, ...)
+            #   mining_pool.PoolClient(address, pubkey, pool_manager=None, pool_url="")
             try:
-                pc = PoolClient(pool_url, address, pubkey)
+                pc = PoolClient(
+                    address=address, pubkey=pubkey, pool_url=pool_url,
+                )
             except TypeError:
+                # Fallback defensivo se algum arquivo tiver assinatura exótica
                 try:
-                    pc = PoolClient(pool_url, pubkey)
+                    pc = PoolClient(address, pubkey, pool_url=pool_url)
                 except TypeError:
-                    try:
-                        pc = PoolClient(pool_url)
-                    except TypeError:
-                        chain = _get_chain()
-                        pc = PoolClient(chain, pubkey)
+                    pc = PoolClient(
+                        address=address, pubkey=pubkey,
+                        pool_manager=None, pool_url=pool_url,
+                    )
 
             set_pool_client_local(pc)
-            log.info("[pool_client] Inicializado dinamicamente")
+            log.info("[pool_client] Inicializado dinamicamente via %s", _source)
         except Exception as e:
+            log.exception("[pool_client] falha ao inicializar: %s", e)
             return jsonify({
                 "ok": False,
-                "msg": f"Falha ao inicializar PoolClient: {e}",
+                "msg": f"Falha ao inicializar PoolClient ({_source}): {e}",
             }), 503
 
     try:
@@ -1694,7 +1735,7 @@ def peers_discovered():
 
 
 # ============================================================
-# [NOVO] ROTA RAIZ — usada pelo Render health check e por humanos
+# ROTA RAIZ — usada pelo Render health check e por humanos
 # ============================================================
 @app.route("/", methods=["GET", "HEAD"])
 def root():
