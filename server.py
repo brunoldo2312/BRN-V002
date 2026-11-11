@@ -1,11 +1,17 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.29)
+server.py — Backend HTTP do nó BRN (v9.9.28)
 ================================================================
-v9.9.29 (2026-11-10):
-  [FIX] Substituído urllib.request por requests para suportar
-        proxy SOCKS5 (Tailscale/ALL_PROXY) no Render.
-  [NEW] Rota /api/bridge/status adicionada para a GUI.
-  [KEEP] v9.9.28: Carteira SÓ VIA GUI, sem .env para wallet.
+v9.9.28 (2026-11-09) — CARTEIRA SÓ VIA GUI:
+  [BREAKING] api_wallet_set_validator_sk NÃO usa mais .env para
+        senha. Removeu password=... e persist_sk_for_reboot().
+        A carteira vem exclusivamente do POST do GUI (via
+        app_wallet_v3.unlock_wallet), que passa sk_hex/address/pubkey
+        já decifrados.
+  [BREAKING] Removida persist_sk_for_reboot do import — não é mais
+        chamada. O GUI já salvou current_wallet.enc antes de POSTar.
+  [KEEP] v9.9.27: /api/validator/announce, integrate_and_propagate
+        no api_wallet_set_validator_sk, trust_download assinado.
+  [KEEP] v9.9.26: STRICT_MULTISIG-aware, proxy pool timeout 30s.
 ================================================================
 """
 from __future__ import annotations
@@ -18,7 +24,8 @@ import hmac
 import logging
 import sys
 import threading
-import requests
+import urllib.request
+import urllib.error
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from functools import wraps
 from pathlib import Path
@@ -145,15 +152,15 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
                     http_port = BOOTSTRAP_HTTP_PORT
 
             url = f"{scheme}://{host}:{http_port}/api/bootstrap/add"
-            # [v9.9.29] Usa requests para suportar ALL_PROXY (SOCKS5)
-            resp = requests.post(
-                url, 
-                json={"address": addr, "pubkey": pubkey}, 
-                headers={"User-Agent": "brn-server/9.9.29"},
-                timeout=2
+            req = urllib.request.Request(
+                url,
+                data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
+                headers={"Content-Type": "application/json",
+                         "User-Agent": "brn-server/9.9.28"},
+                method="POST",
             )
-            resp.raise_for_status()
-            log.info(f"[BOOTSTRAP] {log_prefix}aviso enviado para {host}:{http_port}")
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                log.info(f"[BOOTSTRAP] {log_prefix}aviso enviado para {host}:{http_port}")
         except Exception as e:
             log.warning(f"[BOOTSTRAP] Nao foi possivel avisar {b} ({log_prefix}): {e}")
 
@@ -998,28 +1005,30 @@ def _proxy_pool_request(path: str, method: str = "POST") -> tuple:
     try:
         if method == "POST":
             data = request.get_json(force=True) or {}
-            # [v9.9.29] Usa requests para suportar ALL_PROXY (SOCKS5)
-            resp = requests.post(
-                url, 
-                json=data, 
-                headers={"User-Agent": "brn-server-proxy/1.0"},
-                timeout=PROXY_POOL_TIMEOUT_S
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(data).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "brn-server-proxy/1.0",
+                },
+                method="POST",
             )
         else:
-            resp = requests.get(url, timeout=PROXY_POOL_TIMEOUT_S)
+            req = urllib.request.Request(url, method="GET")
 
-        resp.raise_for_status()
-        return jsonify(resp.json()), resp.status_code
+        with urllib.request.urlopen(req, timeout=PROXY_POOL_TIMEOUT_S) as resp:
+            return jsonify(json.loads(resp.read().decode("utf-8"))), resp.status
 
-    except requests.exceptions.HTTPError as e:
+    except urllib.error.HTTPError as e:
         try:
-            return jsonify(e.response.json()), e.response.status_code
+            return jsonify(json.loads(e.read().decode("utf-8"))), e.code
         except Exception:
-            return jsonify({"ok": False, "msg": f"HTTP {e.response.status_code} no pool remoto"}), e.response.status_code
-    except requests.exceptions.RequestException as e:
+            return jsonify({"ok": False, "msg": f"HTTP {e.code} no pool remoto"}), e.code
+    except urllib.error.URLError as e:
         return jsonify({
             "ok": False,
-            "msg": f"Nao consegui conectar ao Origem ({remote_pool}): {e}",
+            "msg": f"Nao consegui conectar ao Origem ({remote_pool}): {e.reason}",
         }), 502
     except Exception as e:
         return jsonify({"ok": False, "msg": f"Falha no proxy do pool: {e}"}), 502
@@ -1293,6 +1302,22 @@ def pool_stop_local():
 # ============================================================
 @app.route("/api/wallet/set_validator_sk", methods=["POST"])
 def api_wallet_set_validator_sk():
+    """
+    [v9.9.28] SÓ aceita carteira vinda do GUI (via app_wallet_v3).
+    NÃO usa .env para senha. NÃO persiste .enc (GUI já salvou antes).
+    NÃO tenta recarregar em caso de erro.
+
+    Body (do GUI):
+      {
+        "sk_hex":  "abc...",   # 64 hex
+        "address": "brn1...",
+        "pubkey":  "02..."
+      }
+
+    Retorno:
+      {ok, pubkey, sk_installed, in_trust, in_top5, multisig_ready,
+       pbft_ready, propagated, peers_notified, warnings, errors}
+    """
     try:
         data = request.get_json(force=True) or {}
         sk_hex  = (data.get("sk_hex")  or "").strip()
@@ -1309,6 +1334,7 @@ def api_wallet_set_validator_sk():
         except ValueError:
             return jsonify({"ok": False, "msg": "sk_hex não é hex"}), 400
 
+        # ─── Wallet integrator (ponto único) ───
         try:
             from wallet_integrator import (
                 integrate as _integrate_local,
@@ -1667,6 +1693,38 @@ def peers_discovered():
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
+# ============================================================
+# [NOVO] ROTA RAIZ — usada pelo Render health check e por humanos
+# ============================================================
+@app.route("/", methods=["GET", "HEAD"])
+def root():
+    """
+    Rota raiz — usada pelo Render health check e por humanos
+    que abrem https://brn-v002.onrender.com no navegador.
+
+    Sempre retorna 200 mesmo se o DB estiver em erro, para evitar
+    que o health check do Render reinicie o container.
+    """
+    try:
+        chain = _get_chain()
+        return jsonify({
+            "ok": True,
+            "name": "BRN Node",
+            "version": "9.9.28",
+            "height": chain.db.height(),
+            "health": "/health",
+            "status": "/api/status",
+            "explorer": "/dashboard",
+        })
+    except Exception as e:
+        return jsonify({
+            "ok": True,
+            "name": "BRN Node",
+            "version": "9.9.28",
+            "error": str(e),
+        })
+
+
 @app.route("/health", methods=["GET"])
 def health():
     try:
@@ -1693,7 +1751,7 @@ def health():
         return jsonify({
             "ok": True,
             "height": chain.db.height(),
-            "version": "9.9.29",
+            "version": "9.9.28",
             "chain_injected": _CHAIN is not None,
             "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
@@ -1977,5 +2035,5 @@ def bridge_status():
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print("BRN Server v9.9.29 (carteira SÓ via GUI; sem .env para wallet)")
+    print("BRN Server v9.9.28 (carteira SÓ via GUI; sem .env para wallet)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
