@@ -40,10 +40,9 @@ v9.5.2 (2026-11-05):
   [NEW] BRN_STRICT_MULTISIG.
 ================================================================
 """
-
-__version__ = "9.5.7"  # ← ADICIONADO (fix v13.9.4: main.py detecta multi-sig)
-
 from __future__ import annotations
+
+__version__ = "9.5.7"  # ← DEPOIS do from __future__ (fix)
 
 import os
 import time
@@ -95,31 +94,23 @@ BOOTSTRAP_TRUST_THRESHOLD = float(
     os.environ.get("BRN_BOOTSTRAP_TRUST_THRESHOLD", "500")
 )
 
-# [v9.4.10] Bypass de multi-sig ate uma altura.
 BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = int(
     os.environ.get("BRN_BOOTSTRAP_SKIP_SIGS_UNTIL", "0") or "0"
 )
 
-# [v9.4.11] Assume Valid
 BRN_ASSUME_VALID_UNTIL = int(
     os.environ.get("BRN_ASSUME_VALID_UNTIL", "0") or "0"
 )
 
-# [v9.4.11] Checkpoint automático
 BRN_CHECKPOINT_AUTO_HEIGHT = int(
     os.environ.get("BRN_CHECKPOINT_AUTO_HEIGHT", "0") or "0"
 )
 
-# [PBFT] flag de enforcement e altura de ativação
 BRN_PBFT_ENFORCE = os.environ.get("BRN_PBFT_ENFORCE", "0") == "1"
-# [v9.5.4] A partir de qual altura o PBFT passa a ser obrigatório
 BRN_PBFT_START_HEIGHT = int(os.environ.get("BRN_PBFT_START_HEIGHT", "0"))
 
-# [v9.5.2] STRICT MULTISIG: desativa TODOS os bypasses de multi-sig.
 BRN_STRICT_MULTISIG = os.environ.get("BRN_STRICT_MULTISIG", "0") == "1"
 
-# [v9.5.6] Fallback para get_top_validators em _get_active_validators.
-# Default: DESLIGADO, para não ressuscitar nós fantasmas.
 BRN_TRUST_FALLBACK_TO_TOP = os.environ.get("BRN_TRUST_FALLBACK_TO_TOP", "0") == "1"
 
 if BRN_STRICT_MULTISIG:
@@ -538,7 +529,6 @@ class Blockchain:
         self.genesis_expected_hash = None
         self.network_secret = network_secret if network_secret is not None else NETWORK_SECRET
 
-        # [FIX v9.5.6] require_auth_tag agora respeita BRN_REQUIRE_AUTH_TAG=0
         if require_auth_tag is None:
             require_auth_tag = os.environ.get("BRN_REQUIRE_AUTH_TAG", "1") == "1"
         self._auth_tag_requested = bool(require_auth_tag)
@@ -668,7 +658,6 @@ class Blockchain:
         return g
 
     def set_network_secret(self, secret: str) -> None:
-        # [FIX v9.5.6] Recomputa a partir da intenção original
         self.network_secret = (secret or "").strip()
         self.require_auth_tag = self._auth_tag_requested and bool(self.network_secret)
         if self._auth_tag_requested and not self.network_secret:
@@ -912,9 +901,6 @@ class Blockchain:
             return False, "falha na mempool"
         return True, tx["txid"]
 
-    # ============================================================
-    # L2 BRIDGE (BTC -> BRN)
-    # ============================================================
     def add_l2_transaction(self, l2_tx: dict) -> str:
         buyer = l2_tx.get("buyer")
         amount = int(l2_tx.get("brn_amount", 0))
@@ -974,7 +960,6 @@ class Blockchain:
                 log.warning(f"[VALIDATORS] falhou: {e}")
                 validators = []
 
-            # [FIX v9.5.6] Fallback duplicado gated por env.
             if not validators and hasattr(trust, "get_top_validators"):
                 if BRN_TRUST_FALLBACK_TO_TOP:
                     try:
@@ -1027,7 +1012,6 @@ class Blockchain:
 
     def _validate_validators_sig(self, block: dict,
                                   validators: Optional[list] = None) -> tuple:
-        # [v9.4.10] Bypass por altura (só se STRICT_MULTISIG=0)
         if not BRN_STRICT_MULTISIG and BRN_BOOTSTRAP_SKIP_SIGS_UNTIL > 0:
             try:
                 _bh = int(block.get("height", -1))
@@ -1083,15 +1067,6 @@ class Blockchain:
         if got >= required:
             return True, ""
 
-        # ═══════════════════════════════════════════════════════════
-        # BYPASSES (só ativos quando STRICT_MULTISIG=0)
-        #
-        # [FIX CRÍTICO v9.5.6] Bypass 2 e 3 exigem len(validators) < 2.
-        # Em rede 3+ nós, aceitar 1 sig local faz o minerador crescer
-        # a chain local em FORK. Peers (sem a pubkey local) rejeitam.
-        # ═══════════════════════════════════════════════════════════
-
-        # Bypass 1: bootstrap estrangeiro
         if (not BRN_STRICT_MULTISIG and len(validators) < 2
                 and got == 0 and got_foreign >= 1):
             try:
@@ -1112,7 +1087,6 @@ class Blockchain:
             )
             return True, ""
 
-        # Bypass 2: bootstrap local (exige len(validators) < 2)
         if (not BRN_STRICT_MULTISIG
                 and len(validators) < 2
                 and got >= 1
@@ -1139,7 +1113,6 @@ class Blockchain:
                     )
                     return True, ""
 
-        # Bypass 3: bootstrap estendido (exige len(validators) < 2)
         if (not BRN_STRICT_MULTISIG
                 and len(validators) < 2
                 and got >= 1
@@ -1335,13 +1308,6 @@ class Blockchain:
         except Exception as e:
             return False, f"Erro ao gravar bloco #{block['height']}: {e}"
 
-        # ═══════════════════════════════════════════════════════════
-        # [v9.5.7] Auto-promoção de signatários
-        # Após o bloco ser validado e gravado, registra +1 blocks_signed
-        # para cada signatário válido. O trust_network._adjust_score
-        # aplica GAIN_BLOCK_SIGNED (+5) e o auto-promote 500→1000
-        # acontece automaticamente quando blocks_signed >= 10.
-        # ═══════════════════════════════════════════════════════════
         if self.trust_net is not None and block["height"] > 0:
             try:
                 sigs = block.get("validators_sig", []) or []
@@ -1425,7 +1391,6 @@ class Blockchain:
 
         if self._sign_collector is not None:
             extra: list = []
-            # [FIX v9.5.6] pool.shutdown(wait=False) para o timeout valer
             try:
                 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
                 _pool = ThreadPoolExecutor(
@@ -1550,7 +1515,6 @@ class Blockchain:
                 decided = self._pbft.propose(block)
                 if decided:
                     if not self._pbft.attach_proof(block):
-                        # [FIX v9.5.6] Fallback defensivo por hash
                         _matched = False
                         try:
                             _lock = getattr(self._pbft, "lock", None)
@@ -1643,7 +1607,6 @@ class Blockchain:
         return snap
 
 
-# [FIX CIRCULAR IMPORT] Imports lazy
 def _reorg_to_method(self, new_blocks, max_depth=MAX_REORG_DEPTH,
                      allow_genesis_reorg=False):
     try:
