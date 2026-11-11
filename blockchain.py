@@ -40,6 +40,9 @@ v9.5.2 (2026-11-05):
   [NEW] BRN_STRICT_MULTISIG.
 ================================================================
 """
+
+__version__ = "9.5.7"  # ← ADICIONADO (fix v13.9.4: main.py detecta multi-sig)
+
 from __future__ import annotations
 
 import os
