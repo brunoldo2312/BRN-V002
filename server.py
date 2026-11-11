@@ -30,7 +30,7 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from functools import wraps
 from pathlib import Path
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 
 from wallet import Wallet, WalletManager
@@ -1194,17 +1194,11 @@ def pool_local_status():
         return jsonify({"ok": False, "running": False, "msg": str(e)}), 200
 
 
-# ============================================================
-# [FIX] pool_start_local — import com fallback + kwargs
-# ============================================================
 @app.route("/api/pool/start_local", methods=["POST"])
 def pool_start_local():
     pc = _get_pool_client_local()
     if pc is None:
         # [FIX] Tenta miner_pool_client (v7.0) primeiro, depois mining_pool (v6.4).
-        # O erro anterior era:
-        #   "cannot import name 'PoolClient' from 'mining_pool'"
-        # porque o mining_pool.py deployado no Render era antigo (< v6.4).
         PoolClient = None
         _source = ""
         try:
@@ -1252,15 +1246,11 @@ def pool_start_local():
                 _source, pool_url,
             )
 
-            # [FIX] kwargs nomeados — funciona em ambos:
-            #   miner_pool_client.PoolClient(address, pubkey, pool_url=None, ...)
-            #   mining_pool.PoolClient(address, pubkey, pool_manager=None, pool_url="")
             try:
                 pc = PoolClient(
                     address=address, pubkey=pubkey, pool_url=pool_url,
                 )
             except TypeError:
-                # Fallback defensivo se algum arquivo tiver assinatura exótica
                 try:
                     pc = PoolClient(address, pubkey, pool_url=pool_url)
                 except TypeError:
@@ -1755,7 +1745,9 @@ def root():
             "height": chain.db.height(),
             "health": "/health",
             "status": "/api/status",
-            "explorer": "/dashboard",
+            "dashboard": "/dashboard",
+            "monitor": "/monitor",
+            "panel": "/panel",
         })
     except Exception as e:
         return jsonify({
@@ -1764,6 +1756,44 @@ def root():
             "version": "9.9.28",
             "error": str(e),
         })
+
+
+# ============================================================
+# DASHBOARD — serve o explorer.html pela porta pública ($PORT)
+# ============================================================
+@app.route("/dashboard", methods=["GET"])
+def serve_dashboard():
+    """
+    Serve o explorer.html público na porta $PORT (10000 no Render).
+    Antes, o explorer.html só era servido na 8080 (interna),
+    inacessível publicamente no Render.
+    """
+    p = BASE_DIR / "explorer.html"
+    if p.exists():
+        return send_file(p)
+    return jsonify({
+        "ok": False,
+        "msg": "explorer.html não encontrado",
+        "path_esperado": str(p),
+    }), 404
+
+
+@app.route("/monitor", methods=["GET"])
+def serve_monitor():
+    """Serve monitor.html na porta $PORT."""
+    p = BASE_DIR / "monitor.html"
+    if p.exists():
+        return send_file(p)
+    return jsonify({"ok": False, "msg": "monitor.html não encontrado"}), 404
+
+
+@app.route("/panel", methods=["GET"])
+def serve_panel():
+    """Serve panel.html na porta $PORT."""
+    p = BASE_DIR / "panel.html"
+    if p.exists():
+        return send_file(p)
+    return jsonify({"ok": False, "msg": "panel.html não encontrado"}), 404
 
 
 @app.route("/health", methods=["GET"])
