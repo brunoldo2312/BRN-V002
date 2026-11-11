@@ -37,7 +37,7 @@ TRUST_THRESHOLD_VALIDATOR = 150.0
 TRUST_THRESHOLD_ACTIVE = 120.0
 
 GAIN_BLOCK_VALIDATED = 20.0
-GAIN_BLOCK_SIGNED = 5.0        # [v3.11] novo: co-assinatura
+GAIN_BLOCK_SIGNED = 5.0
 GAIN_ONLINE_HOUR = 0.5
 GAIN_SHARE_SUBMITTED = 0.5
 GAIN_REWARD_DISTRIBUTED = 5.0
@@ -61,7 +61,6 @@ ACTIVE_TTL_SECONDS = int(os.environ.get("BRN_TRUST_ACTIVE_TTL", "300"))
 SCORE_PROTECTED    = int(os.environ.get("BRN_TRUST_PROTECT_SCORE", "500"))
 PRUNE_INTERVAL_S   = 60.0
 
-# [v3.11] auto-promoção de clientes novos
 NEW_CLIENT_INITIAL_SCORE = float(os.environ.get("BRN_NEW_CLIENT_SCORE", "500"))
 AUTO_PROMOTE_MIN_BLOCKS  = int(os.environ.get("BRN_AUTO_PROMOTE_MIN_BLOCKS", "10"))
 AUTO_PROMOTE_SCORE       = float(os.environ.get("BRN_AUTO_PROMOTE_SCORE", "1000"))
@@ -84,7 +83,7 @@ class NodeRecord:
     last_connect_time: Optional[float] = None
 
     blocks_validated: int = 0
-    blocks_signed: int = 0        # [v3.11] co-assinaturas
+    blocks_signed: int = 0
     blocks_proposed: int = 0
     shares_submitted: int = 0
     valid_shares: int = 0
@@ -171,7 +170,6 @@ class TrustNetwork:
 
     def sync_local_validator(self, pubkey: str, address: str = "",
                              peer_addr: str = "") -> bool:
-        """[v3.10] Registra pubkey local como nó ativo no trust."""
         if not pubkey:
             return False
         pk = pubkey.strip().lower()
@@ -199,9 +197,6 @@ class TrustNetwork:
 
     def register_new_validator(self, pubkey: str, address: str = "",
                                initial_score: float = None) -> dict:
-        """
-        [v3.11] Registra um cliente novo via /api/trust/register ou /announce.
-        """
         if not pubkey or len(pubkey) != 66:
             return {"ok": False, "msg": "pubkey inválida (66 hex esperado)"}
         try:
@@ -263,9 +258,6 @@ class TrustNetwork:
             }
 
     def record_block_signed(self, node_id: str, block_height: int) -> None:
-        """
-        [v3.11] Chamado por blockchain.accept_block() para cada signatário válido.
-        """
         if not node_id:
             return
         nid = node_id.strip().lower()
@@ -302,7 +294,7 @@ class TrustNetwork:
         self.heartbeat(pubkey)
 
     def remove_ghosts(self, max_age_s: int = 300) -> int:
-        """[v3.12] Remove nós fantasmas, mas protege quem tem score alto."""
+        """[v3.12] Remove nós fantasmas, mas protege quem tem score >= 500."""
         now = time.time()
         to_remove = []
 
@@ -311,7 +303,7 @@ class TrustNetwork:
                 age = now - n.last_seen
                 if self._origin_pubkey and n.public_key.lower() == self._origin_pubkey:
                     continue
-                # [v3.12] Proteção absoluta
+                # [v3.12] Proteção absoluta contra exclusão de validadores
                 if n.trust_score >= SCORE_PROTECTED:
                     continue
                 if age > max_age_s:
@@ -340,7 +332,7 @@ class TrustNetwork:
                 pk = (n.public_key or "").strip().lower()
                 if pk and pk == self._origin_pubkey:
                     continue
-                # [v3.12] Proteção absoluta
+                # [v3.12] Proteção absoluta contra exclusão de validadores
                 if n.trust_score >= SCORE_PROTECTED:
                     continue
                 if (now - n.last_seen) > NODE_TTL_SECONDS:
@@ -899,7 +891,7 @@ class TrustNetwork:
                 "connected_nodes": len(ativos),
                 "banned_nodes": sum(1 for n in self.nodes.values() if n.banned),
                 "validators_count": len(self.active_validators),
-                "nodes_with_pubkey": n_with_pk,
+                "nodes_with_pk": n_with_pk,
                 "avg_trust": round(avg, 1),
                 "top_validators": self.get_validator_list()[:5],
             }
