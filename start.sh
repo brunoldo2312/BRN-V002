@@ -12,10 +12,9 @@ curl -fsSL https://pkgs.tailscale.com/stable/tailscale_1.90.6_amd64.tgz \
   | tar xzf - --strip-components=1 -C /tmp/ts
 chmod +x /tmp/ts/tailscale /tmp/ts/tailscaled
 
-# 3. Daemon userspace
+# 3. Daemon userspace — SEM socks5-server
 /tmp/ts/tailscaled \
   --tun=userspace-networking \
-  --socks5-server=127.0.0.1:1055 \
   --state=/tmp/ts/tailscaled.state \
   --socket=/tmp/ts/tailscaled.sock &
 sleep 5
@@ -24,17 +23,19 @@ sleep 5
 /tmp/ts/tailscale --socket=/tmp/ts/tailscaled.sock \
   up --auth-key=${TAILSCALE_AUTHKEY} --hostname=brn-render
 
-# 4b. [CRÍTICO] Limpa serve configs antigos (o stale 5000)
+# 4b. Limpa serve configs antigos
 /tmp/ts/tailscale --socket=/tmp/ts/tailscaled.sock serve reset 2>/dev/null || true
 
 # 5. Expõe apenas P2P na 6001
 /tmp/ts/tailscale --socket=/tmp/ts/tailscaled.sock \
   serve --bg --tcp 6001 tcp://localhost:6001 2>/dev/null || true
 
-# 6. Proxy SOCKS5h (h = DNS via proxy)
-export ALL_PROXY=socks5h://127.0.0.1:1055
-export HTTP_PROXY=socks5h://127.0.0.1:1055
-export HTTPS_PROXY=socks5h://127.0.0.1:1055
+# 6. LIMPA QUALQUER PROXY HERDADO DO AMBIENTE
+#    (o Render injeta HTTP_PROXY/HTTPS_PROXY em alguns planos)
+unset ALL_PROXY HTTP_PROXY HTTPS_PROXY all_proxy http_proxy https_proxy
+unset NO_PROXY no_proxy
+export NO_PROXY="*"
+export no_proxy="*"
 
 # 7. Roda o nó
 cd /opt/render/project/src
