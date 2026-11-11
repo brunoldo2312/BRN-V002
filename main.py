@@ -1,21 +1,15 @@
-"""main.py — Entrypoint do nó BRN (v13.9.8)
+"""main.py — Entrypoint do nó BRN (v13.9.9)
 ================================================================
-v13.9.8 (2026-11-11) — SEED DETERMINÍSTICO:
-  [NEW] _resolve_validator_sk() resolve a SK em cascata:
-          1. BRN_VALIDATOR_SK_HEX (64 hex explícito)
-          2. BRN_VALIDATOR_SEED   (SHA256(seed) → SK determinística)
-          3. .validator_sk        (arquivo em disco)
-          4. gera nova + salva + loga prominentemente
-        Permite configurar UMA senha (BRN_VALIDATOR_SEED) e o
-        programa deriva sempre a mesma carteira. Sobrevive a
-        hibernações do Render free (15min), sem scripts manuais.
-  [NEW] /health.sk_validation agora expõe "source" (de onde veio).
-  [NEW] SK resolvida é logada prominentemente se for gerada nova
-        (usuário pode copiar para BRN_VALIDATOR_SEED).
-  [KEEP] v13.9.7: validação de SK no boot + /health
+v13.9.9 (2026-11-11) — GUI VIA HTTP:
+  [FIX] _start_gui() agora abre http://127.0.0.1:{web_port}/wallet
+        em vez do arquivo local (file://). Isso resolve o erro
+        "Failed to fetch" na janela do aplicativo, pois a carteira
+        web (index_wallet.html) precisa de um servidor HTTP
+        rodando para funcionar.
+  [KEEP] v13.9.8: seed determinístico (auto-resolve SK)
+  [KEEP] v13.9.7: validação de SK + /health
   [KEEP] v13.9.6: auto-config (SK + mine via env vars)
   [KEEP] v13.9.5: isolation_detector no watchdog
-  [KEEP] v13.9.4: boot sem senha no env (.node_password)
 ================================================================
 """
 from __future__ import annotations
@@ -38,7 +32,7 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.8"
+    VERSION = "13.9.9"
     BUILD_DATE = "2026-11-11"
 
 # [AI v13.9.5] Detector de isolamento
@@ -495,18 +489,16 @@ def _start_explorer(chain):
 
 
 # ============================================================
-# GUI
+# GUI (v13.9.9: agora abre via HTTP, resolvendo o "Failed to fetch")
 # ============================================================
-def _start_gui() -> bool:
+def _start_gui(web_port: int) -> bool:
     try:
         import webview
-        from app_wallet_v3 import WalletApi
-        api = WalletApi()
-        wallet_path = BASE_DIR / "index_wallet.html"
-        if not wallet_path.exists():
-            wallet_path = BASE_DIR / "panel.html"
-        url = wallet_path.as_uri() if wallet_path.exists() else "about:blank"
-        webview.create_window("BRN Wallet", url=url, width=1100, height=780, js_api=api)
+        # Abre a URL do servidor local em vez do arquivo file://
+        url = f"http://127.0.0.1:{web_port}/wallet"
+        
+        logging.getLogger("main").info("[gui] abrindo %s", url)
+        webview.create_window("BRN Wallet", url=url, width=1100, height=780)
         webview.start()
         return True
     except Exception as e:
@@ -518,16 +510,6 @@ def _start_gui() -> bool:
 # [v13.9.8] Resolve SK por seed / env / arquivo / geração
 # ============================================================
 def _resolve_validator_sk() -> tuple:
-    """
-    Resolve (sk_hex, address, pubkey, source) nesta ordem:
-
-      1. BRN_VALIDATOR_SK_HEX (64 hex explícito)
-      2. BRN_VALIDATOR_SEED   (SHA256(seed) → SK determinística)
-      3. .validator_sk        (arquivo salvo em disco, se persistente)
-      4. gera aleatória e tenta salvar em .validator_sk
-
-    Retorna ("", "", "", "error") se tudo falhar.
-    """
     log = logging.getLogger("main")
 
     if not _HAS_WALLET:
@@ -538,10 +520,7 @@ def _resolve_validator_sk() -> tuple:
     sk_env = os.environ.get("BRN_VALIDATOR_SK_HEX", "").strip()
     if sk_env:
         if len(sk_env) != 64 or any(c not in "0123456789abcdefABCDEF" for c in sk_env):
-            log.warning(
-                "[SK] BRN_VALIDATOR_SK_HEX inválida (len=%d) — ignorando",
-                len(sk_env),
-            )
+            log.warning("[SK] BRN_VALIDATOR_SK_HEX inválida (len=%d) — ignorando", len(sk_env))
         else:
             try:
                 w = _Wallet(private_key_hex=sk_env)
@@ -556,10 +535,7 @@ def _resolve_validator_sk() -> tuple:
         try:
             sk_hex = hashlib.sha256(seed.encode("utf-8")).hexdigest()
             w = _Wallet(private_key_hex=sk_hex)
-            log.info(
-                "[SK] fonte: env:BRN_VALIDATOR_SEED → sha256(seed) = %s…",
-                sk_hex[:16],
-            )
+            log.info("[SK] fonte: env:BRN_VALIDATOR_SEED → sha256(seed) = %s…", sk_hex[:16])
             return sk_hex, w.address, w.pub_hex, "env:seed"
         except Exception as e:
             log.warning("[SK] derivação de seed falhou: %s", e)
@@ -613,59 +589,6 @@ def _resolve_validator_sk() -> tuple:
     except Exception as e:
         log.error("[SK] geração falhou: %s", e)
         return "", "", "", "error"
-
-
-# ============================================================
-# [v13.9.7] Validação de SK (helpers)
-# ============================================================
-def _validate_sk_env() -> tuple:
-    """
-    Valida BRN_VALIDATOR_SK_HEX, ADDRESS e PUBKEY (se setados).
-    Retorna (ok: bool, erro: str). Se ok=True, erro="".
-    """
-    sk_hex  = os.environ.get("BRN_VALIDATOR_SK_HEX", "").strip()
-    address = os.environ.get("BRN_VALIDATOR_ADDRESS", "").strip()
-    pubkey  = os.environ.get("BRN_VALIDATOR_PUBKEY", "").strip()
-
-    if not sk_hex:
-        return False, "BRN_VALIDATOR_SK_HEX vazio (env não setada)"
-
-    if len(sk_hex) != 64:
-        return False, f"BRN_VALIDATOR_SK_HEX tem {len(sk_hex)} chars (esperado 64)"
-
-    bad_chars = [c for c in sk_hex if c not in "0123456789abcdefABCDEF"]
-    if bad_chars:
-        return False, f"BRN_VALIDATOR_SK_HEX tem chars inválidos: {bad_chars[:5]}"
-
-    if address and not address.startswith("brn1"):
-        return False, f"BRN_VALIDATOR_ADDRESS inválido: '{address[:30]}...'"
-
-    if pubkey and len(pubkey) != 66:
-        return False, f"BRN_VALIDATOR_PUBKEY tem {len(pubkey)} chars (esperado 66)"
-
-    if not _HAS_WALLET:
-        return False, "wallet.Wallet indisponível"
-
-    try:
-        w = _Wallet(private_key_hex=sk_hex)
-    except Exception as e:
-        return False, f"Wallet(private_key_hex=sk) falhou: {e}"
-
-    if address and w.address != address:
-        return False, (
-            f"ADDRESS MISMATCH — a SK não corresponde a este address\n"
-            f"  configurado: {address}\n"
-            f"  derivado:    {w.address}"
-        )
-
-    if pubkey and w.pub_hex.lower() != pubkey.lower():
-        return False, (
-            f"PUBKEY MISMATCH — a SK não corresponde a esta pubkey\n"
-            f"  configurado: {pubkey}\n"
-            f"  derivado:    {w.pub_hex}"
-        )
-
-    return True, ""
 
 
 # ============================================================
@@ -877,7 +800,7 @@ def main() -> int:
     else:
         log.info("[trust] carregado (origin=%s)", is_origin)
 
-    log.info("[wallet] boot sem carteira (design v13.9.8)")
+    log.info("[wallet] boot sem carteira (design v13.9.9)")
 
     # [6] P2P
     p2p = None
@@ -938,7 +861,7 @@ def main() -> int:
     # [13] GUI ou modo headless
     if not args.headless:
         log.info("[gui] abrindo")
-        if _start_gui():
+        if _start_gui(web_port):  # <--- Alterado para passar a porta
             return 0
     else:
         log.info("=" * 64)
