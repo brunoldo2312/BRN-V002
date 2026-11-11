@@ -1,37 +1,10 @@
 """
-sync_manager.py — Sincronização + Reorg automático + Sync Paralelo (v9.3)
+sync_manager.py — Sincronização + Reorg automático + Sync Paralelo (v9.4)
 ================================================================
-v9.3 (2026-11-08):
-  [FIX CRÍTICO] sync_trust_network() agora REJEITA payloads de
-        trust_network.json SEM assinatura Ed25519 do Origin.
-        Antes: se "signature" e "origin_pubkey" estivessem ausentes,
-        o código simplesmente caía no merge (o `if sig and origin_pub:
-        ...` não tinha um `else: return False`). Um cliente
-        comprometido podia servir um trust sem assinatura, com nós
-        do atacante, e o sync_manager aceitava — envenenando o
-        quórum de validadores da rede.
-        Também adiciona `_HAS_CRYPTO=False` como rejeição
-        (antes logava warning e continuava o merge).
-  [NEW] BRN_TRUST_REQUIRE_SIGNATURE (default "1"). Se "0", aceita
-        payload sem assinatura COM AVISO ALTO — só para bootstrap
-        controlado / rede de dev. Em produção MANTER "1".
-  [NEW] Valida que `data["nodes"]` é dict e ignora nós malformados
-        individualmente (não aborta o sync inteiro por 1 nó ruim).
-  [KEEP] Todas as correções de v9.2 (fix da ordem de pop dos campos
-        em sync_trust_network).
-v9.2 (2026-11-05):
-  [FIX CRÍTICO] sync_trust_network() agora remove os campos
-        "saved_at" e "client_written" do JSON ANTES de verificar
-        a assinatura Ed25519 do Origin. Antes, esses campos eram
-        adicionados DEPOIS da assinatura no trust_network.py, então
-        o payload reconstruído nunca batia e a assinatura era
-        sempre considerada inválida, travando o sync de validadores.
-v9.1 (2026-11-03):
-  [NEW] Sincronização do Trust Network via HTTP.
-v9.0 (2026-11-03):
-  [NEW] SYNC PARALELO de blocos.
-v8.4.3 (2026-10-22):
-  [FIX] _resolve_fork importa funções de checkpoints.py.
+v9.4 (2026-11-10):
+  [FIX] Substituído urllib.request por requests para suportar
+        proxy SOCKS5 (Tailscale/ALL_PROXY) no Render.
+  [KEEP] v9.3: validação de assinatura do Trust, sync paralelo.
 ================================================================
 """
 from __future__ import annotations
@@ -42,8 +15,7 @@ import socket
 import time
 import threading
 import logging
-import urllib.request
-import urllib.error
+import requests
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -59,8 +31,6 @@ BATCH_DELAY_S      = float(os.environ.get("BRN_SYNC_BATCH_DELAY", "0.06"))
 PARALLEL_WORKERS   = int(os.environ.get("BRN_SYNC_PARALLEL_WORKERS", "4"))
 TRUST_SYNC_INTERVAL= float(os.environ.get("BRN_TRUST_SYNC_INTERVAL", "60"))
 
-# [v9.3] Exige assinatura do Origin no payload de trust.
-# Default: True (produção). "0" só para bootstrap controlado.
 BRN_TRUST_REQUIRE_SIGNATURE = (
     os.environ.get("BRN_TRUST_REQUIRE_SIGNATURE", "1") == "1"
 )
@@ -258,21 +228,7 @@ class ChainSyncManager:
 
         return True, ""
 
-    # =================================================================
-    # [v9.3] SINCRONIZAÇÃO DO TRUST NETWORK VIA HTTP
-    # -----------------------------------------------------------------
-    # Regra de segurança:
-    #   - Payload DEVE ter "signature" e "origin_pubkey".
-    #   - Assinatura DEVE verificar com a pubkey do Origin.
-    #   - Caso contrário, REJEITA (a menos que
-    #     BRN_TRUST_REQUIRE_SIGNATURE=0, modo bootstrap explícito).
-    #
-    # Antes (v9.2 e anteriores): se sig/origin_pub faltassem, o merge
-    # acontecia mesmo assim. Um cliente comprometido podia servir
-    # trust sem assinatura, com nós do atacante, e envenenar o quórum.
-    # =================================================================
     def sync_trust_network(self) -> bool:
-        """Baixa o trust_network.json do Origin e atualiza a memória local."""
         origin_url = os.environ.get("BRN_POOL_URL", "").strip().rstrip("/")
         if not origin_url or not origin_url.startswith("http"):
             return False
@@ -285,23 +241,20 @@ class ChainSyncManager:
         url = f"{origin_url}/api/trust/download"
 
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "brn-sync/9.3"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            # [v9.4] Usa requests para suportar ALL_PROXY (SOCKS5)
+            resp = requests.get(url, headers={"User-Agent": "brn-sync/9.4"}, timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
 
             if not isinstance(data, dict):
                 log.error("[TRUST-SYNC] payload não é dict — rejeitando")
                 return False
 
-            # Extrai a assinatura e a pubkey do Origin
             sig = data.pop("signature", None)
             origin_pub = data.pop("origin_pubkey", None)
-            # Campos adicionados DEPOIS da assinatura no flush() do Origin
             data.pop("saved_at", None)
             data.pop("client_written", None)
 
-            # [FIX v9.3] REJEITA se não há assinatura, a menos que
-            # BRN_TRUST_REQUIRE_SIGNATURE=0 (bootstrap explícito).
             if not sig or not origin_pub:
                 if BRN_TRUST_REQUIRE_SIGNATURE:
                     log.error(
@@ -334,7 +287,6 @@ class ChainSyncManager:
                     log.error(f"[TRUST-SYNC] Assinatura do Origin INVÁLIDA: {e}")
                     return False
 
-            # Sanity: 'nodes' tem que ser dict
             nodes_payload = data.get("nodes")
             if not isinstance(nodes_payload, dict):
                 log.error(
@@ -348,7 +300,6 @@ class ChainSyncManager:
                 log.debug("[TRUST-SYNC] chain.trust_net ausente — nada a fazer")
                 return False
 
-            # Se o nó é Origin, um sync de outro Origin é conflito.
             if getattr(trust, "is_origin", False):
                 log.warning(
                     "[TRUST-SYNC] este nó é Origin mas BRN_POOL_URL está "
@@ -385,16 +336,13 @@ class ChainSyncManager:
             )
             return True
 
-        except urllib.error.URLError as e:
+        except requests.exceptions.RequestException as e:
             log.debug(f"[TRUST-SYNC] Conexão falhou: {e}")
             return False
         except Exception as e:
             log.debug(f"[TRUST-SYNC] falhou: {e}")
             return False
 
-    # =================================================================
-    # [v9.0] SYNC PARALELO DE BLOCOS
-    # =================================================================
     def _fetch_blocks_parallel(
         self,
         peers: List[PeerStatus],
@@ -735,7 +683,6 @@ class ChainSyncManager:
             try:
                 while not self._stop_sync.is_set():
                     try:
-                        # [v9.1] Sincroniza o Trust Network via HTTP
                         self.sync_trust_network()
 
                         self._refresh_peers_from_p2p()
@@ -766,7 +713,7 @@ class ChainSyncManager:
             target=_loop, daemon=True, name="ChainSync"
         )
         self.sync_thread.start()
-        log.info("ChainSyncManager v9.3 (paralelo+trust-assinado) iniciado")
+        log.info("ChainSyncManager v9.4 (paralelo+trust-assinado+proxy) iniciado")
 
     def _best_peer_by_work(self) -> Optional[PeerStatus]:
         local_h = self._safe_height()
