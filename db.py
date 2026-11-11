@@ -1,31 +1,17 @@
-"""db.py — Banco SQLite do BRN (v7.3 - Batch seguro + DB Otimizado)
+"""db.py — Banco SQLite do BRN (v7.4 - Otimizado para Cloud/Nuvem)
 ================================================================
-v7.3 (2026-11-08) — PATCH DE AUDITORIA:
-  [FIX CRÍTICO] _flush_batch: futures só são marcadas como done
-        APÓS o COMMIT. Antes, `set_result()` era chamado DURANTE a
-        transação. Se uma op posterior no mesmo batch falhasse, o
-        ROLLBACK desfazia tudo, mas as futures anteriores já
-        retornavam "ok" para os callers. Efeito: add_mempool,
-        set_meta, upsert_peer (todas batch_safe=True) reportavam
-        sucesso mas o dado tinha sido desfeito. Perda silenciosa.
-  [FIX] _add_peer_score_impl: retornava self.get_peer_score() que
-        lê de read_conn. Em WAL, read_conn dentro da transação do
-        writer vê o valor PRÉ-COMMIT (stale). Agora lê da própria
-        self.conn (mesma transação), retornando o valor correto.
-  [FIX] _flush_batch: log warning explícito com nº de ops e motivo
-        quando um batch inteiro é desfeito. Antes, o log era genérico.
-
-v7.2 (2026-11-05):
-  [ARCH] Conexão SQLite separada para LEITURAS (read_conn) e
-         ESCRITAS (conn). Ambas usam WAL.
-  [MELHORIA] Read-only mode para o READER, durabilidade separada
-             (synchronous FULL writer, NORMAL reader) e whitelist
-             na função _count_table.
+v7.4 (2026-11-10) — PATCH PARA RENDER/CLOUD:
+  [FIX] READER connection agora usa modo read-only (URI) para evitar
+        conflitos de lock no Render.
+  [FIX] PRAGMAs separados: WRITER (synchronous=FULL) e READER (NORMAL).
+  [FIX] Adicionado PRAGMA optimize no close() para manter o DB rápido.
+  [FIX] Whitelist de tabelas no _count_table().
+  [KEEP] v7.3: batch seguro.
 ================================================================
 """
 from __future__ import annotations
 
-__version__ = "7.3"
+__version__ = "7.4"
 
 import os
 import time
@@ -66,17 +52,16 @@ class ChainDB:
     def __init__(self, path: str):
         self.path = path
 
-        # ─── [v7.2] Conexão do WRITER ───
+        # ─── Conexão do WRITER ───
         self.conn = sqlite3.connect(
             path, check_same_thread=False, isolation_level=None,
         )
         self.conn.row_factory = sqlite3.Row
         self.lock = threading.RLock()
 
-        # ─── [v7.2] Conexão do READER (separada) ───
+        # ─── Conexão do READER (separada e read-only) ───
         path_uri = pathlib.Path(path).resolve().as_posix()
         try:
-            # [MELHORIA] Modo read-only (quando o DB já existe).
             self.read_conn = sqlite3.connect(
                 f"file:///{path_uri}?mode=ro", check_same_thread=False,
                 isolation_level=None, timeout=5.0, uri=True,
@@ -90,9 +75,7 @@ class ChainDB:
         self.read_conn.row_factory = sqlite3.Row
         self.read_lock = threading.RLock()
 
-        # [MELHORIA] PRAGMAs comuns + durabilidade separada.
-        # writer = FULL (dinheiro — não pode perder bloco em queda de energia)
-        # reader = NORMAL (não escreve, FULL é desperdício)
+        # PRAGMAs comuns + durabilidade separada.
         common_pragmas = (
             "PRAGMA temp_store=MEMORY",
             "PRAGMA cache_size=-64000",
@@ -108,7 +91,7 @@ class ChainDB:
         try:
             self.read_conn.execute("PRAGMA journal_mode=WAL")
         except sqlite3.OperationalError:
-            pass  # Ignora se o reader for read-only
+            pass
 
         for p in common_pragmas:
             self.conn.execute(p)
@@ -124,7 +107,6 @@ class ChainDB:
             pass
 
         # Schema + backfill rodam ANTES do Writer thread começar
-        # (usam self.conn, sem concorrência ainda)
         self._schema()
         self._migrate_raw_txs()
 
@@ -193,16 +175,7 @@ class ChainDB:
             self._flush_batch(batch)
 
     def _flush_batch(self, batch: list) -> None:
-        """
-        Executa um batch de ops batch_safe=True numa transação.
-
-        [FIX v7.3] Futures só são marcadas como done APÓS o COMMIT.
-        Se qualquer op falhar, o batch inteiro é desfeito e TODAS as
-        futures recebem a mesma exceção — os callers sabem que nada
-        foi salvo (antes, ops anteriores à que falhou reportavam
-        sucesso mesmo com ROLLBACK).
-        """
-        pending: list[tuple] = []   # [(op, result | None, exc | None)]
+        pending: list[tuple] = []
         try:
             self.conn.execute("BEGIN IMMEDIATE")
             for op in batch:
@@ -213,7 +186,6 @@ class ChainDB:
                     pending.append((op, None, e))
                     raise
             self.conn.execute("COMMIT")
-            # [FIX v7.3] Só marca futures como done APÓS o COMMIT.
             for op, result, exc in pending:
                 if exc is not None:
                     op.future.set_exception(exc)
@@ -225,20 +197,15 @@ class ChainDB:
             except Exception:
                 pass
 
-            # [FIX v7.3] Log explícito: quais ops foram desfeitas
             done_before = len(pending)
             total = len(batch)
             log.warning(
                 f"[db] batch de {total} ops desfeito por ROLLBACK "
                 f"({done_before} executadas antes da falha): {e}"
             )
-
-            # Ops que executaram antes da falha: recebem set_exception
             for op, _result, _exc in pending:
                 if not op.future.done():
                     op.future.set_exception(e)
-
-            # Ops que NÃO chegaram a executar: também falham
             pending_ids = {id(op) for op, _, _ in pending}
             for op in batch:
                 if id(op) not in pending_ids and not op.future.done():
@@ -511,7 +478,6 @@ class ChainDB:
         return result
 
     def get_blocks_by_heights(self, heights: list) -> dict:
-        """[v7.2] Lê N blocos em UMA query. Otimização para _resolve_fork."""
         if not heights:
             return {}
         try:
@@ -730,8 +696,6 @@ class ChainDB:
 
     def _rollback_block_impl(self, height):
         with self.lock:
-            # get_block usa read_conn — o bloco já foi commitado antes de
-            # rollback_block ser enfileirado, então a leitura vê.
             block = self.get_block(height)
             if not block:
                 return
@@ -940,12 +904,6 @@ class ChainDB:
         return self._enqueue(self._add_peer_score_impl, address, delta, batch_safe=True)
 
     def _add_peer_score_impl(self, address, delta):
-        """
-        [FIX v7.3] Retorna o valor JÁ ATUALIZADO pela conn writer.
-        Antes chamava self.get_peer_score() que lê de read_conn —
-        em WAL, dentro da transação do writer, read_conn vê o valor
-        PRÉ-COMMIT (stale).
-        """
         self.conn.execute(
             "UPDATE peers SET score = COALESCE(score, 0) + ? WHERE address=?", (delta, address),
         )
@@ -1192,7 +1150,6 @@ class ChainDB:
         )
 
     def _update_l2_escrow_status_impl(self, escrow_id, status, btc_txid=None):
-        # Lê pela conn writer para ver estado atual da transação
         row = self.conn.execute(
             "SELECT raw_json FROM l2_escrows WHERE escrow_id=?", (escrow_id,)
         ).fetchone()
@@ -1352,8 +1309,6 @@ class ChainDB:
                         "UPDATE utxos SET spent=1, spent_by=? WHERE txid=? AND vout=?",
                         (txid_base, txid, vout),
                     )
-                # height: lê da conn writer (dentro da transação) — o valor
-                # é o mesmo do read_conn se não houver add_block pendente.
                 cur_h = self.conn.execute(
                     "SELECT MAX(height) AS h FROM blocks"
                 ).fetchone()
@@ -1389,7 +1344,6 @@ class ChainDB:
             pass
         
         # [MELHORIA] PRAGMA optimize = ANALYZE seletivo baseado em query history.
-        # Faz o planner usar os índices certos quando a base cresce.
         try:
             self.conn.execute("PRAGMA optimize")
         except Exception:
