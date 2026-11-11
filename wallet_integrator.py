@@ -1,8 +1,9 @@
 """wallet_integrator.py — Integra carteira e propaga para a rede (v2.2)
 ================================================================
-v2.2 (2026-11-11) — SUPORTE A PROXY SOCKS5:
-  [FIX] _post_announce trocou urllib por requests para funcionar
-        com ALL_PROXY (Tailscale/Render).
+v2.2 (2026-11-11) — FIX PROPAGAÇÃO NO RENDER:
+  [FIX] _post_announce trocou urllib.request por requests.
+        urllib não fala SOCKS5, então o POST /api/validator/announce
+        falhava com "incompatible SOCKS version" no Tailscale userspace.
 ================================================================
 """
 from __future__ import annotations
@@ -15,7 +16,6 @@ import requests
 from typing import Optional
 
 log = logging.getLogger("wallet_integrator")
-
 __version__ = "2.2"
 
 
@@ -134,20 +134,31 @@ def _chain_is_origin(chain) -> bool:
     return os.environ.get("BRN_IS_ORIGIN", "0") == "1"
 
 
-def _post_announce(origin_url: str, payload: dict, timeout: float = 8.0) -> tuple[bool, str]:
-    """POST /api/validator/announce — usa requests para suportar SOCKS5."""
+def _post_announce(origin_url: str, payload: dict,
+                    timeout: float = 10.0) -> tuple[bool, str]:
+    """
+    [FIX v2.2] POST /api/validator/announce usando requests
+    (requests respeita ALL_PROXY=socks5h:// do Tailscale;
+     urllib NÃO respeita, causando "incompatible SOCKS version").
+    """
     url = origin_url.rstrip("/") + "/api/validator/announce"
     try:
-        # requests respeita ALL_PROXY (socks5h://) automaticamente
         r = requests.post(url, json=payload, timeout=timeout)
-        resp = r.json()
+        try:
+            resp = r.json()
+        except Exception:
+            return False, f"HTTP {r.status_code} (resposta não-JSON)"
         if resp.get("ok"):
             return True, f"origin registrou (top5={resp.get('in_top5')})"
-        return False, resp.get("msg", "origin recusou")
-    except requests.exceptions.RequestException as e:
-        return False, f"{type(e).__name__}: {e}"
+        return False, resp.get("msg", f"origin recusou ({r.status_code})")
+    except requests.exceptions.ConnectTimeout:
+        return False, f"connect timeout ({timeout}s)"
+    except requests.exceptions.ReadTimeout:
+        return False, f"read timeout ({timeout}s)"
+    except requests.exceptions.ConnectionError as e:
+        return False, f"connection: {e}"
     except Exception as e:
-        return False, str(e)
+        return False, f"{type(e).__name__}: {e}"
 
 
 def integrate_and_propagate(
@@ -155,7 +166,8 @@ def integrate_and_propagate(
     p2p=None, trust=None, logger=None, origin_url: Optional[str] = None,
 ) -> dict:
     L = logger or log
-    result = integrate(chain, sk_hex, address=address, pubkey=pubkey, p2p=p2p, trust=trust, logger=L)
+    result = integrate(chain, sk_hex, address=address, pubkey=pubkey,
+                        p2p=p2p, trust=trust, logger=L)
     result["propagated"] = False
     result["propagate_msg"] = ""
     result["peers_notified"] = 0
@@ -168,6 +180,7 @@ def integrate_and_propagate(
     installed_pk = result["pubkey"]
 
     if _chain_is_origin(chain):
+        L.info("[integrator] é Origin — pubkey já está no trust local")
         result["propagated"] = True
         result["propagate_msg"] = "origin local"
         if p2p is not None and hasattr(p2p, "broadcast_validator_registration"):
@@ -189,7 +202,8 @@ def integrate_and_propagate(
                 break
 
     if not target_origin:
-        result["propagate_msg"] = "sem Origin configurado"
+        result["propagate_msg"] = "sem Origin configurado (BRN_POOL_URL vazio)"
+        L.warning("[integrator] %s", result["propagate_msg"])
         return result
 
     L.info("[integrator] propagando pubkey para Origin %s", target_origin)
@@ -203,6 +217,7 @@ def integrate_and_propagate(
     result["propagate_msg"] = msg
 
     if ok:
+        L.info("[integrator] Origin registrou pubkey: %s", msg)
         try:
             if hasattr(chain, "_sync_manager") and chain._sync_manager is not None:
                 sm = chain._sync_manager
@@ -210,8 +225,14 @@ def integrate_and_propagate(
                     sm._last_trust_sync = 0
                     sm.sync_trust_network()
                     result["trust_refreshed"] = True
-        except Exception:
-            pass
+            elif hasattr(chain, "sync_manager") and chain.sync_manager is not None:
+                sm = chain.sync_manager
+                if hasattr(sm, "sync_trust_network"):
+                    sm._last_trust_sync = 0
+                    sm.sync_trust_network()
+                    result["trust_refreshed"] = True
+        except Exception as e:
+            L.debug("[integrator] trust refresh falhou: %s", e)
 
         if p2p is not None and hasattr(p2p, "broadcast_validator_registration"):
             try:
@@ -219,5 +240,52 @@ def integrate_and_propagate(
                 result["peers_notified"] = len(p2p.discovery.listar_peers())
             except Exception:
                 pass
+    else:
+        L.warning("[integrator] Origin recusou: %s", msg)
 
+    L.info(
+        "[integrator] propagate — ok=%s msg=%s refreshed=%s peers=%d",
+        result["propagated"], msg,
+        result["trust_refreshed"], result["peers_notified"],
+    )
     return result
+
+
+def persist_sk_for_reboot(sk_hex: str, password: str) -> bool:
+    try:
+        from secure_store import save_current_wallet, load_current_wallet
+        r = load_current_wallet(password)
+        if not r.get("ok"):
+            return False
+        data = {
+            "address": r.get("address", ""),
+            "private_key": sk_hex,
+            "public_key": r.get("public_key") or r.get("pub_hex", ""),
+        }
+        r2 = save_current_wallet(password, data)
+        return bool(r2.get("ok"))
+    except Exception:
+        return False
+
+
+def needs_integration(chain, expected_pubkey: str = "") -> bool:
+    if chain is None:
+        return True
+    try:
+        sk = getattr(chain, "_local_validator_sk", None)
+        if sk is None:
+            return True
+        pk = sk.pub_hex.lower()
+        if expected_pubkey and pk != expected_pubkey.lower():
+            return True
+        trust = getattr(chain, "trust_net", None)
+        if trust is not None and hasattr(trust, "get_top_validators"):
+            try:
+                top = trust.get_top_validators(count=5) or []
+                if pk not in [p.lower() for p in top]:
+                    return True
+            except Exception:
+                pass
+        return False
+    except Exception:
+        return True
