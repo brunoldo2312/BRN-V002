@@ -1,54 +1,10 @@
-"""main.py — Entrypoint do nó BRN (v13.9.4)
+"""main.py — Entrypoint do nó BRN (v13.9.5)
 ================================================================
-v13.9.4 (2026-11-09) — BOOT SEM SENHA NO ENV:
-  [NEW] _get_identity_password(): resolve a senha da identidade do nó
-        SEM depender de .env. Ordem:
-          1. BRN_NODE_PASSWORD
-          2. BRN_WALLET_SESSION_PASS
-          3. .node_password (gerado localmente na 1ª execução, 0600)
-          4. gera secrets.token_hex(16) e grava .node_password
-        Assim o boot funciona em máquina limpa sem .env.
-
-  [NEW] _load_or_create_node_identity() reescrito:
-        - Se node_identity.enc NÃO abre e NÃO há .env com senha:
-            renomeia para .bak.<ts> e cria nova (nunca trava).
-        - Se node_identity.enc NÃO abre e HÁ .env com senha:
-            aborta com instrução (protege contra corrupção).
-        - Se node_identity.enc não existe:
-            cria nova com a senha resolvida.
-
-  [NEW] _check_blockchain_version(): avisa se blockchain.py < 9.4
-        (multi-sig não enforçado). Se BRN_STRICT_MULTISIG=1, aborta.
-
-  [NEW] _setup_trust_daemon() chama o start_daemon() ORIGINAL
-        (trust_daemon.py) — recupera a descoberta de peers via P2P
-        que a v13.9.3 tinha perdido. Fallback inline só se o módulo
-        não existir.
-
-  [FIX] _start_web_server(): o try deixou de englobar srv.app.run().
-        Antes, se set_p2p_manager() não existisse, o servidor HTTP
-        NUNCA subia e a GUI não conseguia instalar a SK.
-
-  [FIX] trust=None agora é erro explícito (exit 7 se STRICT_MULTISIG).
-        Antes, chain.trust_net=None fazia _get_active_validators()
-        retornar [] e accept_block aceitar bloco com 0 assinaturas
-        SEM o operador perceber.
-
-  [KEEP] v13.9.3: carteira só via GUI (POST /api/wallet/set_validator_sk).
-  [KEEP] v13.9.3: watchdog só monitora, NÃO reinstala SK.
-  [KEEP] v13.9.2: identidade segura.
-
-FLUXO DE BOOT (v13.9.4):
-  1. main.py sobe → senha resolvida (env OU .node_password local)
-  2. node_identity.enc carregado/criado
-  3. blockchain.py validado
-  4. chain + trust + p2p + sync + pool + web sobem
-  5. GUI abre (ou modo --headless)
-  6. Usuário desbloqueia carteira → POST /api/wallet/set_validator_sk
-  7. server.py → wallet_integrator.integrate_and_propagate()
-  8. Nó começa a assinar
-
-Em --headless, instale a SK via curl (ver mensagem final do boot).
+v13.9.5 (2026-11-10) — SUPORTE A CLOUD (RENDER):
+  [NEW] Detecta se está no Render via ENV "RENDER" e força
+        BRN_WEB_HOST=0.0.0.0 automaticamente. Isso evita o erro
+        "No open HTTP ports detected" no Render.
+  [KEEP] v13.9.4: boot sem senha no env, identity segura, etc.
 ================================================================
 """
 from __future__ import annotations
@@ -70,8 +26,8 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.4"
-    BUILD_DATE = "2026-11-09"
+    VERSION = "13.9.5"
+    BUILD_DATE = "2026-11-10"
 
 
 # ============================================================
@@ -140,15 +96,6 @@ def _setup_logging(level: str = "INFO"):
 def _get_identity_password() -> str:
     """
     Resolve a senha da IDENTIDADE DO NÓ (Ed25519 do P2P — NÃO é carteira).
-
-    Ordem:
-      1. BRN_NODE_PASSWORD  (se configurada)
-      2. BRN_WALLET_SESSION_PASS (compat)
-      3. .node_password  (arquivo local 0600, gerado na 1ª execução)
-      4. gera secrets.token_hex(16) e grava .node_password
-
-    Retorna "" SÓ se não conseguir gravar .node_password (permissão) —
-    nesse caso o chamador deve decidir se aborta ou usa identidade volátil.
     """
     log = logging.getLogger("main")
 
@@ -193,18 +140,6 @@ def _get_identity_password() -> str:
 # IDENTITY (load/create)
 # ============================================================
 def _load_or_create_node_identity():
-    """
-    Carrega ou cria a identidade Ed25519 do nó.
-
-    v13.9.4: NÃO depende de .env. Usa _get_identity_password().
-
-    Casos:
-      - arquivo existe + senha resolve:           carrega.
-      - arquivo existe + senha do env NÃO resolve:  ABORTA (protege).
-      - arquivo existe + senha local NÃO resolve:   faz .bak.<ts>, cria nova.
-      - arquivo não existe:                          cria nova.
-      - senha vazia (sem permissão para gravar):     identidade volátil.
-    """
     log = logging.getLogger("main")
 
     try:
@@ -284,11 +219,6 @@ def _load_or_create_node_identity():
 # VERSION GATE (blockchain.py)
 # ============================================================
 def _check_blockchain_version() -> bool:
-    """
-    Verifica se blockchain.py >= 9.4.
-    Se BRN_STRICT_MULTISIG=1 e versão < 9.4, retorna False.
-    Se BRN_STRICT_MULTISIG!=1, só avisa e retorna True.
-    """
     log = logging.getLogger("main")
     try:
         import blockchain as _bc
@@ -433,20 +363,15 @@ def _wallet_watchdog_loop(chain, p2p, trust, stop_evt: threading.Event,
 
 
 # ============================================================
-# TRUST DAEMON (v13.9.4: chama start_daemon ORIGINAL)
+# TRUST DAEMON
 # ============================================================
 def _setup_trust_daemon(chain, trust, p2p, password: str,
                         is_origin: bool, stop_evt: threading.Event,
                         interval: int = 30):
-    """
-    Usa trust_daemon.start_daemon() original (descoberta de peers via P2P).
-    Fallback inline só se o módulo não existir/importar.
-    """
     log = logging.getLogger("main")
     if trust is None:
         return None
 
-    # 1) Caminho preferido: trust_daemon.start_daemon
     try:
         from trust_daemon import start_daemon
         t = start_daemon(
@@ -459,7 +384,6 @@ def _setup_trust_daemon(chain, trust, p2p, password: str,
     except Exception as e:
         log.warning("[TrustDaemon] start_daemon falhou: %s — usando fallback", e)
 
-    # 2) Fallback inline (sem descoberta de peers)
     def _loop():
         last_ghost = 0.0
         while not stop_evt.wait(interval):
@@ -506,7 +430,7 @@ def _setup_pool(chain, is_origin: bool):
 
 
 # ============================================================
-# WEB SERVER (v13.9.4: sem try cego)
+# WEB SERVER (v13.9.5: bind 0.0.0.0 no Render)
 # ============================================================
 def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int):
     log = logging.getLogger("main")
@@ -518,7 +442,6 @@ def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int):
 
     srv.set_chain(chain)
 
-    # Setters opcionais (não falham o boot inteiro se ausentes)
     for fn_name, obj in (
         ("set_p2p_manager", p2p),
         ("set_pool_manager", pool),
@@ -536,11 +459,15 @@ def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int):
         except Exception as e:
             log.error("[server] %s(%s) falhou: %s", fn_name, type(obj).__name__, e)
 
-    # Fora do try que englobava tudo:
+    # [NEW v13.9.5] Detecta Render para bindar em 0.0.0.0
+    host = os.environ.get("BRN_WEB_HOST", "127.0.0.1")
+    if os.environ.get("RENDER"):
+        host = "0.0.0.0"
+
     def _run():
         try:
             srv.app.run(
-                host=os.environ.get("BRN_WEB_HOST", "127.0.0.1"),
+                host=host,
                 port=web_port,
                 threaded=True,
                 use_reloader=False,
@@ -549,7 +476,7 @@ def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int):
             log.error("[server] app.run morreu: %s", e)
 
     threading.Thread(target=_run, daemon=True, name="HTTP").start()
-    log.info("[server] HTTP ativo na porta %d", web_port)
+    log.info("[server] HTTP ativo na porta %d (host=%s)", web_port, host)
     return True
 
 
@@ -629,11 +556,9 @@ def main() -> int:
     log.info(" base=%s env_loaded=%d", BASE_DIR, loaded)
     log.info("=" * 64)
 
-    # [1] Version gate (blockchain.py)
     if not _check_blockchain_version():
         return 6
 
-    # [2] Port guard (opcional)
     try:
         import port_guard
         port_guard.check_brn_ports(checar_explorer=not args.no_explorer)
@@ -642,7 +567,6 @@ def main() -> int:
     except Exception:
         pass
 
-    # [3] Node identity (SEM depender de .env)
     try:
         node_id_priv, node_id_pub = _load_or_create_node_identity()
         log.info("[identity] pub=%s…", node_id_pub[:16])
@@ -650,7 +574,6 @@ def main() -> int:
         log.error(str(e))
         return 3
 
-    # [4] Chain
     try:
         from blockchain import Blockchain
         chain = Blockchain(db_path, auto_genesis=False)
@@ -659,7 +582,6 @@ def main() -> int:
         log.error("[chain] fatal: %s", e)
         return 2
 
-    # [5] Trust
     trust = _setup_trust(chain, node_id_priv, is_origin)
     if trust is None:
         log.error(
@@ -671,33 +593,24 @@ def main() -> int:
     else:
         log.info("[trust] carregado (origin=%s)", is_origin)
 
-    # ═══════════════════════════════════════════════════════════
-    # [v13.9.3/13.9.4] CARTEIRA NÃO É CARREGADA NO BOOT.
-    # A SK entra via GUI ou, em --headless, via curl na rota
-    # POST /api/wallet/set_validator_sk.
-    # ═══════════════════════════════════════════════════════════
-    log.info("[wallet] boot sem carteira (design v13.9.4) — "
+    log.info("[wallet] boot sem carteira (design v13.9.5) — "
              "instale SK via API (GUI ou curl)")
 
-    # [6] P2P
     p2p = None
     if not args.no_p2p:
         p2p = _setup_p2p(chain, node_id_priv, p2p_port)
         if p2p is not None:
             log.info("[p2p] iniciado na porta %d", p2p_port)
 
-    # [7] Sync
     sync_mgr = None
     if p2p:
         sync_mgr = _setup_sync(chain, p2p)
         if sync_mgr:
             log.info("[sync] ChainSyncManager iniciado")
 
-    # [8] Broadcast
     if p2p:
         _setup_broadcast(chain, p2p)
 
-    # [9] TrustDaemon + Watchdog
     _stop_bg = threading.Event()
     _setup_trust_daemon(
         chain, trust, p2p,
@@ -713,19 +626,15 @@ def main() -> int:
         name="Wallet-Watchdog",
     ).start()
 
-    # [10] Pool (origin only)
     pool = _setup_pool(chain, is_origin)
 
-    # [11] Web server
     ok_http = _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port)
     if not ok_http:
         log.error("[server] HTTP não subiu — a GUI não vai conseguir instalar SK")
 
-    # [12] Explorer
     if not args.no_explorer:
         _start_explorer(chain)
 
-    # [13] GUI ou modo headless
     if not args.headless:
         log.info("[gui] abrindo — desbloqueie a carteira para instalar a SK")
         if _start_gui():
@@ -740,7 +649,6 @@ def main() -> int:
         log.info(" Sem isso o nó fica PARADO (sem assinar, sem minerar).")
         log.info("=" * 64)
 
-    # [14] Shutdown gracioso
     def _shutdown(*_):
         log.info("[shutdown] encerrando...")
         try: _stop_bg.set()
