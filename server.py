@@ -1,12 +1,11 @@
 """
 server.py — Backend HTTP do nó BRN (v9.9.29)
 ================================================================
-v9.9.29 (2026-11-10) — BRIDGE INTEGRADA:
-  [NEW] /api/sync-info agora lê btc_config em tempo real
-        para exibir Onramp/Offramp/Endereço na GUI.
-  [NEW] Adicionada rota GET /api/bridge/status para a GUI.
+v9.9.29 (2026-11-10):
+  [FIX] Substituído urllib.request por requests para suportar
+        proxy SOCKS5 (Tailscale/ALL_PROXY) no Render.
+  [NEW] Rota /api/bridge/status adicionada para a GUI.
   [KEEP] v9.9.28: Carteira SÓ VIA GUI, sem .env para wallet.
-  [KEEP] v9.9.27: /api/validator/announce.
 ================================================================
 """
 from __future__ import annotations
@@ -19,8 +18,7 @@ import hmac
 import logging
 import sys
 import threading
-import urllib.request
-import urllib.error
+import requests
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from functools import wraps
 from pathlib import Path
@@ -147,15 +145,15 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = "") -> Non
                     http_port = BOOTSTRAP_HTTP_PORT
 
             url = f"{scheme}://{host}:{http_port}/api/bootstrap/add"
-            req = urllib.request.Request(
-                url,
-                data=json.dumps({"address": addr, "pubkey": pubkey}).encode("utf-8"),
-                headers={"Content-Type": "application/json",
-                         "User-Agent": "brn-server/9.9.29"},
-                method="POST",
+            # [v9.9.29] Usa requests para suportar ALL_PROXY (SOCKS5)
+            resp = requests.post(
+                url, 
+                json={"address": addr, "pubkey": pubkey}, 
+                headers={"User-Agent": "brn-server/9.9.29"},
+                timeout=2
             )
-            with urllib.request.urlopen(req, timeout=2) as resp:
-                log.info(f"[BOOTSTRAP] {log_prefix}aviso enviado para {host}:{http_port}")
+            resp.raise_for_status()
+            log.info(f"[BOOTSTRAP] {log_prefix}aviso enviado para {host}:{http_port}")
         except Exception as e:
             log.warning(f"[BOOTSTRAP] Nao foi possivel avisar {b} ({log_prefix}): {e}")
 
@@ -791,7 +789,7 @@ def sync_info():
         "bridge": {"onramp_ativo": False, "taxa": 0, "btc_cofre": "", "offramp_ativo": False},
     }
     
-    # [INTEGRAÇÃO BRIDGE] Injeta status real da bridge lendo o btc_config
+    # [AUTO-FIX] Injeta status real da bridge lendo o btc_config
     try:
         import btc_config
         result["bridge"] = {
@@ -846,24 +844,6 @@ def sync_info():
         pass
 
     return jsonify(result), 200
-
-
-@app.route("/api/bridge/status", methods=["GET"])
-def bridge_status():
-    try:
-        import btc_config
-        return jsonify({
-            "ok": True,
-            "onramp_ativo": bool(btc_config.BTC_RECEIVE_ADDRESS),
-            "offramp_ativo": bool(btc_config.BTC_WIF),
-            "taxa": btc_config.FEE_PERCENT,
-            "btc_cofre": btc_config.BTC_RECEIVE_ADDRESS,
-            "btc_network": btc_config.BTC_NETWORK,
-            "processados": 0,
-            "ultima_sync": int(time.time())
-        })
-    except Exception as e:
-        return jsonify({"ok": False, "msg": str(e)}), 500
 
 
 @app.route("/api/sync/status", methods=["GET"])
@@ -1018,30 +998,28 @@ def _proxy_pool_request(path: str, method: str = "POST") -> tuple:
     try:
         if method == "POST":
             data = request.get_json(force=True) or {}
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(data).encode("utf-8"),
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": "brn-server-proxy/1.0",
-                },
-                method="POST",
+            # [v9.9.29] Usa requests para suportar ALL_PROXY (SOCKS5)
+            resp = requests.post(
+                url, 
+                json=data, 
+                headers={"User-Agent": "brn-server-proxy/1.0"},
+                timeout=PROXY_POOL_TIMEOUT_S
             )
         else:
-            req = urllib.request.Request(url, method="GET")
+            resp = requests.get(url, timeout=PROXY_POOL_TIMEOUT_S)
 
-        with urllib.request.urlopen(req, timeout=PROXY_POOL_TIMEOUT_S) as resp:
-            return jsonify(json.loads(resp.read().decode("utf-8"))), resp.status
+        resp.raise_for_status()
+        return jsonify(resp.json()), resp.status_code
 
-    except urllib.error.HTTPError as e:
+    except requests.exceptions.HTTPError as e:
         try:
-            return jsonify(json.loads(e.read().decode("utf-8"))), e.code
+            return jsonify(e.response.json()), e.response.status_code
         except Exception:
-            return jsonify({"ok": False, "msg": f"HTTP {e.code} no pool remoto"}), e.code
-    except urllib.error.URLError as e:
+            return jsonify({"ok": False, "msg": f"HTTP {e.response.status_code} no pool remoto"}), e.response.status_code
+    except requests.exceptions.RequestException as e:
         return jsonify({
             "ok": False,
-            "msg": f"Nao consegui conectar ao Origem ({remote_pool}): {e.reason}",
+            "msg": f"Nao consegui conectar ao Origem ({remote_pool}): {e}",
         }), 502
     except Exception as e:
         return jsonify({"ok": False, "msg": f"Falha no proxy do pool: {e}"}), 502
@@ -1315,11 +1293,6 @@ def pool_stop_local():
 # ============================================================
 @app.route("/api/wallet/set_validator_sk", methods=["POST"])
 def api_wallet_set_validator_sk():
-    """
-    [v9.9.28] SÓ aceita carteira vinda do GUI (via app_wallet_v3).
-    NÃO usa .env para senha. NÃO persiste .enc (GUI já salvou antes).
-    NÃO tenta recarregar em caso de erro.
-    """
     try:
         data = request.get_json(force=True) or {}
         sk_hex  = (data.get("sk_hex")  or "").strip()
@@ -1984,7 +1957,25 @@ def api_tx_status(txid_str):
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
+
+@app.route("/api/bridge/status", methods=["GET"])
+def bridge_status():
+    try:
+        import btc_config
+        return jsonify({
+            "ok": True,
+            "onramp_ativo": bool(btc_config.BTC_RECEIVE_ADDRESS),
+            "offramp_ativo": bool(btc_config.BTC_WIF),
+            "taxa": btc_config.FEE_PERCENT,
+            "btc_cofre": btc_config.BTC_RECEIVE_ADDRESS,
+            "btc_network": btc_config.BTC_NETWORK,
+            "processados": 0,
+            "ultima_sync": int(time.time())
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print("BRN Server v9.9.29 (Bridge Integrada)")
+    print("BRN Server v9.9.29 (carteira SÓ via GUI; sem .env para wallet)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
