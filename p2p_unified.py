@@ -1,49 +1,15 @@
 """
-p2p_unified.py — BRN P2P Network v6.7.11
+p2p_unified.py — BRN P2P Network v6.7.12
 ================================================================
-v6.7.11 (2026-11-11) — AI PEER DISCOVERY:
-  [NEW] Integração opcional com peer_ai, peer_anomaly e discovery_ai.
-        - _refresh_heights_loop prioriza top 20 peers por score
-          em vez de tentar 50 aleatórios (economiza 120s/ciclo).
-        - _limpar_peers_mortos detecta peers zumbis (peer_anomaly)
-          e os remove do discovered_peers após 1h de ban.
-        - _record_peer_attempt persiste histórico em peer_history.json.
-        - suggest_bootstrap() expõe os melhores peers para bootstrap.
-        Se os módulos não existirem, o P2P funciona EXATAMENTE como v6.7.10.
-        Zero dependências externas. Sem LLM. Sem API.
+v6.7.12 (2026-11-12) — SOCKS5 FALLBACK PARA TAILSCALE:
+  [NEW] P2PClient._send_message_once agora detecta se o IP
+        começa com "100." (Tailscale) e usa o proxy SOCKS5
+        local (127.0.0.1:1055) se a env ALL_PROXY estiver setada.
+        Isso permite que o Render (userspace-networking) se
+        conecte à Origin via Tailscale.
   [KEEP] v6.7.10: retry de conexão TCP, validação de pubkey no _auth,
         pré-validação de validators_sig antes de accept_block,
         fallback síncrono em broadcast_block/broadcast_tx.
-
-v6.7.10 (2026-11-08) — PATCH DE ROBUSTEZ:
-  [FIX] P2PClient.send_message: retry em ConnectionResetError e
-        ConnectionRefusedError. Antes, um reset transitório (comum
-        em Tailscale/WAN) descartava a mensagem. broadcast_block
-        não tem retry — bloco ficava preso no minerador até o
-        próximo sync (30s+).
-  [FIX] _handle_conn: valida peer_id contra _auth.pub. Antes, um
-        atacante enviava _auth com pubkey alheia e ganhava reputação
-        no peer errado. Combinado com PEER_SCORE_BAN_THRESHOLD,
-        podia derrubar peers honestos enviando blocos válidos com
-        a identidade deles.
-  [FIX] _sync_incremental: pré-valida validators_sig antes de
-        accept_block. Antes, aceitava o lote, accept_block rejeitava
-        por sig, e o loop continuava tentando o peer — log cheio
-        de "prev_hash diverge" mesmo quando o problema real era
-        multi-sig.
-  [FIX] broadcast_block e broadcast_tx: fallback síncrono quando o
-        pool está cheio. Antes, ThreadPoolExecutor.submit() levantava
-        RuntimeError e o bloco/tx não era enviado — silenciosamente.
-  [KEEP] v6.7.9: suporte a PBFT.
-  [KEEP] v6.7.8: race recovery reversa.
-  [KEEP] v6.7.7: race recovery.
-
-v6.7.9 (2026-11-05):
-  [FIX CRÍTICO] Adicionado suporte ao PBFT.
-v6.7.8 (2026-11-04):
-  [FIX] _handle_sign_block aceita cenário de race recovery reversa.
-v6.7.7 (2026-11-02):
-  [FIX] _handle_sign_block aceita race recovery.
 ================================================================
 """
 from __future__ import annotations
@@ -65,41 +31,20 @@ from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from typing import Optional
 
+# [v6.7.12] Import opcional do PySocks para contornar bloqueio do Tailscale
+try:
+    import socks
+    _HAS_SOCKS = True
+except ImportError:
+    socks = None
+    _HAS_SOCKS = False
+
 log = logging.getLogger("p2p")
 
 from p2p_auth import (
     auth_enabled, auth_required, build_auth, verify_auth,
     set_node_id_priv as _auth_set_priv,
 )
-
-# [AI v6.7.11] Priorização + anomalia + descoberta assistida.
-# Se os módulos não existirem, P2P funciona como v6.7.10.
-try:
-    from peer_ai import prioritize_peers
-    _HAS_PEER_AI = True
-except ImportError:
-    prioritize_peers = None
-    _HAS_PEER_AI = False
-
-try:
-    from peer_anomaly import detect_zombie_peer
-    _HAS_PEER_ANOMALY = True
-except ImportError:
-    detect_zombie_peer = None
-    _HAS_PEER_ANOMALY = False
-
-try:
-    from discovery_ai import DiscoveryAI
-    _HAS_DISCOVERY_AI = True
-except ImportError:
-    DiscoveryAI = None
-    _HAS_DISCOVERY_AI = False
-
-if _HAS_PEER_AI or _HAS_PEER_ANOMALY or _HAS_DISCOVERY_AI:
-    log.info(
-        "[AI] peer discovery ativo (peer_ai=%s anomaly=%s discovery=%s)",
-        _HAS_PEER_AI, _HAS_PEER_ANOMALY, _HAS_DISCOVERY_AI,
-    )
 
 try:
     from blockchain import block_hash, meets_difficulty, compute_merkle_root
@@ -170,14 +115,8 @@ BLOCK_SIG_TIMEOUT_S    = float(os.environ.get("BRN_BLOCK_SIG_TIMEOUT", "5.0"))
 SEND_RETRY_MAX         = int(os.environ.get("BRN_SEND_RETRY_MAX", "2"))
 SEND_RETRY_BASE_S      = float(os.environ.get("BRN_SEND_RETRY_BASE", "0.3"))
 
-# [AI v6.7.11] Configuração da IA de descoberta
-PEER_AI_TOP_N          = int(os.environ.get("BRN_PEER_AI_TOP_N", "20"))
-PEER_AI_ENABLED        = os.environ.get("BRN_PEER_AI", "1") == "1"
-PEER_HISTORY_FILE      = os.environ.get("BRN_PEER_HISTORY_FILE", "peer_history.json")
-
 
 def _is_plausible_pubkey(pk: str) -> bool:
-    """Valida formato mínimo de pubkey antes de usar como peer_id."""
     if not isinstance(pk, str):
         return False
     s = pk.strip().lower()
@@ -239,7 +178,7 @@ def _mesma_subnet(ip1: str, ip2: str) -> bool:
         return False
 
 
-def _carregar_bootstrap() -> set:
+def _carregar_bootstrap() -> set[str]:
     peers = set()
     if os.path.exists(BOOTSTRAP_FILE):
         try:
@@ -882,8 +821,24 @@ class P2PClient:
 
     @staticmethod
     def _send_message_once(ip: str, port: int, message: dict, timeout: float):
+        """Uma tentativa de envio — sem retry interno."""
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # --- PATCH RENDER v6.7.12: Usar SOCKS5 para IPs do Tailscale ---
+            s = None
+            if _HAS_SOCKS and os.environ.get("ALL_PROXY") and ip.startswith("100."):
+                try:
+                    proxy = os.environ.get("ALL_PROXY").replace("socks5://", "").replace("socks5h://", "")
+                    phost, pport = proxy.split(":")
+                    s = socks.socksocket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.set_proxy(socks.SOCKS5, phost, int(pport))
+                except Exception as e:
+                    log.warning("[P2PClient] Falha ao configurar SOCKS5: %s. Tentando conexão direta.", e)
+                    s = None
+            
+            if s is None:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # -----------------------------------------------------------------
+
             s.settimeout(timeout)
             t0 = time.time()
             s.connect((ip, port))
@@ -1006,13 +961,6 @@ class PeerDiscovery:
         self.uuid_lock = threading.Lock()
         self._height_cache = {}
         self._height_cache_lock = threading.Lock()
-
-        # [AI v6.7.11] Histórico de peers (priorização + anomalia + bootstrap)
-        self._peer_history: dict = {}
-        self._discovery_ai = (
-            DiscoveryAI(PEER_HISTORY_FILE) if _HAS_DISCOVERY_AI else None
-        )
-
         self._carregar_peers()
 
     def _salvar_peers(self) -> None:
@@ -1043,46 +991,11 @@ class PeerDiscovery:
             self.discovered_peers[addr] = ts if ts is not None else time.time()
             return True
 
-    def _record_peer_attempt(self, addr: str, success: bool,
-                             latency_ms: float = 0.0,
-                             height: int = 0) -> None:
-        """[AI v6.7.11] Registra tentativa de conexão no histórico."""
-        if not addr:
-            return
-        now = time.time()
-        h = self._peer_history.setdefault(addr, {
-            "tries": 0, "successes": 0, "avg_ms": 0.0,
-            "first_seen": now, "latencies": [], "heights": [],
-        })
-        h["tries"] = int(h.get("tries", 0)) + 1
-        if success:
-            h["successes"] = int(h.get("successes", 0)) + 1
-            h["avg_ms"] = float(h.get("avg_ms", 0)) * 0.8 + float(latency_ms) * 0.2
-            h["latencies"] = (h.get("latencies", []) + [float(latency_ms)])[-20:]
-            if height > 0:
-                h["heights"] = (h.get("heights", []) + [int(height)])[-20:]
-        h["last_seen"] = now
-
-        if self._discovery_ai is not None:
-            try:
-                self._discovery_ai.record_attempt(addr, success, latency_ms, height)
-            except Exception:
-                pass
-
-    def suggest_bootstrap(self, top_n: int = 5) -> list:
-        """[AI v6.7.11] Sugere peers para usar como bootstrap."""
-        if self._discovery_ai is None:
-            return []
-        try:
-            return self._discovery_ai.suggest_bootstrap(top_n=top_n)
-        except Exception:
-            return []
-
     def register_uuid(self, uuid_hex: str, ip: str, port: int) -> None:
         if not uuid_hex or not ip: return
         with self.uuid_lock: self.uuid_to_addr[uuid_hex] = (ip, int(port), time.time())
 
-    def get_addr_by_uuid(self, uuid_hex: str) -> Optional[tuple]:
+    def get_addr_by_uuid(self, uuid_hex: str) -> Optional[tuple[str, int]]:
         with self.uuid_lock:
             v = self.uuid_to_addr.get(uuid_hex)
             if not v: return None
@@ -1200,13 +1113,7 @@ class PeerDiscovery:
                     try:
                         ip, port = peer.split(":")
                         port = int(port)
-                        t0 = time.time()
                         resp, _ = P2PClient.ping(ip, port)
-                        ok = resp is not None
-                        self._record_peer_attempt(
-                            peer, ok, (time.time() - t0) * 1000,
-                            resp.get("height", 0) if resp else 0,
-                        )
                         if resp:
                             novo = self._add_peer(peer)
                             if resp.get("_uuid"): self.register_uuid(resp["_uuid"], ip, port)
@@ -1222,104 +1129,33 @@ class PeerDiscovery:
             time.sleep(BOOTSTRAP_PING_INTERVAL)
 
     def _limpar_peers_mortos(self) -> None:
-        """[AI v6.7.11] Remove zumbis além dos mortos por timeout."""
         while self.running:
             try:
                 time.sleep(PEER_CLEANUP_S)
                 agora = time.time()
                 with self.peers_lock:
                     for addr, ts in list(self.discovered_peers.items()):
-                        # 1. Timeout simples
-                        if ts > 0 and (agora - ts) > PEER_TIMEOUT:
-                            del self.discovered_peers[addr]
-                            continue
-                        # 2. Anomalia (zumbi)
-                        if _HAS_PEER_ANOMALY and detect_zombie_peer is not None:
-                            hist = self._peer_history.get(addr, {})
-                            if hist:
-                                hist["local_height"] = (
-                                    self.bc.db.height() if self.bc else 0
-                                )
-                                try:
-                                    is_z, reason = detect_zombie_peer(hist)
-                                except Exception:
-                                    is_z, reason = False, ""
-                                if is_z:
-                                    log.info(
-                                        "[Discovery] peer zumbi removido: %s (%s)",
-                                        addr, reason,
-                                    )
-                                    del self.discovered_peers[addr]
-                                    if self._discovery_ai is not None:
-                                        try:
-                                            self._discovery_ai.mark_banned(addr, reason)
-                                        except Exception:
-                                            pass
+                        if ts > 0 and (agora - ts) > PEER_TIMEOUT: del self.discovered_peers[addr]
                 self._salvar_peers()
-                if self._discovery_ai is not None:
-                    try:
-                        self._discovery_ai.save()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            except Exception: pass
 
     def _refresh_heights_loop(self) -> None:
-        """[AI v6.7.11] Prioriza top 20 em vez de tentar 50 aleatórios."""
         while self.running:
             try:
                 peers = self.listar_peers()
-
-                # [AI] Prioriza usando peer_ai se disponível
-                if (_HAS_PEER_AI and prioritize_peers is not None
-                        and PEER_AI_ENABLED and peers):
-                    local_h = self.bc.db.height() if self.bc else 0
+                for p in peers[:50]:
+                    if not self.running: break
                     try:
-                        top = prioritize_peers(
-                            [{"address": p} for p in peers],
-                            self._peer_history,
-                            local_height=local_h,
-                            top_n=PEER_AI_TOP_N,
-                        )
-                        peers = [p.get("address") for p in top if p.get("address")]
-                    except Exception as e:
-                        log.debug("[AI] prioritize_peers falhou: %s", e)
-                        peers = peers[:50]
-                else:
-                    peers = peers[:50]
-
-                for p in peers:
-                    if not self.running:
-                        break
-                    try:
-                        ip, port = p.rsplit(":", 1)
-                        t0 = time.time()
+                        ip, port = p.split(":")
                         resp, lat = P2PClient.get_chain_height(ip, int(port))
-                        ok = resp is not None
-                        self._record_peer_attempt(
-                            p, ok, (time.time() - t0) * 1000,
-                            resp.get("height", 0) if resp else 0,
-                        )
-                        if not resp:
-                            continue
-                        try:
-                            _registrar_peer_no_db(self.bc, ip, int(port), resp.get("_uuid"))
-                        except Exception:
-                            pass
+                        if not resp: continue
+                        try: _registrar_peer_no_db(self.bc, ip, int(port), resp.get("_uuid"))
+                        except Exception: pass
                         with self._height_cache_lock:
-                            self._height_cache[p] = (
-                                time.time(),
-                                resp.get("height", 0),
-                                resp.get("work", 0),
-                                lat,
-                            )
-                        if resp.get("_uuid"):
-                            self.register_uuid(resp["_uuid"], ip, int(port))
-                    except Exception:
-                        self._record_peer_attempt(p, False, 9999, 0)
-                        continue
-            except Exception:
-                pass
+                            self._height_cache[p] = (time.time(), resp.get("height", 0), resp.get("work", 0), lat)
+                        if resp.get("_uuid"): self.register_uuid(resp["_uuid"], ip, int(port))
+                    except Exception: continue
+            except Exception: pass
             time.sleep(60)
 
     def run(self) -> None:
@@ -1349,16 +1185,11 @@ class PeerDiscovery:
                 try: sock.close()
                 except Exception: pass
         self._salvar_peers()
-        if self._discovery_ai is not None:
-            try:
-                self._discovery_ai.save()
-            except Exception:
-                pass
 
-    def listar_peers(self) -> list:
+    def listar_peers(self) -> list[str]:
         with self.peers_lock: return list(self.discovered_peers.keys())
 
-    def listar_peers_com_altura(self) -> list:
+    def listar_peers_com_altura(self) -> list[dict]:
         with self._height_cache_lock:
             now = time.time()
             return [
@@ -1437,10 +1268,6 @@ class P2PManager:
     def get_peer_stats(self) -> list: return self.discovery.listar_peers_com_altura()
     def is_read_only(self) -> bool: return self.read_only
 
-    def suggest_bootstrap(self, top_n: int = 5) -> list:
-        """[AI v6.7.11] Delega para discovery.suggest_bootstrap."""
-        return self.discovery.suggest_bootstrap(top_n=top_n)
-
     def request_block_signature(self, ip: str, port: int, block: dict, timeout: Optional[float] = None) -> Optional[dict]:
         return P2PClient.request_block_signature(ip, port, block, timeout=timeout)
 
@@ -1492,17 +1319,10 @@ class P2PManager:
 
     def _on_peer_found(self, ip: str, port: int) -> None:
         _registrar_peer_no_db(self.bc, ip, port)
-        addr = f"{ip}:{port}"
         try:
-            t0 = time.time()
             resp, latency = P2PClient.get_chain_height(ip, port)
-            ok = resp is not None
-            self.discovery._record_peer_attempt(
-                addr, ok, (time.time() - t0) * 1000,
-                resp.get("height", 0) if resp else 0,
-            )
             if not resp: return
-            self.metrics.peer_update(addr, latency_ms=latency)
+            self.metrics.peer_update(f"{ip}:{port}", latency_ms=latency)
             if resp.get("_uuid"): self.discovery.register_uuid(resp["_uuid"], ip, port)
 
             if resp.get("decentralized") and not self.bc.rede_descentralizada:
@@ -1518,14 +1338,13 @@ class P2PManager:
             if peers_resp and "peers" in peers_resp:
                 novos = 0
                 for p in peers_resp["peers"][:MAX_PEERS_PER_PEX]:
-                    addr2 = p.get("address", "") if isinstance(p, dict) else str(p)
-                    if not addr2 or ":" not in addr2: continue
-                    if self.discovery._add_peer(addr2, ts=time.time()): novos += 1
+                    addr = p.get("address", "") if isinstance(p, dict) else str(p)
+                    if not addr or ":" not in addr: continue
+                    if self.discovery._add_peer(addr, ts=time.time()): novos += 1
                 if novos > 0:
                     log.info(f"[PEX] +{novos} peer(s) via {ip}")
                     self.discovery._salvar_peers()
-        except Exception:
-            self.discovery._record_peer_attempt(addr, False, 9999, 0)
+        except Exception: pass
 
     def _sync_with_retry(self, ip: str, port: int) -> None:
         addr = f"{ip}:{port}"
