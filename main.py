@@ -1,16 +1,12 @@
-
-"""main.py — Entrypoint do nó BRN (v13.9.12)
+"""main.py — Entrypoint do nó BRN (v13.9.13)
 ================================================================
-v13.9.12 (2026-11-11) — PROMPT INTERATIVO PARA ABRIR CARTEIRA:
-  [NEW] _prompt_password_interactive(): se a GUI tem carteira salva
-        mas nenhuma senha do env funciona, PERGUNTA no console.
-        Aceita 3 tentativas. Se o usuário der ENTER vazio ou errar
-        3x, abre a GUI sem carteira (para criar/carregar manual).
-  [NEW] Funciona só em terminal interativo (sys.stdin.isatty()).
-        Em modo headless ou batch sem stdin, pula o prompt.
-  [NEW] Se carteira NÃO existe em disco, abre GUI direto para criar.
-  [KEEP] v13.9.11: auto-unlock via env vars + gui_wallet_source no /health
-  [KEEP] v13.9.10: multi-máquina (defaults neutros, --no-auto-config, --no-gui)
+v13.9.13 (2026-11-12) — FALLBACK HTTP SYNC:
+  [NEW] _force_http_sync_loop(): se o nó não encontrar peers P2P
+        em 10 segundos (ou estiver com height=-1), baixa a
+        blockchain diretamente via HTTP (porta 5000 do Origin).
+        Resolve o problema de portas P2P bloqueadas por firewall.
+  [KEEP] v13.9.12: prompt interativo para abrir carteira
+  [KEEP] v13.9.10: multi-máquina
   [KEEP] v13.9.9: ping rápido + auto-mine persistente
 ================================================================
 """
@@ -34,8 +30,8 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.12"
-    BUILD_DATE = "2026-11-11"
+    VERSION = "13.9.13"
+    BUILD_DATE = "2026-11-12"
 
 try:
     from isolation_detector import IsolationDetector
@@ -79,7 +75,6 @@ SK_VALIDATION_STATE = {
     "gui_wallet_source": "",
 }
 
-
 # ============================================================
 # ARGS
 # ============================================================
@@ -90,10 +85,8 @@ def parse_args():
     p.add_argument("--client-mode", action="store_true")
     p.add_argument("--origem", action="store_true")
     p.add_argument("--no-pool-client", action="store_true")
-    p.add_argument("--no-auto-config", action="store_true",
-                   help="não tenta auto-SK nem auto-mine (só sync)")
-    p.add_argument("--no-interactive", action="store_true",
-                   help="nunca pergunta senha (só env vars)")
+    p.add_argument("--no-auto-config", action="store_true")
+    p.add_argument("--no-interactive", action="store_true")
     p.add_argument("--no-p2p", action="store_true")
     p.add_argument("--no-explorer", action="store_true")
     p.add_argument("--db", metavar="PATH", default=None)
@@ -102,7 +95,6 @@ def parse_args():
     p.add_argument("--version", action="store_true")
     p.add_argument("--skip-verify", action="store_true")
     return p.parse_args()
-
 
 # ============================================================
 # ENV
@@ -128,7 +120,6 @@ def _load_env_file():
             loaded += 1
     return loaded
 
-
 def _read_bootstrap_json() -> str:
     p = BASE_DIR / "bootstrap_peers.json"
     if not p.exists():
@@ -142,7 +133,6 @@ def _read_bootstrap_json() -> str:
     except Exception:
         pass
     return ""
-
 
 # ============================================================
 # LOGGING
@@ -159,18 +149,15 @@ def _setup_logging(level: str = "INFO"):
         )
         return logging.getLogger("main")
 
-
 # ============================================================
-# IDENTITY PASSWORD
+# IDENTITY
 # ============================================================
 def _get_identity_password() -> str:
     log = logging.getLogger("main")
-
     pw = (os.environ.get("BRN_NODE_PASSWORD", "").strip()
           or os.environ.get("BRN_WALLET_SESSION_PASS", "").strip())
     if pw:
         return pw
-
     local_file = BASE_DIR / ".node_password"
     if local_file.exists():
         try:
@@ -179,7 +166,6 @@ def _get_identity_password() -> str:
                 return pw
         except Exception:
             pass
-
     pw = secrets.token_hex(16)
     try:
         local_file.write_text(pw + "\n", encoding="utf-8")
@@ -193,13 +179,8 @@ def _get_identity_password() -> str:
         log.warning("[identity] não gravei %s: %s", local_file.name, e)
         return ""
 
-
-# ============================================================
-# IDENTITY
-# ============================================================
 def _load_or_create_node_identity():
     log = logging.getLogger("main")
-
     try:
         from secure_store import load_node_identity, save_node_identity
         from crypto import Ed25519PrivateKey
@@ -253,7 +234,6 @@ def _load_or_create_node_identity():
         raise RuntimeError(f"[identity] não salvei {p.name}: {e}") from e
     return priv, pub
 
-
 # ============================================================
 # VERSION GATE
 # ============================================================
@@ -276,7 +256,6 @@ def _check_blockchain_version() -> bool:
         return False
     return True
 
-
 # ============================================================
 # SETUP
 # ============================================================
@@ -290,7 +269,6 @@ def _setup_trust(chain, node_id_priv, is_origin: bool):
         logging.getLogger("main").error("[trust] init falhou: %s", e)
         return None
 
-
 def _setup_p2p(chain, node_id_priv, p2p_port: int):
     try:
         from p2p_unified import P2PManager
@@ -302,7 +280,6 @@ def _setup_p2p(chain, node_id_priv, p2p_port: int):
         logging.getLogger("main").error("[p2p] init falhou: %s", e)
         return None
 
-
 def _setup_sync(chain, p2p):
     try:
         from sync_manager import ChainSyncManager
@@ -312,7 +289,6 @@ def _setup_sync(chain, p2p):
     except Exception as e:
         logging.getLogger("main").warning("[sync] init falhou: %s", e)
         return None
-
 
 def _setup_broadcast(chain, p2p):
     log = logging.getLogger("main")
@@ -326,7 +302,6 @@ def _setup_broadcast(chain, p2p):
         log.warning("[P2P] broadcast falhou: %s", e)
         return False
 
-
 def _setup_pool(chain, is_origin: bool):
     if not is_origin:
         return None
@@ -339,11 +314,9 @@ def _setup_pool(chain, is_origin: bool):
         logging.getLogger("main").warning("[pool] init falhou: %s", e)
         return None
 
-
 def _wallet_watchdog_loop(chain, p2p, trust, stop_evt: threading.Event, interval: int = 30):
     log = logging.getLogger("main")
     log.info("[watchdog] iniciado (interval=%ds)", interval)
-
     detector = IsolationDetector() if _HAS_ISOLATION else None
     if detector is not None:
         log.info("[watchdog] isolation_detector ativo")
@@ -359,7 +332,6 @@ def _wallet_watchdog_loop(chain, p2p, trust, stop_evt: threading.Event, interval
                     log.warning("[ISOLATION] %s: %s", alert.severity.upper(), alert.reason)
             except Exception as _e:
                 log.debug("[ISOLATION] check falhou: %s", _e)
-
         try:
             sk = getattr(chain, "_local_validator_sk", None)
             if sk is None:
@@ -367,11 +339,9 @@ def _wallet_watchdog_loop(chain, p2p, trust, stop_evt: threading.Event, interval
                     chain._watchdog_sk_warned = True
                     log.warning("[watchdog] SK=None — nó NÃO assina")
                 continue
-
             if getattr(chain, "_watchdog_sk_warned", False):
                 chain._watchdog_sk_warned = False
                 log.info("[watchdog] SK detectada pk=%s…", sk.pub_hex[:16])
-
             collector = getattr(chain, "_sign_collector", None)
             if collector is None:
                 if not getattr(chain, "_watchdog_collector_warned", False):
@@ -381,16 +351,12 @@ def _wallet_watchdog_loop(chain, p2p, trust, stop_evt: threading.Event, interval
             chain._watchdog_collector_warned = False
         except Exception as e:
             log.warning("[watchdog] loop: %s", e)
-
     log.info("[watchdog] encerrado")
 
-
-def _setup_trust_daemon(chain, trust, p2p, password: str, is_origin: bool,
-                        stop_evt: threading.Event, interval: int = 30):
+def _setup_trust_daemon(chain, trust, p2p, password: str, is_origin: bool, stop_evt: threading.Event, interval: int = 30):
     log = logging.getLogger("main")
     if trust is None:
         return None
-
     try:
         from trust_daemon import start_daemon
         t = start_daemon(chain, trust, p2p, password, is_origin, stop_evt)
@@ -412,12 +378,10 @@ def _setup_trust_daemon(chain, trust, p2p, password: str, is_origin: bool,
                         pass
             except Exception:
                 pass
-
     t = threading.Thread(target=_loop, daemon=True, name="TrustDaemon")
     t.start()
     log.info("[TrustDaemon] fallback ativado")
     return t
-
 
 def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int):
     log = logging.getLogger("main")
@@ -428,7 +392,6 @@ def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int):
         return False
 
     srv.set_chain(chain)
-
     for fn_name, obj in (
         ("set_p2p_manager", p2p),
         ("set_pool_manager", pool),
@@ -467,7 +430,6 @@ def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int):
     log.info("[server] HTTP ativo na porta %d", web_port)
     return True
 
-
 def _start_explorer(chain):
     try:
         import explorer as exp
@@ -484,41 +446,31 @@ def _start_explorer(chain):
     except Exception as e:
         logging.getLogger("main").debug("[explorer] não iniciou: %s", e)
 
-
 # ============================================================
-# [v13.9.12] PROMPT INTERATIVO PARA ABRIR CARTEIRA
+# GUI AUTO-UNLOCK
 # ============================================================
 def _candidate_gui_passwords() -> list:
     cands = []
     seen = set()
-
     def _add(src: str, val: str):
         v = (val or "").strip()
         if not v or v in seen:
             return
         seen.add(v)
         cands.append((src, v))
-
-    _add("env:BRN_WALLET_SESSION_PASS",
-         os.environ.get("BRN_WALLET_SESSION_PASS", ""))
-    _add("env:BRN_VALIDATOR_SEED",
-         os.environ.get("BRN_VALIDATOR_SEED", ""))
-    _add("env:BRN_NODE_PASSWORD",
-         os.environ.get("BRN_NODE_PASSWORD", ""))
-
+    _add("env:BRN_WALLET_SESSION_PASS", os.environ.get("BRN_WALLET_SESSION_PASS", ""))
+    _add("env:BRN_VALIDATOR_SEED", os.environ.get("BRN_VALIDATOR_SEED", ""))
+    _add("env:BRN_NODE_PASSWORD", os.environ.get("BRN_NODE_PASSWORD", ""))
     p = BASE_DIR / ".node_password"
     if p.exists():
         try:
             _add("file:.node_password", p.read_text(encoding="utf-8").strip())
         except Exception:
             pass
-
     return cands
-
 
 def _prompt_password_interactive(api, max_attempts: int = 3) -> tuple:
     log = logging.getLogger("main")
-
     try:
         if not sys.stdin.isatty():
             log.info("[GUI] prompt de senha pulado (stdin não interativo)")
@@ -540,11 +492,9 @@ def _prompt_password_interactive(api, max_attempts: int = 3) -> tuple:
         except (EOFError, KeyboardInterrupt):
             print("\n [cancelado]")
             return False, "cancelled", "", "cancelado"
-
         if not pw:
             print(" [vazio] — abrindo GUI sem carteira")
             return False, "empty_input", "", "usuário deixou vazio"
-
         try:
             r = api.unlock_wallet(pw)
             if r.get("ok"):
@@ -565,10 +515,8 @@ def _prompt_password_interactive(api, max_attempts: int = 3) -> tuple:
     SK_VALIDATION_STATE["gui_wallet_source"] = "interactive_failed"
     return False, "interactive_failed", "", f"{max_attempts} tentativas falharam"
 
-
 def _auto_unlock_gui(api, allow_interactive: bool = True) -> tuple:
     log = logging.getLogger("main")
-
     try:
         has = api.has_wallet()
         if not has.get("exists"):
@@ -604,28 +552,18 @@ def _auto_unlock_gui(api, allow_interactive: bool = True) -> tuple:
             log.debug("[GUI] %s exception: %s", src, e)
 
     if allow_interactive:
-        log.info(
-            "[GUI] nenhuma senha do env funcionou (%d tentadas). "
-            "Pedindo no console...", len(cands),
-        )
+        log.info("[GUI] nenhuma senha do env funcionou (%d tentadas). Pedindo no console...", len(cands))
         ok, src, addr, err = _prompt_password_interactive(api, max_attempts=3)
         if ok:
             log.info("[GUI] ✅ carteira ABERTA via %s — address=%s", src, addr)
             return True, src, addr, ""
         else:
-            log.warning(
-                "[GUI] prompt falhou (%s) — GUI abrirá sem carteira. "
-                "Use 'Carregar' ou 'Gerar nova'.", src,
-            )
+            log.warning("[GUI] prompt falhou (%s) — GUI abrirá sem carteira. Use 'Carregar' ou 'Gerar nova'.", src)
             return False, src, "", err
 
-    log.warning(
-        "[GUI] ❌ não consegui abrir a carteira. "
-        "Clique em 'Carregar' ou 'Gerar nova' na GUI."
-    )
+    log.warning("[GUI] ❌ não consegui abrir a carteira. Clique em 'Carregar' ou 'Gerar nova' na GUI.")
     SK_VALIDATION_STATE["gui_wallet_source"] = "all_passwords_failed"
     return False, "all_passwords_failed", "", "todas as senhas falharam"
-
 
 def _start_gui(allow_interactive: bool = True) -> bool:
     try:
@@ -634,11 +572,8 @@ def _start_gui(allow_interactive: bool = True) -> bool:
         log = logging.getLogger("main")
 
         api = WalletApi()
-
         log.info("[GUI] tentando abrir carteira salva...")
-        ok, source, addr, err = _auto_unlock_gui(
-            api, allow_interactive=allow_interactive
-        )
+        ok, source, addr, err = _auto_unlock_gui(api, allow_interactive=allow_interactive)
 
         if ok:
             log.info("[GUI] auto-unlock OK (source=%s) — janela com carteira", source)
@@ -660,13 +595,11 @@ def _start_gui(allow_interactive: bool = True) -> bool:
         logging.getLogger("main").warning("[gui] falha: %s", e)
         return False
 
-
 # ============================================================
-# [v13.9.8] Resolve SK
+# SK + AUTO MINE
 # ============================================================
 def _resolve_validator_sk() -> tuple:
     log = logging.getLogger("main")
-
     if not _HAS_WALLET:
         log.error("[SK] wallet.Wallet indisponível")
         return "", "", "", "error"
@@ -739,36 +672,29 @@ def _resolve_validator_sk() -> tuple:
         log.error("[SK] geração falhou: %s", e)
         return "", "", "", "error"
 
-
-# ============================================================
-# [v13.9.9] Ping Origin + install local + auto-mine
-# ============================================================
 def _ping_origin(timeout: float = 3.0) -> bool:
     log = logging.getLogger("main")
     pool_url = os.environ.get("BRN_POOL_URL", "").strip().rstrip("/")
     if not pool_url:
         return False
-
     if not _HAS_REQUESTS:
         try:
             import urllib.request
             req = urllib.request.Request(
                 f"{pool_url}/api/status",
-                headers={"User-Agent": "brn-main/13.9.12"},
+                headers={"User-Agent": "brn-main/13.9.13"},
             )
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.status == 200
         except Exception as e:
             log.debug("[ORIGIN] urllib ping falhou: %s", e)
             return False
-
     try:
         r = _requests.get(f"{pool_url}/api/status", timeout=timeout)
         return r.status_code == 200
     except Exception as e:
         log.debug("[ORIGIN] requests ping falhou: %s", e)
         return False
-
 
 def _install_sk_local_only(chain, sk_hex: str, address: str, pubkey: str) -> bool:
     log = logging.getLogger("main")
@@ -780,13 +706,72 @@ def _install_sk_local_only(chain, sk_hex: str, address: str, pubkey: str) -> boo
         log.exception("[SK] set_local_validator_sk falhou: %s", e)
         return False
 
+# ============================================================
+# [v13.9.13] FALLBACK HTTP SYNC
+# ============================================================
+def _force_http_sync_loop(chain, pool_url, stop_evt):
+    """
+    Se o nó estiver com height=-1 e sem peers, baixa via HTTP.
+    Isso contorna bloqueios de firewall na porta P2P (6001).
+    """
+    import requests
+    import time
+    import json
+    
+    log = logging.getLogger("main")
+    log.info("[HTTP-SYNC] Thread iniciada (fallback via HTTP)")
+    time.sleep(15) # Dá 15s para o P2P tentar primeiro
+    
+    while not stop_evt.is_set():
+        try:
+            local_h = chain.db.height()
+            if local_h >= 0:
+                # Se já sincronizou algo, a thread pode dormir mais
+                stop_evt.wait(60)
+                continue
+                
+            # Pinga o status do Origin
+            try:
+                r = requests.get(f"{pool_url}/api/status", timeout=10)
+                target_h = r.json().get("height", 0)
+            except Exception as e:
+                log.warning(f"[HTTP-SYNC] Origin inacessível: {e}")
+                stop_evt.wait(30)
+                continue
+                
+            if target_h > 0:
+                log.info(f"[HTTP-SYNC] Iniciando download: local={local_h}, target={target_h}")
+                start = max(0, local_h + 1)
+                batch = 100
+                while start <= target_h and not stop_evt.is_set():
+                    try:
+                        r = requests.get(f"{pool_url}/api/blocks?start={start}&limit={batch}", timeout=30)
+                        blocks = r.json().get("blocks", [])
+                        if not blocks:
+                            break
+                            
+                        for blk in blocks:
+                            ok, msg = chain.accept_block(blk)
+                            if not ok:
+                                log.error(f"[HTTP-SYNC] Bloco #{blk.get('height')} rejeitado: {msg}")
+                                break
+                        
+                        start += len(blocks)
+                        log.info(f"[HTTP-SYNC] Progresso: {chain.db.height()}/{target_h}")
+                    except Exception as e:
+                        log.warning(f"[HTTP-SYNC] Erro no lote {start}: {e}")
+                        break # Tenta de novo no próximo loop
+            else:
+                log.info("[HTTP-SYNC] Origin com altura 0. Aguardando.")
+                stop_evt.wait(30)
+        except Exception as e:
+            log.error(f"[HTTP-SYNC] Erro no loop: {e}")
+            stop_evt.wait(30)
 
-def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
-                    stop_evt: threading.Event) -> None:
+def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int, stop_evt: threading.Event) -> None:
     log = logging.getLogger("main")
     SK_VALIDATION_STATE["auto_mine_status"] = "starting"
     log.info("[AUTO-MINE] loop iniciado (checa Origin a cada 30s)")
-
     pool_url = os.environ.get("BRN_POOL_URL", "").strip()
     failures = 0
 
@@ -797,13 +782,9 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
                 if stop_evt.wait(10):
                     break
                 continue
-
             if _HAS_REQUESTS:
                 try:
-                    r = _requests.get(
-                        f"http://127.0.0.1:{web_port}/api/pool/local_status",
-                        timeout=5,
-                    )
+                    r = _requests.get(f"http://127.0.0.1:{web_port}/api/pool/local_status", timeout=5)
                     if r.status_code == 200:
                         data = r.json()
                         if data.get("running"):
@@ -820,10 +801,7 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
             if not origin_online:
                 SK_VALIDATION_STATE["auto_mine_status"] = "waiting_origin"
                 if failures == 0 or failures % 4 == 0:
-                    log.warning(
-                        "[AUTO-MINE] Origin offline (%s) — aguardando 30s",
-                        pool_url or "(BRN_POOL_URL vazio)",
-                    )
+                    log.warning("[AUTO-MINE] Origin offline (%s) — aguardando 30s", pool_url or "(vazio)")
                 failures += 1
                 if stop_evt.wait(30):
                     break
@@ -852,39 +830,26 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
                 if data.get("ok"):
                     failures = 0
                     SK_VALIDATION_STATE["auto_mine_status"] = "running"
-                    log.info(
-                        "[AUTO-MINE] ✅ PoolClient iniciado (miner_id=%s)",
-                        data.get("miner_id", "?"),
-                    )
+                    log.info("[AUTO-MINE] ✅ PoolClient iniciado (miner_id=%s)", data.get("miner_id", "?"))
                 else:
                     failures += 1
                     SK_VALIDATION_STATE["auto_mine_status"] = f"failed:{data.get('msg', '?')[:60]}"
-                    log.warning(
-                        "[AUTO-MINE] PoolClient falhou (%d): %s",
-                        failures, data.get("msg", "?"),
-                    )
+                    log.warning("[AUTO-MINE] PoolClient falhou (%d): %s", failures, data.get("msg", "?"))
             except Exception as e:
                 failures += 1
                 SK_VALIDATION_STATE["auto_mine_status"] = f"error:{type(e).__name__}"
                 log.warning("[AUTO-MINE] start_local exception: %s", e)
-
         except Exception as e:
             log.exception("[AUTO-MINE] loop exceção: %s", e)
-
         if stop_evt.wait(30):
             break
-
     SK_VALIDATION_STATE["auto_mine_status"] = "stopped"
-
 
 # ============================================================
 # AUTO-CONFIG
 # ============================================================
-def _auto_configure(chain, p2p, trust, web_port: int,
-                    is_origin: bool, stop_evt: threading.Event,
-                    force_auto_mine: bool = False) -> None:
+def _auto_configure(chain, p2p, trust, web_port: int, is_origin: bool, stop_evt: threading.Event, force_auto_mine: bool = False) -> None:
     log = logging.getLogger("main")
-
     sk_hex, address, pubkey, source = _resolve_validator_sk()
 
     SK_VALIDATION_STATE["checked"] = True
@@ -897,7 +862,7 @@ def _auto_configure(chain, p2p, trust, web_port: int,
     SK_VALIDATION_STATE["pubkey_derived"] = pubkey
 
     log.info("=" * 64)
-    log.info(" [SK RESOLUTION v13.9.12]")
+    log.info(" [SK RESOLUTION v13.9.13]")
     log.info("=" * 64)
     log.info("  source           : %s", source or "(nenhum)")
     log.info("  SK_HEX len       : %d", len(sk_hex) if sk_hex else 0)
@@ -911,7 +876,6 @@ def _auto_configure(chain, p2p, trust, web_port: int,
 
     log.info("  RESULTADO        : ✅ SK resolvida")
     log.info("=" * 64)
-
     _install_sk_local_only(chain, sk_hex, address, pubkey)
 
     log.info("[AUTO-CONFIG] pingando Origin...")
@@ -932,22 +896,13 @@ def _auto_configure(chain, p2p, trust, web_port: int,
                     p2p=p2p, trust=trust, logger=log,
                 )
                 if r.get("ok"):
-                    log.info(
-                        "[AUTO-CONFIG] ✅ SK propagada (in_trust=%s in_top5=%s propagated=%s)",
-                        r.get("in_trust"), r.get("in_top5"), r.get("propagated"),
-                    )
+                    log.info("[AUTO-CONFIG] ✅ SK propagada (in_trust=%s in_top5=%s propagated=%s)", r.get("in_trust"), r.get("in_top5"), r.get("propagated"))
                 else:
-                    log.warning(
-                        "[AUTO-CONFIG] ⚠️ propagate falhou: %s",
-                        r.get("errors") or r.get("msg"),
-                    )
+                    log.warning("[AUTO-CONFIG] ⚠️ propagate falhou: %s", r.get("errors") or r.get("msg"))
             except Exception as e:
                 log.exception("[AUTO-CONFIG] integrate_and_propagate falhou: %s", e)
     else:
-        log.warning(
-            "[AUTO-CONFIG] ⚠️ Origin OFFLINE (%.0fms) — SK instalada localmente.",
-            dt_ms,
-        )
+        log.warning("[AUTO-CONFIG] ⚠️ Origin OFFLINE (%.0fms) — SK instalada localmente.", dt_ms)
 
     env_auto_mine = os.environ.get("BRN_AUTO_MINE", "").strip()
     if env_auto_mine == "1":
@@ -983,17 +938,12 @@ def _auto_configure(chain, p2p, trust, web_port: int,
         name="AutoMine",
     ).start()
 
-
-def _delayed_auto_configure(chain, p2p, trust, web_port: int,
-                            is_origin: bool, stop_evt: threading.Event,
-                            force_auto_mine: bool = False) -> None:
+def _delayed_auto_configure(chain, p2p, trust, web_port: int, is_origin: bool, stop_evt: threading.Event, force_auto_mine: bool = False) -> None:
     try:
         time.sleep(3)
-        _auto_configure(chain, p2p, trust, web_port, is_origin, stop_evt,
-                        force_auto_mine=force_auto_mine)
+        _auto_configure(chain, p2p, trust, web_port, is_origin, stop_evt, force_auto_mine=force_auto_mine)
     except Exception as e:
         logging.getLogger("main").exception("[AUTO-CONFIG] falhou: %s", e)
-
 
 # ============================================================
 # CONFIG
@@ -1005,7 +955,6 @@ def _resolve_config(log) -> dict:
         "pool_url": "",
         "pool_url_source": "(vazio)",
     }
-
     env_bootstrap = os.environ.get("BRN_BOOTSTRAP_PEERS", "").strip()
     if env_bootstrap:
         cfg["bootstrap"] = env_bootstrap
@@ -1029,9 +978,7 @@ def _resolve_config(log) -> dict:
                 cfg["pool_url"] = f"http://{host}:5000"
                 cfg["pool_url_source"] = "inferido do bootstrap"
                 os.environ["BRN_POOL_URL"] = cfg["pool_url"]
-
     return cfg
-
 
 # ============================================================
 # MAIN
@@ -1041,7 +988,6 @@ def main() -> int:
     if args.version:
         print(f"BRN Node v{VERSION} (build {BUILD_DATE})")
         return 0
-
     if args.skip_verify:
         print("[main] --skip-verify ativo")
 
@@ -1064,10 +1010,8 @@ def main() -> int:
     log.info("=" * 64)
 
     cfg = _resolve_config(log)
-    log.info("[CONFIG] BRN_BOOTSTRAP_PEERS: %s (%s)",
-             cfg["bootstrap"] or "(vazio)", cfg["bootstrap_source"])
-    log.info("[CONFIG] BRN_POOL_URL: %s (%s)",
-             cfg["pool_url"] or "(vazio)", cfg["pool_url_source"])
+    log.info("[CONFIG] BRN_BOOTSTRAP_PEERS: %s (%s)", cfg["bootstrap"] or "(vazio)", cfg["bootstrap_source"])
+    log.info("[CONFIG] BRN_POOL_URL: %s (%s)", cfg["pool_url"] or "(vazio)", cfg["pool_url_source"])
 
     if not _check_blockchain_version():
         return 6
@@ -1103,8 +1047,7 @@ def main() -> int:
     else:
         log.info("[trust] carregado (origin=%s)", is_origin)
 
-    log.info("[wallet] boot sem carteira (design v13.9.12) — "
-             "GUI tentará abrir carteira salva (auto + prompt interativo)")
+    log.info("[wallet] boot sem carteira (design v13.9.13) — GUI tentará abrir carteira salva")
 
     p2p = None
     if not args.no_p2p:
@@ -1118,10 +1061,19 @@ def main() -> int:
         if sync_mgr:
             log.info("[sync] ChainSyncManager iniciado")
 
+    # [v13.9.13] Inicia a thread de sincronização HTTP (fallback)
+    _stop_bg = threading.Event()
+    if cfg["pool_url"] and _HAS_REQUESTS:
+        threading.Thread(
+            target=_force_http_sync_loop,
+            args=(chain, cfg["pool_url"], _stop_bg),
+            daemon=True,
+            name="HttpSyncFallback",
+        ).start()
+
     if p2p:
         _setup_broadcast(chain, p2p)
 
-    _stop_bg = threading.Event()
     _setup_trust_daemon(
         chain, trust, p2p,
         password=_get_identity_password(),
@@ -1167,8 +1119,7 @@ def main() -> int:
             log.info("[gui] desligada por --no-gui")
         log.info("=" * 64)
         log.info(" MODO HEADLESS — consulte /health:")
-        log.info("   GET http://%s:%d/health",
-                 os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
+        log.info("   GET http://%s:%d/health", os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
         log.info("=" * 64)
 
     def _shutdown(*_):
@@ -1191,12 +1142,9 @@ def main() -> int:
 
     log.info("=" * 64)
     log.info(" NÓ ATIVO — Ctrl+C para encerrar")
-    log.info("   API      : http://%s:%d",
-             os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
-    log.info("   Wallet   : http://%s:%d/wallet",
-             os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
-    log.info("   Health   : http://%s:%d/health",
-             os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
+    log.info("   API      : http://%s:%d", os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
+    log.info("   Wallet   : http://%s:%d/wallet", os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
+    log.info("   Health   : http://%s:%d/health", os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
     log.info("   P2P      : :%d", p2p_port)
     log.info("=" * 64)
 
@@ -1205,9 +1153,7 @@ def main() -> int:
             time.sleep(1)
     except KeyboardInterrupt:
         _shutdown()
-
     return 0
-
 
 if __name__ == "__main__":
     try:
