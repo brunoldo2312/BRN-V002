@@ -1,28 +1,41 @@
-"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.20)
+"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.21)
 ================================================================
-v3.20 (2026-11-09) — FIX CARREGAR .wallet:
-  [FIX CRÍTICO] load_wallet(): strip de ".wallet" do nome ANTES de
-        chamar WalletManager.load_encrypted_wallet. Antes, o HTML
-        passava "masmasmasmas.wallet" e o WalletManager procurava
-        "wallets/masmasmasmas.wallet.wallet" → "arquivo vazio".
-  [FIX] save_wallet(): detecta assinatura de save_encrypted_wallet
-        por introspecção (kwargs → positional 5-args → positional
-        3-args). Antes, chamada positional fixa falhava em
-        versões antigas com assinatura diferente.
-  [FIX] list_wallets(): retorna [{name, address, public_key}]
-        sempre como dict — antes alguns retornos viravam string.
-  [KEEP] v3.19: fallback WalletManager, create_and_unlock em 3
-        lugares, unlock propaga SK ao Origin, has_wallet considera
-        wallets/*.wallet.
-
-v3.19 (2026-11-09):
-  [NEW] unlock_wallet(): fallback WalletManager se .enc falhar.
-  [NEW] unlock_wallet(): chama integrate_and_propagate via HTTP.
-  [NEW] list_wallets(): normaliza 3 formatos de retorno.
-  [NEW] create_and_unlock(): salva em current_wallet.enc E wallets/.
-
-v3.18 (2026-11-06):
-  [NEW] check_sync_barrier().
+v3.21 (2026-11-12) — UNLOCK HONESTO SOBRE SK:
+  [FIX CRÍTICO] unlock_wallet() agora retorna warning explícito
+        e node_will_sign=False quando a SK NÃO foi instalada no nó.
+        Antes: unlock_wallet retornava ok:True silenciosamente
+        mesmo com sync_r={} (servidor offline, sk_hex inválida,
+        wallet_integrator quebrado). A GUI mostrava "carteira
+        aberta" e o operador descobria no log do consenso que o
+        nó assinava com 0 assinaturas — exatamente o cenário do
+        #4301 (got=0, faltam 02eeec..., 03244d..., 03b992d...).
+  [NEW] _verify_sk_on_node(pubkey_hex): após tentar instalar a
+        SK, confirma via /api/consensus/validators que o nó
+        REALMENTE viu a chave. Se /health.wallet_sk_installed=
+        False OU local_pk_full != pubkey_hex, retorna
+        installed=False. Fonte de verdade final.
+  [NEW] unlock_wallet() cross-check: se _sync_sk_to_chain falhou
+        com erro de rede mas o nó já tem a SK (de uma sessão
+        anterior), marca sk_installed=True com nota
+        "verified_after_sync_failure".
+  [NEW] retry_sk_sync(): método público para a GUI chamar quando
+        a rede voltar, sem fechar/abrir a carteira. Idempotente.
+  [NEW] load_wallet() também propaga sync_r (antes ignorava —
+        tinha o mesmo bug do unlock).
+  [NEW] create_and_unlock() e generate_wallet() idem.
+  [NEW] _sync_sk_to_chain retorna error_code
+        ("connection"|"timeout"|"server_offline"|"rejected"|
+        "no_requests"|"exception") para classificar warning vs
+        error.
+  [NEW] CLI --verify-sk: carrega senha do env, faz unlock, e
+        imprime o estado real (sk_installed, node_will_sign,
+        validators do nó). Útil para debugar o #4301 sem abrir
+        a GUI.
+  [KEEP] v3.20: FIX load_wallet() strip .wallet; save_wallet()
+        detecta 3 assinaturas; list_wallets() sempre lista de
+        dicts; fallback WalletManager; create_and_unlock em 3
+        lugares; unlock propaga SK ao Origin; has_wallet
+        considera wallets/*.wallet.
 ================================================================
 """
 from __future__ import annotations
@@ -36,7 +49,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "3.20"
+__version__ = "3.21"
 
 try:
     import requests
@@ -61,36 +74,142 @@ _WALLET_SESSION: dict = {}
 # ═══════════════════════════════════════════════════════════════
 # Helpers HTTP
 # ═══════════════════════════════════════════════════════════════
-def _sync_sk_to_chain(sk_hex: str, address: str = "", pubkey: str = "") -> dict:
+def _classify_post_error(msg: str) -> str:
+    """Classifica a msg de erro de _post em error_code."""
+    m = (msg or "").lower()
+    if "não instalado" in m or "nao instalado" in m:
+        return "no_requests"
+    if "offline" in m:
+        return "server_offline"
+    if "timeout" in m:
+        return "timeout"
+    if "connection" in m or "connect" in m:
+        return "connection"
+    if "400" in m or "401" in m or "403" in m or "422" in m:
+        return "rejected"
+    if "500" in m or "502" in m or "503" in m or "504" in m:
+        return "server_error"
+    return "exception"
+
+
+def _sync_sk_to_chain(sk_hex: str, address: str = "",
+                      pubkey: str = "") -> dict:
     """
     Instala SK no nó via HTTP /api/wallet/set_validator_sk.
 
-    O server.py v9.9.28 chama wallet_integrator.integrate_and_propagate:
+    O server.py v9.9.32 chama wallet_integrator.integrate_and_propagate:
       1. instala SK local
       2. configura multisig
       3. avisa o Origin (se cliente)
+
+    [v3.21] Retorna dict com error_code classificado + ok + sk_installed
+    + todos os campos do server. Sempre inclui "ok" (False quando falhou).
     """
     if not sk_hex:
-        return {"ok": False, "msg": "sk vazio"}
+        return {"ok": False, "msg": "sk vazio", "error_code": "empty_sk",
+                "sk_installed": False}
     try:
         r = _post("/api/wallet/set_validator_sk", {
             "sk_hex": sk_hex,
             "address": address or "",
             "pubkey":  pubkey or "",
         }, timeout=15.0)
+        if not isinstance(r, dict):
+            return {"ok": False, "msg": "resposta inválida", "error_code": "bad_response",
+                    "sk_installed": False}
         if not r.get("ok"):
-            log.warning("_sync_sk_to_chain falhou: %s", r.get("msg"))
-        else:
-            log.info(
-                "_sync_sk_to_chain ok — pk=%s… propagated=%s peers=%s",
-                (r.get("pubkey") or "")[:16],
-                r.get("propagated", False),
-                r.get("peers_notified", 0),
-            )
+            msg = r.get("msg", "") or str(r)
+            r["error_code"] = _classify_post_error(msg)
+            r.setdefault("sk_installed", False)
+            log.warning("_sync_sk_to_chain falhou [%s]: %s",
+                        r["error_code"], msg)
+            return r
+        log.info(
+            "_sync_sk_to_chain ok — pk=%s… sk_installed=%s propagated=%s peers=%s",
+            (r.get("pubkey") or pubkey or "")[:16],
+            r.get("sk_installed"),
+            r.get("propagated", False),
+            r.get("peers_notified", 0),
+        )
         return r
     except Exception as e:
         log.warning("_sync_sk_to_chain exception: %s", e)
-        return {"ok": False, "msg": str(e)}
+        return {"ok": False, "msg": str(e), "error_code": "exception",
+                "sk_installed": False}
+
+
+def _verify_sk_on_node(pubkey_hex: str) -> dict:
+    """
+    [v3.21] Confirma via /api/consensus/validators que o NÓ realmente
+    tem a SK instalada com essa pubkey. Fonte de verdade final.
+
+    Retorna:
+      {"installed": bool, "local_pk_full": str, "source": "...",
+       "n_trust": int, "n_active": int, "required_sigs": int,
+       "bootstrap_would_fire": bool, "raw": dict}
+    """
+    out = {"installed": False, "local_pk_full": "", "source": "unavailable",
+           "n_trust": 0, "n_active": 0, "required_sigs": 0,
+           "bootstrap_would_fire": None, "raw": {}}
+    if not pubkey_hex:
+        out["source"] = "no_pubkey"
+        return out
+
+    pubkey_hex = pubkey_hex.strip().lower()
+
+    # Preferência: /api/consensus/validators (v9.9.32 traz local_pk_full)
+    try:
+        r = _get("/api/consensus/validators", timeout=5.0)
+        if isinstance(r, dict) and r.get("ok"):
+            out["raw"] = r
+            local_full = (r.get("local_pk_full") or "").strip().lower()
+            out["local_pk_full"] = local_full
+            out["n_trust"] = int(r.get("n_trust", 0) or 0)
+            out["n_active"] = int(r.get("n_active", 0) or 0)
+            out["required_sigs"] = int(r.get("required_sigs", 0) or 0)
+            out["bootstrap_would_fire"] = bool(r.get("bootstrap_would_fire", False))
+            if local_full and local_full == pubkey_hex:
+                out["installed"] = True
+                out["source"] = "consensus/validators:full_match"
+                return out
+            if r.get("local_pk_installed") and not local_full:
+                # Servidor antigo (<v9.9.32) não retorna local_pk_full
+                out["source"] = "consensus/validators:truncated_only"
+            elif local_full and local_full != pubkey_hex:
+                out["source"] = f"consensus/validators:mismatch({local_full[:16]})"
+                return out
+    except Exception as e:
+        log.debug("_verify_sk_on_node: /api/consensus/validators falhou: %s", e)
+
+    # Fallback: /health
+    try:
+        r = _get("/health", timeout=5.0)
+        if isinstance(r, dict) and r.get("ok"):
+            out["raw"] = r
+            installed_flag = bool(r.get("wallet_sk_installed"))
+            val = r.get("validators") or {}
+            local_trunc = (val.get("local_pk") or "").rstrip(".").strip().lower()
+            if not installed_flag:
+                out["source"] = "health:wallet_sk_installed=false"
+                return out
+            if local_trunc and pubkey_hex.startswith(local_trunc):
+                out["installed"] = True
+                out["source"] = "health:prefix_match"
+                return out
+            if local_trunc and not pubkey_hex.startswith(local_trunc):
+                out["source"] = f"health:prefix_mismatch({local_trunc})"
+                return out
+            # wallet_sk_installed=True mas sem pk exposta: assume OK
+            if installed_flag and not local_trunc:
+                out["installed"] = True
+                out["source"] = "health:flag_only"
+                return out
+    except Exception as e:
+        log.debug("_verify_sk_on_node: /health falhou: %s", e)
+
+    if out["source"] == "unavailable":
+        out["source"] = "all_endpoints_failed"
+    return out
 
 
 def _get_default_password() -> str:
@@ -302,6 +421,95 @@ def _populate_session_from_data(data: dict) -> None:
     )
 
 
+def _build_unlock_response(source: str, sync_r: dict,
+                            verification: dict | None = None) -> dict:
+    """
+    [v3.21] Monta a resposta de unlock_wallet/load_wallet/create
+    consolidando sync_r + verificação cruzada do nó.
+
+    Classifica erros:
+      - error_code em {connection, timeout, server_offline, no_requests}
+        → warning (transitório, GUI deve avisar mas não travar)
+      - error_code em {rejected, server_error, empty_sk, bad_response}
+        → error (o servidor recusou, precisa intervenção)
+
+    Sempre inclui:
+      - sk_installed (bool, com cross-check)
+      - node_will_sign (bool derivado)
+      - verification_source ("sync" | "cross_check" | "none")
+      - warnings, errors (listas)
+    """
+    sk_installed = bool(sync_r.get("sk_installed", False))
+    in_trust = bool(sync_r.get("in_trust", False))
+    multisig_ready = bool(sync_r.get("multisig_ready", False))
+    propagated = bool(sync_r.get("propagated", False))
+    peers_notified = int(sync_r.get("peers_notified", 0) or 0)
+    warnings = list(sync_r.get("warnings", []) or [])
+    errors = list(sync_r.get("errors", []) or [])
+    verification_source = "sync"
+
+    error_code = sync_r.get("error_code", "")
+    msg = sync_r.get("msg", "")
+
+    if not sk_installed:
+        # Cross-check com o nó — talvez a SK já estava instalada de
+        # uma sessão anterior e o _sync falhou por rede.
+        verify_pubkey = (_WALLET_SESSION.get("public_key") or "").strip()
+        if verify_pubkey:
+            try:
+                v = _verify_sk_on_node(verify_pubkey)
+            except Exception as e:
+                v = {"installed": False, "source": f"verify_exception:{e}"}
+        else:
+            v = {"installed": False, "source": "no_pubkey"}
+        verification = v
+        if v.get("installed"):
+            sk_installed = True
+            verification_source = f"cross_check:{v.get('source','?')}"
+            warnings.append(
+                f"SK verificada no nó via {v.get('source')} "
+                f"(sync HTTP havia falhado com {error_code or 'erro'})"
+            )
+        else:
+            verification_source = f"cross_check_failed:{v.get('source','?')}"
+
+    if not sk_installed:
+        if error_code in ("connection", "timeout", "server_offline", "no_requests"):
+            warnings.append(
+                f"NÓ NÃO ASSINARÁ — servidor inacessível ({error_code}). "
+                f"Verifique se main.py está rodando em :5000 e use "
+                f"retry_sk_sync() quando voltar."
+            )
+        elif error_code:
+            errors.append(
+                f"SK REJEITADA pelo nó [{error_code}]: {msg or 'sem detalhes'}"
+            )
+        else:
+            warnings.append(
+                "SK NÃO foi instalada no nó — nó não vai assinar blocos. "
+                "Chame retry_sk_sync() ou reinicie a carteira."
+            )
+
+    node_will_sign = bool(sk_installed)
+
+    return {
+        "ok": True,
+        "address": _WALLET_SESSION.get("address", ""),
+        "source": source,
+        "sk_installed": sk_installed,
+        "node_will_sign": node_will_sign,
+        "verification_source": verification_source,
+        "in_trust": in_trust,
+        "multisig_ready": multisig_ready,
+        "propagated": propagated,
+        "peers_notified": peers_notified,
+        "warnings": warnings,
+        "errors": errors,
+        "sync_error_code": error_code,
+        "verification": verification or {},
+    }
+
+
 # ═══════════════════════════════════════════════════════════════
 # WalletApi
 # ═══════════════════════════════════════════════════════════════
@@ -341,6 +549,10 @@ class WalletApi:
           2. Se falhar: WalletManager.load_encrypted_wallet em wallets/*.wallet
           3. Se decifrou via WalletManager, salva em current_wallet.enc
           4. POST /api/wallet/set_validator_sk (integra + propaga)
+
+        [v3.21] Retorna warning/error explícitos quando sk_installed=False
+        e node_will_sign=False. Antes retornava ok:True silencioso e a
+        GUI mostrava "aberta" mesmo com o nó sem SK (bug do #4301).
         """
         global _WALLET_SESSION
         pwd = (password or "").strip() or _get_default_password()
@@ -391,25 +603,46 @@ class WalletApi:
                 _WALLET_SESSION.get("address", ""),
                 _WALLET_SESSION.get("public_key", ""),
             )
+        else:
+            sync_r = {
+                "ok": False, "error_code": "no_private_key",
+                "msg": "carteira sem private_key no payload",
+                "sk_installed": False,
+            }
 
         log.info(
-            "[wallet] unlock OK via %s — address=%s…",
+            "[wallet] unlock OK via %s — address=%s… sk_installed=%s node_will_sign=%s",
             source, _WALLET_SESSION["address"][:16],
+            sync_r.get("sk_installed", False),
+            sync_r.get("ok") and sync_r.get("sk_installed", False),
         )
 
-        return {
-            "ok": True,
-            "address": _WALLET_SESSION["address"],
-            "source": source,
-            "sk_installed": sync_r.get("sk_installed", False),
-            "in_trust": sync_r.get("in_trust", False),
-            "in_top5": sync_r.get("in_top5", False),
-            "multisig_ready": sync_r.get("multisig_ready", False),
-            "propagated": sync_r.get("propagated", False),
-            "peers_notified": sync_r.get("peers_notified", 0),
-            "warnings": sync_r.get("warnings", []),
-            "errors": sync_r.get("errors", []),
-        }
+        return _build_unlock_response(source or "unknown", sync_r)
+
+    def retry_sk_sync(self) -> dict:
+        """
+        [v3.21] Reinstala a SK no nó para a carteira atualmente
+        desbloqueada. Idempotente. Use quando a rede voltar após um
+        unlock_wallet() com sk_installed=False.
+
+        Não fecha nem reabre a carteira — só refaz o POST e
+        re-verifica o estado do nó.
+        """
+        if not _WALLET_SESSION.get("address"):
+            return {"ok": False, "msg": "wallet não desbloqueada"}
+        sk = _WALLET_SESSION.get("private_key", "")
+        if not sk:
+            return {"ok": False, "msg": "sessão sem private_key"}
+
+        log.info("[retry_sk_sync] tentando reinstalar SK para %s…",
+                 _WALLET_SESSION["address"][:16])
+
+        sync_r = _sync_sk_to_chain(
+            sk,
+            _WALLET_SESSION.get("address", ""),
+            _WALLET_SESSION.get("public_key", ""),
+        )
+        return _build_unlock_response("retry", sync_r)
 
     def create_and_unlock(self, password: str) -> dict:
         global _WALLET_SESSION
@@ -480,17 +713,7 @@ class WalletApi:
             _populate_session_from_data(data)
             sync_r = _sync_sk_to_chain(w.priv_hex, w.address, w.pub_hex)
 
-            return {
-                "ok": True,
-                "address": w.address,
-                "source": "create",
-                "sk_installed": sync_r.get("sk_installed", False),
-                "in_trust": sync_r.get("in_trust", False),
-                "in_top5": sync_r.get("in_top5", False),
-                "multisig_ready": sync_r.get("multisig_ready", False),
-                "propagated": sync_r.get("propagated", False),
-                "peers_notified": sync_r.get("peers_notified", 0),
-            }
+            return _build_unlock_response("create", sync_r)
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
@@ -597,30 +820,28 @@ class WalletApi:
                 "private_key": w.priv_hex,
                 "public_key": w.pub_hex,
             })
-            _sync_sk_to_chain(w.priv_hex, w.address, w.pub_hex)
-            return {
+            sync_r = _sync_sk_to_chain(w.priv_hex, w.address, w.pub_hex)
+            resp = _build_unlock_response("generate", sync_r)
+            resp.update({
                 "address": w.address,
                 "private_key": w.priv_hex,
                 "public_key": w.pub_hex,
-                "ok": True,
-            }
+            })
+            return resp
         except Exception as e:
             return {"erro": str(e)}
 
     # ═══════════════════════════════════════════════════════════
-    # [FIX v3.20] save_wallet com detecção de assinatura
+    # save_wallet com detecção de assinatura (v3.20 mantido)
     # ═══════════════════════════════════════════════════════════
     def save_wallet(self, name: str, password: str,
                     address: str, sk: str, pk: str) -> dict:
         """
         Salva carteira em wallets/{name}.wallet via WalletManager.
 
-        [FIX v3.20] Detecta 3 assinaturas possíveis de
-        save_encrypted_wallet (kwargs, positional 5-args, positional
-        3-args). Antes, chamada positional fixa falhava em versões
-        antigas com assinatura diferente.
+        Detecta 3 assinaturas possíveis de save_encrypted_wallet
+        (kwargs, positional 5-args, positional 3-args).
         """
-        # Validação básica
         if not name or not name.strip():
             return {"ok": False, "msg": "nome vazio"}
         if not password:
@@ -640,7 +861,6 @@ class WalletApi:
         if not hasattr(WalletManager, "save_encrypted_wallet"):
             return {"ok": False, "msg": "WalletManager.save_encrypted_wallet inexistente"}
 
-        # Tenta 3 assinaturas — na ordem mais provável
         erros = []
         try:
             r = WalletManager.save_encrypted_wallet(
@@ -682,7 +902,6 @@ class WalletApi:
         except Exception as e:
             erros.append(f"3-args: {type(e).__name__} {e}")
 
-        # Fallback: write direto via _save_blob (aad=b"wallet")
         try:
             from secure_store import _save_blob
             path = BASE_DIR / "wallets" / f"{name}.wallet"
@@ -700,16 +919,14 @@ class WalletApi:
         return {"ok": False, "msg": " | ".join(erros[-2:])}
 
     # ═══════════════════════════════════════════════════════════
-    # [FIX v3.20] load_wallet com strip de .wallet
+    # load_wallet com strip de .wallet (v3.20) + sync_r (v3.21)
     # ═══════════════════════════════════════════════════════════
     def load_wallet(self, name: str, password: str) -> dict:
         """
         Carrega carteira nomeada.
 
-        [FIX v3.20] Strip de ".wallet" ANTES de chamar o WalletManager.
-        Antes, se o HTML passasse "masmasmasmas.wallet", o
-        WalletManager procurava "wallets/masmasmasmas.wallet.wallet"
-        e retornava "arquivo vazio".
+        [v3.20] Strip de ".wallet" ANTES de chamar o WalletManager.
+        [v3.21] Propaga sync_r (SK install) igual ao unlock_wallet.
         """
         global _WALLET_SESSION
         if not name:
@@ -717,49 +934,69 @@ class WalletApi:
         if not password:
             return {"ok": False, "msg": "senha vazia"}
 
-        # [FIX] Strip .wallet do nome
         name = name.strip()
         if name.endswith(".wallet"):
             name = name[:-7]
         elif name.endswith(".enc"):
             name = name[:-4]
 
+        data = None
+        source = None
+
         try:
             from wallet import WalletManager
             r = WalletManager.load_encrypted_wallet(name, password)
             if r and (not isinstance(r, dict) or r.get("ok") is not False):
                 if isinstance(r, dict):
-                    _populate_session_from_data(r)
-                    if _WALLET_SESSION.get("private_key"):
-                        _sync_sk_to_chain(
-                            _WALLET_SESSION["private_key"],
-                            _WALLET_SESSION["address"],
-                            _WALLET_SESSION["public_key"],
-                        )
-                return r if isinstance(r, dict) else {"ok": True, "address": ""}
-            return r or {"ok": False, "msg": "resposta vazia"}
-
+                    data = r
+                    source = f"WalletManager:{name}"
+                else:
+                    # resposta estranha (True ou string) sem dict: não dá
+                    # pra popular a sessão. Retorna cru pra compat.
+                    return r if isinstance(r, dict) else {"ok": True, "address": ""}
+            else:
+                return r or {"ok": False, "msg": "resposta vazia"}
         except Exception as e_load:
-            # Fallback: tenta _load_blob direto
+            # Fallback: _load_blob direto
             try:
                 from secure_store import _load_blob
                 path = BASE_DIR / "wallets" / f"{name}.wallet"
                 if path.exists():
                     data = _load_blob(str(path), password, b"wallet")
                     if data and data.get("private_key"):
-                        _populate_session_from_data(data)
-                        if _WALLET_SESSION.get("private_key"):
-                            _sync_sk_to_chain(
-                                _WALLET_SESSION["private_key"],
-                                _WALLET_SESSION["address"],
-                                _WALLET_SESSION["public_key"],
-                            )
+                        source = f"_load_blob:{name}"
                         log.info("[load_wallet] OK via _load_blob fallback: %s", path)
-                        return {"ok": True, **data}
             except Exception:
                 pass
+            if not data:
+                return {"ok": False, "msg": str(e_load)}
 
-            return {"ok": False, "msg": str(e_load)}
+        if not data:
+            return {"ok": False, "msg": "carteira carregada mas sem dados"}
+
+        # Normaliza e popula sessão
+        if not data.get("private_key"):
+            data["private_key"] = data.get("priv_hex") or data.get("sk") or ""
+        if not data.get("public_key"):
+            data["public_key"] = data.get("pub_hex") or data.get("pubkey") or ""
+
+        _populate_session_from_data(data)
+
+        sync_r = {}
+        if _WALLET_SESSION.get("private_key"):
+            sync_r = _sync_sk_to_chain(
+                _WALLET_SESSION["private_key"],
+                _WALLET_SESSION.get("address", ""),
+                _WALLET_SESSION.get("public_key", ""),
+            )
+        else:
+            sync_r = {
+                "ok": False, "error_code": "no_private_key",
+                "msg": "carteira sem private_key",
+                "sk_installed": False,
+            }
+
+        return _build_unlock_response(source or "load_wallet", sync_r)
 
     def get_experiment_variant(self) -> dict:
         try:
@@ -865,6 +1102,7 @@ class WalletApi:
                 "last_block_sigs": last_sigs,
                 "is_multisig_active": required >= 1,
                 "last_block_ready": last_sigs >= required if required > 0 else True,
+                "bootstrap_would_fire": bool(validators_resp.get("bootstrap_would_fire", False)),
             }
         except Exception as e:
             return {"ok": False, "msg": str(e), "validators_active": 0, "required_sigs": 0}
@@ -1050,11 +1288,30 @@ class WalletApi:
             pool_running = bool(ps.get("running", False))
         except Exception:
             pass
+
+        node_verification = {}
+        if _WALLET_SESSION.get("public_key"):
+            try:
+                node_verification = _verify_sk_on_node(_WALLET_SESSION["public_key"])
+                # Não vaza o raw (pode ser grande)
+                node_verification = {
+                    "installed": bool(node_verification.get("installed")),
+                    "source": node_verification.get("source"),
+                    "n_trust": node_verification.get("n_trust"),
+                    "n_active": node_verification.get("n_active"),
+                    "required_sigs": node_verification.get("required_sigs"),
+                    "bootstrap_would_fire": node_verification.get("bootstrap_would_fire"),
+                }
+            except Exception as e:
+                node_verification = {"error": str(e)}
+
         return {
             "version": __version__, "api_base": API_BASE,
             "has_requests": _HAS_REQUESTS,
             "wallet_locked": not bool(_WALLET_SESSION.get("address")),
             "wallet_address": _WALLET_SESSION.get("address", ""),
+            "wallet_public_key": _WALLET_SESSION.get("public_key", ""),
+            "node_verification": node_verification,
             "pool_client_running": pool_running,
             "pool_url_resolved": self._resolve_pool_url(),
             "consensus": consensus_info,
@@ -1089,6 +1346,12 @@ def _self_test() -> int:
     r = api.ping()
     if r.get("ok"):
         print(f"[1] ping OK — height={r.get('height')} v={r.get('version', '?')}")
+        val = r.get("validators") or {}
+        if val:
+            print(f"    validators: n_trust={val.get('n_trust')} "
+                  f"n_active={val.get('n_active')} "
+                  f"required_sigs={val.get('required_sigs')} "
+                  f"bootstrap_would_fire={val.get('bootstrap_would_fire')}")
     else:
         print(f"[1] [X] ping: {r} (main.py offline?)")
 
@@ -1101,16 +1364,95 @@ def _self_test() -> int:
     for w in lw:
         print(f"      - {w}")
 
-    # [NOVO v3.20] Testa strip de .wallet
     pw = _get_default_password()
     if pw and lw:
         first = lw[0]["name"]
-        print(f"\n[4] Teste load_wallet('{first}.wallet') — deve strip:")
+        print(f"\n[4] Teste load_wallet('{first}.wallet'):")
         r = api.load_wallet(f"{first}.wallet", pw)
-        print(f"      resultado: ok={r.get('ok')} address={(r.get('address') or '')[:16]}…")
+        print(f"    ok={r.get('ok')} address={(r.get('address') or '')[:16]}…")
+        print(f"    sk_installed={r.get('sk_installed')} "
+              f"node_will_sign={r.get('node_will_sign')} "
+              f"verification_source={r.get('verification_source')}")
+        for w in (r.get("warnings") or []):
+            print(f"    [WARN] {w}")
+        for e in (r.get("errors") or []):
+            print(f"    [ERR]  {e}")
 
     print("\n" + "=" * 60)
     print(" SELF-TEST CONCLUIDO")
+    print("=" * 60)
+    return 0
+
+
+def _cmd_verify_sk() -> int:
+    """
+    [v3.21] Carrega senha do env, faz unlock e imprime o estado
+    completo. Útil para debugar o #4301 sem abrir a GUI.
+    """
+    print(f"app_wallet_v3.py v{__version__} — --verify-sk")
+    print(f"API_BASE: {API_BASE}")
+    print("=" * 60)
+
+    pw = _get_default_password()
+    if not pw:
+        print("[X] Senha não encontrada no env "
+              "(BRN_PASSWORD / BRN_WALLET_SESSION_PASS / BRN_NODE_PASSWORD)")
+        return 1
+
+    if not _HAS_REQUESTS:
+        print("[X] requests não instalado")
+        return 1
+
+    api = WalletApi()
+    print("[1] unlock_wallet(pwd do env)…")
+    r = api.unlock_wallet(pw)
+
+    print(f"\n    ok               = {r.get('ok')}")
+    print(f"    address          = {r.get('address')}")
+    print(f"    source           = {r.get('source')}")
+    print(f"    sk_installed     = {r.get('sk_installed')}  <-- O QUE IMPORTA")
+    print(f"    node_will_sign   = {r.get('node_will_sign')}  <-- DERIVADO")
+    print(f"    verification     = {r.get('verification_source')}")
+    print(f"    in_trust         = {r.get('in_trust')}")
+    print(f"    multisig_ready   = {r.get('multisig_ready')}")
+    print(f"    propagated       = {r.get('propagated')}")
+    print(f"    peers_notified   = {r.get('peers_notified')}")
+    print(f"    sync_error_code  = {r.get('sync_error_code') or '(nenhum)'}")
+
+    for w in (r.get("warnings") or []):
+        print(f"\n    [WARN] {w}")
+    for e in (r.get("errors") or []):
+        print(f"\n    [ERR]  {e}")
+
+    if not r.get("ok"):
+        print(f"\n[X] unlock falhou: {r.get('msg')}")
+        return 1
+
+    if not r.get("sk_installed"):
+        print("\n" + "=" * 60)
+        print(" [!] ATENÇÃO: SK NÃO INSTALADA — NÓ NÃO VAI ASSINAR")
+        print("=" * 60)
+        print(" Sem SK o nó fica com got=0 em validators_sig.")
+        print(" É exatamente o que o log do #4301 mostra:")
+        print("   'Bloco #4301 ... tem 0. Faltam: 02eeec..., 03244d..., 03b992d...'")
+        print()
+        print(" Diagnóstico:")
+        ec = r.get("sync_error_code") or ""
+        if ec in ("connection", "timeout", "server_offline", "no_requests"):
+            print(f"  - _sync_sk_to_chain falhou com erro TRANSITÓRIO ({ec})")
+            print("  - main.py pode estar offline ou o servidor em :5000 caiu")
+            print("  - rode 'python3 app_wallet_v3.py --verify-sk' de novo quando voltar")
+            print("  - ou chame retry_sk_sync() pela GUI")
+        elif ec:
+            print(f"  - _sync_sk_to_chain foi REJEITADA pelo servidor ({ec})")
+            print("  - verifique BRN_STRICT_MULTISIG e wallet_integrator")
+            print("  - os logs do main.py/server.py devem ter o motivo")
+        else:
+            print("  - sync_r veio vazio: carteira sem private_key?")
+        return 2
+
+    print("\n" + "=" * 60)
+    print(" [ok] SK INSTALADA — NÓ DEVE ASSINAR NORMALMENTE")
     print("=" * 60)
     return 0
 
@@ -1121,6 +1463,8 @@ if __name__ == "__main__":
 
     p = argparse.ArgumentParser(prog="app_wallet_v3.py")
     p.add_argument("--self-test", action="store_true")
+    p.add_argument("--verify-sk", action="store_true",
+                   help="unlock do env + imprime estado da SK no nó")
     p.add_argument("--version", action="store_true")
     args = p.parse_args()
 
@@ -1131,5 +1475,8 @@ if __name__ == "__main__":
     if args.self_test:
         sys.exit(_self_test())
 
-    print("Uso: python3 app_wallet_v3.py --self-test")
+    if args.verify_sk:
+        sys.exit(_cmd_verify_sk())
+
+    print("Uso: python3 app_wallet_v3.py --self-test | --verify-sk | --version")
     sys.exit(0)
