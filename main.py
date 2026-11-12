@@ -1,22 +1,17 @@
-"""main.py — Entrypoint do nó BRN (v13.9.10)
+
+"""main.py — Entrypoint do nó BRN (v13.9.12)
 ================================================================
-v13.9.10 (2026-11-11) — MULTI-MÁQUINA (CLIENTES WINDOWS):
-  [NEW] --no-auto-config: cliente que só quer sincronizar sem
-        tentar auto-SK nem auto-mine.
-  [NEW] --no-gui: força headless mesmo em Windows com display.
-  [NEW] Defaults NEUTROS: não força IP do Origin. Prioriza:
-          1. env var (BRN_BOOTSTRAP_PEERS / BRN_POOL_URL)
-          2. bootstrap_peers.json (lido automaticamente)
-          3. vazio (cliente só sync, sem pool)
-        Evita PCs tentando conectar em Origin errada.
-  [NEW] Detecção de contexto:
-          - is_origin=True  → auto-mine padrão se env não setado
-          - is_origin=False → só auto-mine se BRN_AUTO_MINE=1
-  [NEW] Log [CONFIG] mostra origem de cada parâmetro.
+v13.9.12 (2026-11-11) — PROMPT INTERATIVO PARA ABRIR CARTEIRA:
+  [NEW] _prompt_password_interactive(): se a GUI tem carteira salva
+        mas nenhuma senha do env funciona, PERGUNTA no console.
+        Aceita 3 tentativas. Se o usuário der ENTER vazio ou errar
+        3x, abre a GUI sem carteira (para criar/carregar manual).
+  [NEW] Funciona só em terminal interativo (sys.stdin.isatty()).
+        Em modo headless ou batch sem stdin, pula o prompt.
+  [NEW] Se carteira NÃO existe em disco, abre GUI direto para criar.
+  [KEEP] v13.9.11: auto-unlock via env vars + gui_wallet_source no /health
+  [KEEP] v13.9.10: multi-máquina (defaults neutros, --no-auto-config, --no-gui)
   [KEEP] v13.9.9: ping rápido + auto-mine persistente
-  [KEEP] v13.9.8: seed determinístico
-  [KEEP] v13.9.7: /health.sk_validation
-  [KEEP] v13.9.5: isolation_detector no watchdog
 ================================================================
 """
 from __future__ import annotations
@@ -39,10 +34,9 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.10"
+    VERSION = "13.9.12"
     BUILD_DATE = "2026-11-11"
 
-# [AI v13.9.5] Detector de isolamento
 try:
     from isolation_detector import IsolationDetector
     _HAS_ISOLATION = True
@@ -50,7 +44,6 @@ except ImportError:
     IsolationDetector = None
     _HAS_ISOLATION = False
 
-# [AUTO-CONFIG v13.9.6] SK + mineração automáticas
 try:
     import wallet_integrator as _wi
     _HAS_WI = True
@@ -65,7 +58,6 @@ except ImportError:
     _requests = None
     _HAS_REQUESTS = False
 
-# [VALIDAÇÃO v13.9.7] Wallet
 try:
     from wallet import Wallet as _Wallet
     _HAS_WALLET = True
@@ -73,7 +65,6 @@ except ImportError:
     _Wallet = None
     _HAS_WALLET = False
 
-# Estado global da validação de SK (para /health)
 SK_VALIDATION_STATE = {
     "checked": False,
     "ok": False,
@@ -85,6 +76,7 @@ SK_VALIDATION_STATE = {
     "pubkey_derived": "",
     "origin_online": None,
     "auto_mine_status": "idle",
+    "gui_wallet_source": "",
 }
 
 
@@ -93,20 +85,22 @@ SK_VALIDATION_STATE = {
 # ============================================================
 def parse_args():
     p = argparse.ArgumentParser(prog="main.py")
-    p.add_argument("--headless", action="store_true", help="sem GUI")
-    p.add_argument("--no-gui", action="store_true", help="força headless mesmo com display")
-    p.add_argument("--client-mode", action="store_true", help="nó cliente")
-    p.add_argument("--origem", action="store_true", help="força BRN_IS_ORIGIN=1")
-    p.add_argument("--no-pool-client", action="store_true", help="não inicia PoolClient")
+    p.add_argument("--headless", action="store_true")
+    p.add_argument("--no-gui", action="store_true")
+    p.add_argument("--client-mode", action="store_true")
+    p.add_argument("--origem", action="store_true")
+    p.add_argument("--no-pool-client", action="store_true")
     p.add_argument("--no-auto-config", action="store_true",
                    help="não tenta auto-SK nem auto-mine (só sync)")
-    p.add_argument("--no-p2p", action="store_true", help="desliga P2P")
-    p.add_argument("--no-explorer", action="store_true", help="não inicia Explorer")
-    p.add_argument("--db", metavar="PATH", default=None, help="caminho do DB")
-    p.add_argument("--web-port", type=int, default=None, help="porta HTTP")
-    p.add_argument("--p2p-port", type=int, default=None, help="porta P2P")
-    p.add_argument("--version", action="store_true", help="mostra versão")
-    p.add_argument("--skip-verify", action="store_true", help="pula verificações")
+    p.add_argument("--no-interactive", action="store_true",
+                   help="nunca pergunta senha (só env vars)")
+    p.add_argument("--no-p2p", action="store_true")
+    p.add_argument("--no-explorer", action="store_true")
+    p.add_argument("--db", metavar="PATH", default=None)
+    p.add_argument("--web-port", type=int, default=None)
+    p.add_argument("--p2p-port", type=int, default=None)
+    p.add_argument("--version", action="store_true")
+    p.add_argument("--skip-verify", action="store_true")
     return p.parse_args()
 
 
@@ -136,7 +130,6 @@ def _load_env_file():
 
 
 def _read_bootstrap_json() -> str:
-    """Lê bootstrap_peers.json (lista) → 'peer1,peer2'."""
     p = BASE_DIR / "bootstrap_peers.json"
     if not p.exists():
         return ""
@@ -285,7 +278,7 @@ def _check_blockchain_version() -> bool:
 
 
 # ============================================================
-# SETUP (trust, p2p, sync, broadcast, pool, web, explorer, gui)
+# SETUP
 # ============================================================
 def _setup_trust(chain, node_id_priv, is_origin: bool):
     try:
@@ -492,15 +485,174 @@ def _start_explorer(chain):
         logging.getLogger("main").debug("[explorer] não iniciou: %s", e)
 
 
-def _start_gui() -> bool:
+# ============================================================
+# [v13.9.12] PROMPT INTERATIVO PARA ABRIR CARTEIRA
+# ============================================================
+def _candidate_gui_passwords() -> list:
+    cands = []
+    seen = set()
+
+    def _add(src: str, val: str):
+        v = (val or "").strip()
+        if not v or v in seen:
+            return
+        seen.add(v)
+        cands.append((src, v))
+
+    _add("env:BRN_WALLET_SESSION_PASS",
+         os.environ.get("BRN_WALLET_SESSION_PASS", ""))
+    _add("env:BRN_VALIDATOR_SEED",
+         os.environ.get("BRN_VALIDATOR_SEED", ""))
+    _add("env:BRN_NODE_PASSWORD",
+         os.environ.get("BRN_NODE_PASSWORD", ""))
+
+    p = BASE_DIR / ".node_password"
+    if p.exists():
+        try:
+            _add("file:.node_password", p.read_text(encoding="utf-8").strip())
+        except Exception:
+            pass
+
+    return cands
+
+
+def _prompt_password_interactive(api, max_attempts: int = 3) -> tuple:
+    log = logging.getLogger("main")
+
+    try:
+        if not sys.stdin.isatty():
+            log.info("[GUI] prompt de senha pulado (stdin não interativo)")
+            return False, "no_stdin", "", "stdin não é TTY"
+    except Exception:
+        return False, "no_stdin", "", "stdin check falhou"
+
+    print()
+    print("=" * 60)
+    print(" 🔐 ABRIR CARTEIRA BRN")
+    print("=" * 60)
+    print(" Carteira salva encontrada em disco.")
+    print(" Digite a senha para abrir (ou ENTER para abrir a GUI vazia).")
+    print()
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            pw = input(f" Senha [{attempt}/{max_attempts}]: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n [cancelado]")
+            return False, "cancelled", "", "cancelado"
+
+        if not pw:
+            print(" [vazio] — abrindo GUI sem carteira")
+            return False, "empty_input", "", "usuário deixou vazio"
+
+        try:
+            r = api.unlock_wallet(pw)
+            if r.get("ok"):
+                addr = r.get("address", "")
+                print(f" ✅ Carteira aberta: {addr}")
+                SK_VALIDATION_STATE["gui_wallet_source"] = f"interactive:{attempt}"
+                SK_VALIDATION_STATE["address_derived"] = addr
+                SK_VALIDATION_STATE["address_configured"] = addr[:40] if addr else ""
+                return True, f"interactive:{attempt}", addr, ""
+            else:
+                print(f" ❌ Senha incorreta: {r.get('msg', '?')}")
+        except Exception as e:
+            print(f" ❌ Erro: {e}")
+
+    print()
+    print(" ❌ Senha incorreta %d vezes. Abrindo GUI sem carteira." % max_attempts)
+    print("    Use 'Carregar' ou 'Gerar nova' na interface.")
+    SK_VALIDATION_STATE["gui_wallet_source"] = "interactive_failed"
+    return False, "interactive_failed", "", f"{max_attempts} tentativas falharam"
+
+
+def _auto_unlock_gui(api, allow_interactive: bool = True) -> tuple:
+    log = logging.getLogger("main")
+
+    try:
+        has = api.has_wallet()
+        if not has.get("exists"):
+            log.info("[GUI] nenhuma carteira em disco — GUI abrirá para GERAR nova")
+            SK_VALIDATION_STATE["gui_wallet_source"] = "no_wallet_on_disk"
+            return False, "no_wallet_on_disk", "", "sem carteira em disco"
+    except Exception as e:
+        log.warning("[GUI] has_wallet() falhou: %s", e)
+        return False, "has_wallet_error", "", str(e)
+
+    try:
+        aw = api.get_active_wallet()
+        if aw.get("ok") and aw.get("address"):
+            log.info("[GUI] carteira JÁ desbloqueada: %s…", aw["address"][:32])
+            SK_VALIDATION_STATE["gui_wallet_source"] = "already_unlocked"
+            return True, "already_unlocked", aw["address"], ""
+    except Exception:
+        pass
+
+    cands = _candidate_gui_passwords()
+    for src, pw in cands:
+        try:
+            log.info("[GUI] tentando unlock com %s (len=%d)…", src, len(pw))
+            r = api.unlock_wallet(pw)
+            if r.get("ok"):
+                addr = r.get("address", "")
+                log.info("[GUI] ✅ carteira ABERTA com %s — address=%s", src, addr)
+                SK_VALIDATION_STATE["gui_wallet_source"] = src
+                SK_VALIDATION_STATE["address_derived"] = addr
+                SK_VALIDATION_STATE["address_configured"] = addr[:40] if addr else ""
+                return True, src, addr, ""
+        except Exception as e:
+            log.debug("[GUI] %s exception: %s", src, e)
+
+    if allow_interactive:
+        log.info(
+            "[GUI] nenhuma senha do env funcionou (%d tentadas). "
+            "Pedindo no console...", len(cands),
+        )
+        ok, src, addr, err = _prompt_password_interactive(api, max_attempts=3)
+        if ok:
+            log.info("[GUI] ✅ carteira ABERTA via %s — address=%s", src, addr)
+            return True, src, addr, ""
+        else:
+            log.warning(
+                "[GUI] prompt falhou (%s) — GUI abrirá sem carteira. "
+                "Use 'Carregar' ou 'Gerar nova'.", src,
+            )
+            return False, src, "", err
+
+    log.warning(
+        "[GUI] ❌ não consegui abrir a carteira. "
+        "Clique em 'Carregar' ou 'Gerar nova' na GUI."
+    )
+    SK_VALIDATION_STATE["gui_wallet_source"] = "all_passwords_failed"
+    return False, "all_passwords_failed", "", "todas as senhas falharam"
+
+
+def _start_gui(allow_interactive: bool = True) -> bool:
     try:
         import webview
         from app_wallet_v3 import WalletApi
+        log = logging.getLogger("main")
+
         api = WalletApi()
+
+        log.info("[GUI] tentando abrir carteira salva...")
+        ok, source, addr, err = _auto_unlock_gui(
+            api, allow_interactive=allow_interactive
+        )
+
+        if ok:
+            log.info("[GUI] auto-unlock OK (source=%s) — janela com carteira", source)
+        elif source == "no_wallet_on_disk":
+            log.info("[GUI] sem carteira — janela abre em modo CRIAÇÃO")
+        else:
+            log.info("[GUI] sem carteira aberta (%s) — janela abre vazia", source)
+
         wallet_path = BASE_DIR / "index_wallet.html"
         if not wallet_path.exists():
             wallet_path = BASE_DIR / "panel.html"
         url = wallet_path.as_uri() if wallet_path.exists() else "about:blank"
+
+        log.info("[gui] abrindo %s", wallet_path.name)
         webview.create_window("BRN Wallet", url=url, width=1100, height=780, js_api=api)
         webview.start()
         return True
@@ -589,22 +741,20 @@ def _resolve_validator_sk() -> tuple:
 
 
 # ============================================================
-# [v13.9.9] Ping rápido no Origin
+# [v13.9.9] Ping Origin + install local + auto-mine
 # ============================================================
 def _ping_origin(timeout: float = 3.0) -> bool:
     log = logging.getLogger("main")
     pool_url = os.environ.get("BRN_POOL_URL", "").strip().rstrip("/")
     if not pool_url:
-        log.debug("[ORIGIN] BRN_POOL_URL vazio — não posso pingar")
         return False
 
     if not _HAS_REQUESTS:
         try:
             import urllib.request
-            import urllib.error
             req = urllib.request.Request(
                 f"{pool_url}/api/status",
-                headers={"User-Agent": "brn-main/13.9.10"},
+                headers={"User-Agent": "brn-main/13.9.12"},
             )
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.status == 200
@@ -620,9 +770,6 @@ def _ping_origin(timeout: float = 3.0) -> bool:
         return False
 
 
-# ============================================================
-# [v13.9.9] Instala SK local sem propagar
-# ============================================================
 def _install_sk_local_only(chain, sk_hex: str, address: str, pubkey: str) -> bool:
     log = logging.getLogger("main")
     try:
@@ -634,9 +781,6 @@ def _install_sk_local_only(chain, sk_hex: str, address: str, pubkey: str) -> boo
         return False
 
 
-# ============================================================
-# [v13.9.9] Auto-mine loop persistente
-# ============================================================
 def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
                     stop_evt: threading.Event) -> None:
     log = logging.getLogger("main")
@@ -649,7 +793,6 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
     while not stop_evt.is_set():
         try:
             if getattr(chain, "_local_validator_sk", None) is None:
-                log.info("[AUTO-MINE] SK ainda ausente — aguardando instalação")
                 SK_VALIDATION_STATE["auto_mine_status"] = "waiting_sk"
                 if stop_evt.wait(10):
                     break
@@ -665,10 +808,6 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
                         data = r.json()
                         if data.get("running"):
                             SK_VALIDATION_STATE["auto_mine_status"] = "running"
-                            log.debug(
-                                "[AUTO-MINE] PoolClient já rodando (miner_id=%s)",
-                                data.get("miner_id", "?"),
-                            )
                             if stop_evt.wait(30):
                                 break
                             continue
@@ -694,7 +833,6 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
             log.info("[AUTO-MINE] Origin online — iniciando PoolClient...")
 
             if not _HAS_REQUESTS:
-                log.error("[AUTO-MINE] requests indisponível")
                 SK_VALIDATION_STATE["auto_mine_status"] = "error_no_requests"
                 if stop_evt.wait(60):
                     break
@@ -709,7 +847,7 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
                 try:
                     data = r.json() if r.content else {}
                 except Exception:
-                    data = {"ok": False, "msg": f"HTTP {r.status_code} sem JSON"}
+                    data = {"ok": False, "msg": f"HTTP {r.status_code}"}
 
                 if data.get("ok"):
                     failures = 0
@@ -737,18 +875,16 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
             break
 
     SK_VALIDATION_STATE["auto_mine_status"] = "stopped"
-    log.info("[AUTO-MINE] loop encerrado")
 
 
 # ============================================================
-# [v13.9.10] AUTO-CONFIG (multi-máquina)
+# AUTO-CONFIG
 # ============================================================
 def _auto_configure(chain, p2p, trust, web_port: int,
                     is_origin: bool, stop_evt: threading.Event,
                     force_auto_mine: bool = False) -> None:
     log = logging.getLogger("main")
 
-    # ─── 1. Resolve SK ───
     sk_hex, address, pubkey, source = _resolve_validator_sk()
 
     SK_VALIDATION_STATE["checked"] = True
@@ -761,7 +897,7 @@ def _auto_configure(chain, p2p, trust, web_port: int,
     SK_VALIDATION_STATE["pubkey_derived"] = pubkey
 
     log.info("=" * 64)
-    log.info(" [SK RESOLUTION v13.9.10]")
+    log.info(" [SK RESOLUTION v13.9.12]")
     log.info("=" * 64)
     log.info("  source           : %s", source or "(nenhum)")
     log.info("  SK_HEX len       : %d", len(sk_hex) if sk_hex else 0)
@@ -776,10 +912,8 @@ def _auto_configure(chain, p2p, trust, web_port: int,
     log.info("  RESULTADO        : ✅ SK resolvida")
     log.info("=" * 64)
 
-    # ─── 2. Instala SK local (sempre) ───
     _install_sk_local_only(chain, sk_hex, address, pubkey)
 
-    # ─── 3. Ping Origin ───
     log.info("[AUTO-CONFIG] pingando Origin...")
     t0 = time.time()
     origin_online = _ping_origin(timeout=3.0)
@@ -811,22 +945,20 @@ def _auto_configure(chain, p2p, trust, web_port: int,
                 log.exception("[AUTO-CONFIG] integrate_and_propagate falhou: %s", e)
     else:
         log.warning(
-            "[AUTO-CONFIG] ⚠️ Origin OFFLINE (%.0fms) — SK instalada localmente. "
-            "Auto-mine monitora até Origin voltar.",
+            "[AUTO-CONFIG] ⚠️ Origin OFFLINE (%.0fms) — SK instalada localmente.",
             dt_ms,
         )
 
-    # ─── 4. Decide se inicia auto-mine ───
     env_auto_mine = os.environ.get("BRN_AUTO_MINE", "").strip()
     if env_auto_mine == "1":
         should_mine = True
         reason = "BRN_AUTO_MINE=1"
     elif env_auto_mine == "0":
         should_mine = False
-        reason = "BRN_AUTO_MINE=0 (explícito)"
+        reason = "BRN_AUTO_MINE=0"
     elif force_auto_mine:
         should_mine = True
-        reason = "--auto-mine (flag CLI)"
+        reason = "--auto-mine"
     elif is_origin:
         should_mine = True
         reason = "origin (padrão)"
@@ -841,7 +973,6 @@ def _auto_configure(chain, p2p, trust, web_port: int,
         return
 
     if not address or not pubkey:
-        log.warning("[AUTO-CONFIG] faltam ADDRESS/PUBKEY")
         SK_VALIDATION_STATE["auto_mine_status"] = "error_no_addr"
         return
 
@@ -865,15 +996,9 @@ def _delayed_auto_configure(chain, p2p, trust, web_port: int,
 
 
 # ============================================================
-# [v13.9.10] CONFIG — resolve defaults neutros
+# CONFIG
 # ============================================================
 def _resolve_config(log) -> dict:
-    """
-    Resolve os parâmetros de rede com prioridade:
-      1. env var explícita
-      2. bootstrap_peers.json (para bootstrap)
-      3. vazio (sem forçar IP)
-    """
     cfg = {
         "bootstrap": "",
         "bootstrap_source": "(vazio)",
@@ -881,7 +1006,6 @@ def _resolve_config(log) -> dict:
         "pool_url_source": "(vazio)",
     }
 
-    # ─── bootstrap ───
     env_bootstrap = os.environ.get("BRN_BOOTSTRAP_PEERS", "").strip()
     if env_bootstrap:
         cfg["bootstrap"] = env_bootstrap
@@ -893,13 +1017,11 @@ def _resolve_config(log) -> dict:
             cfg["bootstrap_source"] = "file:bootstrap_peers.json"
             os.environ["BRN_BOOTSTRAP_PEERS"] = json_bootstrap
 
-    # ─── pool_url ───
     env_pool = os.environ.get("BRN_POOL_URL", "").strip()
     if env_pool:
         cfg["pool_url"] = env_pool
         cfg["pool_url_source"] = "env:BRN_POOL_URL"
     else:
-        # Tenta inferir do primeiro bootstrap peer (host:porta)
         if cfg["bootstrap"]:
             first = cfg["bootstrap"].split(",")[0].strip()
             if ":" in first:
@@ -941,18 +1063,15 @@ def main() -> int:
     log.info(" base=%s env_loaded=%d", BASE_DIR, loaded)
     log.info("=" * 64)
 
-    # [v13.9.10] Resolve config neutra
     cfg = _resolve_config(log)
     log.info("[CONFIG] BRN_BOOTSTRAP_PEERS: %s (%s)",
              cfg["bootstrap"] or "(vazio)", cfg["bootstrap_source"])
     log.info("[CONFIG] BRN_POOL_URL: %s (%s)",
              cfg["pool_url"] or "(vazio)", cfg["pool_url_source"])
 
-    # [1] Version gate
     if not _check_blockchain_version():
         return 6
 
-    # [2] Port guard
     try:
         import port_guard
         port_guard.check_brn_ports(checar_explorer=not args.no_explorer)
@@ -961,7 +1080,6 @@ def main() -> int:
     except Exception:
         pass
 
-    # [3] Node identity
     try:
         node_id_priv, node_id_pub = _load_or_create_node_identity()
         log.info("[identity] pub=%s…", node_id_pub[:16])
@@ -969,7 +1087,6 @@ def main() -> int:
         log.error(str(e))
         return 3
 
-    # [4] Chain
     try:
         from blockchain import Blockchain
         chain = Blockchain(db_path, auto_genesis=False)
@@ -978,36 +1095,32 @@ def main() -> int:
         log.error("[chain] fatal: %s", e)
         return 2
 
-    # [5] Trust
     trust = _setup_trust(chain, node_id_priv, is_origin)
     if trust is None:
-        log.error("[trust] não carregou — multi-sig DESLIGADO")
+        log.error("[trust] não carregou")
         if os.environ.get("BRN_STRICT_MULTISIG") == "1":
             return 7
     else:
         log.info("[trust] carregado (origin=%s)", is_origin)
 
-    log.info("[wallet] boot sem carteira (design v13.9.10)")
+    log.info("[wallet] boot sem carteira (design v13.9.12) — "
+             "GUI tentará abrir carteira salva (auto + prompt interativo)")
 
-    # [6] P2P
     p2p = None
     if not args.no_p2p:
         p2p = _setup_p2p(chain, node_id_priv, p2p_port)
         if p2p is not None:
             log.info("[p2p] iniciado na porta %d", p2p_port)
 
-    # [7] Sync
     sync_mgr = None
     if p2p:
         sync_mgr = _setup_sync(chain, p2p)
         if sync_mgr:
             log.info("[sync] ChainSyncManager iniciado")
 
-    # [8] Broadcast
     if p2p:
         _setup_broadcast(chain, p2p)
 
-    # [9] TrustDaemon + Watchdog
     _stop_bg = threading.Event()
     _setup_trust_daemon(
         chain, trust, p2p,
@@ -1023,15 +1136,12 @@ def main() -> int:
         name="Wallet-Watchdog",
     ).start()
 
-    # [10] Pool (origin only)
     pool = _setup_pool(chain, is_origin)
 
-    # [11] Web server
     ok_http = _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port)
     if not ok_http:
         log.error("[server] HTTP não subiu")
 
-    # [11.5] [AUTO-CONFIG v13.9.10]
     if not args.no_auto_config and not args.no_pool_client:
         threading.Thread(
             target=_delayed_auto_configure,
@@ -1041,20 +1151,16 @@ def main() -> int:
         ).start()
         log.info("[AUTO-CONFIG] agendado (3s)")
     else:
-        if args.no_auto_config:
-            log.info("[AUTO-CONFIG] desligado por --no-auto-config")
-        else:
-            log.info("[AUTO-CONFIG] desligado por --no-pool-client")
+        log.info("[AUTO-CONFIG] desligado")
 
-    # [12] Explorer
     if not args.no_explorer:
         _start_explorer(chain)
 
-    # [13] GUI ou headless
     want_gui = (not args.headless) and (not args.no_gui)
     if want_gui:
-        log.info("[gui] abrindo")
-        if _start_gui():
+        allow_interactive = not args.no_interactive
+        log.info("[gui] abrindo (interativo=%s)", allow_interactive)
+        if _start_gui(allow_interactive=allow_interactive):
             return 0
     else:
         if args.no_gui:
@@ -1065,7 +1171,6 @@ def main() -> int:
                  os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
         log.info("=" * 64)
 
-    # [14] Shutdown
     def _shutdown(*_):
         log.info("[shutdown] encerrando...")
         try: _stop_bg.set()
@@ -1088,19 +1193,11 @@ def main() -> int:
     log.info(" NÓ ATIVO — Ctrl+C para encerrar")
     log.info("   API      : http://%s:%d",
              os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
-    if not args.no_explorer:
-        log.info("   Explorer : http://0.0.0.0:%s",
-                 os.environ.get("BRN_EXPLORER_PORT", "8080"))
     log.info("   Wallet   : http://%s:%d/wallet",
              os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
     log.info("   Health   : http://%s:%d/health",
              os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
     log.info("   P2P      : :%d", p2p_port)
-    log.info("   Bootstrap: %s", cfg["bootstrap"] or "(vazio)")
-    log.info("   Pool URL : %s", cfg["pool_url"] or "(vazio)")
-    log.info("   SK source: %s",
-             os.environ.get("BRN_VALIDATOR_SEED") and "env:seed"
-             or (os.environ.get("BRN_VALIDATOR_SK_HEX") and "env:sk_hex" or "(resolve no boot)"))
     log.info("=" * 64)
 
     try:
