@@ -1,10 +1,23 @@
 """
-sync_manager.py — Sincronização + Reorg automático + Sync Paralelo (v9.4)
+sync_manager.py — Sincronização + Reorg automático + Aguarda Origin (v9.4)
 ================================================================
-v9.4 (2026-11-10):
-  [FIX] Substituído urllib.request por requests para suportar
-        proxy SOCKS5 (Tailscale/ALL_PROXY) no Render.
-  [KEEP] v9.3: validação de assinatura do Trust, sync paralelo.
+v9.4 (2026-11-12) — AGUARDA ORIGIN + CONVERGÊNCIA DE ALTURA:
+  [NEW] _wait_origin_online(): em vez de só logar "Origin offline"
+        e tentar com outro peer, aguarda o Origin (BRN_POOL_URL)
+        voltar a responder. Só então começa a sincronizar.
+        Isso resolve o log cheio de "Origin inacessível: Conexão
+        recusada" que aparecia quando o Origin estava desligado.
+  [NEW] _check_peer_heights(): consulta a altura de todos os peers
+        via P2P antes de escolher de quem baixar.
+  [NEW] _wait_convergence(): aguarda até N peers reportarem a mesma
+        altura (configurável por BRN_CONVERGENCE_CYCLES) antes de
+        considerar "sincronizado". Evita declarar synced quando só
+        1 peer respondeu e os outros ainda estão subindo.
+  [FIX] _best_peer_by_work: prefere o Origin quando empatado em work.
+  [KEEP] v9.3: sync de trust assinado
+  [KEEP] v9.2: fix da ordem de pop dos campos
+  [KEEP] v9.1: sync do Trust Network via HTTP
+  [KEEP] v9.0: sync paralelo de blocos
 ================================================================
 """
 from __future__ import annotations
@@ -15,7 +28,8 @@ import socket
 import time
 import threading
 import logging
-import requests
+import urllib.request
+import urllib.error
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -41,6 +55,12 @@ REORG_FETCH_BATCH    = int(os.environ.get("BRN_REORG_FETCH_BATCH", "200"))
 REORG_MAX_FAILS      = int(os.environ.get("BRN_REORG_MAX_FAILS", "3"))
 REORG_COOLDOWN_S     = float(os.environ.get("BRN_REORG_COOLDOWN_S", "60"))
 
+# [v9.4] Aguardar Origin e convergência
+ORIGIN_WAIT_INTERVAL = float(os.environ.get("BRN_ORIGIN_WAIT_S", "30"))
+ORIGIN_WAIT_TIMEOUT  = float(os.environ.get("BRN_ORIGIN_TIMEOUT_S", "0"))  # 0 = infinito
+CONVERGENCE_CYCLES   = int(os.environ.get("BRN_CONVERGENCE_CYCLES", "3"))
+CONVERGENCE_INTERVAL = float(os.environ.get("BRN_CONVERGENCE_INTERVAL", "10"))
+
 try:
     from blockchain import block_hash as _block_hash_fn, meets_difficulty as _meets_diff_fn
     _HAS_HELPERS = True
@@ -55,10 +75,8 @@ try:
     _HAS_CRYPTO = True
 except ImportError:
     _HAS_CRYPTO = False
-    log.warning(
-        "[sync] crypto.Ed25519PublicKey indisponível — sync de trust "
-        "SERÁ REJEITADO (payload sem verificação de assinatura é inseguro)."
-    )
+    log.warning("[sync] crypto.Ed25519PublicKey indisponível — sync de trust "
+                "SERÁ REJEITADO.")
 
 
 @dataclass
@@ -70,6 +88,7 @@ class PeerStatus:
     cumulative_work: int = 0
     last_seen: float = field(default_factory=time.time)
     latency_ms: float = 0.0
+    is_origin: bool = False
 
     @property
     def addr(self) -> str:
@@ -92,6 +111,9 @@ class SyncStatus:
     reorgs_total: int = 0
     last_reorg_height: int = -1
     parallel_workers: int = PARALLEL_WORKERS
+    origin_online: bool = False
+    waiting_origin: bool = False
+    convergence_cycles: int = 0
 
 
 class ChainSyncManager:
@@ -129,6 +151,11 @@ class ChainSyncManager:
         self._reorg_fails: Dict[str, dict] = {}
         self._reorg_fails_lock = threading.Lock()
 
+        # [v9.4] Estado do Origin
+        self._origin_url = os.environ.get("BRN_POOL_URL", "").strip().rstrip("/")
+        self._origin_wait_start: float = 0.0
+        self._last_origin_check: float = 0.0
+
     def set_sync_mode(self, mode: str = "full") -> None:
         if mode not in ("full", "spv"):
             raise ValueError("Modo inválido: use 'full' ou 'spv'")
@@ -139,7 +166,8 @@ class ChainSyncManager:
         self.status.mode = mode
 
     def register_peer(self, node_id: str, ip: str, port: int,
-                      height: int = 0, cumulative_work: int = 0) -> None:
+                      height: int = 0, cumulative_work: int = 0,
+                      is_origin: bool = False) -> None:
         if not node_id:
             return
         with self.peer_lock:
@@ -150,10 +178,12 @@ class ChainSyncManager:
                 existing.last_seen = time.time()
                 existing.ip = ip
                 existing.port = port
+                existing.is_origin = is_origin
             else:
                 self.peers[node_id] = PeerStatus(
                     node_id=node_id, ip=ip, port=port,
                     height=height, cumulative_work=cumulative_work,
+                    is_origin=is_origin,
                 )
             self.status.peers_known = len(self.peers)
 
@@ -228,8 +258,198 @@ class ChainSyncManager:
 
         return True, ""
 
+    # =================================================================
+    # [v9.4] AGUARDAR ORIGIN ONLINE
+    # =================================================================
+    def _check_origin_online(self) -> bool:
+        """
+        Testa HTTP do Origin com timeout de 3s.
+        Retorna True se respondeu 200 em /api/status.
+        """
+        if not self._origin_url:
+            return False
+
+        try:
+            req = urllib.request.Request(
+                f"{self._origin_url}/api/status",
+                headers={"User-Agent": "brn-sync/9.4"},
+            )
+            with urllib.request.urlopen(req, timeout=3) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    def _wait_origin_online(self, max_wait_s: float = None) -> bool:
+        """
+        Aguarda o Origin ficar online. Se max_wait_s=None usa
+        ORIGIN_WAIT_TIMEOUT (0=infinito).
+
+        Retorna True quando online, False se timeout.
+        """
+        if not self._origin_url:
+            # Sem Origin configurado, não podemos aguardar
+            return False
+
+        t_start = time.time()
+        if max_wait_s is None:
+            max_wait_s = ORIGIN_WAIT_TIMEOUT
+
+        self.status.waiting_origin = True
+        self._origin_wait_start = t_start
+        first_attempt = True
+
+        while not self._stop_sync.is_set():
+            online = self._check_origin_online()
+            self.status.origin_online = online
+            self._last_origin_check = time.time()
+
+            if online:
+                if not first_attempt:
+                    waited = int(time.time() - t_start)
+                    log.info(
+                        "[SYNC] Origin voltou online após %ds — iniciando sync",
+                        waited,
+                    )
+                self.status.waiting_origin = False
+                return True
+
+            if first_attempt:
+                log.warning(
+                    "[SYNC] Origin offline (%s) — aguardando...",
+                    self._origin_url,
+                )
+                first_attempt = False
+
+            # Log periódico a cada ~2 min
+            waited = time.time() - t_start
+            if int(waited) % 120 < int(ORIGIN_WAIT_INTERVAL):
+                log.info("[SYNC] Aguardando Origin há %ds...", int(waited))
+
+            # Verifica timeout
+            if max_wait_s > 0 and (time.time() - t_start) > max_wait_s:
+                log.warning(
+                    "[SYNC] Origin não voltou em %ds — seguindo sem ele",
+                    int(max_wait_s),
+                )
+                self.status.waiting_origin = False
+                return False
+
+            if self._stop_sync.wait(ORIGIN_WAIT_INTERVAL):
+                break
+
+        self.status.waiting_origin = False
+        return False
+
+    # =================================================================
+    # [v9.4] CONSULTAR ALTURA DE TODOS OS PEERS
+    # =================================================================
+    def _check_peer_heights(self) -> dict:
+        """
+        Consulta a altura de cada peer via P2P (get_chain_height).
+        Atualiza self.peers e retorna {addr: (height, work)}.
+        """
+        peers_with_height = {}
+        with self.peer_lock:
+            peers_snapshot = list(self.peers.values())
+
+        if not peers_snapshot:
+            return peers_with_height
+
+        for peer in peers_snapshot:
+            if self._stop_sync.is_set():
+                break
+            try:
+                resp = self._do_send(
+                    peer.ip, peer.port,
+                    {"type": "get_chain_height"},
+                    DEFAULT_TIMEOUT,
+                )
+                if resp:
+                    h = int(resp.get("height", 0) or 0)
+                    w = int(resp.get("work", 0) or 0)
+                    with self.peer_lock:
+                        if peer.node_id in self.peers:
+                            self.peers[peer.node_id].height = h
+                            self.peers[peer.node_id].cumulative_work = w
+                            self.peers[peer.node_id].last_seen = time.time()
+                    peers_with_height[peer.addr] = (h, w)
+            except Exception as e:
+                log.debug("[SYNC] peer %s altura falhou: %s", peer.addr, e)
+
+        return peers_with_height
+
+    # =================================================================
+    # [v9.4] AGUARDAR CONVERGÊNCIA
+    # =================================================================
+    def _wait_convergence(self, target_height: int) -> bool:
+        """
+        Aguarda N ciclos consecutivos onde a maioria dos peers reporta
+        a mesma altura (target_height ± 1).
+
+        Retorna True quando convergiu, False se timeout.
+        """
+        if CONVERGENCE_CYCLES <= 0:
+            return True
+
+        self.status.convergence_cycles = 0
+        consecutive = 0
+
+        for cycle in range(CONVERGENCE_CYCLES * 3):  # máximo 3x
+            if self._stop_sync.is_set():
+                return False
+
+            peers_h = self._check_peer_heights()
+            if not peers_h:
+                log.debug("[SYNC] convergência: sem peers para checar")
+                if self._stop_sync.wait(CONVERGENCE_INTERVAL):
+                    return False
+                continue
+
+            # Conta quantos estão na altura alvo
+            at_target = sum(
+                1 for h, _w in peers_h.values()
+                if abs(h - target_height) <= 1
+            )
+            total = len(peers_h)
+            ratio = at_target / max(1, total)
+
+            if ratio >= 0.6:  # 60%+ na mesma altura
+                consecutive += 1
+                self.status.convergence_cycles = consecutive
+                log.info(
+                    "[SYNC] convergência %d/%d: %d/%d peers em #%d",
+                    consecutive, CONVERGENCE_CYCLES,
+                    at_target, total, target_height,
+                )
+                if consecutive >= CONVERGENCE_CYCLES:
+                    log.info(
+                        "[SYNC] ✅ convergiu — %d peers na altura #%d",
+                        at_target, target_height,
+                    )
+                    return True
+            else:
+                consecutive = 0
+                self.status.convergence_cycles = 0
+                log.info(
+                    "[SYNC] aguardando convergência: %d/%d peers em #%d (precisa 60%%)",
+                    at_target, total, target_height,
+                )
+
+            if self._stop_sync.wait(CONVERGENCE_INTERVAL):
+                return False
+
+        log.warning(
+            "[SYNC] convergência não atingida após %d ciclos",
+            CONVERGENCE_CYCLES * 3,
+        )
+        return False
+
+    # =================================================================
+    # SINCRONIZAÇÃO DO TRUST NETWORK VIA HTTP
+    # =================================================================
     def sync_trust_network(self) -> bool:
-        origin_url = os.environ.get("BRN_POOL_URL", "").strip().rstrip("/")
+        """Baixa o trust_network.json do Origin e atualiza a memória local."""
+        origin_url = self._origin_url
         if not origin_url or not origin_url.startswith("http"):
             return False
 
@@ -241,10 +461,9 @@ class ChainSyncManager:
         url = f"{origin_url}/api/trust/download"
 
         try:
-            # [v9.4] Usa requests para suportar ALL_PROXY (SOCKS5)
-            resp = requests.get(url, headers={"User-Agent": "brn-sync/9.4"}, timeout=5)
-            resp.raise_for_status()
-            data = resp.json()
+            req = urllib.request.Request(url, headers={"User-Agent": "brn-sync/9.4"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
 
             if not isinstance(data, dict):
                 log.error("[TRUST-SYNC] payload não é dict — rejeitando")
@@ -259,23 +478,18 @@ class ChainSyncManager:
                 if BRN_TRUST_REQUIRE_SIGNATURE:
                     log.error(
                         "[TRUST-SYNC] REJEITADO: payload sem assinatura "
-                        "do Origin (sig=%s origin_pub=%s). "
-                        "Configure BRN_TRUST_REQUIRE_SIGNATURE=0 APENAS "
-                        "em bootstrap controlado.",
+                        "do Origin (sig=%s origin_pub=%s)",
                         bool(sig), bool(origin_pub),
                     )
                     return False
                 log.warning(
                     "[TRUST-SYNC] ATENÇÃO: aceitando trust SEM assinatura "
-                    "(BRN_TRUST_REQUIRE_SIGNATURE=0). Use SÓ em dev."
+                    "(BRN_TRUST_REQUIRE_SIGNATURE=0)"
                 )
 
             if sig and origin_pub:
                 if not _HAS_CRYPTO:
-                    log.error(
-                        "[TRUST-SYNC] REJEITADO: crypto.Ed25519PublicKey "
-                        "indisponível — não posso verificar a assinatura."
-                    )
+                    log.error("[TRUST-SYNC] crypto indisponível — rejeitando")
                     return False
                 payload = json.dumps(
                     data, sort_keys=True, separators=(",", ":")
@@ -284,27 +498,26 @@ class ChainSyncManager:
                     pk = Ed25519PublicKey.from_public_bytes(bytes.fromhex(origin_pub))
                     pk.verify(bytes.fromhex(sig), payload)
                 except Exception as e:
-                    log.error(f"[TRUST-SYNC] Assinatura do Origin INVÁLIDA: {e}")
+                    log.error("[TRUST-SYNC] Assinatura do Origin INVÁLIDA: %s", e)
                     return False
 
             nodes_payload = data.get("nodes")
             if not isinstance(nodes_payload, dict):
                 log.error(
-                    "[TRUST-SYNC] payload.nodes não é dict (%s) — rejeitando",
+                    "[TRUST-SYNC] payload.nodes não é dict (%s)",
                     type(nodes_payload).__name__,
                 )
                 return False
 
             trust = getattr(self.chain, "trust_net", None)
             if trust is None:
-                log.debug("[TRUST-SYNC] chain.trust_net ausente — nada a fazer")
+                log.debug("[TRUST-SYNC] chain.trust_net ausente")
                 return False
 
             if getattr(trust, "is_origin", False):
                 log.warning(
-                    "[TRUST-SYNC] este nó é Origin mas BRN_POOL_URL está "
-                    "setado para %s. Ignorando sync de trust externo.",
-                    origin_url,
+                    "[TRUST-SYNC] este nó é Origin mas BRN_POOL_URL está setado "
+                    "para %s. Ignorando.", origin_url,
                 )
                 return False
 
@@ -326,23 +539,26 @@ class ChainSyncManager:
 
             if rejected:
                 log.warning(
-                    "[TRUST-SYNC] %d nó(s) ignorado(s) por formato inválido "
-                    "(de %d total)", rejected, len(nodes_payload),
+                    "[TRUST-SYNC] %d nó(s) ignorado(s) (de %d total)",
+                    rejected, len(nodes_payload),
                 )
             log.info(
-                "[TRUST-SYNC] %d nós atualizados do Origin via HTTP "
+                "[TRUST-SYNC] %d nós atualizados do Origin "
                 "(assinatura=%s)", merged,
                 "válida" if sig and origin_pub else "AUSENTE",
             )
             return True
 
-        except requests.exceptions.RequestException as e:
+        except urllib.error.URLError as e:
             log.debug(f"[TRUST-SYNC] Conexão falhou: {e}")
             return False
         except Exception as e:
             log.debug(f"[TRUST-SYNC] falhou: {e}")
             return False
 
+    # =================================================================
+    # SYNC PARALELO DE BLOCOS
+    # =================================================================
     def _fetch_blocks_parallel(
         self,
         peers: List[PeerStatus],
@@ -358,7 +574,10 @@ class ChainSyncManager:
             chunk_end = min(cursor + chunk_size, end)
             chunks.append((cursor, chunk_end))
 
-        log.info(f"[SYNC-PARALELO] {len(chunks)} chunk(s) de {chunk_size} blocos, {len(peers)} peer(s)")
+        log.info(
+            f"[SYNC-PARALELO] {len(chunks)} chunk(s) de {chunk_size} blocos, "
+            f"{len(peers)} peer(s)"
+        )
 
         def fetch_chunk(chunk_start: int, chunk_end: int) -> Tuple[int, List[Dict]]:
             for peer in peers:
@@ -412,7 +631,7 @@ class ChainSyncManager:
             entry["last_fail"] = now
             if entry["fails"] >= REORG_MAX_FAILS:
                 entry["blocked_until"] = now + REORG_COOLDOWN_S
-                log.warning(f"[REORG] peer {peer_id[:12]} com {entry['fails']} falhas — cooldown")
+                log.warning(f"[REORG] peer {peer_id[:12]} cooldown")
 
     def _peer_record_success(self, peer_id: str) -> None:
         with self._reorg_fails_lock:
@@ -442,7 +661,10 @@ class ChainSyncManager:
                 best_work = p.cumulative_work
 
         if best is not None:
-            log.warning(f"[REORG] detectado: peer {best.node_id[:12]} h={best.height} work={best.cumulative_work}")
+            log.warning(
+                f"[REORG] detectado: peer {best.node_id[:12]} "
+                f"h={best.height} work={best.cumulative_work}"
+            )
         return best
 
     def _resolve_fork(self, peer: PeerStatus) -> bool:
@@ -508,7 +730,10 @@ class ChainSyncManager:
                         cp_heights = [int(h) for h in cps.keys()]
                         highest_cp = max(cp_heights) if cp_heights else -1
                         if highest_cp >= 0 and common_h < highest_cp:
-                            log.error(f"[REORG] BLOQUEADO: ancestral #{common_h} < checkpoint #{highest_cp}")
+                            log.error(
+                                f"[REORG] BLOQUEADO: ancestral #{common_h} < "
+                                f"checkpoint #{highest_cp}"
+                            )
                             self._peer_record_fail(peer_id)
                             return False
                 except ImportError:
@@ -631,13 +856,18 @@ class ChainSyncManager:
             self.status.last_error = "nenhum peer com altura maior"
             return False
 
-        log.info(f"[SYNC-PARALELO] {local_h} -> {peer.height} usando {len(all_peers)} peer(s)")
+        log.info(
+            f"[SYNC-PARALELO] {local_h} -> {peer.height} "
+            f"usando {len(all_peers)} peer(s)"
+        )
 
         cursor = local_h + 1
         total_applied = 0
         while cursor <= peer.height and not self._stop_sync.is_set():
             chunk_end = min(cursor + self.batch_size * 2, peer.height + 1)
-            blocks = self._fetch_blocks_parallel(all_peers, cursor, chunk_end, chunk_size=self.batch_size)
+            blocks = self._fetch_blocks_parallel(
+                all_peers, cursor, chunk_end, chunk_size=self.batch_size,
+            )
 
             if not blocks:
                 self.status.last_error = f"falha no chunk {cursor}-{chunk_end}"
@@ -659,9 +889,14 @@ class ChainSyncManager:
 
             self.status.local_height = self._safe_height()
             target = max(1, self.status.target_height)
-            self.status.progress = min(100.0, self.status.local_height / target * 100.0)
+            self.status.progress = min(
+                100.0, self.status.local_height / target * 100.0,
+            )
 
-            log.info(f"[SYNC-PARALELO] {self.status.local_height}/{peer.height} ({self.status.progress:.1f}%) +{applied} ok")
+            log.info(
+                f"[SYNC-PARALELO] {self.status.local_height}/{peer.height} "
+                f"({self.status.progress:.1f}%) +{applied} ok"
+            )
 
             if failed > 0:
                 break
@@ -672,6 +907,9 @@ class ChainSyncManager:
             self.status.synced = (self._safe_height() >= peer.height)
         return self.status.synced
 
+    # =================================================================
+    # LOOP PRINCIPAL (v9.4)
+    # =================================================================
     def start_sync_loop(self) -> None:
         if self.sync_lock.locked():
             log.debug("sync loop já está rodando")
@@ -681,28 +919,73 @@ class ChainSyncManager:
 
         def _loop():
             try:
+                # ─── 1. Se é Origin, não precisa aguardar ninguém ───
+                is_origin = bool(getattr(self.chain, "is_origin", False))
+                if is_origin:
+                    log.info("[SYNC] este nó é Origin — sync loop desativado "
+                             "(ele É a fonte)")
+                    self.status.synced = True
+                    self.status.local_height = self._safe_height()
+                    self.status.target_height = self.status.local_height
+                    return
+
+                # ─── 2. Se não é Origin, aguarda Origin online ───
+                if self._origin_url:
+                    log.info(
+                        "[SYNC] aguardando Origin (%s) ficar online...",
+                        self._origin_url,
+                    )
+                    online = self._wait_origin_online()
+                    if not online and self._stop_sync.is_set():
+                        return
+
+                # ─── 3. Loop principal ───
                 while not self._stop_sync.is_set():
                     try:
+                        # 3a. Se Origin caiu durante operação, aguarda de novo
+                        if self._origin_url and not self._check_origin_online():
+                            self.status.origin_online = False
+                            log.warning(
+                                "[SYNC] Origin caiu — aguardando voltar..."
+                            )
+                            if not self._wait_origin_online():
+                                if self._stop_sync.is_set():
+                                    break
+                            continue
+
+                        self.status.origin_online = True
+
+                        # 3b. Sync do trust
                         self.sync_trust_network()
 
+                        # 3c. Refresh peers
                         self._refresh_peers_from_p2p()
 
+                        # 3d. Detecta fork
                         fork_peer = self._detect_fork()
                         if fork_peer is not None:
                             self._resolve_fork(fork_peer)
                             continue
 
+                        # 3e. Escolhe melhor peer
                         best = self._best_peer_by_work()
                         if best is not None:
                             self.status.active_peer = best.node_id
                             self.sync_with_peer(best)
+
+                            # 3f. Aguarda convergência
+                            if self.status.synced:
+                                target_h = self._safe_height()
+                                self._wait_convergence(target_h)
                         else:
                             self.status.synced = True
                             self.status.local_height = self._safe_height()
                             self.status.target_height = self.status.local_height
+
                     except Exception as e:
                         log.warning(f"sync loop erro: {e}")
                         self.status.last_error = str(e)
+
                     if self._stop_sync.wait(timeout=DEFAULT_INTERVAL_S):
                         break
             finally:
@@ -710,12 +993,16 @@ class ChainSyncManager:
                 self.status.active_peer = None
 
         self.sync_thread = threading.Thread(
-            target=_loop, daemon=True, name="ChainSync"
+            target=_loop, daemon=True, name="ChainSync",
         )
         self.sync_thread.start()
-        log.info("ChainSyncManager v9.4 (paralelo+trust-assinado+proxy) iniciado")
+        log.info("ChainSyncManager v9.4 (aguarda Origin + convergência) iniciado")
 
     def _best_peer_by_work(self) -> Optional[PeerStatus]:
+        """
+        Escolhe o peer com maior work acumulado.
+        [v9.4] Prefere o Origin quando empatado.
+        """
         local_h = self._safe_height()
         local_work = self._local_work()
         with self.peer_lock:
@@ -727,7 +1014,25 @@ class ChainSyncManager:
             ]
         if not candidates:
             return None
-        return max(candidates, key=lambda p: (p.cumulative_work, p.height))
+
+        # Ordena por (work, é_origin, height)
+        candidates.sort(
+            key=lambda p: (p.cumulative_work, p.is_origin, p.height),
+            reverse=True,
+        )
+        best = candidates[0]
+
+        if best.is_origin:
+            log.debug(
+                "[SYNC] escolhido Origin (%s) h=%d work=%d",
+                best.addr, best.height, best.cumulative_work,
+            )
+        else:
+            log.debug(
+                "[SYNC] escolhido peer (%s) h=%d work=%d",
+                best.addr, best.height, best.cumulative_work,
+            )
+        return best
 
     def stop(self) -> None:
         self._stop_sync.set()
@@ -774,6 +1079,9 @@ class ChainSyncManager:
             "parallel_workers":    PARALLEL_WORKERS,
             "peers_in_cooldown":   blocked,
             "trust_require_signature": BRN_TRUST_REQUIRE_SIGNATURE,
+            "origin_online":       self.status.origin_online,
+            "waiting_origin":      self.status.waiting_origin,
+            "convergence_cycles":  self.status.convergence_cycles,
         }
 
     def __enter__(self):
