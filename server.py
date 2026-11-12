@@ -1,33 +1,28 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.33)
+server.py — Backend HTTP do nó BRN (v9.9.34)
 ================================================================
-v9.9.33 (2026-11-12) — GATE DE MINERAÇÃO NO SERVER:
-  [NEW] _check_mining_gates(chain): gate autoritativo de mineração.
-        3 condições em sequência:
-          1. chain.db.height() >= BRN_FAST_SYNC_UNTIL (default 6000)
-          2. chain._local_validator_sk != None
-          3. >= BRN_MIN_VALIDATORS_FOR_MINING peers no DB (default 1)
-             em altura dentro de ±BRN_VALIDATOR_HEIGHT_TOLERANCE
-             (default 1) e last_seen <= BRN_VALIDATOR_MAX_AGE_S
-             (default 300s)
-        Cache de 2s para não martelar o DB em /api/status 1Hz.
-  [NEW] /api/pool/start_local retorna 409 + gate_reason quando os
-        gates NÃO passam. Antes, o server instanciava PoolClient
-        sem checar nada — PoolClient v7.2 já se auto-bloqueia, mas
-        o server é a fonte de verdade para a GUI.
-  [NEW] /api/miner/start idem (bloqueia mineração P2P/direta).
-  [NEW] /api/faucet idem (faucet minera 1 bloco).
-  [NEW] /api/mine/gate: expõe {mining_allowed, reason, detail}
-        sem efeito colateral. A GUI consulta antes de oferecer o
-        botão "Iniciar mineração".
-  [NEW] /api/status inclui: fast_sync_active, fast_sync_until,
-        validators_ready, validators_reason, mining_allowed.
-  [NEW] /health inclui: mining_gate (mesmo dict de /api/mine/gate
-        resumido), n_validators_synced, fast_sync_active.
-  [NEW] _MINE_GATE_CACHE (2s TTL) com lock.
-  [KEEP] v9.9.32: /api/consensus/validators via
-        chain.diagnose_validators() (honesto); /health com
-        validators summary; StateRefresh injetado por main.py.
+v9.9.34 (2026-11-12) — PAINEL /sync + SIGN_INFO:
+  [NEW] /api/sync/live: snapshot consolidado (sync + peers + validators
+        + mining_gate + signing). Calcula taxa blocos/s entre chamadas
+        e ETA. Quando _HTTP_SYNC_STATE está ativo, prevalece sobre o
+        cálculo do DB (percent, local, target, best_peer).
+  [NEW] /api/validators/sign_info: variáveis necessárias para assinar
+        blocos (BRN_VALIDATOR_SK_HEX, SEED, .validator_sk,
+        BRN_NODE_PASSWORD, etc) com estado sim/não, valor mascarado,
+        obrigatoriedade e descrição + onde setar no Render.
+  [NEW] /sync: serve sync_panel.html da raiz do projeto. Fallback 404
+        com instruções se o arquivo não existir.
+  [NEW] _build_peers_detail(chain): converte listar_peers() em lista
+        pronta para o painel (ip, height, delta, age_s, stale, synced).
+  [NEW] _build_sign_info(chain): detecta fonte de SK ativa e monta a
+        tabela de variáveis.
+  [NEW] _SYNC_LIVE_HISTORY: memória do último (ts, height) para
+        calcular taxa de download entre chamadas 2s do painel.
+  [KEEP] v9.9.33: mining gate (height/SK/validators) em
+        /api/pool/start_local, /api/miner/start, /api/faucet;
+        /api/mine/gate; /api/status com fast_sync/validators/mining.
+  [KEEP] v9.9.32: /api/consensus/validators via diagnose_validators();
+        /health com validators summary.
   [KEEP] v9.9.31: /api/sync-info expõe HTTP_SYNC_STATE.
 ================================================================
 """
@@ -79,7 +74,7 @@ TXT_HISTORY_LIMIT_DEFAULT = 200
 TXT_HISTORY_LIMIT_MAX = 500
 BOOTSTRAP_HTTP_PORT = int(os.environ.get("BRN_BOOTSTRAP_HTTP_PORT", os.environ.get("BRN_WEB_PORT", "5000")))
 
-# [v9.9.33] Gate de mineração — config por env
+# Mining gate (v9.9.33)
 _MIN_FAST_SYNC_UNTIL = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "6000") or "0")
 _MIN_VALIDATORS_FOR_MINING = max(1, int(os.environ.get("BRN_MIN_VALIDATORS_FOR_MINING", "1") or "1"))
 _VALIDATOR_HEIGHT_TOLERANCE = max(0, int(os.environ.get("BRN_VALIDATOR_HEIGHT_TOLERANCE", "1") or "1"))
@@ -87,6 +82,10 @@ _VALIDATOR_MAX_AGE_S = max(30, int(os.environ.get("BRN_VALIDATOR_MAX_AGE_S", "30
 _MINE_GATE_CACHE_TTL = 2.0
 _MINE_GATE_CACHE = {"ts": 0.0, "result": None}
 _MINE_GATE_LOCK = threading.Lock()
+
+# Sync live (v9.9.34)
+_SYNC_LIVE_HISTORY = {"ts": 0.0, "height": -1}
+_SYNC_LIVE_LOCK = threading.Lock()
 
 if not ADMIN_TOKEN: log.warning("[server] BRN_ADMIN_TOKEN vazio. /api/faucet ABERTO.")
 elif len(ADMIN_TOKEN) < 16: log.warning("[server] BRN_ADMIN_TOKEN curto.")
@@ -194,15 +193,10 @@ def _register_miner_in_trust(pubkey: str, address: str):
 
 
 # ============================================================
-# [v9.9.33] MINING GATE
+# MINING GATE (v9.9.33)
 # ============================================================
 def _check_validators_synced(chain, min_validators: int, tolerance: int,
                               max_age_s: int) -> tuple:
-    """
-    Verifica que >= min_validators peers estão na mesma altura
-    (dentro de `tolerance`) que o nó local, e vistos há <= max_age_s.
-    Retorna (ok, reason, detail).
-    """
     our_h = int(chain.db.height())
     now = time.time()
 
@@ -276,25 +270,6 @@ def _check_validators_synced(chain, min_validators: int, tolerance: int,
 
 
 def _check_mining_gates(chain, force_refresh: bool = False) -> dict:
-    """
-    [v9.9.33] Gate autoritativo de mineração.
-
-    Retorna dict:
-      {
-        "mining_allowed": bool,
-        "reason": str,       # ok | fast_sync_below_N | no_sk |
-                             # validators_not_synced | db_empty
-        "detail": {
-          "current_height", "fast_sync_until", "fast_sync_active",
-          "sk_installed", "local_pk",
-          "validators_ready", "validators_reason",
-          "validators_detail": {...},
-          "checks": {"height": {...}, "sk": {...}, "validators": {...}}
-        }
-      }
-
-    Cacheado por 2s para não martelar listar_peers() em /api/status 1Hz.
-    """
     now = time.time()
     with _MINE_GATE_LOCK:
         if (not force_refresh
@@ -342,7 +317,6 @@ def _check_mining_gates(chain, force_refresh: bool = False) -> dict:
         },
     }
 
-    # 1. Height gate
     if fast_sync_active:
         result = {
             "mining_allowed": False,
@@ -364,7 +338,6 @@ def _check_mining_gates(chain, force_refresh: bool = False) -> dict:
             _MINE_GATE_CACHE["result"] = result
         return result
 
-    # 2. SK gate
     if not sk_installed:
         result = {
             "mining_allowed": False,
@@ -386,7 +359,6 @@ def _check_mining_gates(chain, force_refresh: bool = False) -> dict:
             _MINE_GATE_CACHE["result"] = result
         return result
 
-    # 3. Validators gate
     ok_val, reason_val, detail_val = _check_validators_synced(
         chain,
         min_validators=_MIN_VALIDATORS_FOR_MINING,
@@ -448,6 +420,196 @@ def _invalidate_mining_gate_cache():
         _MINE_GATE_CACHE["result"] = None
 
 
+# ============================================================
+# SYNC LIVE helpers (v9.9.34)
+# ============================================================
+def _build_peers_detail(chain) -> list:
+    now = time.time()
+    our_h = int(chain.db.height())
+    out = []
+    try:
+        rows = chain.db.listar_peers(apenas_ativos=False)
+    except Exception:
+        rows = []
+    for p in (rows or []):
+        if not isinstance(p, dict):
+            continue
+        addr = (p.get("address") or "").strip()
+        if not addr:
+            continue
+        ip = addr.rsplit(":", 1)[0] if ":" in addr else addr
+        if not ip or ip.startswith("127.") or ip == "0.0.0.0":
+            continue
+        try:
+            ph = int(p.get("height", 0) or 0)
+        except (ValueError, TypeError):
+            ph = 0
+        try:
+            ls = float(p.get("last_seen", 0) or 0)
+        except (ValueError, TypeError):
+            ls = 0.0
+        age = int(now - ls) if ls > 0 else -1
+        delta = ph - our_h
+        stale = (age < 0 or age > _VALIDATOR_MAX_AGE_S)
+        synced = (not stale) and abs(delta) <= _VALIDATOR_HEIGHT_TOLERANCE
+        out.append({
+            "ip": ip,
+            "address": addr,
+            "height": ph,
+            "delta": delta,
+            "age_s": age,
+            "last_seen": int(ls) if ls > 0 else 0,
+            "stale": stale,
+            "synced": synced,
+        })
+    out.sort(key=lambda x: (x["stale"], not x["synced"], -x["height"]))
+    return out
+
+
+def _build_sign_info(chain) -> dict:
+    sk = getattr(chain, "_local_validator_sk", None)
+    can_sign = sk is not None
+    pubkey = ""
+    if can_sign:
+        try:
+            pubkey = getattr(sk, "pub_hex", "") or ""
+        except Exception:
+            pass
+
+    def _mask(v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            return ""
+        if len(v) <= 8:
+            return "•" * len(v)
+        return v[:4] + "•" * (len(v) - 8) + v[-4:]
+
+    sk_hex_set = bool(os.environ.get("BRN_VALIDATOR_SK_HEX", "").strip())
+    seed_set = bool(os.environ.get("BRN_VALIDATOR_SEED", "").strip())
+    node_pw_set = bool(
+        os.environ.get("BRN_NODE_PASSWORD", "").strip()
+        or os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
+        or (BASE_DIR / ".node_password").exists()
+    )
+    sk_file = BASE_DIR / ".validator_sk"
+    sk_file_set = sk_file.exists()
+
+    if not can_sign:
+        reason = "nenhuma SK válida instalada no nó"
+    else:
+        reason = ""
+
+    variables = [
+        {
+            "name": "BRN_VALIDATOR_SK_HEX",
+            "required": True,
+            "set": sk_hex_set,
+            "value_masked": _mask(os.environ.get("BRN_VALIDATOR_SK_HEX", "")),
+            "description": "Chave privada Ed25519 em hex (64 chars). Fonte MAIS direta. "
+                           "Setar isso sozinho já basta para o nó assinar. "
+                           "No Render: Environment → Add → BRN_VALIDATOR_SK_HEX = <64 hex>.",
+        },
+        {
+            "name": "BRN_VALIDATOR_SEED",
+            "required": False,
+            "set": seed_set,
+            "value_masked": _mask(os.environ.get("BRN_VALIDATOR_SEED", "")),
+            "description": "Alternativa a SK_HEX: uma string qualquer. O nó faz "
+                           "sha256(seed) para derivar a chave. Útil se você quer "
+                           "reproduzir a MESMA carteira entre deploys sem expor o hex. "
+                           "Se SK_HEX estiver setado, SK_HEX vence.",
+        },
+        {
+            "name": ".validator_sk",
+            "required": False,
+            "set": sk_file_set,
+            "value_masked": "(arquivo)" if sk_file_set else "(não existe)",
+            "description": "Arquivo na raiz do projeto com a chave em hex na 1ª linha. "
+                           "Fallback se nem SK_HEX nem SEED estiverem setados. "
+                           "No Render, arquivos não persistem entre deploys — prefira "
+                           "SK_HEX ou SEED.",
+        },
+        {
+            "name": "BRN_NODE_PASSWORD",
+            "required": False,
+            "set": node_pw_set,
+            "value_masked": "(definido)" if node_pw_set else "(não definido)",
+            "description": "Senha para decifrar node_identity.enc (identidade P2P). "
+                           "NÃO é a mesma coisa que a SK do validador. Sem ela, o nó "
+                           "gera uma identidade nova a cada boot (muda o node_id no P2P "
+                           "e o peer pode rejeitar). Defina para estabilidade.",
+        },
+        {
+            "name": "BRN_IS_ORIGIN",
+            "required": False,
+            "set": bool(os.environ.get("BRN_IS_ORIGIN", "").strip()),
+            "value_masked": os.environ.get("BRN_IS_ORIGIN", "0"),
+            "description": "1 = este nó é o Origin (serve pool, trust autoritativo, "
+                           "minera por padrão). 0 = cliente (precisa BRN_AUTO_MINE=1 "
+                           "e BRN_POOL_URL apontando para o Origin).",
+        },
+        {
+            "name": "BRN_POOL_URL",
+            "required": False,
+            "set": bool(os.environ.get("BRN_POOL_URL", "").strip()),
+            "value_masked": os.environ.get("BRN_POOL_URL", ""),
+            "description": "URL do Origin (ex: http://100.111.253.8:5000). "
+                           "Sem ela, o cliente não propaga SK nem minera via pool.",
+        },
+        {
+            "name": "BRN_AUTO_MINE",
+            "required": False,
+            "set": bool(os.environ.get("BRN_AUTO_MINE", "").strip()),
+            "value_masked": os.environ.get("BRN_AUTO_MINE", ""),
+            "description": "1 = cliente inicia mineração sozinho após os 4 gates. "
+                           "No Origin, mineração é padrão (não precisa setar). "
+                           "No cliente, sem isso o nó só sincroniza e assina sob demanda.",
+        },
+        {
+            "name": "BRN_STRICT_MULTISIG",
+            "required": False,
+            "set": bool(os.environ.get("BRN_STRICT_MULTISIG", "").strip()),
+            "value_masked": os.environ.get("BRN_STRICT_MULTISIG", "0"),
+            "description": "1 = desativa todos os bypasses de multi-sig. Deixe 0 durante "
+                           "bootstrap (rede pequena) e mude para 1 só quando todos os "
+                           "validadores estiverem alinhados em /api/consensus/validators.",
+        },
+        {
+            "name": "BRN_FAST_SYNC_UNTIL",
+            "required": False,
+            "set": bool(os.environ.get("BRN_FAST_SYNC_UNTIL", "").strip()),
+            "value_masked": os.environ.get("BRN_FAST_SYNC_UNTIL", "6000"),
+            "description": "Altura até a qual pular validação completa (PoW/merkle/sigs). "
+                           "Default 6000. Só afeta o boot — se o DB já passou, não ativa.",
+        },
+    ]
+
+    return {
+        "can_sign": can_sign,
+        "reason": reason,
+        "pubkey": pubkey,
+        "sk_source": (
+            "BRN_VALIDATOR_SK_HEX" if sk_hex_set else
+            "BRN_VALIDATOR_SEED" if seed_set else
+            ".validator_sk" if sk_file_set else
+            "chain._local_validator_sk (já em memória)"
+        ),
+        "variables": variables,
+        "current_env": {
+            "BRN_VALIDATOR_SK_HEX_set": sk_hex_set,
+            "BRN_VALIDATOR_SEED_set": seed_set,
+            "BRN_NODE_PASSWORD_set": node_pw_set,
+            "BRN_IS_ORIGIN": os.environ.get("BRN_IS_ORIGIN", "0"),
+            "BRN_AUTO_MINE": os.environ.get("BRN_AUTO_MINE", ""),
+            "BRN_POOL_URL": os.environ.get("BRN_POOL_URL", ""),
+            "BRN_STRICT_MULTISIG": os.environ.get("BRN_STRICT_MULTISIG", "0"),
+        },
+    }
+
+
+# ============================================================
+# APP
+# ============================================================
 app = Flask(__name__)
 if BEHIND_PROXY:
     try:
@@ -694,7 +856,6 @@ def status():
             try: peer_count = chain.db.contar_peers(apenas_ativos=True)
             except Exception: pass
 
-        # [v9.9.33] Gate de mineração no status
         gate = _check_mining_gates(chain)
         gd = gate.get("detail", {})
 
@@ -709,7 +870,6 @@ def status():
             "difficulty": chain.current_difficulty(),
             "fila_tamanho": len(chain.fila_mineracao),
             "rede_descentralizada": chain.rede_descentralizada,
-            # [v9.9.33]
             "fast_sync_active": bool(gd.get("fast_sync_active", False)),
             "fast_sync_until": int(gd.get("fast_sync_until", 0) or 0),
             "validators_ready": bool(gd.get("validators_ready", False)),
@@ -789,10 +949,6 @@ def sync_status():
 
 @app.route("/api/mine/gate", methods=["GET"])
 def api_mine_gate():
-    """
-    [v9.9.33] Gate autoritativo de mineração. Sem efeito colateral.
-    force=1 na query string invalida o cache.
-    """
     try:
         chain = _get_chain()
         force = request.args.get("force") == "1"
@@ -812,14 +968,10 @@ def api_mine_gate():
 @require_rate_limit("miner_start")
 def miner_start():
     try:
-        # [v9.9.33] Gate de mineração
         chain = _get_chain()
         gate = _check_mining_gates(chain, force_refresh=True)
         if not gate.get("mining_allowed"):
-            audit_log("miner_start_denied", {
-                "reason": gate.get("reason"),
-                "ip": get_client_ip(),
-            })
+            audit_log("miner_start_denied", {"reason": gate.get("reason"), "ip": get_client_ip()})
             return jsonify({
                 "ok": False,
                 "msg": f"Mineração bloqueada: {gate.get('reason')}",
@@ -1001,14 +1153,11 @@ def pool_local_status():
 
 @app.route("/api/pool/start_local", methods=["POST"])
 def pool_start_local():
-    # [v9.9.33] Gate de mineração ANTES de instanciar PoolClient
     try:
         chain = _get_chain()
         gate = _check_mining_gates(chain, force_refresh=True)
         if not gate.get("mining_allowed"):
-            log.warning(
-                "[server] pool/start_local DENEGADO: %s",
-                gate.get("reason"))
+            log.warning("[server] pool/start_local DENEGADO: %s", gate.get("reason"))
             return jsonify({
                 "ok": False,
                 "msg": f"Mineração bloqueada: {gate.get('reason')}",
@@ -1236,8 +1385,8 @@ def peers_discovered():
 def root():
     try:
         chain = _get_chain()
-        return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.33", "height": chain.db.height(), "health": "/health", "status": "/api/status", "mine_gate": "/api/mine/gate", "dashboard": "/dashboard", "wallet": "/wallet", "monitor": "/monitor", "panel": "/panel"})
-    except Exception as e: return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.33", "error": str(e)})
+        return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.34", "height": chain.db.height(), "health": "/health", "sync_panel": "/sync", "status": "/api/status", "mine_gate": "/api/mine/gate", "dashboard": "/dashboard", "wallet": "/wallet", "monitor": "/monitor", "panel": "/panel"})
+    except Exception as e: return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.34", "error": str(e)})
 
 
 @app.route("/dashboard", methods=["GET"])
@@ -1296,7 +1445,6 @@ def health():
         else:
             val_summary = {"error": "blockchain.py sem diagnose_validators()"}
 
-        # [v9.9.33] Gate de mineração
         gate = _check_mining_gates(chain)
         gd = gate.get("detail", {})
         gate_summary = {
@@ -1313,7 +1461,7 @@ def health():
         return jsonify({
             "ok": True,
             "height": chain.db.height(),
-            "version": "9.9.33",
+            "version": "9.9.34",
             "chain_injected": _CHAIN is not None,
             "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
@@ -1343,7 +1491,6 @@ def _shutdown():
 @_admin_required
 def faucet():
     try:
-        # [v9.9.33] Faucet minera 1 bloco → mesmo gate
         chain = _get_chain()
         gate = _check_mining_gates(chain, force_refresh=True)
         if not gate.get("mining_allowed"):
@@ -1400,11 +1547,6 @@ def api_get_block(height):
 @app.route("/api/consensus/validators", methods=["GET"])
 @require_rate_limit("status")
 def consensus_validators():
-    """
-    Fonte de verdade: chain.diagnose_validators() (blockchain v9.5.8).
-    v9.9.32: alinhado com o consenso (antes usava trust.get_top_validators
-    direto, que podia divergir de _get_active_validators).
-    """
     try:
         chain = _get_chain()
         trust = _get_trust_network()
@@ -1532,7 +1674,143 @@ def bridge_status():
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
 
+# ============================================================
+# SYNC LIVE PANEL (v9.9.34)
+# ============================================================
+@app.route("/api/sync/live", methods=["GET"])
+def api_sync_live():
+    try:
+        chain = _get_chain()
+        our_h = int(chain.db.height())
+
+        now = time.time()
+        with _SYNC_LIVE_LOCK:
+            prev_ts, prev_h = _SYNC_LIVE_HISTORY["ts"], _SYNC_LIVE_HISTORY["height"]
+            _SYNC_LIVE_HISTORY["ts"] = now
+            _SYNC_LIVE_HISTORY["height"] = our_h
+
+        if prev_ts > 0 and prev_h >= 0 and our_h > prev_h and (now - prev_ts) > 0:
+            rate = (our_h - prev_h) / (now - prev_ts)
+        else:
+            rate = 0.0
+
+        peers = _build_peers_detail(chain)
+        target_h = max([our_h] + [p["height"] for p in peers]) if peers else our_h
+        remaining = max(0, target_h - our_h)
+        pct = 100.0 if target_h == 0 else min(100.0, round((max(our_h, 0) / target_h) * 100.0, 1))
+
+        if rate > 0 and remaining > 0:
+            eta_s = int(remaining / rate)
+        elif remaining == 0:
+            eta_s = 0
+        else:
+            eta_s = -1
+
+        best_peer = ""
+        if _HTTP_SYNC_STATE and _HTTP_SYNC_STATE.get("syncing"):
+            pct = float(_HTTP_SYNC_STATE.get("percent", pct))
+            target_h = int(_HTTP_SYNC_STATE.get("target_height", target_h))
+            our_h = int(_HTTP_SYNC_STATE.get("local_height", our_h))
+            remaining = max(0, target_h - our_h)
+            best_peer = _HTTP_SYNC_STATE.get("best_peer", "")
+            if rate <= 0 and remaining > 0:
+                eta_s = -1
+            elif remaining == 0:
+                eta_s = 0
+        else:
+            if peers and peers[0]["height"] > 0:
+                best_peer = peers[0]["address"]
+
+        fast_until = 0
+        try:
+            fast_until = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "6000"))
+        except (ValueError, TypeError):
+            fast_until = 6000
+        fast_active = (fast_until > 0 and our_h < fast_until)
+
+        val = {}
+        if hasattr(chain, "diagnose_validators"):
+            try:
+                d = chain.diagnose_validators()
+                val = {
+                    "n_trust": int(d.get("n_trust", 0) or 0),
+                    "n_active": int(d.get("n_active", 0) or 0),
+                    "required_sigs": int(d.get("required_sigs", 0) or 0),
+                    "local_pk": (d.get("local_pk") or "")[:16] + ("…" if d.get("local_pk") else ""),
+                    "local_pk_full": d.get("local_pk") or "",
+                    "local_pk_installed": bool(d.get("local_pk")),
+                    "local_in_trust": bool(d.get("local_in_trust", False)),
+                    "bootstrap_would_fire": bool(d.get("bootstrap_would_fire", False)),
+                }
+            except Exception as e:
+                val = {"error": str(e)}
+
+        gate = _check_mining_gates(chain)
+        gate_out = {
+            "allowed": bool(gate.get("mining_allowed", False)),
+            "reason": gate.get("reason", ""),
+            "checks": (gate.get("detail") or {}).get("checks", {}),
+        }
+
+        sign = _build_sign_info(chain)
+
+        return jsonify({
+            "ok": True,
+            "now": int(now),
+            "node": {
+                "height": our_h,
+                "tip_hash": chain.db.tip_hash(),
+                "version": "13.9.17",
+                "is_origin": os.environ.get("BRN_IS_ORIGIN", "0") == "1",
+            },
+            "sync": {
+                "active": bool(_HTTP_SYNC_STATE and _HTTP_SYNC_STATE.get("syncing")),
+                "percent": pct,
+                "local_height": our_h,
+                "target_height": target_h,
+                "remaining": remaining,
+                "best_peer": best_peer,
+                "download_rate_blocks_per_s": round(rate, 2),
+                "eta_s": eta_s,
+            },
+            "fast_sync": {
+                "active": fast_active,
+                "until": fast_until,
+                "finished": (not fast_active) and fast_until > 0,
+            },
+            "peers": peers,
+            "validators": val,
+            "mining_gate": gate_out,
+            "signing": sign,
+        }), 200
+    except Exception as e:
+        log.exception("api_sync_live falhou")
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/validators/sign_info", methods=["GET"])
+def api_validators_sign_info():
+    try:
+        chain = _get_chain()
+        return jsonify({"ok": True, **_build_sign_info(chain)}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/sync", methods=["GET"])
+def serve_sync_panel():
+    p = BASE_DIR / "sync_panel.html"
+    if p.exists():
+        return send_file(p)
+    return (
+        "<h1>sync_panel.html não encontrado</h1>"
+        "<p>Coloque o arquivo <code>sync_panel.html</code> na raiz do projeto "
+        "e recarregue esta página.</p>"
+        "<p>Alternativa: <a href='/api/sync/live'>/api/sync/live</a> (JSON).</p>"
+    ), 404
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print("BRN Server v9.9.33 (Mining Gate)")
+    print("BRN Server v9.9.34 (Sync Panel + Mining Gate)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
