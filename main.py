@@ -1,13 +1,14 @@
-"""main.py — Entrypoint do nó BRN (v13.9.13)
+"""main.py — Entrypoint do nó BRN (v13.9.14)
 ================================================================
-v13.9.13 (2026-11-12) — FALLBACK HTTP SYNC:
-  [NEW] _force_http_sync_loop(): se o nó não encontrar peers P2P
-        em 10 segundos (ou estiver com height=-1), baixa a
-        blockchain diretamente via HTTP (porta 5000 do Origin).
-        Resolve o problema de portas P2P bloqueadas por firewall.
+v13.9.14 (2026-11-12) — BARREIRA DE SINCRONIZAÇÃO:
+  [NEW] _auto_mine_loop() agora verifica se o nó local está 
+        sincronizado com o Origin ANTES de iniciar o PoolClient.
+        Se `local_height < remote_height - 1`, ele aguarda
+        (status "waiting_sync") até baixar todos os blocos.
+        Isso evita minerar em fork e bloqueia erros de validação.
+  [KEEP] v13.9.13: fallback de sync via HTTP (_force_http_sync_loop)
   [KEEP] v13.9.12: prompt interativo para abrir carteira
   [KEEP] v13.9.10: multi-máquina
-  [KEEP] v13.9.9: ping rápido + auto-mine persistente
 ================================================================
 """
 from __future__ import annotations
@@ -30,7 +31,7 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.13"
+    VERSION = "13.9.14"
     BUILD_DATE = "2026-11-12"
 
 try:
@@ -682,7 +683,7 @@ def _ping_origin(timeout: float = 3.0) -> bool:
             import urllib.request
             req = urllib.request.Request(
                 f"{pool_url}/api/status",
-                headers={"User-Agent": "brn-main/13.9.13"},
+                headers={"User-Agent": "brn-main/13.9.14"},
             )
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.status == 200
@@ -710,10 +711,6 @@ def _install_sk_local_only(chain, sk_hex: str, address: str, pubkey: str) -> boo
 # [v13.9.13] FALLBACK HTTP SYNC
 # ============================================================
 def _force_http_sync_loop(chain, pool_url, stop_evt):
-    """
-    Se o nó estiver com height=-1 e sem peers, baixa via HTTP.
-    Isso contorna bloqueios de firewall na porta P2P (6001).
-    """
     import requests
     import time
     import json
@@ -726,11 +723,9 @@ def _force_http_sync_loop(chain, pool_url, stop_evt):
         try:
             local_h = chain.db.height()
             if local_h >= 0:
-                # Se já sincronizou algo, a thread pode dormir mais
                 stop_evt.wait(60)
                 continue
                 
-            # Pinga o status do Origin
             try:
                 r = requests.get(f"{pool_url}/api/status", timeout=10)
                 target_h = r.json().get("height", 0)
@@ -760,7 +755,7 @@ def _force_http_sync_loop(chain, pool_url, stop_evt):
                         log.info(f"[HTTP-SYNC] Progresso: {chain.db.height()}/{target_h}")
                     except Exception as e:
                         log.warning(f"[HTTP-SYNC] Erro no lote {start}: {e}")
-                        break # Tenta de novo no próximo loop
+                        break
             else:
                 log.info("[HTTP-SYNC] Origin com altura 0. Aguardando.")
                 stop_evt.wait(30)
@@ -771,7 +766,7 @@ def _force_http_sync_loop(chain, pool_url, stop_evt):
 def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int, stop_evt: threading.Event) -> None:
     log = logging.getLogger("main")
     SK_VALIDATION_STATE["auto_mine_status"] = "starting"
-    log.info("[AUTO-MINE] loop iniciado (checa Origin a cada 30s)")
+    log.info("[AUTO-MINE] loop iniciado (checa Origin e Sync a cada 30s)")
     pool_url = os.environ.get("BRN_POOL_URL", "").strip()
     failures = 0
 
@@ -782,6 +777,8 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int, stop_evt: t
                 if stop_evt.wait(10):
                     break
                 continue
+
+            # 1. Já está minerando?
             if _HAS_REQUESTS:
                 try:
                     r = _requests.get(f"http://127.0.0.1:{web_port}/api/pool/local_status", timeout=5)
@@ -795,6 +792,7 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int, stop_evt: t
                 except Exception:
                     pass
 
+            # 2. Origin está online?
             origin_online = _ping_origin(timeout=3.0)
             SK_VALIDATION_STATE["origin_online"] = origin_online
 
@@ -807,8 +805,31 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int, stop_evt: t
                     break
                 continue
 
+            # ═══════════════════════════════════════════════════════
+            # [v13.9.14] BARREIRA DE SINCRONIZAÇÃO
+            # Só inicia o PoolClient se o nó local estiver sincronizado.
+            # ═══════════════════════════════════════════════════════
+            if _HAS_REQUESTS:
+                try:
+                    r = _requests.get(f"{pool_url}/api/status", timeout=10)
+                    remote_h = r.json().get("height", 0)
+                    local_h = chain.db.height()
+                    
+                    if local_h < remote_h - 1:
+                        log.info("[AUTO-MINE] Aguardando sincronização: local=%d / target=%d", local_h, remote_h)
+                        SK_VALIDATION_STATE["auto_mine_status"] = "waiting_sync"
+                        if stop_evt.wait(15):
+                            break
+                        continue
+                except Exception as e:
+                    log.warning("[AUTO-MINE] Erro ao checar sincronização: %s", e)
+                    if stop_evt.wait(15):
+                        break
+                    continue
+            # ═══════════════════════════════════════════════════════
+
             SK_VALIDATION_STATE["auto_mine_status"] = "starting_pool"
-            log.info("[AUTO-MINE] Origin online — iniciando PoolClient...")
+            log.info("[AUTO-MINE] Sincronizado! Origin online — iniciando PoolClient...")
 
             if not _HAS_REQUESTS:
                 SK_VALIDATION_STATE["auto_mine_status"] = "error_no_requests"
@@ -862,7 +883,7 @@ def _auto_configure(chain, p2p, trust, web_port: int, is_origin: bool, stop_evt:
     SK_VALIDATION_STATE["pubkey_derived"] = pubkey
 
     log.info("=" * 64)
-    log.info(" [SK RESOLUTION v13.9.13]")
+    log.info(" [SK RESOLUTION v13.9.14]")
     log.info("=" * 64)
     log.info("  source           : %s", source or "(nenhum)")
     log.info("  SK_HEX len       : %d", len(sk_hex) if sk_hex else 0)
@@ -1047,7 +1068,7 @@ def main() -> int:
     else:
         log.info("[trust] carregado (origin=%s)", is_origin)
 
-    log.info("[wallet] boot sem carteira (design v13.9.13) — GUI tentará abrir carteira salva")
+    log.info("[wallet] boot sem carteira (design v13.9.14) — GUI tentará abrir carteira salva")
 
     p2p = None
     if not args.no_p2p:
