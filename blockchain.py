@@ -1,48 +1,40 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.5.7 | Data: 09/11/2026
+Versão: 9.5.8 | Data: 12/11/2026
 ================================================================
-v9.5.7 (2026-11-09) — AUTO-PROMOÇÃO DE CLIENTES:
-  [NEW] accept_block() chama trust_network.record_block_signed()
-        para cada signatário válido do bloco. O trust então:
-          - incrementa blocks_signed do nó
-          - aplica GAIN_BLOCK_SIGNED (+5 no score)
-          - auto-promove 500→1000 quando blocks_signed >= 10
-        Permite que clientes novos subam sozinhos sem --promote
-        manual. Requer trust_network.py v3.11+.
-  [KEEP] v9.5.6: bypass multi-sig, auth_tag env, shutdown
-        timeout, fallback fantasma, PBFT attach.
+v9.5.8 (2026-11-12) — FIX BOOTSTRAP MULTI-SIG COM SK LOCAL:
+  [FIX] _get_trust_validators() novo: retorna APENAS os validadores
+        do trust (get_active_validators / get_top_validators), SEM
+        injetar o pk local. É a fonte de verdade para decidir se o
+        nó está em bootstrap (len < 2).
+  [FIX] _get_active_validators() agora usa _get_trust_validators()
+        por baixo + append do pk local (se _local_validator_sk
+        estiver setado). Comportamento idêntico ao anterior para
+        quem consome a lista completa (quórum, coleta de sigs).
+  [FIX] _validate_validators_sig(): os 3 bypasses de bootstrap
+        ("estrangeiro", "local", "estendido") agora checam
+        len(trust_validators) < 2 em vez de len(validators) < 2.
+        Antes, um nó com trust de 1 validador + SK local instalada
+        tinha len=2 e NUNCA entrava em bootstrap — rejeitava blocos
+        do peer mesmo sendo rede de 1 validador real. v9.5.6 tinha
+        endurecido isso para evitar fork silencioso em rede 3+; o
+        endurecimento continua válido (trust real >= 2 não bypassa),
+        mas o bootstrap legítimo de rede pequena voltou a funcionar.
+  [FIX] Mensagem de erro final agora inclui trust_validators=N e
+        bootstrap_local=M, para diagnóstico rápido.
+  [NEW] diagnose_validators() — snapshot do estado de validadores
+        para expor em /api/consensus/validators (ou chamar direto).
+  [KEEP] v9.5.7: auto-promoção via record_block_signed.
+  [KEEP] v9.5.6: bypass multi-sig endurecido, auth_tag env,
+        shutdown timeout, fallback fantasma, PBFT attach.
   [KEEP] v9.5.5: L2 bridge (l2_mint).
   [KEEP] v9.5.4: BRN_PBFT_START_HEIGHT.
   [KEEP] v9.5.3: genesis do peer aceito se DB vazio.
   [KEEP] v9.5.2: BRN_STRICT_MULTISIG desativa bypasses.
-
-v9.5.6 (2026-11-08) — PATCH DE AUDITORIA:
-  [FIX CRÍTICO] _validate_validators_sig: Bypass 2 e 3 agora exigem
-        len(validators) < 2. Antes, em rede 3+ nós, aceitava bloco
-        com 1 sig local mesmo com required=3 → fork silencioso.
-  [FIX] require_auth_tag respeita BRN_REQUIRE_AUTH_TAG=0.
-  [FIX] set_network_secret: não força require_auth_tag=True.
-  [FIX] _collect_signatures: SIG_COLLECT_TIMEOUT efetivo.
-  [FIX] _get_active_validators: fallback duplicado gated por env.
-  [FIX] mine_block_interruptible: fallback attach_proof por hash.
-
-v9.5.5 (2026-11-08):
-  [NEW] Integração L2 Bridge (add_l2_transaction, l2_mint).
-  [FIX] Import circular (reorg e chain_validator) — lazy import.
-
-v9.5.4 (2026-11-06):
-  [NEW] BRN_PBFT_START_HEIGHT.
-
-v9.5.3 (2026-11-05):
-  [FIX] validate_block aceita Genesis de peer se DB vazio.
-
-v9.5.2 (2026-11-05):
-  [NEW] BRN_STRICT_MULTISIG.
 ================================================================
 """
 from __future__ import annotations
 
-__version__ = "9.5.7"  # ← DEPOIS do from __future__ (fix)
+__version__ = "9.5.8"
 
 import os
 import time
@@ -945,43 +937,79 @@ class Blockchain:
         timestamps.sort()
         return timestamps[len(timestamps) // 2]
 
-    def _get_active_validators(self) -> list:
+    # ============================================================
+    # [v9.5.8] Validadores: trust puro vs trust + local
+    # ============================================================
+    def _get_trust_validators(self) -> list:
+        """
+        [v9.5.8] Validadores do TrustNetwork APENAS — SEM injetar o pk
+        local. Usado para decidir se o nó está em bootstrap
+        (len < 2), porque o pk local NÃO é um validador do trust: ele
+        é uma adição temporária para o nó conseguir assinar seus
+        próprios blocos.
+
+        Antes do v9.5.8, `_get_active_validators()` retornava
+        trust + local, e os bypasses de bootstrap checavam
+        `len(validators) < 2` — o que nunca disparava num nó com
+        SK local instalada e 1 validador no trust. Resultado: o nó
+        rejeitava blocos legítimos do único peer, mesmo com a rede
+        de 1 validador real.
+        """
         validators: list = []
         trust = self.trust_net
-        if trust is not None:
-            try:
-                if hasattr(trust, "get_active_validators"):
-                    validators = list(trust.get_active_validators(
-                        count=MAX_VALIDATORS) or [])
-                else:
+        if trust is None:
+            return []
+
+        try:
+            if hasattr(trust, "get_active_validators"):
+                validators = list(trust.get_active_validators(
+                    count=MAX_VALIDATORS) or [])
+            else:
+                validators = list(trust.get_top_validators(
+                    count=MAX_VALIDATORS) or [])
+        except Exception as e:
+            log.warning(f"[VALIDATORS] falhou: {e}")
+            validators = []
+
+        if not validators and hasattr(trust, "get_top_validators"):
+            if BRN_TRUST_FALLBACK_TO_TOP:
+                try:
                     validators = list(trust.get_top_validators(
                         count=MAX_VALIDATORS) or [])
-            except Exception as e:
-                log.warning(f"[VALIDATORS] falhou: {e}")
-                validators = []
-
-            if not validators and hasattr(trust, "get_top_validators"):
-                if BRN_TRUST_FALLBACK_TO_TOP:
-                    try:
-                        validators = list(trust.get_top_validators(
-                            count=MAX_VALIDATORS) or [])
-                        if validators:
-                            log.warning(
-                                "[VALIDATORS] active_validators vazio; usando "
-                                "get_top_validators() como fallback "
-                                "(BRN_TRUST_FALLBACK_TO_TOP=1) — %d validador(es)",
-                                len(validators),
-                            )
-                    except Exception as e:
+                    if validators:
                         log.warning(
-                            f"[VALIDATORS] fallback get_top_validators falhou: {e}")
-                        validators = []
-                else:
+                            "[VALIDATORS] active_validators vazio; usando "
+                            "get_top_validators() como fallback "
+                            "(BRN_TRUST_FALLBACK_TO_TOP=1) — %d validador(es)",
+                            len(validators),
+                        )
+                except Exception as e:
                     log.warning(
-                        "[VALIDATORS] active_validators vazio e "
-                        "BRN_TRUST_FALLBACK_TO_TOP=0 — quórum fica vazio "
-                        "(bootstrap, multi-sig desligado)."
-                    )
+                        f"[VALIDATORS] fallback get_top_validators falhou: {e}")
+                    validators = []
+            else:
+                log.warning(
+                    "[VALIDATORS] active_validators vazio e "
+                    "BRN_TRUST_FALLBACK_TO_TOP=0 — quórum fica vazio "
+                    "(bootstrap, multi-sig desligado)."
+                )
+
+        return sorted({p for p in validators if p})
+
+    def _get_active_validators(self) -> list:
+        """
+        Trust validators + pk local (bootstrap).
+
+        Usado para:
+          - calcular o quórum (`_required_signatures`)
+          - `valid_set` em `_collect_signatures` e
+            `_validate_validators_sig` (o pk local precisa estar em
+            `valid_set` para que a assinatura local seja aceita)
+
+        NÃO usar o resultado desta função para decidir bypass de
+        bootstrap — para isso, ver `_get_trust_validators()`.
+        """
+        validators = self._get_trust_validators()
 
         local_sk = self._local_validator_sk
         if local_sk is not None:
@@ -1012,6 +1040,7 @@ class Blockchain:
 
     def _validate_validators_sig(self, block: dict,
                                   validators: Optional[list] = None) -> tuple:
+        # Bypass 1: BRN_BOOTSTRAP_SKIP_SIGS_UNTIL (por altura)
         if not BRN_STRICT_MULTISIG and BRN_BOOTSTRAP_SKIP_SIGS_UNTIL > 0:
             try:
                 _bh = int(block.get("height", -1))
@@ -1033,6 +1062,13 @@ class Blockchain:
             return True, ""
 
         required = self._required_signatures(validators)
+
+        # [v9.5.8] trust-only count, para decisão de bootstrap.
+        # Usamos o trust "puro" porque o pk local NÃO é validador
+        # do trust — ele é adição temporária para assinar.
+        trust_validators = self._get_trust_validators()
+        n_trust = len(trust_validators)
+        n_bootstrap_local = len(validators) - n_trust
 
         sigs = block.get("validators_sig", [])
         if sigs is None:
@@ -1067,7 +1103,10 @@ class Blockchain:
         if got >= required:
             return True, ""
 
-        if (not BRN_STRICT_MULTISIG and len(validators) < 2
+        # Bypass 2 (estrangeiro): trust real tem <2 validadores e o
+        # bloco veio assinado por >=1 chave que não está no nosso set.
+        # [v9.5.8] usa n_trust (trust puro), não len(validators).
+        if (not BRN_STRICT_MULTISIG and n_trust < 2
                 and got == 0 and got_foreign >= 1):
             try:
                 block_h = int(block.get("height", -1))
@@ -1082,13 +1121,16 @@ class Blockchain:
                 )
             log.warning(
                 f"[SIG] Bloco #{block_h}: aceito em MODO BOOTSTRAP "
-                f"(set local tem {len(validators)} validador(es), "
+                f"(trust real tem {n_trust} validador(es), "
                 f"{got_foreign} assinatura(s) estrangeira(s) válida(s))."
             )
             return True, ""
 
+        # Bypass 3 (local): trust real tem <2 validadores e a única
+        # assinatura é a nossa própria SK local.
+        # [v9.5.8] usa n_trust.
         if (not BRN_STRICT_MULTISIG
-                and len(validators) < 2
+                and n_trust < 2
                 and got >= 1
                 and got_foreign == 0):
             local_pk = ""
@@ -1113,8 +1155,11 @@ class Blockchain:
                     )
                     return True, ""
 
+        # Bypass 4 (estendido): trust real tem <2 validadores e o
+        # assinante tem trust_score >= BOOTSTRAP_TRUST_THRESHOLD.
+        # [v9.5.8] usa n_trust.
         if (not BRN_STRICT_MULTISIG
-                and len(validators) < 2
+                and n_trust < 2
                 and got >= 1
                 and got_foreign == 0):
             trusted = False
@@ -1160,8 +1205,42 @@ class Blockchain:
             f"{prefix}Bloco #{block['height']} precisa de "
             f"{required}/{len(validators)} assinaturas do set local, "
             f"tem {got}. Faltam: {', '.join(missing[:5])}. "
-            f"({got_foreign} assinatura(s) estrangeira(s) ignorada(s))"
+            f"({got_foreign} assinatura(s) estrangeira(s) ignorada(s); "
+            f"trust_validators={n_trust}, bootstrap_local={n_bootstrap_local})."
         )
+
+    def diagnose_validators(self) -> dict:
+        """
+        [v9.5.8] Snapshot do estado de validadores para diagnóstico.
+        Não altera nada. Seguro para expor via HTTP.
+        """
+        trust_v = self._get_trust_validators()
+        active_v = self._get_active_validators()
+        local_pk = ""
+        if self._local_validator_sk is not None:
+            try:
+                local_pk = self._local_validator_sk.pub_hex
+            except Exception:
+                pass
+        return {
+            "trust_validators": trust_v,
+            "active_validators": active_v,
+            "local_pk": local_pk,
+            "local_in_trust": (local_pk in trust_v) if local_pk else False,
+            "local_in_active": (local_pk in active_v) if local_pk else False,
+            "n_trust": len(trust_v),
+            "n_active": len(active_v),
+            "n_bootstrap_local": max(0, len(active_v) - len(trust_v)),
+            "required_sigs": self._required_signatures(active_v),
+            "require_all_sigs": REQUIRE_ALL_SIGS,
+            "validator_quorum": VALIDATOR_QUORUM,
+            "bootstrap_would_fire": (len(trust_v) < 2),
+            "bootstrap_trust_threshold": BOOTSTRAP_TRUST_THRESHOLD,
+            "bootstrap_skip_until": BRN_BOOTSTRAP_SKIP_SIGS_UNTIL,
+            "assume_valid_until": BRN_ASSUME_VALID_UNTIL,
+            "strict_multisig": BRN_STRICT_MULTISIG,
+            "trust_fallback_to_top": BRN_TRUST_FALLBACK_TO_TOP,
+        }
 
     def validate_block(self, block: dict, prev_block=None,
                         validators: Optional[list] = None) -> tuple:
