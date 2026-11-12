@@ -1,34 +1,33 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.32)
+server.py — Backend HTTP do nó BRN (v9.9.33)
 ================================================================
-v9.9.32 (2026-11-12) — DIAGNÓSTICO DE VALIDADORES HONESTO:
-  [FIX] /api/consensus/validators agora usa
-        chain.diagnose_validators() (blockchain.py v9.5.8) como
-        fonte de verdade. Antes, o route chamava
-        trust.get_top_validators(count=5) direto, enquanto o
-        consenso usa _get_active_validators() (que tenta
-        get_active_validators() PRIMEIRO). Se TrustNetwork tiver os
-        dois métodos e retornarem sets diferentes, o painel web
-        mostrava um set e o consenso usava outro — exatamente o
-        cenário do #4301 (painel dizia 3 validadores, consenso
-        rejeitava como "estrangeiro").
-  [FIX] /api/consensus/validators agora retorna required_sigs
-        calculado por _required_signatures() (respeita
-        BRN_REQUIRE_ALL_SIGS e BRN_VALIDATOR_QUORUM) em vez de
-        len(top5). Antes, painel mostrava required_sigs=N mesmo
-        quando quórum era ceil(N*0.67).
-  [NEW] /api/consensus/validators agora inclui por validador:
-        in_active, in_trust, is_local. Assim você vê na hora
-        qual pk está no consenso, qual está só no trust, e qual é
-        sua SK local.
-  [NEW] /api/consensus/validators retorna campos top-level:
-        n_trust, n_active, n_bootstrap_local,
-        local_pk_installed, local_pk, bootstrap_would_fire,
-        diagnosis (snapshot cru de diagnose_validators).
-  [NEW] /health retorna validators={n_trust, n_active,
-        n_bootstrap_local, required_sigs, local_pk_installed,
-        bootstrap_would_fire} — 1 chamada para saber se o nó
-        está em bootstrap legítimo ou com trust divergente.
+v9.9.33 (2026-11-12) — GATE DE MINERAÇÃO NO SERVER:
+  [NEW] _check_mining_gates(chain): gate autoritativo de mineração.
+        3 condições em sequência:
+          1. chain.db.height() >= BRN_FAST_SYNC_UNTIL (default 6000)
+          2. chain._local_validator_sk != None
+          3. >= BRN_MIN_VALIDATORS_FOR_MINING peers no DB (default 1)
+             em altura dentro de ±BRN_VALIDATOR_HEIGHT_TOLERANCE
+             (default 1) e last_seen <= BRN_VALIDATOR_MAX_AGE_S
+             (default 300s)
+        Cache de 2s para não martelar o DB em /api/status 1Hz.
+  [NEW] /api/pool/start_local retorna 409 + gate_reason quando os
+        gates NÃO passam. Antes, o server instanciava PoolClient
+        sem checar nada — PoolClient v7.2 já se auto-bloqueia, mas
+        o server é a fonte de verdade para a GUI.
+  [NEW] /api/miner/start idem (bloqueia mineração P2P/direta).
+  [NEW] /api/faucet idem (faucet minera 1 bloco).
+  [NEW] /api/mine/gate: expõe {mining_allowed, reason, detail}
+        sem efeito colateral. A GUI consulta antes de oferecer o
+        botão "Iniciar mineração".
+  [NEW] /api/status inclui: fast_sync_active, fast_sync_until,
+        validators_ready, validators_reason, mining_allowed.
+  [NEW] /health inclui: mining_gate (mesmo dict de /api/mine/gate
+        resumido), n_validators_synced, fast_sync_active.
+  [NEW] _MINE_GATE_CACHE (2s TTL) com lock.
+  [KEEP] v9.9.32: /api/consensus/validators via
+        chain.diagnose_validators() (honesto); /health com
+        validators summary; StateRefresh injetado por main.py.
   [KEEP] v9.9.31: /api/sync-info expõe HTTP_SYNC_STATE.
 ================================================================
 """
@@ -80,8 +79,27 @@ TXT_HISTORY_LIMIT_DEFAULT = 200
 TXT_HISTORY_LIMIT_MAX = 500
 BOOTSTRAP_HTTP_PORT = int(os.environ.get("BRN_BOOTSTRAP_HTTP_PORT", os.environ.get("BRN_WEB_PORT", "5000")))
 
+# [v9.9.33] Gate de mineração — config por env
+_MIN_FAST_SYNC_UNTIL = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "6000") or "0")
+_MIN_VALIDATORS_FOR_MINING = max(1, int(os.environ.get("BRN_MIN_VALIDATORS_FOR_MINING", "1") or "1"))
+_VALIDATOR_HEIGHT_TOLERANCE = max(0, int(os.environ.get("BRN_VALIDATOR_HEIGHT_TOLERANCE", "1") or "1"))
+_VALIDATOR_MAX_AGE_S = max(30, int(os.environ.get("BRN_VALIDATOR_MAX_AGE_S", "300") or "300"))
+_MINE_GATE_CACHE_TTL = 2.0
+_MINE_GATE_CACHE = {"ts": 0.0, "result": None}
+_MINE_GATE_LOCK = threading.Lock()
+
 if not ADMIN_TOKEN: log.warning("[server] BRN_ADMIN_TOKEN vazio. /api/faucet ABERTO.")
 elif len(ADMIN_TOKEN) < 16: log.warning("[server] BRN_ADMIN_TOKEN curto.")
+
+if _MIN_FAST_SYNC_UNTIL > 0:
+    log.warning(
+        "[server] MINING GATE: mineração só libera após altura %d, "
+        "SK instalada, e >=%d validador(es) sincronizados (±%d blocos, "
+        "idade máxima %ds).",
+        _MIN_FAST_SYNC_UNTIL, _MIN_VALIDATORS_FOR_MINING,
+        _VALIDATOR_HEIGHT_TOLERANCE, _VALIDATOR_MAX_AGE_S,
+    )
+
 
 def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = ""):
     for b in os.environ.get("BRN_BOOTSTRAP_PEERS", "").split(","):
@@ -103,6 +121,7 @@ def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = ""):
             with urllib.request.urlopen(req, timeout=2): pass
             log.info(f"[BOOTSTRAP] {log_prefix}aviso para {host}")
         except Exception as e: log.warning(f"[BOOTSTRAP] falhou {b}: {e}")
+
 
 _CHAIN = None; CHAIN_LOCK = threading.RLock()
 def set_chain(chain):
@@ -127,7 +146,6 @@ def set_sk_validation_state(state):
     global _SK_VALIDATION_STATE
     _SK_VALIDATION_STATE = dict(state) if state else {}
 
-# Estado do progresso HTTP (v9.9.31)
 _HTTP_SYNC_STATE = {}
 def set_http_sync_state(state):
     global _HTTP_SYNC_STATE
@@ -163,6 +181,7 @@ def set_pool_client_local(pc):
     with _POOL_CLIENT_LOCK: _POOL_CLIENT_LOCAL = pc
 def _get_pool_client_local(): return _POOL_CLIENT_LOCAL
 
+
 def _register_miner_in_trust(pubkey: str, address: str):
     trust = _get_trust_network()
     if trust is None: return
@@ -173,6 +192,262 @@ def _register_miner_in_trust(pubkey: str, address: str):
             trust.register_node(node_id=pubkey, address=address, public_key=pubkey); trust.mark_connected(pubkey)
     except Exception as e: log.warning(f"[Trust] falha {pubkey[:12]}: {e}")
 
+
+# ============================================================
+# [v9.9.33] MINING GATE
+# ============================================================
+def _check_validators_synced(chain, min_validators: int, tolerance: int,
+                              max_age_s: int) -> tuple:
+    """
+    Verifica que >= min_validators peers estão na mesma altura
+    (dentro de `tolerance`) que o nó local, e vistos há <= max_age_s.
+    Retorna (ok, reason, detail).
+    """
+    our_h = int(chain.db.height())
+    now = time.time()
+
+    detail = {
+        "our_height": our_h,
+        "min_validators": min_validators,
+        "tolerance": tolerance,
+        "max_age_s": max_age_s,
+        "synced_peers": [],
+        "ahead_peers": [],
+        "behind_peers": [],
+        "stale_peers": [],
+        "total_peers": 0,
+    }
+
+    if our_h < 0:
+        return False, f"DB local vazio (height={our_h})", detail
+
+    try:
+        peers = chain.db.listar_peers(apenas_ativos=False)
+    except Exception as e:
+        return False, f"listar_peers falhou: {e}", detail
+
+    for p in (peers or []):
+        if not isinstance(p, dict):
+            continue
+        addr = (p.get("address") or "").strip()
+        if not addr:
+            continue
+        ip = addr.rsplit(":", 1)[0] if ":" in addr else addr
+        if not ip or ip.startswith("127.") or ip == "0.0.0.0":
+            continue
+        try:
+            ph = int(p.get("height", 0) or 0)
+        except (ValueError, TypeError):
+            ph = 0
+        try:
+            ls = float(p.get("last_seen", 0) or 0)
+        except (ValueError, TypeError):
+            ls = 0.0
+        age = int(now - ls) if ls > 0 else -1
+        entry = {"ip": ip, "height": ph, "age_s": age}
+        if age < 0 or age > max_age_s:
+            detail["stale_peers"].append(entry)
+            continue
+        delta = ph - our_h
+        if abs(delta) <= tolerance:
+            detail["synced_peers"].append({**entry, "delta": delta})
+        elif delta > 0:
+            detail["ahead_peers"].append({**entry, "delta": delta})
+        else:
+            detail["behind_peers"].append({**entry, "delta": delta})
+
+    detail["total_peers"] = (
+        len(detail["synced_peers"]) + len(detail["ahead_peers"])
+        + len(detail["behind_peers"]) + len(detail["stale_peers"]))
+
+    if len(detail["synced_peers"]) >= min_validators:
+        return True, (
+            f"{len(detail['synced_peers'])} validador(es) em altura "
+            f"~{our_h} (tolerância ±{tolerance})"
+        ), detail
+
+    return False, (
+        f"apenas {len(detail['synced_peers'])}/{min_validators} "
+        f"validador(es) em altura ~{our_h} "
+        f"(à frente={len(detail['ahead_peers'])}, "
+        f"atrás={len(detail['behind_peers'])}, "
+        f"stale={len(detail['stale_peers'])})"
+    ), detail
+
+
+def _check_mining_gates(chain, force_refresh: bool = False) -> dict:
+    """
+    [v9.9.33] Gate autoritativo de mineração.
+
+    Retorna dict:
+      {
+        "mining_allowed": bool,
+        "reason": str,       # ok | fast_sync_below_N | no_sk |
+                             # validators_not_synced | db_empty
+        "detail": {
+          "current_height", "fast_sync_until", "fast_sync_active",
+          "sk_installed", "local_pk",
+          "validators_ready", "validators_reason",
+          "validators_detail": {...},
+          "checks": {"height": {...}, "sk": {...}, "validators": {...}}
+        }
+      }
+
+    Cacheado por 2s para não martelar listar_peers() em /api/status 1Hz.
+    """
+    now = time.time()
+    with _MINE_GATE_LOCK:
+        if (not force_refresh
+                and _MINE_GATE_CACHE["result"] is not None
+                and (now - _MINE_GATE_CACHE["ts"]) < _MINE_GATE_CACHE_TTL):
+            return _MINE_GATE_CACHE["result"]
+
+    try:
+        our_h = int(chain.db.height())
+    except Exception as e:
+        result = {
+            "mining_allowed": False,
+            "reason": f"chain_error:{e}",
+            "detail": {"error": str(e)},
+        }
+        with _MINE_GATE_LOCK:
+            _MINE_GATE_CACHE["ts"] = now
+            _MINE_GATE_CACHE["result"] = result
+        return result
+
+    sk = getattr(chain, "_local_validator_sk", None)
+    sk_installed = sk is not None
+    local_pk = ""
+    if sk_installed:
+        try:
+            local_pk = getattr(sk, "pub_hex", "") or ""
+        except Exception:
+            pass
+
+    fast_sync_active = (_MIN_FAST_SYNC_UNTIL > 0 and our_h < _MIN_FAST_SYNC_UNTIL)
+
+    checks = {
+        "height": {
+            "ok": (not fast_sync_active),
+            "current": our_h,
+            "required": _MIN_FAST_SYNC_UNTIL,
+        },
+        "sk": {
+            "ok": sk_installed,
+            "local_pk": (local_pk[:16] + "...") if local_pk else "",
+        },
+        "validators": {
+            "ok": False,
+            "reason": "not_checked",
+        },
+    }
+
+    # 1. Height gate
+    if fast_sync_active:
+        result = {
+            "mining_allowed": False,
+            "reason": f"fast_sync_below_{_MIN_FAST_SYNC_UNTIL}",
+            "detail": {
+                "current_height": our_h,
+                "fast_sync_until": _MIN_FAST_SYNC_UNTIL,
+                "fast_sync_active": True,
+                "sk_installed": sk_installed,
+                "local_pk": checks["sk"]["local_pk"],
+                "validators_ready": False,
+                "validators_reason": "not_checked (fast-sync ativo)",
+                "validators_detail": {},
+                "checks": checks,
+            },
+        }
+        with _MINE_GATE_LOCK:
+            _MINE_GATE_CACHE["ts"] = now
+            _MINE_GATE_CACHE["result"] = result
+        return result
+
+    # 2. SK gate
+    if not sk_installed:
+        result = {
+            "mining_allowed": False,
+            "reason": "no_sk",
+            "detail": {
+                "current_height": our_h,
+                "fast_sync_until": _MIN_FAST_SYNC_UNTIL,
+                "fast_sync_active": False,
+                "sk_installed": False,
+                "local_pk": "",
+                "validators_ready": False,
+                "validators_reason": "not_checked (sem SK)",
+                "validators_detail": {},
+                "checks": checks,
+            },
+        }
+        with _MINE_GATE_LOCK:
+            _MINE_GATE_CACHE["ts"] = now
+            _MINE_GATE_CACHE["result"] = result
+        return result
+
+    # 3. Validators gate
+    ok_val, reason_val, detail_val = _check_validators_synced(
+        chain,
+        min_validators=_MIN_VALIDATORS_FOR_MINING,
+        tolerance=_VALIDATOR_HEIGHT_TOLERANCE,
+        max_age_s=_VALIDATOR_MAX_AGE_S,
+    )
+    checks["validators"] = {
+        "ok": ok_val,
+        "reason": reason_val,
+        "synced": len(detail_val.get("synced_peers", [])),
+        "required": _MIN_VALIDATORS_FOR_MINING,
+    }
+
+    if not ok_val:
+        result = {
+            "mining_allowed": False,
+            "reason": "validators_not_synced",
+            "detail": {
+                "current_height": our_h,
+                "fast_sync_until": _MIN_FAST_SYNC_UNTIL,
+                "fast_sync_active": False,
+                "sk_installed": True,
+                "local_pk": checks["sk"]["local_pk"],
+                "validators_ready": False,
+                "validators_reason": reason_val,
+                "validators_detail": detail_val,
+                "checks": checks,
+            },
+        }
+        with _MINE_GATE_LOCK:
+            _MINE_GATE_CACHE["ts"] = now
+            _MINE_GATE_CACHE["result"] = result
+        return result
+
+    result = {
+        "mining_allowed": True,
+        "reason": "ok",
+        "detail": {
+            "current_height": our_h,
+            "fast_sync_until": _MIN_FAST_SYNC_UNTIL,
+            "fast_sync_active": False,
+            "sk_installed": True,
+            "local_pk": checks["sk"]["local_pk"],
+            "validators_ready": True,
+            "validators_reason": reason_val,
+            "validators_detail": detail_val,
+            "checks": checks,
+        },
+    }
+    with _MINE_GATE_LOCK:
+        _MINE_GATE_CACHE["ts"] = now
+        _MINE_GATE_CACHE["result"] = result
+    return result
+
+
+def _invalidate_mining_gate_cache():
+    with _MINE_GATE_LOCK:
+        _MINE_GATE_CACHE["ts"] = 0.0
+        _MINE_GATE_CACHE["result"] = None
+
+
 app = Flask(__name__)
 if BEHIND_PROXY:
     try:
@@ -181,10 +456,12 @@ if BEHIND_PROXY:
     except ImportError: pass
 if CORS_ORIGINS: CORS(app, origins=CORS_ORIGINS)
 
+
 def _require_admin() -> bool:
     if not ADMIN_TOKEN: return True
     hdr = request.headers.get("Authorization", "")
     return hdr.startswith("Bearer ") and hmac.compare_digest(hdr[7:], ADMIN_TOKEN)
+
 
 def _admin_required(f):
     @wraps(f)
@@ -194,6 +471,7 @@ def _admin_required(f):
             return jsonify({"ok": False, "msg": "unauthorized"}), 401
         return f(*args, **kwargs)
     return wrapper
+
 
 _cache_saldos = {}; _cache_lock = threading.Lock(); _faucet_history = {}
 def _saldo_cache_get(addr):
@@ -206,6 +484,7 @@ def _saldo_cache_set(addr, val):
     with _cache_lock: _cache_saldos[addr] = (time.time(), val)
 def _saldo_cache_invalidate(addr):
     with _cache_lock: _cache_saldos.pop(addr, None)
+
 
 _wallets_lock = threading.Lock()
 def carregar_wallets() -> dict:
@@ -226,6 +505,7 @@ def _registrar_pubkey(addr, pk):
         if wallets.get(addr, {}).get("public_key") != pk:
             wallets[addr] = {"public_key": pk}; salvar_wallets(wallets)
     except Exception: pass
+
 
 def _pubkey_from_db_or_payload(addr: str, payload_pubkey: str = "", payload_sk: str = "") -> str:
     if payload_pubkey: return payload_pubkey.strip()
@@ -255,6 +535,7 @@ def _pubkey_from_db_or_payload(addr: str, payload_pubkey: str = "", payload_sk: 
     except Exception: pass
     return ""
 
+
 def _cleanup_loop():
     while True:
         time.sleep(300)
@@ -265,6 +546,7 @@ def _cleanup_loop():
             for a in [k for k, v in _faucet_history.items() if not v or agora - v[-1] > FAUCET_COOLDOWN_S]: del _faucet_history[a]
         except Exception: pass
 threading.Thread(target=_cleanup_loop, daemon=True, name="CacheCleanup").start()
+
 
 # ============================================================
 # ROTAS BÁSICAS
@@ -283,8 +565,10 @@ def bootstrap_add():
         chain = _get_chain()
         chain.adicionar_na_fila(addr, pubkey)
         _register_miner_in_trust(pubkey, addr)
+        _invalidate_mining_gate_cache()
         return jsonify({"ok": True, "fila_tamanho": len(chain.fila_mineracao), "rede_descentralizada": chain.rede_descentralizada})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
+
 
 @app.route("/api/nova-carteira", methods=["POST"])
 @require_rate_limit("nova_carteira")
@@ -297,6 +581,7 @@ def nova_carteira():
         return jsonify(dados)
     except Exception as e: return jsonify({"success": False, "error": str(e)}), 500
 
+
 @app.route("/api/saldo/<address>", methods=["GET"])
 def saldo(address):
     try:
@@ -307,6 +592,7 @@ def saldo(address):
         return jsonify({"success": True, "address": address, "balance_sats": cached, "balance_brn": cached / 10**8})
     except Exception as e: return jsonify({"success": False, "error": str(e)}), 500
 
+
 @app.route("/api/portfolio/<address>", methods=["GET"])
 def portfolio(address):
     try:
@@ -316,6 +602,7 @@ def portfolio(address):
             cached = sum(u["amount"] for u in utxos); _saldo_cache_set(address, cached)
         return jsonify({"portfolio": {"BRN": cached / 10**8, "KYC": 0}})
     except Exception as e: return jsonify({"portfolio": {}, "error": str(e)}), 500
+
 
 @app.route("/api/minhas-txs/<address>", methods=["GET"])
 @app.route("/api/transacoes/<address>", methods=["GET"])
@@ -347,6 +634,7 @@ def minhas_txs(address):
             transactions.append({"txid": tx.get("txid", ""), "direction": direction, "amount": amount, "status": status, "block_height": block_height, "confirmations": confirmations, "timestamp": int(tx.get("timestamp", 0) or 0)})
         return jsonify({"ok": True, "address": address, "count": len(transactions), "limit": _limit, "transactions": transactions})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
+
 
 @app.route("/api/transfer", methods=["POST"])
 @app.route("/api/send", methods=["POST"])
@@ -394,6 +682,7 @@ def transfer():
         return jsonify({"ok": True, "txid": tx["txid"], "msg": f"Aceita na mempool ({amount_dec} BRN)."})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
+
 @app.route("/api/status", methods=["GET"])
 def status():
     try:
@@ -404,8 +693,33 @@ def status():
         if peer_count == 0:
             try: peer_count = chain.db.contar_peers(apenas_ativos=True)
             except Exception: pass
-        return jsonify({"name": "BrunoCoin", "ticker": "BRN", "height": chain.db.height(), "tip_hash": chain.db.tip_hash(), "utxos": chain.db.count_utxos(), "mempool": len(chain.db.all_mempool(limit=1000)), "peers": peer_count, "reward": chain.current_reward(chain.db.height() + 1), "difficulty": chain.current_difficulty(), "fila_tamanho": len(chain.fila_mineracao), "rede_descentralizada": chain.rede_descentralizada})
-    except Exception as e: return jsonify({"success": False, "error": str(e)}), 500
+
+        # [v9.9.33] Gate de mineração no status
+        gate = _check_mining_gates(chain)
+        gd = gate.get("detail", {})
+
+        return jsonify({
+            "name": "BrunoCoin", "ticker": "BRN",
+            "height": chain.db.height(),
+            "tip_hash": chain.db.tip_hash(),
+            "utxos": chain.db.count_utxos(),
+            "mempool": len(chain.db.all_mempool(limit=1000)),
+            "peers": peer_count,
+            "reward": chain.current_reward(chain.db.height() + 1),
+            "difficulty": chain.current_difficulty(),
+            "fila_tamanho": len(chain.fila_mineracao),
+            "rede_descentralizada": chain.rede_descentralizada,
+            # [v9.9.33]
+            "fast_sync_active": bool(gd.get("fast_sync_active", False)),
+            "fast_sync_until": int(gd.get("fast_sync_until", 0) or 0),
+            "validators_ready": bool(gd.get("validators_ready", False)),
+            "validators_reason": gd.get("validators_reason", ""),
+            "mining_allowed": bool(gate.get("mining_allowed", False)),
+            "mining_gate_reason": gate.get("reason", ""),
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 @app.route("/api/chain-info", methods=["GET"])
 def chain_info():
@@ -413,6 +727,7 @@ def chain_info():
         chain = _get_chain()
         return jsonify({"success": True, "name": "BrunoCoin", "ticker": "BRN", "height": chain.db.height(), "tip_hash": chain.db.tip_hash(), "reward": chain.current_reward(chain.db.height() + 1), "difficulty": chain.current_difficulty()})
     except Exception as e: return jsonify({"success": False, "error": str(e)}), 500
+
 
 @app.route("/api/sync-info", methods=["GET"])
 def sync_info():
@@ -456,6 +771,7 @@ def sync_info():
 
     return jsonify(result), 200
 
+
 @app.route("/api/sync/status", methods=["GET"])
 def sync_status():
     try:
@@ -470,16 +786,53 @@ def sync_status():
         return jsonify({"ok": True, "synced": bool(data.get("synced", True)), "syncing": bool(data.get("syncing", False)), "forking": bool(data.get("forking", False)), "progress": round(float(data.get("progress", 100.0)), 2), "local_height": local_h, "target_height": int(data.get("target_height", local_h)), "blocos_faltando": max(0, int(data.get("target_height", local_h)) - local_h), "eta_segundos": data.get("eta_segundos"), "eta_legivel": data.get("eta_legivel", ""), "active_peer": data.get("active_peer"), "peers_known": int(data.get("peers_known", 0)), "reorgs_total": int(data.get("reorgs_total", 0)), "last_reorg_height": int(data.get("last_reorg_height", -1)), "last_error": data.get("last_error", "")}), 200
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
+
+@app.route("/api/mine/gate", methods=["GET"])
+def api_mine_gate():
+    """
+    [v9.9.33] Gate autoritativo de mineração. Sem efeito colateral.
+    force=1 na query string invalida o cache.
+    """
+    try:
+        chain = _get_chain()
+        force = request.args.get("force") == "1"
+        gate = _check_mining_gates(chain, force_refresh=force)
+        return jsonify({
+            "ok": True,
+            "mining_allowed": gate.get("mining_allowed", False),
+            "reason": gate.get("reason", ""),
+            "detail": gate.get("detail", {}),
+        }), 200
+    except Exception as e:
+        log.exception("api_mine_gate falhou")
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
 @app.route("/api/miner/start", methods=["POST"])
 @require_rate_limit("miner_start")
 def miner_start():
     try:
+        # [v9.9.33] Gate de mineração
+        chain = _get_chain()
+        gate = _check_mining_gates(chain, force_refresh=True)
+        if not gate.get("mining_allowed"):
+            audit_log("miner_start_denied", {
+                "reason": gate.get("reason"),
+                "ip": get_client_ip(),
+            })
+            return jsonify({
+                "ok": False,
+                "msg": f"Mineração bloqueada: {gate.get('reason')}",
+                "mining_allowed": False,
+                "gate": gate,
+            }), 409
+
         data = request.get_json(force=True) or {}
         addr = (data.get("validator_address") or data.get("address") or "").strip()
         pubkey = _pubkey_from_db_or_payload(addr, data.get("miner_pubkey", ""), data.get("private_key", ""))
         if not WalletManager.validate_address(addr): return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
         if not pubkey: return jsonify({"ok": False, "msg": "Pubkey desconhecida."}), 400
-        chain = _get_chain(); chain.adicionar_na_fila(addr, pubkey)
+        chain.adicionar_na_fila(addr, pubkey)
         try: chain.db.set_meta("miner_address", addr)
         except Exception: pass
         _notify_bootstrap_peers(addr, pubkey, log_prefix="fila ")
@@ -493,6 +846,7 @@ def miner_start():
         return jsonify({"ok": True, "msg": "Minerador iniciado.", **st})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
+
 @app.route("/api/miner/status", methods=["GET"])
 def miner_status():
     try:
@@ -505,6 +859,7 @@ def miner_status():
         return jsonify({**st, "height": chain.db.height(), "difficulty": chain.current_difficulty(), "validators_active": validators_active, "signatures_required": validators_active, "signatures_collected": st.get("signatures_collected", 0), "rede_descentralizada": chain.rede_descentralizada, "fila_tamanho": len(chain.fila_mineracao)})
     except Exception as e: return jsonify({"running": False, "error": str(e)}), 200
 
+
 @app.route("/api/miner/stop", methods=["POST"])
 @require_rate_limit("miner_stop")
 def miner_stop():
@@ -514,6 +869,7 @@ def miner_stop():
         audit_log("miner_stop_ok" if ok else "miner_stop_failed", {"ip": get_client_ip(), "msg": msg})
         return jsonify({"ok": ok, "msg": msg, **m.status()})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
+
 
 def _proxy_pool_request(path: str, method: str = "POST") -> tuple:
     remote_pool = os.environ.get("BRN_POOL_URL", "").strip().rstrip("/")
@@ -530,6 +886,7 @@ def _proxy_pool_request(path: str, method: str = "POST") -> tuple:
         except Exception: return jsonify({"ok": False, "msg": f"HTTP {e.code} no pool remoto"}), e.code
     except urllib.error.URLError as e: return jsonify({"ok": False, "msg": f"Nao consegui conectar ao Origem ({remote_pool}): {e.reason}"}), 502
     except Exception as e: return jsonify({"ok": False, "msg": f"Falha no proxy do pool: {e}"}), 502
+
 
 @app.route("/api/pool/register", methods=["POST"])
 @require_rate_limit("pool_register")
@@ -549,6 +906,7 @@ def pool_register():
         return jsonify(r), (200 if r.get("ok") else 400)
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
+
 @app.route("/api/pool/work", methods=["POST"])
 @require_rate_limit("pool_work")
 def pool_work():
@@ -562,9 +920,11 @@ def pool_work():
         return jsonify(r), (200 if r.get("ok") else 404)
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
+
 @app.route("/api/pool/getwork", methods=["POST"])
 @require_rate_limit("pool_work")
 def pool_getwork_compat(): return pool_work()
+
 
 @app.route("/api/pool/submit", methods=["POST"])
 @require_rate_limit("pool_submit")
@@ -582,6 +942,7 @@ def pool_submit():
         return jsonify(r), (200 if r.get("ok") else 400)
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
+
 @app.route("/api/pool/heartbeat", methods=["POST"])
 @require_rate_limit("pool_heartbeat")
 def pool_heartbeat():
@@ -595,6 +956,7 @@ def pool_heartbeat():
         return jsonify(r), (200 if r.get("ok") else 404)
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
+
 @app.route("/api/pool/stats", methods=["GET"])
 @require_rate_limit("pool_stats")
 def pool_stats():
@@ -603,6 +965,7 @@ def pool_stats():
     try: return jsonify(pool.stats())
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
+
 @app.route("/api/pool/miners", methods=["GET"])
 @require_rate_limit("pool_miners")
 def pool_miners():
@@ -610,6 +973,7 @@ def pool_miners():
     if pool is None: return _proxy_pool_request("/api/pool/miners", "GET")
     try: return jsonify({"ok": True, "miners": pool.miners_list()})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
+
 
 @app.route("/api/pool/disconnect", methods=["POST"])
 @require_rate_limit("pool_disconnect")
@@ -624,6 +988,7 @@ def pool_disconnect():
         return jsonify(r)
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
+
 @app.route("/api/pool/local_status", methods=["GET"])
 def pool_local_status():
     pc = _get_pool_client_local()
@@ -633,8 +998,27 @@ def pool_local_status():
         return jsonify({"ok": True, **st})
     except Exception as e: return jsonify({"ok": False, "running": False, "msg": str(e)}), 200
 
+
 @app.route("/api/pool/start_local", methods=["POST"])
 def pool_start_local():
+    # [v9.9.33] Gate de mineração ANTES de instanciar PoolClient
+    try:
+        chain = _get_chain()
+        gate = _check_mining_gates(chain, force_refresh=True)
+        if not gate.get("mining_allowed"):
+            log.warning(
+                "[server] pool/start_local DENEGADO: %s",
+                gate.get("reason"))
+            return jsonify({
+                "ok": False,
+                "msg": f"Mineração bloqueada: {gate.get('reason')}",
+                "mining_allowed": False,
+                "gate": gate,
+            }), 409
+    except Exception as e:
+        log.exception("[server] pool/start_local: gate falhou")
+        return jsonify({"ok": False, "msg": f"gate falhou: {e}"}), 500
+
     pc = _get_pool_client_local()
     if pc is None:
         PoolClient = None; _source = ""
@@ -677,6 +1061,7 @@ def pool_start_local():
         return jsonify({"ok": bool(ok), "msg": msg, **status})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
+
 @app.route("/api/pool/stop_local", methods=["POST"])
 def pool_stop_local():
     pc = _get_pool_client_local()
@@ -689,6 +1074,7 @@ def pool_stop_local():
         ok, msg = stop_method(); status = pc.status() if hasattr(pc, "status") else {}
         return jsonify({"ok": bool(ok), "msg": msg, **status})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
+
 
 @app.route("/api/wallet/set_validator_sk", methods=["POST"])
 def api_wallet_set_validator_sk():
@@ -707,8 +1093,10 @@ def api_wallet_set_validator_sk():
             r = _integrate_local(chain, sk_hex, address=address, pubkey=pubkey, p2p=p2p, trust=trust, logger=log)
             r["propagated"] = False; r["propagate_msg"] = f"propagate falhou: {e_prop}"
         if not r.get("ok"): return jsonify(r), (500 if r.get("errors") else 400)
+        _invalidate_mining_gate_cache()
         return jsonify(r), 200
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
+
 
 @app.route("/api/validator/announce", methods=["POST"])
 def api_validator_announce():
@@ -744,8 +1132,10 @@ def api_validator_announce():
         total_nodes = 0
         try: total_nodes = len(getattr(trust, "nodes", {}) or {})
         except Exception: pass
+        _invalidate_mining_gate_cache()
         return jsonify({"ok": True, "in_top5": in_top5, "peers_notified": peers_notified, "total_nodes": total_nodes}), 200
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
+
 
 @app.route("/api/trust/stats", methods=["GET"])
 @require_rate_limit("trust_stats")
@@ -758,6 +1148,7 @@ def trust_stats():
             return jsonify({"ok": True, "total_nodes": total, "validators_count": trusted, "banned_nodes": banned})
         else: return jsonify({"ok": True, **trust.get_network_stats()})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
+
 
 @app.route("/api/trust/download", methods=["GET"])
 def trust_download():
@@ -772,6 +1163,7 @@ def trust_download():
         if TRUST_DOWNLOAD_REQUIRE_SIG and not has_sig: return jsonify({"ok": False, "msg": "este nó não tem trust assinado pelo Origin", "is_origin": is_origin, "has_signature": False}), 403
         return jsonify(data)
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
+
 
 @app.route("/api/trust/nodes", methods=["GET"])
 @require_rate_limit("trust_nodes")
@@ -805,6 +1197,7 @@ def trust_nodes():
         return jsonify({"ok": True, "count": len(nodes), "nodes": nodes[:limit]})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
+
 @app.route("/api/blocks", methods=["GET"])
 def api_get_blocks():
     try:
@@ -813,12 +1206,14 @@ def api_get_blocks():
         return jsonify({"blocks": blocks, "start": start, "count": len(blocks)})
     except Exception as e: return jsonify({"error": str(e)}), 500
 
+
 @app.route("/api/latest", methods=["GET"])
 def api_latest_blocks():
     try:
         chain = _get_chain(); h = chain.db.height(); start = max(0, h - 14); blocks = chain.db.get_blocks_range(start, h + 1)
         return jsonify(list(reversed(blocks)))
     except Exception as e: return jsonify({"error": str(e)}), 500
+
 
 @app.route("/api/peers/discovered", methods=["GET"])
 @app.route("/api/peers", methods=["GET"])
@@ -836,32 +1231,38 @@ def peers_discovered():
         return jsonify({"ok": True, "count": len(out), "peers": out, "active": len(out)})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
+
 @app.route("/", methods=["GET", "HEAD"])
 def root():
     try:
         chain = _get_chain()
-        return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.32", "height": chain.db.height(), "health": "/health", "status": "/api/status", "dashboard": "/dashboard", "wallet": "/wallet", "monitor": "/monitor", "panel": "/panel"})
-    except Exception as e: return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.32", "error": str(e)})
+        return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.33", "height": chain.db.height(), "health": "/health", "status": "/api/status", "mine_gate": "/api/mine/gate", "dashboard": "/dashboard", "wallet": "/wallet", "monitor": "/monitor", "panel": "/panel"})
+    except Exception as e: return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.33", "error": str(e)})
+
 
 @app.route("/dashboard", methods=["GET"])
 def serve_dashboard():
     p = BASE_DIR / "explorer.html"
     return send_file(p) if p.exists() else (jsonify({"ok": False, "msg": "explorer.html não encontrado"}), 404)[0]
 
+
 @app.route("/monitor", methods=["GET"])
 def serve_monitor():
     p = BASE_DIR / "monitor.html"
     return send_file(p) if p.exists() else (jsonify({"ok": False, "msg": "monitor.html não encontrado"}), 404)[0]
+
 
 @app.route("/panel", methods=["GET"])
 def serve_panel():
     p = BASE_DIR / "panel.html"
     return send_file(p) if p.exists() else (jsonify({"ok": False, "msg": "panel.html não encontrado"}), 404)[0]
 
+
 @app.route("/wallet", methods=["GET"])
 def serve_wallet():
     p = BASE_DIR / "index_wallet.html"
     return send_file(p) if p.exists() else (jsonify({"ok": False, "msg": "index_wallet.html não encontrado"}), 404)[0]
+
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -876,8 +1277,6 @@ def health():
         try: has_pbft = getattr(chain, "_pbft", None) is not None
         except Exception: pass
 
-        # [v9.9.32] Snapshot compacto do estado de validadores.
-        # Fonte de verdade: chain.diagnose_validators() (blockchain v9.5.8).
         val_summary = {}
         if hasattr(chain, "diagnose_validators"):
             try:
@@ -897,10 +1296,24 @@ def health():
         else:
             val_summary = {"error": "blockchain.py sem diagnose_validators()"}
 
+        # [v9.9.33] Gate de mineração
+        gate = _check_mining_gates(chain)
+        gd = gate.get("detail", {})
+        gate_summary = {
+            "mining_allowed": bool(gate.get("mining_allowed", False)),
+            "reason": gate.get("reason", ""),
+            "current_height": gd.get("current_height"),
+            "fast_sync_active": bool(gd.get("fast_sync_active", False)),
+            "fast_sync_until": gd.get("fast_sync_until"),
+            "sk_installed": bool(gd.get("sk_installed", False)),
+            "validators_ready": bool(gd.get("validators_ready", False)),
+            "validators_reason": gd.get("validators_reason", ""),
+        }
+
         return jsonify({
             "ok": True,
             "height": chain.db.height(),
-            "version": "9.9.32",
+            "version": "9.9.33",
             "chain_injected": _CHAIN is not None,
             "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
@@ -912,9 +1325,11 @@ def health():
             "strict_multisig": STRICT_MULTISIG,
             "trust_download_require_sig": TRUST_DOWNLOAD_REQUIRE_SIG,
             "validators": val_summary,
+            "mining_gate": gate_summary,
             "sk_validation": dict(_SK_VALIDATION_STATE),
         })
     except Exception as e: return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @atexit.register
 def _shutdown():
@@ -922,11 +1337,23 @@ def _shutdown():
     try: close_audit()
     except Exception: pass
 
+
 @app.route("/api/faucet", methods=["POST"])
 @require_rate_limit("faucet")
 @_admin_required
 def faucet():
     try:
+        # [v9.9.33] Faucet minera 1 bloco → mesmo gate
+        chain = _get_chain()
+        gate = _check_mining_gates(chain, force_refresh=True)
+        if not gate.get("mining_allowed"):
+            return jsonify({
+                "ok": False,
+                "msg": f"Faucet bloqueado: {gate.get('reason')}",
+                "mining_allowed": False,
+                "gate": gate,
+            }), 409
+
         data = request.get_json(force=True) or {}; addr = (data.get("address") or "").strip()
         if not WalletManager.validate_address(addr): return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
         agora = time.time(); hist = _faucet_history.setdefault(addr, []); hist[:] = [t for t in hist if agora - t < FAUCET_COOLDOWN_S]
@@ -934,15 +1361,16 @@ def faucet():
         if hist and agora - hist[-1] < FAUCET_COOLDOWN_S: return jsonify({"ok": False, "msg": f"Aguarde {int(FAUCET_COOLDOWN_S - (agora - hist[-1]))}s."}), 429
         miner_pubkey = _pubkey_from_db_or_payload(addr, data.get("pubkey", ""), data.get("private_key", ""))
         if not miner_pubkey: return jsonify({"ok": False, "msg": "Pubkey desconhecida."}), 400
-        chain = _get_chain()
         with CHAIN_LOCK: block = chain.mine_block(addr, miner_pubkey)
         if not block: return jsonify({"ok": False, "msg": "Falha ao minerar."}), 500
         hist.append(agora); _saldo_cache_invalidate(addr)
+        _invalidate_mining_gate_cache()
         reward_sats = 0
         try: cb = block["transactions"][0]; reward_sats = sum(o.get("amount", 0) for o in cb.get("outputs", []) if o.get("address") == addr)
         except Exception: pass
         return jsonify({"ok": True, "msg": f"Faucet enviado! +{reward_sats/1e8} BRN", "txid": block["transactions"][0]["txid"], "amount": reward_sats / 1e8})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
+
 
 @app.route("/api/verificar-recebimento/<address>/<txid_str>", methods=["GET"])
 def verificar_recebimento(address, txid_str):
@@ -960,6 +1388,7 @@ def verificar_recebimento(address, txid_str):
         return jsonify({"ok": True, "chegou": chegou, "status": "confirmed", "valor": valor, "confirmacoes": confs, "block_height": block_height, "msg": f"Confirmado no bloco #{block_height} com {confs} confirmacoes." if chegou else "Endereco nao esta nos outputs."})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
+
 @app.route("/api/block/<int:height>", methods=["GET"])
 def api_get_block(height):
     try:
@@ -967,17 +1396,14 @@ def api_get_block(height):
         return jsonify(block) if block else (jsonify({"error": "Bloco não encontrado"}), 404)[0]
     except Exception as e: return jsonify({"error": str(e)}), 500
 
+
 @app.route("/api/consensus/validators", methods=["GET"])
 @require_rate_limit("status")
 def consensus_validators():
     """
-    [v9.9.32] Fonte de verdade: chain.diagnose_validators() (blockchain v9.5.8).
-
-    Antes: usava trust.get_top_validators(count=5) direto, o que
-    podia divergir de _get_active_validators() (que tenta
-    get_active_validators() PRIMEIRO). O painel web mostrava um set,
-    o consenso usava outro. Era exatamente o cenário do #4301:
-    painel "3 validadores", consenso rejeitava como estrangeiro.
+    Fonte de verdade: chain.diagnose_validators() (blockchain v9.5.8).
+    v9.9.32: alinhado com o consenso (antes usava trust.get_top_validators
+    direto, que podia divergir de _get_active_validators).
     """
     try:
         chain = _get_chain()
@@ -1001,7 +1427,6 @@ def consensus_validators():
             all_required = bool(diag.get("require_all_sigs", True))
             bootstrap_fire = bool(diag.get("bootstrap_would_fire", False))
         else:
-            # Fallback para o comportamento antigo (compat)
             if trust is not None:
                 if hasattr(trust, "get_active_validators"):
                     try: active_pks = list(trust.get_active_validators(count=5) or [])
@@ -1041,7 +1466,6 @@ def consensus_validators():
                     "is_local": is_local,
                 })
 
-        # Local primeiro, depois active, depois score
         validators.sort(key=lambda v: (
             not v["is_local"],
             not v["in_active"],
@@ -1067,6 +1491,7 @@ def consensus_validators():
         log.exception("consensus_validators falhou")
         return jsonify({"ok": False, "msg": str(e)}), 500
 
+
 @app.route("/api/block/<int:height>/signatures", methods=["GET"])
 @require_rate_limit("status")
 def block_signatures(height):
@@ -1078,12 +1503,14 @@ def block_signatures(height):
         return jsonify({"ok": True, "height": height, "block_hash": block.get("hash", ""), "signatures_count": len(sigs), "signatures": [{"pubkey": (s or {}).get("pubkey", "")[:32] + "...", "pubkey_full": (s or {}).get("pubkey", ""), "signature": (s or {}).get("signature", "")[:64] + "..."} for s in sigs]})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
+
 @app.route("/api/work", methods=["GET"])
 def api_work():
     try:
         chain = _get_chain()
         return jsonify({"ok": True, "cumulative_work": chain.cumulative_work(), "height": chain.db.height(), "difficulty": chain.current_difficulty()})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
+
 
 @app.route("/api/tx-status/<txid_str>", methods=["GET"])
 def api_tx_status(txid_str):
@@ -1096,6 +1523,7 @@ def api_tx_status(txid_str):
         return jsonify({"ok": True, "status": "not_found", "block_height": None, "confirmations": 0})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
+
 @app.route("/api/bridge/status", methods=["GET"])
 def bridge_status():
     try:
@@ -1103,7 +1531,8 @@ def bridge_status():
         return jsonify({"ok": True, "onramp_ativo": bool(btc_config.BTC_RECEIVE_ADDRESS), "offramp_ativo": bool(btc_config.BTC_WIF), "taxa": btc_config.FEE_PERCENT, "btc_cofre": btc_config.BTC_RECEIVE_ADDRESS, "btc_network": btc_config.BTC_NETWORK, "processados": 0, "ultima_sync": int(time.time())})
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
+
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print("BRN Server v9.9.32 (Honest Validator Diagnostics)")
+    print("BRN Server v9.9.33 (Mining Gate)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
