@@ -1,9 +1,13 @@
-"""miner_pool_client.py — Pool client BRN (v7.0)
+"""miner_pool_client.py — Pool client BRN (v7.1)
 ================================================================
-v7.0 (2026-11-03):
-  [FIX] Envia 'share_difficulty' e 'active_share_difficulty' no
-        status() para a GUI mostrar o Vardiff corretamente.
-  [FIX] Normaliza 'share_diff' para 'share_difficulty' no _fetch_work.
+v7.1 (2026-11-12) — FIX CRÍTICO DE TIMEOUT NO RENDER:
+  [FIX] start_mining() não faz mais chamada HTTP bloqueante.
+        Agora apenas inicia as threads e retorna True imediatamente.
+        A thread _loop_heartbeat faz o registro (e re-registro)
+        em background. Isso evita que o servidor Flask trave
+        por timeout quando a Origin está lenta.
+  [FIX] _fetch_work() agora detecta "desconhecido" e aciona
+        _reregister() automaticamente.
 ================================================================
 """
 from __future__ import annotations
@@ -19,7 +23,7 @@ import urllib.error
 from blockchain import block_hash, target_from_difficulty
 
 log = logging.getLogger("pool.client")
-__version__ = "7.0"
+__version__ = "7.1"
 
 _INSTANCE = None
 _INSTANCE_LOCK = threading.RLock()
@@ -126,20 +130,8 @@ class PoolClient(threading.Thread):
         if self._running:
             return False, "ja rodando"
 
-        r = _http_post(f"{self.pool_url}/api/pool/register", {
-            "miner_id": self.miner_id,
-            "address":  self.address,
-            "pubkey":   self.pubkey,
-        })
-        
-        if not r.get("ok"):
-            msg = r.get("msg", "register falhou")
-            if "já registrado" not in msg.lower():
-                log.error("PoolClient: falha ao registrar: %s", msg)
-                return False, msg
-
-        self.miner_id = r.get("miner_id", self.miner_id)
-
+        # [FIX v7.1] Removida a chamada bloqueante de _http_post.
+        # O registro agora é feito de forma assíncrona na thread.
         self._stop.clear()
         self._running = True
         self.started_at = time.time()
@@ -169,6 +161,9 @@ class PoolClient(threading.Thread):
         return self._running
 
     def _loop_heartbeat(self):
+        # [FIX v7.1] Tenta registrar ao iniciar a thread
+        self._reregister()
+        
         while not self._stop.wait(5.0):
             try:
                 h = self.hashrate_meter.rate()
@@ -195,10 +190,12 @@ class PoolClient(threading.Thread):
         r = _http_post(f"{self.pool_url}/api/pool/work", {"miner_id": self.miner_id})
         if not r.get("ok"):
             self.last_error = r.get("msg", "work falhou")
+            # [FIX v7.1] Se o pool não conhece o minerador, tenta registrar de novo
+            if "desconhecido" in self.last_error.lower():
+                self._reregister()
             return
         job = r.get("job") or {}
         
-        # [FIX] Normaliza a dificuldade para a interface gráfica ler
         if "share_difficulty" not in job:
             job["share_difficulty"] = job.get("share_diff", 4)
             
@@ -306,7 +303,6 @@ class PoolClient(threading.Thread):
                 "job_id": job.get("job_id"),
                 "job_height": job.get("height"),
                 "pool_url": self.pool_url,
-                # [FIX] Envia todos os nomes para a GUI conseguir ler
                 "share_difficulty": sdiff,
                 "active_share_difficulty": sdiff,
                 "job_share_diff": sdiff,
