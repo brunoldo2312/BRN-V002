@@ -1,19 +1,21 @@
-"""main.py — Entrypoint do nó BRN (v13.9.9)
+"""main.py — Entrypoint do nó BRN (v13.9.10)
 ================================================================
-v13.9.9 (2026-11-11) — PING RÁPIDO NO ORIGIN:
-  [NEW] _ping_origin(): testa HTTP do Origin (BRN_POOL_URL) com
-        timeout de 3s antes de qualquer integração. Sem isso, o
-        wallet_integrator travava 10s e o requests travava 30s
-        cada vez que Origin estava offline → Render travava.
-  [NEW] _install_sk_local_only(): instala SK no chain sem chamar
-        integrate_and_propagate. Usado quando Origin está offline.
-  [NEW] _auto_mine_loop(): thread persistente que monitora Origin
-        a cada 30s. Quando Origin volta online, inicia PoolClient
-        automaticamente. Sobrevive a quedas/hibernação do Origin.
-  [NEW] Logs [AUTO-MINE] mostram status do monitoramento.
-  [KEEP] v13.9.8: seed determinístico (BRN_VALIDATOR_SEED)
-  [KEEP] v13.9.7: /health.sk_validation com motivo exato
-  [KEEP] v13.9.6: defaults bootstrap/pool
+v13.9.10 (2026-11-11) — MULTI-MÁQUINA (CLIENTES WINDOWS):
+  [NEW] --no-auto-config: cliente que só quer sincronizar sem
+        tentar auto-SK nem auto-mine.
+  [NEW] --no-gui: força headless mesmo em Windows com display.
+  [NEW] Defaults NEUTROS: não força IP do Origin. Prioriza:
+          1. env var (BRN_BOOTSTRAP_PEERS / BRN_POOL_URL)
+          2. bootstrap_peers.json (lido automaticamente)
+          3. vazio (cliente só sync, sem pool)
+        Evita PCs tentando conectar em Origin errada.
+  [NEW] Detecção de contexto:
+          - is_origin=True  → auto-mine padrão se env não setado
+          - is_origin=False → só auto-mine se BRN_AUTO_MINE=1
+  [NEW] Log [CONFIG] mostra origem de cada parâmetro.
+  [KEEP] v13.9.9: ping rápido + auto-mine persistente
+  [KEEP] v13.9.8: seed determinístico
+  [KEEP] v13.9.7: /health.sk_validation
   [KEEP] v13.9.5: isolation_detector no watchdog
 ================================================================
 """
@@ -37,7 +39,7 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.9"
+    VERSION = "13.9.10"
     BUILD_DATE = "2026-11-11"
 
 # [AI v13.9.5] Detector de isolamento
@@ -63,7 +65,7 @@ except ImportError:
     _requests = None
     _HAS_REQUESTS = False
 
-# [VALIDAÇÃO v13.9.7] Wallet para checar SK
+# [VALIDAÇÃO v13.9.7] Wallet
 try:
     from wallet import Wallet as _Wallet
     _HAS_WALLET = True
@@ -92,9 +94,12 @@ SK_VALIDATION_STATE = {
 def parse_args():
     p = argparse.ArgumentParser(prog="main.py")
     p.add_argument("--headless", action="store_true", help="sem GUI")
+    p.add_argument("--no-gui", action="store_true", help="força headless mesmo com display")
     p.add_argument("--client-mode", action="store_true", help="nó cliente")
     p.add_argument("--origem", action="store_true", help="força BRN_IS_ORIGIN=1")
     p.add_argument("--no-pool-client", action="store_true", help="não inicia PoolClient")
+    p.add_argument("--no-auto-config", action="store_true",
+                   help="não tenta auto-SK nem auto-mine (só sync)")
     p.add_argument("--no-p2p", action="store_true", help="desliga P2P")
     p.add_argument("--no-explorer", action="store_true", help="não inicia Explorer")
     p.add_argument("--db", metavar="PATH", default=None, help="caminho do DB")
@@ -128,6 +133,22 @@ def _load_env_file():
             os.environ[k] = v
             loaded += 1
     return loaded
+
+
+def _read_bootstrap_json() -> str:
+    """Lê bootstrap_peers.json (lista) → 'peer1,peer2'."""
+    p = BASE_DIR / "bootstrap_peers.json"
+    if not p.exists():
+        return ""
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return ",".join(str(x).strip() for x in data if str(x).strip())
+        if isinstance(data, dict) and "peers" in data:
+            return ",".join(str(x).strip() for x in data["peers"] if str(x).strip())
+    except Exception:
+        pass
+    return ""
 
 
 # ============================================================
@@ -264,7 +285,7 @@ def _check_blockchain_version() -> bool:
 
 
 # ============================================================
-# TRUST / P2P / SYNC / BROADCAST / POOL / WEB
+# SETUP (trust, p2p, sync, broadcast, pool, web, explorer, gui)
 # ============================================================
 def _setup_trust(chain, node_id_priv, is_origin: bool):
     try:
@@ -489,23 +510,15 @@ def _start_gui() -> bool:
 
 
 # ============================================================
-# [v13.9.8] Resolve SK por seed / env / arquivo / geração
+# [v13.9.8] Resolve SK
 # ============================================================
 def _resolve_validator_sk() -> tuple:
-    """
-    Resolve (sk_hex, address, pubkey, source) nesta ordem:
-      1. BRN_VALIDATOR_SK_HEX (64 hex explícito)
-      2. BRN_VALIDATOR_SEED   (SHA256(seed) → SK determinística)
-      3. .validator_sk        (arquivo salvo em disco)
-      4. gera aleatória e tenta salvar em .validator_sk
-    """
     log = logging.getLogger("main")
 
     if not _HAS_WALLET:
         log.error("[SK] wallet.Wallet indisponível")
         return "", "", "", "error"
 
-    # ─── 1. SK explícita ───
     sk_env = os.environ.get("BRN_VALIDATOR_SK_HEX", "").strip()
     if sk_env:
         if len(sk_env) != 64 or any(c not in "0123456789abcdefABCDEF" for c in sk_env):
@@ -518,7 +531,6 @@ def _resolve_validator_sk() -> tuple:
             except Exception as e:
                 log.warning("[SK] Wallet(sk_env) falhou: %s", e)
 
-    # ─── 2. Seed determinístico ───
     seed = os.environ.get("BRN_VALIDATOR_SEED", "").strip()
     if seed:
         try:
@@ -529,7 +541,6 @@ def _resolve_validator_sk() -> tuple:
         except Exception as e:
             log.warning("[SK] derivação de seed falhou: %s", e)
 
-    # ─── 3. Arquivo .validator_sk em disco ───
     sk_file = BASE_DIR / ".validator_sk"
     if sk_file.exists():
         try:
@@ -544,7 +555,6 @@ def _resolve_validator_sk() -> tuple:
         except Exception as e:
             log.warning("[SK] leitura de %s falhou: %s", sk_file.name, e)
 
-    # ─── 4. Gera nova ───
     try:
         w = _Wallet()
         sk_hex = w.priv_hex
@@ -582,11 +592,6 @@ def _resolve_validator_sk() -> tuple:
 # [v13.9.9] Ping rápido no Origin
 # ============================================================
 def _ping_origin(timeout: float = 3.0) -> bool:
-    """
-    Testa HTTP do Origin (BRN_POOL_URL/api/status) com timeout curto.
-    Retorna True se o Origin respondeu 200, False caso contrário.
-    Nunca lança exceção.
-    """
     log = logging.getLogger("main")
     pool_url = os.environ.get("BRN_POOL_URL", "").strip().rstrip("/")
     if not pool_url:
@@ -594,13 +599,12 @@ def _ping_origin(timeout: float = 3.0) -> bool:
         return False
 
     if not _HAS_REQUESTS:
-        # fallback para urllib se requests não estiver instalado
         try:
             import urllib.request
             import urllib.error
             req = urllib.request.Request(
                 f"{pool_url}/api/status",
-                headers={"User-Agent": "brn-main/13.9.9"},
+                headers={"User-Agent": "brn-main/13.9.10"},
             )
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.status == 200
@@ -617,13 +621,9 @@ def _ping_origin(timeout: float = 3.0) -> bool:
 
 
 # ============================================================
-# [v13.9.9] Instala SK local sem tentar propagar
+# [v13.9.9] Instala SK local sem propagar
 # ============================================================
 def _install_sk_local_only(chain, sk_hex: str, address: str, pubkey: str) -> bool:
-    """
-    Instala SK no chain (set_local_validator_sk) sem chamar
-    integrate_and_propagate. Não bloqueia em rede.
-    """
     log = logging.getLogger("main")
     try:
         chain.set_local_validator_sk(sk_hex)
@@ -635,18 +635,10 @@ def _install_sk_local_only(chain, sk_hex: str, address: str, pubkey: str) -> boo
 
 
 # ============================================================
-# [v13.9.9] Auto-mine loop (persistente, sobrevive a Origin offline)
+# [v13.9.9] Auto-mine loop persistente
 # ============================================================
 def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
                     stop_evt: threading.Event) -> None:
-    """
-    Thread persistente. A cada 30s:
-      1. Se SK ainda não está no chain → continua esperando
-      2. Se Origin offline → dorme 30s, tenta de novo
-      3. Se Origin online → chama POST /api/pool/start_local
-      4. Se PoolClient já está rodando → dorme e monitora
-      5. Se PoolClient parou (crash, timeout) → reinicia
-    """
     log = logging.getLogger("main")
     SK_VALIDATION_STATE["auto_mine_status"] = "starting"
     log.info("[AUTO-MINE] loop iniciado (checa Origin a cada 30s)")
@@ -656,7 +648,6 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
 
     while not stop_evt.is_set():
         try:
-            # ─── 1. SK no chain? ───
             if getattr(chain, "_local_validator_sk", None) is None:
                 log.info("[AUTO-MINE] SK ainda ausente — aguardando instalação")
                 SK_VALIDATION_STATE["auto_mine_status"] = "waiting_sk"
@@ -664,7 +655,6 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
                     break
                 continue
 
-            # ─── 2. PoolClient já rodando? ───
             if _HAS_REQUESTS:
                 try:
                     r = _requests.get(
@@ -685,7 +675,6 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
                 except Exception:
                     pass
 
-            # ─── 3. Origin online? ───
             origin_online = _ping_origin(timeout=3.0)
             SK_VALIDATION_STATE["origin_online"] = origin_online
 
@@ -701,12 +690,11 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
                     break
                 continue
 
-            # ─── 4. Inicia PoolClient ───
             SK_VALIDATION_STATE["auto_mine_status"] = "starting_pool"
             log.info("[AUTO-MINE] Origin online — iniciando PoolClient...")
 
             if not _HAS_REQUESTS:
-                log.error("[AUTO-MINE] requests indisponível — não posso chamar start_local")
+                log.error("[AUTO-MINE] requests indisponível")
                 SK_VALIDATION_STATE["auto_mine_status"] = "error_no_requests"
                 if stop_evt.wait(60):
                     break
@@ -745,7 +733,6 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
         except Exception as e:
             log.exception("[AUTO-MINE] loop exceção: %s", e)
 
-        # Dorme antes da próxima rodada
         if stop_evt.wait(30):
             break
 
@@ -754,19 +741,11 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
 
 
 # ============================================================
-# [v13.9.9] AUTO-CONFIG (com ping rápido)
+# [v13.9.10] AUTO-CONFIG (multi-máquina)
 # ============================================================
 def _auto_configure(chain, p2p, trust, web_port: int,
-                    stop_evt: threading.Event) -> None:
-    """
-    Fluxo v13.9.9:
-      1. Resolve SK
-      2. Instala SK local (sempre)
-      3. Ping rápido no Origin (3s)
-         - Se online: propaga (integrate_and_propagate)
-         - Se offline: pula propagação, registra no /health
-      4. Inicia thread de auto-mine (independente)
-    """
+                    is_origin: bool, stop_evt: threading.Event,
+                    force_auto_mine: bool = False) -> None:
     log = logging.getLogger("main")
 
     # ─── 1. Resolve SK ───
@@ -782,7 +761,7 @@ def _auto_configure(chain, p2p, trust, web_port: int,
     SK_VALIDATION_STATE["pubkey_derived"] = pubkey
 
     log.info("=" * 64)
-    log.info(" [SK RESOLUTION v13.9.9]")
+    log.info(" [SK RESOLUTION v13.9.10]")
     log.info("=" * 64)
     log.info("  source           : %s", source or "(nenhum)")
     log.info("  SK_HEX len       : %d", len(sk_hex) if sk_hex else 0)
@@ -800,7 +779,7 @@ def _auto_configure(chain, p2p, trust, web_port: int,
     # ─── 2. Instala SK local (sempre) ───
     _install_sk_local_only(chain, sk_hex, address, pubkey)
 
-    # ─── 3. Ping rápido no Origin ───
+    # ─── 3. Ping Origin ───
     log.info("[AUTO-CONFIG] pingando Origin...")
     t0 = time.time()
     origin_online = _ping_origin(timeout=3.0)
@@ -832,20 +811,37 @@ def _auto_configure(chain, p2p, trust, web_port: int,
                 log.exception("[AUTO-CONFIG] integrate_and_propagate falhou: %s", e)
     else:
         log.warning(
-            "[AUTO-CONFIG] ⚠️ Origin OFFLINE (%.0fms) — SK instalada localmente, "
-            "sem propagação. Auto-mine vai monitorar até Origin voltar.",
+            "[AUTO-CONFIG] ⚠️ Origin OFFLINE (%.0fms) — SK instalada localmente. "
+            "Auto-mine monitora até Origin voltar.",
             dt_ms,
         )
 
-    # ─── 4. Thread de auto-mine (independente do Origin agora) ───
-    auto_mine = os.environ.get("BRN_AUTO_MINE", "0") == "1"
-    if not auto_mine:
-        log.info("[AUTO-CONFIG] BRN_AUTO_MINE desligado — não inicia mineração")
+    # ─── 4. Decide se inicia auto-mine ───
+    env_auto_mine = os.environ.get("BRN_AUTO_MINE", "").strip()
+    if env_auto_mine == "1":
+        should_mine = True
+        reason = "BRN_AUTO_MINE=1"
+    elif env_auto_mine == "0":
+        should_mine = False
+        reason = "BRN_AUTO_MINE=0 (explícito)"
+    elif force_auto_mine:
+        should_mine = True
+        reason = "--auto-mine (flag CLI)"
+    elif is_origin:
+        should_mine = True
+        reason = "origin (padrão)"
+    else:
+        should_mine = False
+        reason = "cliente + BRN_AUTO_MINE não setado"
+
+    log.info("[AUTO-CONFIG] auto-mine: %s (%s)", should_mine, reason)
+
+    if not should_mine:
         SK_VALIDATION_STATE["auto_mine_status"] = "disabled"
         return
 
     if not address or not pubkey:
-        log.warning("[AUTO-CONFIG] BRN_AUTO_MINE=1 mas faltam ADDRESS/PUBKEY")
+        log.warning("[AUTO-CONFIG] faltam ADDRESS/PUBKEY")
         SK_VALIDATION_STATE["auto_mine_status"] = "error_no_addr"
         return
 
@@ -858,12 +854,61 @@ def _auto_configure(chain, p2p, trust, web_port: int,
 
 
 def _delayed_auto_configure(chain, p2p, trust, web_port: int,
-                            stop_evt: threading.Event) -> None:
+                            is_origin: bool, stop_evt: threading.Event,
+                            force_auto_mine: bool = False) -> None:
     try:
         time.sleep(3)
-        _auto_configure(chain, p2p, trust, web_port, stop_evt)
+        _auto_configure(chain, p2p, trust, web_port, is_origin, stop_evt,
+                        force_auto_mine=force_auto_mine)
     except Exception as e:
         logging.getLogger("main").exception("[AUTO-CONFIG] falhou: %s", e)
+
+
+# ============================================================
+# [v13.9.10] CONFIG — resolve defaults neutros
+# ============================================================
+def _resolve_config(log) -> dict:
+    """
+    Resolve os parâmetros de rede com prioridade:
+      1. env var explícita
+      2. bootstrap_peers.json (para bootstrap)
+      3. vazio (sem forçar IP)
+    """
+    cfg = {
+        "bootstrap": "",
+        "bootstrap_source": "(vazio)",
+        "pool_url": "",
+        "pool_url_source": "(vazio)",
+    }
+
+    # ─── bootstrap ───
+    env_bootstrap = os.environ.get("BRN_BOOTSTRAP_PEERS", "").strip()
+    if env_bootstrap:
+        cfg["bootstrap"] = env_bootstrap
+        cfg["bootstrap_source"] = "env:BRN_BOOTSTRAP_PEERS"
+    else:
+        json_bootstrap = _read_bootstrap_json()
+        if json_bootstrap:
+            cfg["bootstrap"] = json_bootstrap
+            cfg["bootstrap_source"] = "file:bootstrap_peers.json"
+            os.environ["BRN_BOOTSTRAP_PEERS"] = json_bootstrap
+
+    # ─── pool_url ───
+    env_pool = os.environ.get("BRN_POOL_URL", "").strip()
+    if env_pool:
+        cfg["pool_url"] = env_pool
+        cfg["pool_url_source"] = "env:BRN_POOL_URL"
+    else:
+        # Tenta inferir do primeiro bootstrap peer (host:porta)
+        if cfg["bootstrap"]:
+            first = cfg["bootstrap"].split(",")[0].strip()
+            if ":" in first:
+                host = first.rsplit(":", 1)[0]
+                cfg["pool_url"] = f"http://{host}:5000"
+                cfg["pool_url_source"] = "inferido do bootstrap"
+                os.environ["BRN_POOL_URL"] = cfg["pool_url"]
+
+    return cfg
 
 
 # ============================================================
@@ -896,18 +941,12 @@ def main() -> int:
     log.info(" base=%s env_loaded=%d", BASE_DIR, loaded)
     log.info("=" * 64)
 
-    # [v13.9.6] Defaults
-    if not os.environ.get("BRN_BOOTSTRAP_PEERS"):
-        os.environ["BRN_BOOTSTRAP_PEERS"] = "100.111.253.8:6001"
-        log.info("[config] BRN_BOOTSTRAP_PEERS default: 100.111.253.8:6001")
-    else:
-        log.info("[config] BRN_BOOTSTRAP_PEERS: %s", os.environ.get("BRN_BOOTSTRAP_PEERS"))
-
-    if not os.environ.get("BRN_POOL_URL"):
-        os.environ["BRN_POOL_URL"] = "http://100.111.253.8:5000"
-        log.info("[config] BRN_POOL_URL default: http://100.111.253.8:5000")
-    else:
-        log.info("[config] BRN_POOL_URL: %s", os.environ.get("BRN_POOL_URL"))
+    # [v13.9.10] Resolve config neutra
+    cfg = _resolve_config(log)
+    log.info("[CONFIG] BRN_BOOTSTRAP_PEERS: %s (%s)",
+             cfg["bootstrap"] or "(vazio)", cfg["bootstrap_source"])
+    log.info("[CONFIG] BRN_POOL_URL: %s (%s)",
+             cfg["pool_url"] or "(vazio)", cfg["pool_url_source"])
 
     # [1] Version gate
     if not _check_blockchain_version():
@@ -948,7 +987,7 @@ def main() -> int:
     else:
         log.info("[trust] carregado (origin=%s)", is_origin)
 
-    log.info("[wallet] boot sem carteira (design v13.9.9)")
+    log.info("[wallet] boot sem carteira (design v13.9.10)")
 
     # [6] P2P
     p2p = None
@@ -992,28 +1031,36 @@ def main() -> int:
     if not ok_http:
         log.error("[server] HTTP não subiu")
 
-    # [11.5] [AUTO-CONFIG v13.9.9] resolve + valida + ping + instala + auto-mine
-    if not args.no_pool_client:
+    # [11.5] [AUTO-CONFIG v13.9.10]
+    if not args.no_auto_config and not args.no_pool_client:
         threading.Thread(
             target=_delayed_auto_configure,
-            args=(chain, p2p, trust, web_port, _stop_bg),
+            args=(chain, p2p, trust, web_port, is_origin, _stop_bg),
             daemon=True,
             name="AutoConfig",
         ).start()
-        log.info("[AUTO-CONFIG] agendado (3s: resolve SK + ping Origin + auto-mine)")
+        log.info("[AUTO-CONFIG] agendado (3s)")
+    else:
+        if args.no_auto_config:
+            log.info("[AUTO-CONFIG] desligado por --no-auto-config")
+        else:
+            log.info("[AUTO-CONFIG] desligado por --no-pool-client")
 
     # [12] Explorer
     if not args.no_explorer:
         _start_explorer(chain)
 
     # [13] GUI ou headless
-    if not args.headless:
+    want_gui = (not args.headless) and (not args.no_gui)
+    if want_gui:
         log.info("[gui] abrindo")
         if _start_gui():
             return 0
     else:
+        if args.no_gui:
+            log.info("[gui] desligada por --no-gui")
         log.info("=" * 64)
-        log.info(" MODO HEADLESS — consulte /health para estado da SK:")
+        log.info(" MODO HEADLESS — consulte /health:")
         log.info("   GET http://%s:%d/health",
                  os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
         log.info("=" * 64)
@@ -1049,8 +1096,8 @@ def main() -> int:
     log.info("   Health   : http://%s:%d/health",
              os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
     log.info("   P2P      : :%d", p2p_port)
-    log.info("   Bootstrap: %s", os.environ.get("BRN_BOOTSTRAP_PEERS", "(vazio)"))
-    log.info("   Pool URL : %s", os.environ.get("BRN_POOL_URL", "(vazio)"))
+    log.info("   Bootstrap: %s", cfg["bootstrap"] or "(vazio)")
+    log.info("   Pool URL : %s", cfg["pool_url"] or "(vazio)")
     log.info("   SK source: %s",
              os.environ.get("BRN_VALIDATOR_SEED") and "env:seed"
              or (os.environ.get("BRN_VALIDATOR_SK_HEX") and "env:sk_hex" or "(resolve no boot)"))
