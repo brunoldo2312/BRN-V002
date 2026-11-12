@@ -1,15 +1,15 @@
 """
-p2p_unified.py — BRN P2P Network v6.7.12
+p2p_unified.py — BRN P2P Network v6.7.13
 ================================================================
-v6.7.12 (2026-11-12) — SOCKS5 FALLBACK PARA TAILSCALE:
-  [NEW] P2PClient._send_message_once agora detecta se o IP
-        começa com "100." (Tailscale) e usa o proxy SOCKS5
-        local (127.0.0.1:1055) se a env ALL_PROXY estiver setada.
-        Isso permite que o Render (userspace-networking) se
-        conecte à Origin via Tailscale.
-  [KEEP] v6.7.10: retry de conexão TCP, validação de pubkey no _auth,
-        pré-validação de validators_sig antes de accept_block,
-        fallback síncrono em broadcast_block/broadcast_tx.
+v6.7.13 (2026-11-12) — SYNC LOCK & SOCKET CLEANUP:
+  [FIX CRÍTICO] Adicionado `_sync_internal_lock` no P2PManager.
+        Isso impede que múltiplos peers (ou o SyncManager) tentem
+        baixar blocos simultaneamente, o que causava o erro
+        "fatal — bloco #10 fora de sequência".
+  [FIX] _send_message_once agora fecha o socket no `finally`.
+        Evita vazamento de conexões (FD leak) quando o SOCKS5 falha.
+  [KEEP] v6.7.12: SOCKS5 fallback para Tailscale no Render.
+  [KEEP] v6.7.10: retry, validação de pubkey, fallback síncrono.
 ================================================================
 """
 from __future__ import annotations
@@ -822,9 +822,9 @@ class P2PClient:
     @staticmethod
     def _send_message_once(ip: str, port: int, message: dict, timeout: float):
         """Uma tentativa de envio — sem retry interno."""
+        s = None
         try:
             # --- PATCH RENDER v6.7.12: Usar SOCKS5 para IPs do Tailscale ---
-            s = None
             if _HAS_SOCKS and os.environ.get("ALL_PROXY") and ip.startswith("100."):
                 try:
                     proxy = os.environ.get("ALL_PROXY").replace("socks5://", "").replace("socks5h://", "")
@@ -872,7 +872,6 @@ class P2PClient:
                         continue
 
             latency_ms = (time.time() - t0) * 1000
-            s.close()
 
             if raw.startswith(NETWORK_MAGIC):
                 resp = json.loads(raw[len(NETWORK_MAGIC):].decode())
@@ -891,6 +890,13 @@ class P2PClient:
             raise
         except Exception:
             return None, 0.0
+        finally:
+            # [FIX v6.7.13] Fecha o socket garantidamente (evita FD leak)
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
 
     @staticmethod
     def ping(ip, port, timeout=None):
@@ -1217,6 +1223,8 @@ class P2PManager:
 
         self._backoffs = defaultdict(lambda: ExponentialBackoff(base=SYNC_RETRY_BASE_S, max_s=SYNC_RETRY_MAX_S))
         self._backoff_lock = threading.Lock()
+        # [FIX v6.7.13] Lock para evitar sincronizações simultâneas (Race Condition)
+        self._sync_internal_lock = threading.Lock() 
         self._broadcast_pool = ThreadPoolExecutor(max_workers=20, thread_name_prefix="p2p-bcast")
 
         self.server = P2PServer(
@@ -1347,31 +1355,39 @@ class P2PManager:
         except Exception: pass
 
     def _sync_with_retry(self, ip: str, port: int) -> None:
-        addr = f"{ip}:{port}"
-        backoff = self._backoffs[addr]
-        self.metrics.inc("sync_runs")
-        while True:
-            try:
-                result, msg = self._sync_incremental(ip, port)
-                if result in (SyncResult.OK, SyncResult.UP_TO_DATE):
-                    backoff.reset()
-                    self.metrics.inc("sync_success")
-                    return
-                self.metrics.inc("sync_failed")
-                if result == SyncResult.FATAL:
-                    log.warning(f"[Sync] {addr}: fatal — {msg}")
-                    return
-                if backoff.give_up(SYNC_RETRY_MAX):
-                    log.warning(f"[Sync] desistindo de {addr} — {msg}")
-                    return
-                wait = backoff.next_sleep()
-                log.info(f"[Sync] {addr}: retry em {wait:.1f}s — {msg}")
-                time.sleep(wait)
-            except Exception as e:
-                self.metrics.inc("sync_failed")
-                if backoff.give_up(SYNC_RETRY_MAX): return
-                wait = backoff.next_sleep()
-                time.sleep(wait)
+        # [FIX v6.7.13] Garante que apenas uma sincronização roda por vez no P2PManager
+        if not self._sync_internal_lock.acquire(blocking=False):
+            log.debug(f"[Sync] Ignorando sync com {ip}:{port} pois outra já está em andamento.")
+            return
+            
+        try:
+            addr = f"{ip}:{port}"
+            backoff = self._backoffs[addr]
+            self.metrics.inc("sync_runs")
+            while True:
+                try:
+                    result, msg = self._sync_incremental(ip, port)
+                    if result in (SyncResult.OK, SyncResult.UP_TO_DATE):
+                        backoff.reset()
+                        self.metrics.inc("sync_success")
+                        return
+                    self.metrics.inc("sync_failed")
+                    if result == SyncResult.FATAL:
+                        log.warning(f"[Sync] {addr}: fatal — {msg}")
+                        return
+                    if backoff.give_up(SYNC_RETRY_MAX):
+                        log.warning(f"[Sync] desistindo de {addr} — {msg}")
+                        return
+                    wait = backoff.next_sleep()
+                    log.info(f"[Sync] {addr}: retry em {wait:.1f}s — {msg}")
+                    time.sleep(wait)
+                except Exception as e:
+                    self.metrics.inc("sync_failed")
+                    if backoff.give_up(SYNC_RETRY_MAX): return
+                    wait = backoff.next_sleep()
+                    time.sleep(wait)
+        finally:
+            self._sync_internal_lock.release()
 
     def _sync_incremental(self, ip: str, port: int):
         t0 = time.time()
