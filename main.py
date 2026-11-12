@@ -1,43 +1,47 @@
-"""main.py — Entrypoint do nó BRN (v13.9.16)
+"""main.py — Entrypoint do nó BRN (v13.9.17)
 ================================================================
-v13.9.16 (2026-11-12) — FIX HTTP SYNC + FORCE RESYNC:
-  [FIX CRÍTICO] _force_http_sync_loop() tinha `if local_h >= 0:`.
-        Como db.height() retorna -1 APENAS com DB vazia, qualquer
-        bloco (incluindo genesis em h=0) fazia o check passar e o
-        loop marcava "synced 100%" para sempre. Resultado: o
-        fallback HTTP NUNCA re-sincronizava um nó que já tinha
-        blocos. Só servia para o primeiro download numa DB virgem.
-        Era exatamente o cenário do #4301: P2P sync travou, HTTP
-        sync não rodava, nó congelou em 4300.
-  [FIX] _force_http_sync_loop() agora compara local_h vs
-        target_h (via /api/status do peer). Se local_h < target_h,
-        sincroniza; se >=, dorme POLL_INTERVAL; se peer offline,
-        dorme metade do POLL_INTERVAL.
-  [NEW] BRN_HTTP_SYNC_TRUNCATE_ON_REJECT (default "0"): quando o
-        peer rejeita um bloco durante sync, tenta truncar a chain
-        in-place para BRN_HTTP_SYNC_TRUNCATE_HEIGHT (default 0) e
-        recomeçar. Útil para sair de fork/multi-sig travado.
-  [NEW] BRN_HTTP_SYNC_TRUNCATE_HEIGHT (default "0"): altura alvo
-        do truncate. 0 = reset total (re-sync do genesis).
-  [NEW] BRN_HTTP_SYNC_POLL_INTERVAL (default "60"): intervalo de
-        poll entre iterações (s) quando ocioso.
-  [NEW] --force-http-resync CLI flag: renomeia o DB para
-        {db}.bak.{timestamp} e sai. Recuperação explícita e
-        reversível para quando o truncate in-place não está
-        disponível no ChainDB. Use quando o log disser
-        "truncate in-place falhou" ou quando você quiser garantir
-        re-sync do zero.
-  [NEW] Diagnóstico no log quando um bloco é rejeitado durante
-        HTTP sync: aponta para app_wallet_v3 --verify-sk,
-        auto_trust_daemon --once --dry-run, e sugere remover
-        BRN_BOOTSTRAP_SKIP_SIGS_UNTIL se ainda estiver no env.
-  [NEW] _try_truncate_chain_in_place(chain, target, log): tenta
-        métodos comuns de ChainDB (remove_blocks_above,
-        truncate_to, prune_above, truncate, reset_to_height).
-        Retorna True se conseguiu verificar altura <= target.
-  [KEEP] v13.9.15: painel de download HTTP em HTTP_SYNC_PROGRESS
-        (server.py /api/sync-info já consome).
-  [KEEP] Auto-mine, auto-config, GUI, P2P, trust daemon, watchdog.
+v13.9.17 (2026-11-12) — FAST-SYNC ATÉ 6000 + GATE DE MINERAÇÃO:
+  [NEW] Fast-sync automático: se a altura do DB no boot for
+        < BRN_FAST_SYNC_UNTIL (default 6000), main.py seta
+        BRN_ASSUME_VALID_UNTIL=6000 e BRN_BOOTSTRAP_SKIP_SIGS_UNTIL=6000
+        ANTES de importar o blockchain. Blocos 1..6000 são aceitos
+        sem validação completa (PoW/merkle/sigs/auth_tag) — apenas
+        prev_hash + hash calculado. Acima de 6000 a validação FULL
+        volta automaticamente sem precisar reiniciar.
+  [NEW] Se a altura do DB já for >= 6000 no boot, fast-sync NÃO é
+        ativado (validação completa desde o genesis).
+  [NEW] _verify_validators_synced(): consulta peers do DB, filtra
+        por last_seen recente (BRN_VALIDATOR_MAX_AGE_S, default 300s),
+        compara alturas com tolerância (BRN_VALIDATOR_HEIGHT_TOLERANCE,
+        default 1) e exige BRN_MIN_VALIDATORS_FOR_MINING validadores
+        sincronizados (default 1).
+  [NEW] _auto_mine_loop reescrito com 4 gates em sequência:
+          1. SK instalada (_local_validator_sk != None)
+          2. altura >= BRN_FAST_SYNC_UNTIL (sai do fast-sync)
+          3. Origin online e não à frente (tolerância)
+          4. _verify_validators_synced() OK
+        Só então chama POST /api/pool/start_local. Os 4 gates são
+        re-verificados a cada 30s.
+  [NEW] SK_VALIDATION_STATE ganhou: local_height, fast_sync_active,
+        fast_sync_until, validators_ready, validators_reason,
+        validators_detail. Exposto via /health.sk_validation.
+  [NEW] _start_web_server() agora recebe stop_evt e mantém thread
+        StateRefresh que re-injeta SK_VALIDATION_STATE e
+        HTTP_SYNC_PROGRESS a cada 5s — server.py copia o dict no
+        setter, sem isso o /health ficaria stale.
+  [NEW] CLI flags:
+          --fast-sync-until N  (override de BRN_FAST_SYNC_UNTIL)
+          --no-fast-sync       (desativa fast-sync; validação completa)
+  [NEW] Env vars:
+          BRN_FAST_SYNC_UNTIL             (default 6000)
+          BRN_MIN_VALIDATORS_FOR_MINING   (default 1)
+          BRN_VALIDATOR_HEIGHT_TOLERANCE  (default 1)
+          BRN_VALIDATOR_MAX_AGE_S         (default 300)
+  [FIX] _auto_mine_loop antes só checava o origin (pool_url); agora
+        também verifica o quórum de validadores no DB. Sem isso,
+        minerar em fork era possível.
+  [KEEP] v13.9.16: fix do HTTP sync, --force-http-resync,
+        truncate in-place, diagnóstico no reject.
 ================================================================
 """
 from __future__ import annotations
@@ -51,6 +55,7 @@ import time
 import json
 import logging
 import secrets
+import sqlite3
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -59,7 +64,7 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.16"
+    VERSION = "13.9.17"
     BUILD_DATE = "2026-11-12"
 
 try:
@@ -90,14 +95,21 @@ except ImportError:
     _Wallet = None
     _HAS_WALLET = False
 
+
 SK_VALIDATION_STATE = {
     "checked": False, "ok": False, "error": "", "source": "",
     "address_configured": "", "address_derived": "",
     "pubkey_configured": "", "pubkey_derived": "",
     "origin_online": None, "auto_mine_status": "idle", "gui_wallet_source": "",
+    # [v13.9.17] Fast-sync + validator gating
+    "local_height": -1,
+    "fast_sync_active": False,
+    "fast_sync_until": 0,
+    "validators_ready": False,
+    "validators_reason": "",
+    "validators_detail": {},
 }
 
-# Estado do download HTTP para o painel (server.py /api/sync-info consome)
 HTTP_SYNC_PROGRESS = {
     "syncing": False,
     "local_height": -1,
@@ -126,6 +138,12 @@ def parse_args():
     p.add_argument("--force-http-resync", action="store_true",
                    help="renomeia o DB para .bak.TIMESTAMP e sai "
                         "(para forçar re-sync do zero na próxima execução)")
+    # [v13.9.17] Fast-sync
+    p.add_argument("--fast-sync-until", type=int, default=None,
+                   help="Altura até a qual pular validação completa "
+                        "(default: BRN_FAST_SYNC_UNTIL ou 6000)")
+    p.add_argument("--no-fast-sync", action="store_true",
+                   help="Desativa fast-sync (validação completa desde o boot)")
     return p.parse_args()
 
 
@@ -167,6 +185,194 @@ def _setup_logging(level: str = "INFO"):
         return logging.getLogger("main")
 
 
+# ============================================================
+# [v13.9.17] FAST-SYNC — helpers
+# ============================================================
+def _get_current_db_height(db_path: str) -> int:
+    """Lê MAX(height) do DB sem abrir via ChainDB (evita import de blockchain)."""
+    if not os.path.isabs(db_path):
+        db_path = str(BASE_DIR / db_path)
+    if not os.path.exists(db_path):
+        return -1
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        try:
+            row = conn.execute("SELECT MAX(height) FROM blocks").fetchone()
+            return int(row[0]) if row and row[0] is not None else -1
+        finally:
+            conn.close()
+    except Exception:
+        return -1
+
+
+def _resolve_fast_sync_until(args) -> int:
+    """Resolve BRN_FAST_SYNC_UNTIL considerando CLI > env > default."""
+    if getattr(args, "no_fast_sync", False):
+        return 0
+    if getattr(args, "fast_sync_until", None) is not None:
+        try:
+            return max(0, int(args.fast_sync_until))
+        except (ValueError, TypeError):
+            pass
+    try:
+        return max(0, int(os.environ.get("BRN_FAST_SYNC_UNTIL", "6000")))
+    except (ValueError, TypeError):
+        return 6000
+
+
+def _maybe_enable_fast_sync(fast_sync_until: int, args) -> None:
+    """
+    Se a altura atual do DB < fast_sync_until, ativa os bypasses do
+    blockchain via env vars ANTES do import de blockchain.
+
+    Regras:
+      - CLI --no-fast-sync           → não faz nada (retorna antes)
+      - CLI --fast-sync-until N      → override (sobrescreve env)
+      - Env BRN_FAST_SYNC_UNTIL=N    → usa N
+      - Env BRN_ASSUME_VALID_UNTIL já setado → respeita (não sobrescreve)
+      - DB >= fast_sync_until        → não ativa (validação completa)
+    """
+    log = logging.getLogger("main")
+    cli_explicit = getattr(args, "fast_sync_until", None) is not None
+    no_fast_sync = getattr(args, "no_fast_sync", False)
+
+    if no_fast_sync:
+        log.info("[FAST-SYNC] --no-fast-sync ativo — validação completa desde o boot")
+        return
+
+    if fast_sync_until <= 0:
+        log.info("[FAST-SYNC] desativado (fast_sync_until=%d)", fast_sync_until)
+        return
+
+    db_path = os.environ.get("BRN_DB", "brn_v2_chain.db")
+    current_h = _get_current_db_height(db_path)
+
+    if current_h >= fast_sync_until:
+        log.info(
+            "[FAST-SYNC] DB em %d (>= %d) — fast-sync NÃO ativado. "
+            "Validação completa desde o boot.",
+            current_h, fast_sync_until,
+        )
+        return
+
+    # CLI explicit overrides env; caso contrário respeita env existente
+    def _should_set(key: str) -> bool:
+        if cli_explicit:
+            return True
+        return not os.environ.get(key)
+
+    if _should_set("BRN_ASSUME_VALID_UNTIL"):
+        os.environ["BRN_ASSUME_VALID_UNTIL"] = str(fast_sync_until)
+    if _should_set("BRN_BOOTSTRAP_SKIP_SIGS_UNTIL"):
+        os.environ["BRN_BOOTSTRAP_SKIP_SIGS_UNTIL"] = str(fast_sync_until)
+
+    log.warning("=" * 64)
+    log.warning(" [FAST-SYNC] ATIVADO")
+    log.warning("=" * 64)
+    log.warning("  altura atual    : %d", current_h)
+    log.warning("  sync rápido até : %d", fast_sync_until)
+    log.warning("  Blocos 1..%d aceitos SEM validação completa", fast_sync_until)
+    log.warning("  (PoW/merkle/multi-sig/auth_tag ignorados; só prev_hash")
+    log.warning("   e hash calculado são verificados).")
+    log.warning("  A partir de %d, validação FULL é obrigatória.",
+                fast_sync_until + 1)
+    log.warning("  Mineração só libera APÓS %d E validadores sincronizados.",
+                fast_sync_until)
+    log.warning("=" * 64)
+
+
+def _verify_validators_synced(chain, min_validators: int = 1,
+                              tolerance: int = 1,
+                              max_age_s: int = 300) -> tuple:
+    """
+    [v13.9.17] Verifica que pelo menos `min_validators` peers estão
+    na mesma altura que nós (dentro de `tolerance`).
+
+    Fonte: chain.db.listar_peers(apenas_ativos=False) — peers vistos
+    via P2P handshake. `last_seen` do DB indica freshness; peers com
+    last_seen < now - max_age_s são ignorados (stale).
+
+    Retorna (ok: bool, reason: str, details: dict).
+    """
+    our_h = int(chain.db.height())
+    now = time.time()
+
+    details = {
+        "our_height": our_h,
+        "min_validators": min_validators,
+        "tolerance": tolerance,
+        "max_age_s": max_age_s,
+        "synced_peers": [],
+        "ahead_peers": [],
+        "behind_peers": [],
+        "stale_peers": [],
+        "total_peers": 0,
+    }
+
+    if our_h < 0:
+        return False, f"nosso DB está vazio (height={our_h})", details
+
+    try:
+        peers = chain.db.listar_peers(apenas_ativos=False)
+    except Exception as e:
+        return False, f"falha ao listar peers do DB: {e}", details
+
+    peers = peers or []
+    details["total_peers"] = len(peers)
+
+    for p in peers:
+        if not isinstance(p, dict):
+            continue
+        addr = (p.get("address") or "").strip()
+        if not addr:
+            continue
+        ip = addr.rsplit(":", 1)[0] if ":" in addr else addr
+        if not ip or ip.startswith("127.") or ip == "0.0.0.0":
+            continue
+
+        try:
+            peer_h = int(p.get("height", 0) or 0)
+        except (ValueError, TypeError):
+            peer_h = 0
+        try:
+            last_seen = float(p.get("last_seen", 0) or 0)
+        except (ValueError, TypeError):
+            last_seen = 0.0
+        age_s = int(now - last_seen) if last_seen > 0 else -1
+
+        entry = {"ip": ip, "height": peer_h, "age_s": age_s}
+
+        if age_s < 0 or age_s > max_age_s:
+            details["stale_peers"].append(entry)
+            continue
+
+        delta = peer_h - our_h
+        if abs(delta) <= tolerance:
+            details["synced_peers"].append({**entry, "delta": delta})
+        elif delta > 0:
+            details["ahead_peers"].append({**entry, "delta": delta})
+        else:
+            details["behind_peers"].append({**entry, "delta": delta})
+
+    if len(details["synced_peers"]) >= min_validators:
+        return True, (
+            f"{len(details['synced_peers'])} validador(es) em altura "
+            f"~{our_h} (tolerância ±{tolerance})"
+        ), details
+
+    return False, (
+        f"apenas {len(details['synced_peers'])}/{min_validators} "
+        f"validador(es) em altura ~{our_h} "
+        f"(à frente={len(details['ahead_peers'])}, "
+        f"atrás={len(details['behind_peers'])}, "
+        f"stale={len(details['stale_peers'])}, "
+        f"total={details['total_peers']})"
+    ), details
+
+
+# ============================================================
+# Identidade / wallet / trust / p2p / sync / pool
+# ============================================================
 def _get_identity_password() -> str:
     log = logging.getLogger("main")
     pw = (os.environ.get("BRN_NODE_PASSWORD", "").strip() or os.environ.get("BRN_WALLET_SESSION_PASS", "").strip())
@@ -366,7 +572,8 @@ def _setup_trust_daemon(chain, trust, p2p, password: str, is_origin: bool, stop_
     return t
 
 
-def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int):
+def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int,
+                     stop_evt: threading.Event = None):
     log = logging.getLogger("main")
     try: import server as srv
     except Exception as e:
@@ -374,7 +581,8 @@ def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int):
         return False
 
     srv.set_chain(chain)
-    for fn_name, obj in (("set_p2p_manager", p2p), ("set_pool_manager", pool), ("set_sync_manager", sync_mgr), ("set_trust_network", trust)):
+    for fn_name, obj in (("set_p2p_manager", p2p), ("set_pool_manager", pool),
+                          ("set_sync_manager", sync_mgr), ("set_trust_network", trust)):
         if obj is None: continue
         fn = getattr(srv, fn_name, None)
         if fn is None: continue
@@ -389,6 +597,20 @@ def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int):
             srv.set_http_sync_state(HTTP_SYNC_PROGRESS)
             log.info("[server] http_sync_state injetado")
     except Exception as e: log.debug("[server] set_state falhou: %s", e)
+
+    # [v13.9.17] Refresh thread: server copia o dict no setter,
+    # sem isso /health.sk_validation fica stale.
+    if stop_evt is not None and hasattr(srv, "set_sk_validation_state"):
+        def _refresh():
+            while not stop_evt.wait(5):
+                try:
+                    srv.set_sk_validation_state(SK_VALIDATION_STATE)
+                    if hasattr(srv, "set_http_sync_state"):
+                        srv.set_http_sync_state(HTTP_SYNC_PROGRESS)
+                except Exception:
+                    pass
+        threading.Thread(target=_refresh, daemon=True, name="StateRefresh").start()
+        log.info("[server] state refresh thread iniciada (5s)")
 
     def _run():
         try: srv.app.run(host=os.environ.get("BRN_WEB_HOST", "127.0.0.1"), port=web_port, threaded=True, use_reloader=False)
@@ -459,8 +681,6 @@ def _prompt_password_interactive(api, max_attempts: int = 3) -> tuple:
                         print(f"     [WARN] {w}")
                     for e in (r.get("errors") or []):
                         print(f"     [ERR]  {e}")
-                    print("     O nó NÃO vai assinar. Verifique main.py e ")
-                    print("     use 'python3 app_wallet_v3.py --verify-sk'.")
                     SK_VALIDATION_STATE["gui_wallet_source"] = f"interactive:{attempt}:no_sk"
                     SK_VALIDATION_STATE["address_derived"] = addr
                     SK_VALIDATION_STATE["address_configured"] = addr[:40] if addr else ""
@@ -470,7 +690,6 @@ def _prompt_password_interactive(api, max_attempts: int = 3) -> tuple:
         except Exception as e: print(f" ❌ Erro: {e}")
 
     print(f"\n ❌ Senha incorreta {max_attempts} vezes. Abrindo GUI sem carteira.")
-    print("    Use 'Carregar' ou 'Gerar nova' na interface.")
     SK_VALIDATION_STATE["gui_wallet_source"] = "interactive_failed"
     return False, "interactive_failed", "", f"{max_attempts} tentativas falharam"
 
@@ -508,9 +727,7 @@ def _auto_unlock_gui(api, allow_interactive: bool = True) -> tuple:
                         "[GUI] ⚠️ carteira ABERTA com %s mas SK NÃO instalada "
                         "(sk_installed=False). Nó NÃO vai assinar. "
                         "warnings=%s errors=%s",
-                        src,
-                        r.get("warnings"),
-                        r.get("errors"),
+                        src, r.get("warnings"), r.get("errors"),
                     )
                 SK_VALIDATION_STATE["gui_wallet_source"] = (
                     src if r.get("sk_installed") else f"{src}:no_sk"
@@ -527,7 +744,7 @@ def _auto_unlock_gui(api, allow_interactive: bool = True) -> tuple:
             log.info("[GUI] ✅ carteira ABERTA via %s — address=%s", src, addr)
             return True, src, addr, err
         else:
-            log.warning("[GUI] prompt falhou (%s) — GUI abrirá sem carteira. Use 'Carregar' ou 'Gerar nova'.", src)
+            log.warning("[GUI] prompt falhou (%s) — GUI abrirá sem carteira.", src)
             return False, src, "", err
 
     log.warning("[GUI] ❌ não consegui abrir a carteira. Clique em 'Carregar' ou 'Gerar nova' na GUI.")
@@ -574,653 +791,4 @@ def _resolve_validator_sk() -> tuple:
                 return sk_env, w.address, w.pub_hex, "env:sk_hex"
             except Exception as e: log.warning("[SK] Wallet(sk_env) falhou: %s", e)
 
-    seed = os.environ.get("BRN_VALIDATOR_SEED", "").strip()
-    if seed:
-        try:
-            sk_hex = hashlib.sha256(seed.encode("utf-8")).hexdigest()
-            w = _Wallet(private_key_hex=sk_hex)
-            log.info("[SK] fonte: env:BRN_VALIDATOR_SEED → sha256(seed) = %s…", sk_hex[:16])
-            return sk_hex, w.address, w.pub_hex, "env:seed"
-        except Exception as e: log.warning("[SK] derivação de seed falhou: %s", e)
-
-    sk_file = BASE_DIR / ".validator_sk"
-    if sk_file.exists():
-        try:
-            content = sk_file.read_text(encoding="utf-8").strip()
-            sk_hex = content.split("|")[0].strip()
-            if len(sk_hex) == 64 and all(c in "0123456789abcdefABCDEF" for c in sk_hex):
-                w = _Wallet(private_key_hex=sk_hex)
-                log.info("[SK] fonte: arquivo %s", sk_file.name)
-                return sk_hex, w.address, w.pub_hex, "file"
-            else: log.warning("[SK] %s corrompido — ignorando", sk_file.name)
-        except Exception as e: log.warning("[SK] leitura de %s falhou: %s", sk_file.name, e)
-
-    try:
-        w = _Wallet()
-        sk_hex = w.priv_hex; address = w.address; pubkey = w.pub_hex
-        source = "generated:volatile"
-        try:
-            sk_file.write_text(sk_hex + "\n", encoding="utf-8")
-            try: os.chmod(sk_file, 0o600)
-            except Exception: pass
-            source = "generated:file"
-        except Exception as e: log.warning("[SK] não gravei .validator_sk: %s (volátil)", e)
-
-        log.warning("=" * 64)
-        log.warning(" [SK] NOVA CARTEIRA GERADA — GUARDE PARA RECUPERAR")
-        log.warning("=" * 64)
-        log.warning("   address: %s", address)
-        log.warning("   pubkey : %s", pubkey)
-        log.warning("   sk_hex : %s", sk_hex)
-        log.warning("")
-        log.warning("   Para reusar: BRN_VALIDATOR_SEED=<qualquer-senha>")
-        log.warning("   Ou copie a sk_hex para: BRN_VALIDATOR_SK_HEX=%s", sk_hex)
-        log.warning("=" * 64)
-
-        return sk_hex, address, pubkey, source
-    except Exception as e:
-        log.error("[SK] geração falhou: %s", e); return "", "", "", "error"
-
-
-def _ping_origin(timeout: float = 3.0) -> bool:
-    log = logging.getLogger("main")
-    pool_url = os.environ.get("BRN_POOL_URL", "").strip().rstrip("/")
-    if not pool_url: return False
-    if not _HAS_REQUESTS:
-        try:
-            import urllib.request
-            req = urllib.request.Request(f"{pool_url}/api/status", headers={"User-Agent": "brn-main/13.9.16"})
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return r.status == 200
-        except Exception as e:
-            log.debug("[ORIGIN] urllib ping falhou: %s", e); return False
-    try:
-        r = _requests.get(f"{pool_url}/api/status", timeout=timeout)
-        return r.status_code == 200
-    except Exception as e:
-        log.debug("[ORIGIN] requests ping falhou: %s", e); return False
-
-
-def _install_sk_local_only(chain, sk_hex: str, address: str, pubkey: str) -> bool:
-    log = logging.getLogger("main")
-    try:
-        chain.set_local_validator_sk(sk_hex)
-        log.info("[SK] instalada localmente (sem propagar) pk=%s…", pubkey[:16])
-        return True
-    except Exception as e:
-        log.exception("[SK] set_local_validator_sk falhou: %s", e); return False
-
-
-# ============================================================
-# [v13.9.16] HTTP SYNC + TRUNCATE
-# ============================================================
-def _try_truncate_chain_in_place(chain, target_height: int, log) -> bool:
-    """
-    Tenta truncar a chain para target_height usando métodos comuns
-    de ChainDB. Retorna True se conseguiu (altura resultante <= target).
-
-    Não é destrutiva no sentido de apagar arquivo — usa API do DB.
-    Se nenhum método estiver disponível, retorna False e o chamador
-    deve instruir o usuário a usar --force-http-resync.
-    """
-    db = chain.db
-
-    candidates = [
-        ("remove_blocks_above", (target_height,)),
-        ("truncate_to",         (target_height,)),
-        ("prune_above",         (target_height,)),
-        ("truncate",            (target_height,)),
-        ("reset_to_height",     (target_height,)),
-    ]
-
-    for meth_name, args in candidates:
-        if not hasattr(db, meth_name):
-            continue
-        try:
-            fn = getattr(db, meth_name)
-            result = fn(*args)
-            log.warning("[HTTP-SYNC] truncado via db.%s%s → %r",
-                        meth_name, args, result)
-            try:
-                new_h = int(db.height())
-            except Exception:
-                new_h = -999
-            if new_h <= target_height:
-                log.warning("[HTTP-SYNC] altura após truncate: %d (alvo %d)",
-                            new_h, target_height)
-                return True
-            log.warning("[HTTP-SYNC] db.%s não reduziu a altura (agora %d)",
-                        meth_name, new_h)
-        except Exception as e:
-            log.debug("[HTTP-SYNC] db.%s falhou: %s", meth_name, e)
-
-    log.error("[HTTP-SYNC] ChainDB não expõe método de truncate conhecido")
-    return False
-
-
-def _force_http_sync_loop(chain, pool_url, stop_evt):
-    """
-    [v13.9.16] Reescrito para comparar local_h vs target_h do peer,
-    não contra 0. Antes, `if local_h >= 0` matava o loop para sempre
-    depois do genesis.
-
-    Env:
-      BRN_HTTP_SYNC_POLL_INTERVAL       (default 60s)
-      BRN_HTTP_SYNC_TRUNCATE_ON_REJECT  (default "0")
-      BRN_HTTP_SYNC_TRUNCATE_HEIGHT     (default "0")
-    """
-    log = logging.getLogger("main")
-    log.info("[HTTP-SYNC] Thread iniciada (peer=%s)", pool_url)
-
-    try:
-        TRUNCATE_ON_REJECT = os.environ.get(
-            "BRN_HTTP_SYNC_TRUNCATE_ON_REJECT", "0") == "1"
-    except Exception:
-        TRUNCATE_ON_REJECT = False
-
-    try:
-        TRUNCATE_HEIGHT = int(os.environ.get(
-            "BRN_HTTP_SYNC_TRUNCATE_HEIGHT", "0"))
-    except (ValueError, TypeError):
-        TRUNCATE_HEIGHT = 0
-
-    try:
-        POLL_INTERVAL = float(os.environ.get(
-            "BRN_HTTP_SYNC_POLL_INTERVAL", "60"))
-    except (ValueError, TypeError):
-        POLL_INTERVAL = 60.0
-    POLL_INTERVAL = max(10.0, POLL_INTERVAL)
-
-    # Delay inicial para deixar P2P subir e evitar duplicar trabalho
-    time.sleep(15)
-
-    while not stop_evt.is_set():
-        try:
-            # 1. Descobrir target do peer
-            try:
-                r = _requests.get(f"{pool_url}/api/status", timeout=10)
-                target_h = int(r.json().get("height", 0) or 0)
-            except Exception as e:
-                log.warning("[HTTP-SYNC] Origin inacessível: %s", e)
-                HTTP_SYNC_PROGRESS["syncing"] = False
-                if stop_evt.wait(POLL_INTERVAL * 0.5): break
-                continue
-
-            local_h = int(chain.db.height())
-
-            HTTP_SYNC_PROGRESS["target_height"] = target_h
-            HTTP_SYNC_PROGRESS["local_height"] = local_h
-            HTTP_SYNC_PROGRESS["best_peer"] = pool_url
-
-            # 2. Sem target útil? Espera.
-            if target_h <= 0:
-                HTTP_SYNC_PROGRESS["syncing"] = False
-                HTTP_SYNC_PROGRESS["percent"] = 0.0
-                if stop_evt.wait(POLL_INTERVAL): break
-                continue
-
-            # 3. Já sincronizado (ou à frente)? Dorme.
-            if local_h >= target_h:
-                HTTP_SYNC_PROGRESS["syncing"] = False
-                HTTP_SYNC_PROGRESS["percent"] = 100.0
-                if stop_evt.wait(POLL_INTERVAL): break
-                continue
-
-            # 4. Precisamos sincronizar
-            HTTP_SYNC_PROGRESS["syncing"] = True
-            HTTP_SYNC_PROGRESS["percent"] = round(
-                (max(local_h, 0) / max(target_h, 1)) * 100.0, 1)
-
-            log.info("[HTTP-SYNC] iniciando: local=%d target=%d (faltam %d)",
-                     local_h, target_h, target_h - local_h)
-
-            start = max(0, local_h + 1)
-            batch = 100
-            reject_info = None
-
-            while start <= target_h and not stop_evt.is_set():
-                try:
-                    r = _requests.get(
-                        f"{pool_url}/api/blocks?start={start}&limit={batch}",
-                        timeout=30)
-                    blocks = r.json().get("blocks", []) or []
-                    if not blocks:
-                        log.warning("[HTTP-SYNC] peer retornou vazio em start=%d",
-                                    start)
-                        break
-
-                    for blk in blocks:
-                        ok, msg = chain.accept_block(blk)
-                        if not ok:
-                            reject_info = {
-                                "height": int(blk.get("height", -1)),
-                                "msg": msg,
-                            }
-                            log.error(
-                                "[HTTP-SYNC] bloco #%s rejeitado: %s",
-                                blk.get("height"), msg,
-                            )
-                            break
-
-                    if reject_info:
-                        break
-
-                    start += len(blocks)
-                    local_h = int(chain.db.height())
-                    HTTP_SYNC_PROGRESS["local_height"] = local_h
-                    if target_h > 0:
-                        HTTP_SYNC_PROGRESS["percent"] = min(
-                            100.0,
-                            round((max(local_h, 0) / target_h) * 100.0, 1))
-                    log.info("[HTTP-SYNC] progresso: %d/%d (%.1f%%)",
-                             local_h, target_h,
-                             HTTP_SYNC_PROGRESS["percent"])
-                except Exception as e:
-                    log.warning("[HTTP-SYNC] erro no lote start=%d: %s",
-                                start, e)
-                    break
-
-            # 5. Tratamento de rejeição
-            if reject_info:
-                log.error("[HTTP-SYNC] " + "=" * 50)
-                log.error("[HTTP-SYNC] reject em #%s",
-                          reject_info.get("height"))
-                log.error("[HTTP-SYNC]   %s", reject_info.get("msg"))
-                log.error("[HTTP-SYNC] Diagnóstico sugerido:")
-                log.error("[HTTP-SYNC]   1. SK local:  python3 app_wallet_v3.py --verify-sk")
-                log.error("[HTTP-SYNC]   2. Trust:     python3 auto_trust_daemon.py --once --dry-run")
-                log.error("[HTTP-SYNC]   3. env:       remova BRN_BOOTSTRAP_SKIP_SIGS_UNTIL se ainda presente")
-                log.error("[HTTP-SYNC]   4. re-sync:   BRN_HTTP_SYNC_TRUNCATE_ON_REJECT=1")
-                log.error("[HTTP-SYNC]      ou python3 main.py --force-http-resync")
-                log.error("[HTTP-SYNC] " + "=" * 50)
-
-                if TRUNCATE_ON_REJECT:
-                    log.warning("[HTTP-SYNC] TRUNCATE_ON_REJECT=1 → "
-                                "truncando para %d", TRUNCATE_HEIGHT)
-                    if _try_truncate_chain_in_place(
-                            chain, TRUNCATE_HEIGHT, log):
-                        log.info("[HTTP-SYNC] truncado, retomando em 5s")
-                        if stop_evt.wait(5): break
-                        continue
-                    else:
-                        log.error("[HTTP-SYNC] truncate in-place falhou.")
-                        log.error("[HTTP-SYNC] use: "
-                                  "python3 main.py --force-http-resync")
-                        HTTP_SYNC_PROGRESS["syncing"] = False
-                        if stop_evt.wait(300): break
-                        continue
-                else:
-                    log.warning("[HTTP-SYNC] para truncate automático, "
-                                "defina BRN_HTTP_SYNC_TRUNCATE_ON_REJECT=1")
-                    HTTP_SYNC_PROGRESS["syncing"] = False
-                    if stop_evt.wait(POLL_INTERVAL * 5): break
-                    continue
-
-            # 6. Loop de novo (vai comparar contra target)
-            if stop_evt.wait(POLL_INTERVAL): break
-
-        except Exception as e:
-            log.error("[HTTP-SYNC] erro no loop: %s", e)
-            HTTP_SYNC_PROGRESS["syncing"] = False
-            if stop_evt.wait(30): break
-
-
-def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int, stop_evt: threading.Event) -> None:
-    log = logging.getLogger("main")
-    SK_VALIDATION_STATE["auto_mine_status"] = "starting"
-    log.info("[AUTO-MINE] loop iniciado (checa Origin e Sync a cada 30s)")
-    pool_url = os.environ.get("BRN_POOL_URL", "").strip()
-    failures = 0
-
-    while not stop_evt.is_set():
-        try:
-            if getattr(chain, "_local_validator_sk", None) is None:
-                SK_VALIDATION_STATE["auto_mine_status"] = "waiting_sk"
-                if stop_evt.wait(10): break
-                continue
-
-            if _HAS_REQUESTS:
-                try:
-                    r = _requests.get(f"http://127.0.0.1:{web_port}/api/pool/local_status", timeout=5)
-                    if r.status_code == 200:
-                        data = r.json()
-                        if data.get("running"):
-                            SK_VALIDATION_STATE["auto_mine_status"] = "running"
-                            if stop_evt.wait(30): break
-                            continue
-                except Exception: pass
-
-            origin_online = _ping_origin(timeout=3.0)
-            SK_VALIDATION_STATE["origin_online"] = origin_online
-
-            if not origin_online:
-                SK_VALIDATION_STATE["auto_mine_status"] = "waiting_origin"
-                if failures == 0 or failures % 4 == 0:
-                    log.warning("[AUTO-MINE] Origin offline (%s) — aguardando 30s", pool_url or "(vazio)")
-                failures += 1
-                if stop_evt.wait(30): break
-                continue
-
-            if _HAS_REQUESTS:
-                try:
-                    r = _requests.get(f"{pool_url}/api/status", timeout=10)
-                    remote_h = r.json().get("height", 0)
-                    local_h = chain.db.height()
-
-                    if local_h < remote_h - 1:
-                        log.info("[AUTO-MINE] Aguardando sincronização: local=%d / target=%d", local_h, remote_h)
-                        SK_VALIDATION_STATE["auto_mine_status"] = "waiting_sync"
-                        if stop_evt.wait(15): break
-                        continue
-                except Exception as e:
-                    log.warning("[AUTO-MINE] Erro ao checar sincronização: %s", e)
-                    if stop_evt.wait(15): break
-                    continue
-
-            SK_VALIDATION_STATE["auto_mine_status"] = "starting_pool"
-            log.info("[AUTO-MINE] Sincronizado! Origin online — iniciando PoolClient...")
-
-            if not _HAS_REQUESTS:
-                SK_VALIDATION_STATE["auto_mine_status"] = "error_no_requests"
-                if stop_evt.wait(60): break
-                continue
-
-            try:
-                r = _requests.post(f"http://127.0.0.1:{web_port}/api/pool/start_local", json={"address": address, "pubkey": pubkey}, timeout=15)
-                try: data = r.json() if r.content else {}
-                except Exception: data = {"ok": False, "msg": f"HTTP {r.status_code}"}
-
-                if data.get("ok"):
-                    failures = 0
-                    SK_VALIDATION_STATE["auto_mine_status"] = "running"
-                    log.info("[AUTO-MINE] ✅ PoolClient iniciado (miner_id=%s)", data.get("miner_id", "?"))
-                else:
-                    failures += 1
-                    SK_VALIDATION_STATE["auto_mine_status"] = f"failed:{data.get('msg', '?')[:60]}"
-                    log.warning("[AUTO-MINE] PoolClient falhou (%d): %s", failures, data.get("msg", "?"))
-            except Exception as e:
-                failures += 1
-                SK_VALIDATION_STATE["auto_mine_status"] = f"error:{type(e).__name__}"
-                log.warning("[AUTO-MINE] start_local exception: %s", e)
-        except Exception as e:
-            log.exception("[AUTO-MINE] loop exceção: %s", e)
-        if stop_evt.wait(30): break
-    SK_VALIDATION_STATE["auto_mine_status"] = "stopped"
-
-
-def _auto_configure(chain, p2p, trust, web_port: int, is_origin: bool, stop_evt: threading.Event, force_auto_mine: bool = False) -> None:
-    log = logging.getLogger("main")
-    sk_hex, address, pubkey, source = _resolve_validator_sk()
-
-    SK_VALIDATION_STATE.update({
-        "checked": True, "ok": bool(sk_hex), "source": source,
-        "address_configured": address[:40] if address else "",
-        "address_derived": address,
-        "pubkey_configured": pubkey[:40] if pubkey else "",
-        "pubkey_derived": pubkey,
-        "error": "" if sk_hex else "não foi possível resolver SK"
-    })
-
-    log.info("=" * 64)
-    log.info(" [SK RESOLUTION v13.9.16]")
-    log.info("=" * 64)
-    log.info("  source           : %s", source or "(nenhum)")
-    log.info("  SK_HEX len       : %d", len(sk_hex) if sk_hex else 0)
-    log.info("  ADDRESS          : %s", (address[:40] + "…") if address else "(vazio)")
-    log.info("  PUBKEY           : %s", (pubkey[:40] + "…") if pubkey else "(vazio)")
-
-    if not sk_hex:
-        log.error("  RESULTADO        : ❌ não foi possível resolver SK")
-        log.error("=" * 64); return
-
-    log.info("  RESULTADO        : ✅ SK resolvida")
-    log.info("=" * 64)
-    _install_sk_local_only(chain, sk_hex, address, pubkey)
-
-    log.info("[AUTO-CONFIG] pingando Origin...")
-    origin_online = _ping_origin(timeout=3.0)
-    SK_VALIDATION_STATE["origin_online"] = origin_online
-
-    if origin_online:
-        log.info("[AUTO-CONFIG] Origin ONLINE — propagando SK...")
-        if not _HAS_WI: log.error("[AUTO-CONFIG] wallet_integrator indisponível")
-        else:
-            try:
-                r = _wi.integrate_and_propagate(chain, sk_hex, address=address, pubkey=pubkey, p2p=p2p, trust=trust, logger=log)
-                if r.get("ok"): log.info("[AUTO-CONFIG] ✅ SK propagada (in_trust=%s in_top5=%s propagated=%s)", r.get("in_trust"), r.get("in_top5"), r.get("propagated"))
-                else: log.warning("[AUTO-CONFIG] ⚠️ propagate falhou: %s", r.get("errors") or r.get("msg"))
-            except Exception as e: log.exception("[AUTO-CONFIG] integrate_and_propagate falhou: %s", e)
-    else:
-        log.warning("[AUTO-CONFIG] ⚠️ Origin OFFLINE — SK instalada localmente.")
-
-    env_auto_mine = os.environ.get("BRN_AUTO_MINE", "").strip()
-    if env_auto_mine == "1": should_mine = True; reason = "BRN_AUTO_MINE=1"
-    elif env_auto_mine == "0": should_mine = False; reason = "BRN_AUTO_MINE=0"
-    elif force_auto_mine: should_mine = True; reason = "--auto-mine"
-    elif is_origin: should_mine = True; reason = "origin (padrão)"
-    else: should_mine = False; reason = "cliente + BRN_AUTO_MINE não setado"
-
-    log.info("[AUTO-CONFIG] auto-mine: %s (%s)", should_mine, reason)
-
-    if not should_mine:
-        SK_VALIDATION_STATE["auto_mine_status"] = "disabled"; return
-
-    if not address or not pubkey:
-        SK_VALIDATION_STATE["auto_mine_status"] = "error_no_addr"; return
-
-    threading.Thread(target=_auto_mine_loop, args=(chain, address, pubkey, web_port, stop_evt), daemon=True, name="AutoMine").start()
-
-
-def _delayed_auto_configure(chain, p2p, trust, web_port: int, is_origin: bool, stop_evt: threading.Event, force_auto_mine: bool = False) -> None:
-    try:
-        time.sleep(3)
-        _auto_configure(chain, p2p, trust, web_port, is_origin, stop_evt, force_auto_mine=force_auto_mine)
-    except Exception as e: logging.getLogger("main").exception("[AUTO-CONFIG] falhou: %s", e)
-
-
-def _resolve_config(log) -> dict:
-    cfg = {"bootstrap": "", "bootstrap_source": "(vazio)", "pool_url": "", "pool_url_source": "(vazio)"}
-    env_bootstrap = os.environ.get("BRN_BOOTSTRAP_PEERS", "").strip()
-    if env_bootstrap:
-        cfg["bootstrap"] = env_bootstrap; cfg["bootstrap_source"] = "env:BRN_BOOTSTRAP_PEERS"
-    else:
-        json_bootstrap = _read_bootstrap_json()
-        if json_bootstrap:
-            cfg["bootstrap"] = json_bootstrap; cfg["bootstrap_source"] = "file:bootstrap_peers.json"
-            os.environ["BRN_BOOTSTRAP_PEERS"] = json_bootstrap
-
-    env_pool = os.environ.get("BRN_POOL_URL", "").strip()
-    if env_pool:
-        cfg["pool_url"] = env_pool; cfg["pool_url_source"] = "env:BRN_POOL_URL"
-    else:
-        if cfg["bootstrap"]:
-            first = cfg["bootstrap"].split(",")[0].strip()
-            if ":" in first:
-                host = first.rsplit(":", 1)[0]
-                cfg["pool_url"] = f"http://{host}:5000"; cfg["pool_url_source"] = "inferido do bootstrap"
-                os.environ["BRN_POOL_URL"] = cfg["pool_url"]
-    return cfg
-
-
-def _do_force_http_resync(db_path: str) -> int:
-    """
-    [v13.9.16] Renomeia o DB para {db}.bak.{ts} e sai.
-    O chamador deve rodar main.py de novo para re-sync do zero.
-    """
-    if not os.path.isabs(db_path):
-        db_path = str(BASE_DIR / db_path)
-
-    if not os.path.exists(db_path):
-        print(f"[main] DB não existe: {db_path}")
-        return 0
-
-    backup = f"{db_path}.bak.{int(time.time())}"
-    try:
-        os.rename(db_path, backup)
-    except Exception as e:
-        print(f"[main] falha ao renomear DB: {e}")
-        return 1
-
-    # Renomeia WAL/SHM se existirem
-    for ext in ("-wal", "-shm"):
-        src = db_path + ext
-        if os.path.exists(src):
-            try:
-                os.rename(src, backup + ext)
-            except Exception as e:
-                print(f"[main] aviso: não renomeei {src}: {e}")
-
-    print(f"[main] DB renomeado: {db_path} → {backup}")
-    print("[main] Agora rode novamente sem --force-http-resync:")
-    print(f"[main]   python3 main.py" + (" --headless" if "--headless" in sys.argv else ""))
-    print("[main] O nó vai re-sincronizar do genesis via HTTP/P2P.")
-    return 0
-
-
-def main() -> int:
-    args = parse_args()
-    if args.version: print(f"BRN Node v{VERSION} (build {BUILD_DATE})"); return 0
-    if args.skip_verify: print("[main] --skip-verify ativo")
-
-    loaded = _load_env_file()
-
-    if args.client_mode: os.environ["BRN_IS_ORIGIN"] = "0"
-    if args.origem: os.environ["BRN_IS_ORIGIN"] = "1"
-    if args.web_port is not None: os.environ["BRN_WEB_PORT"] = str(args.web_port)
-    if args.p2p_port is not None: os.environ["BRN_P2P_PORT"] = str(args.p2p_port)
-
-    is_origin = os.environ.get("BRN_IS_ORIGIN", "0") == "1"
-    web_port  = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    p2p_port  = int(os.environ.get("BRN_P2P_PORT", "6001"))
-    db_path   = args.db or os.environ.get("BRN_DB", "brn_v2_chain.db")
-
-    # [v13.9.16] --force-http-resync: renomeia DB e sai
-    if args.force_http_resync:
-        return _do_force_http_resync(db_path)
-
-    log = _setup_logging()
-    log.info("=" * 64)
-    log.info(" BRN Node v%s (build %s) is_origin=%s", VERSION, BUILD_DATE, is_origin)
-    log.info(" base=%s env_loaded=%d", BASE_DIR, loaded)
-    log.info("=" * 64)
-
-    cfg = _resolve_config(log)
-    log.info("[CONFIG] BRN_BOOTSTRAP_PEERS: %s (%s)", cfg["bootstrap"] or "(vazio)", cfg["bootstrap_source"])
-    log.info("[CONFIG] BRN_POOL_URL: %s (%s)", cfg["pool_url"] or "(vazio)", cfg["pool_url_source"])
-
-    if not _check_blockchain_version(): return 6
-
-    try:
-        import port_guard
-        port_guard.check_brn_ports(checar_explorer=not args.no_explorer)
-    except SystemExit: raise
-    except Exception: pass
-
-    try:
-        node_id_priv, node_id_pub = _load_or_create_node_identity()
-        log.info("[identity] pub=%s…", node_id_pub[:16])
-    except RuntimeError as e:
-        log.error(str(e)); return 3
-
-    try:
-        from blockchain import Blockchain
-        chain = Blockchain(db_path, auto_genesis=False)
-        log.info("[chain] aberta height=%d", chain.db.height())
-    except Exception as e:
-        log.error("[chain] fatal: %s", e); return 2
-
-    trust = _setup_trust(chain, node_id_priv, is_origin)
-    if trust is None:
-        log.error("[trust] não carregou")
-        if os.environ.get("BRN_STRICT_MULTISIG") == "1": return 7
-    else: log.info("[trust] carregado (origin=%s)", is_origin)
-
-    log.info("[wallet] boot sem carteira (design v13.9.16) — GUI tentará abrir carteira salva")
-
-    p2p = None
-    if not args.no_p2p:
-        p2p = _setup_p2p(chain, node_id_priv, p2p_port)
-        if p2p is not None: log.info("[p2p] iniciado na porta %d", p2p_port)
-
-    sync_mgr = None
-    if p2p:
-        sync_mgr = _setup_sync(chain, p2p)
-        if sync_mgr: log.info("[sync] ChainSyncManager iniciado")
-
-    _stop_bg = threading.Event()
-
-    # [v13.9.16] HTTP sync fallback — corrigido para funcionar em
-    # qualquer altura, não só em DB virgem.
-    if cfg["pool_url"] and _HAS_REQUESTS:
-        threading.Thread(
-            target=_force_http_sync_loop,
-            args=(chain, cfg["pool_url"], _stop_bg),
-            daemon=True,
-            name="HttpSyncFallback",
-        ).start()
-        log.info("[HTTP-SYNC] thread iniciada (peer=%s)", cfg["pool_url"])
-
-    if p2p: _setup_broadcast(chain, p2p)
-
-    _setup_trust_daemon(chain, trust, p2p, password=_get_identity_password(), is_origin=is_origin, stop_evt=_stop_bg, interval=30)
-    threading.Thread(target=_wallet_watchdog_loop, args=(chain, p2p, trust, _stop_bg, 30), daemon=True, name="Wallet-Watchdog").start()
-
-    pool = _setup_pool(chain, is_origin)
-
-    ok_http = _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port)
-    if not ok_http: log.error("[server] HTTP não subiu")
-
-    if not args.no_auto_config and not args.no_pool_client:
-        threading.Thread(target=_delayed_auto_configure, args=(chain, p2p, trust, web_port, is_origin, _stop_bg), daemon=True, name="AutoConfig").start()
-        log.info("[AUTO-CONFIG] agendado (3s)")
-    else: log.info("[AUTO-CONFIG] desligado")
-
-    if not args.no_explorer: _start_explorer(chain)
-
-    want_gui = (not args.headless) and (not args.no_gui)
-    if want_gui:
-        allow_interactive = not args.no_interactive
-        log.info("[gui] abrindo (interativo=%s)", allow_interactive)
-        if _start_gui(allow_interactive=allow_interactive): return 0
-    else:
-        if args.no_gui: log.info("[gui] desligada por --no-gui")
-        log.info("=" * 64)
-        log.info(" MODO HEADLESS — consulte /health:")
-        log.info("   GET http://%s:%d/health", os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
-        log.info("=" * 64)
-
-    def _shutdown(*_):
-        log.info("[shutdown] encerrando...")
-        try: _stop_bg.set()
-        except Exception: pass
-        try:
-            if trust is not None: trust.shutdown()
-        except Exception: pass
-        try: chain.db.close()
-        except Exception: pass
-        try:
-            from secure_store import WalletSession
-            WalletSession().lock()
-        except Exception: pass
-        os._exit(0)
-
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
-
-    log.info("=" * 64)
-    log.info(" NÓ ATIVO — Ctrl+C para encerrar")
-    log.info("   API      : http://%s:%d", os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
-    log.info("   Wallet   : http://%s:%d/wallet", os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
-    log.info("   Health   : http://%s:%d/health", os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
-    log.info("   P2P      : :%d", p2p_port)
-    log.info("=" * 64)
-
-    try:
-        while True: time.sleep(1)
-    except KeyboardInterrupt: _shutdown()
-    return 0
-
-
-if __name__ == "__main__":
-    try: sys.exit(main())
-    except KeyboardInterrupt: sys.exit(130)
+    seed = os.environ.get("BRN_VALIDATOR_SEED",
