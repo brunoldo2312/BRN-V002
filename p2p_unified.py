@@ -1,15 +1,16 @@
 """
-p2p_unified.py — BRN P2P Network v6.7.13
+p2p_unified.py — BRN P2P Network v6.7.14
 ================================================================
-v6.7.13 (2026-11-12) — SYNC LOCK & SOCKET CLEANUP:
-  [FIX CRÍTICO] Adicionado `_sync_internal_lock` no P2PManager.
-        Isso impede que múltiplos peers (ou o SyncManager) tentem
-        baixar blocos simultaneamente, o que causava o erro
-        "fatal — bloco #10 fora de sequência".
-  [FIX] _send_message_once agora fecha o socket no `finally`.
-        Evita vazamento de conexões (FD leak) quando o SOCKS5 falha.
-  [KEEP] v6.7.12: SOCKS5 fallback para Tailscale no Render.
-  [KEEP] v6.7.10: retry, validação de pubkey, fallback síncrono.
+v6.7.14 (2026-11-12) — TOLERÂNCIA A FALHAS NO BOOTSTRAP:
+  [FIX CRÍTICO] _sync_incremental agora verifica a variável
+        BRN_BOOTSTRAP_SKIP_SIGS_UNTIL. Se o nó estiver baixando
+        blocos antigos (ex: até o 4300), um lote fora de sequência
+        retorna RETRYABLE (tenta de novo) em vez de FATAL (aborta).
+        Isso impede que o Render pare de sincronizar por causa de
+        um simples atraso de rede.
+  [KEEP] v6.7.13: Sync lock (impede sincronizações simultâneas) e
+        Socket Cleanup (evita vazamento de memória).
+  [KEEP] v6.7.12: SOCKS5 fallback para Tailscale.
 ================================================================
 """
 from __future__ import annotations
@@ -31,7 +32,6 @@ from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from typing import Optional
 
-# [v6.7.12] Import opcional do PySocks para contornar bloqueio do Tailscale
 try:
     import socks
     _HAS_SOCKS = True
@@ -1425,12 +1425,21 @@ class P2PManager:
         if not blocks_to_apply: return SyncResult.RETRYABLE, "nenhum bloco recebido"
         if not _HAS_BLOCKCHAIN_HELPERS: return SyncResult.FATAL, "blockchain helpers ausentes"
 
+        # [FIX v6.7.14] Pular validação estrita de sequência durante bootstrap (< 4300)
+        boot_skip = int(os.environ.get("BRN_BOOTSTRAP_SKIP_SIGS_UNTIL", "0") or "0")
+        boot_assume = int(os.environ.get("BRN_ASSUME_VALID_UNTIL", "0") or "0")
+        skip_until = max(boot_skip, boot_assume)
+
         prev = self.bc.db.get_block(local_height)
         prev_hash = prev["hash"] if prev else "0" * 64
         expected_height = local_height + 1
         for blk in blocks_to_apply:
             try:
                 if blk.get("height") != expected_height:
+                    # Se estamos sincronizando blocos antigos, não aborta o processo, apenas tenta de novo
+                    if blk.get("height") <= skip_until or expected_height <= skip_until:
+                        log.debug(f"[Sync] Lote desordenado recebido (bloco #{blk.get('height')}, esperado #{expected_height}). Ignorando lote.")
+                        return SyncResult.RETRYABLE, f"lote desordenado no bootstrap"
                     return SyncResult.FATAL, f"altura fora de ordem: {blk.get('height')}"
                 if blk.get("prev_hash") != prev_hash:
                     return SyncResult.FATAL, f"prev_hash diverge em #{blk.get('height')}"
@@ -1468,6 +1477,9 @@ class P2PManager:
             expected_h = self.bc.db.height() + 1
             expected_prev = self.bc.db.tip_hash()
             if blk["height"] != expected_h:
+                if blk["height"] <= skip_until or expected_h <= skip_until:
+                    log.debug(f"[Sync] Bloco #{blk['height']} fora de ordem no banco (esperado #{expected_h}). Tentando novo lote...")
+                    return SyncResult.RETRYABLE, "banco fora de ordem no bootstrap"
                 return SyncResult.FATAL, f"bloco #{blk['height']} fora de sequência"
             if blk["prev_hash"] != expected_prev:
                 return SyncResult.FATAL, f"prev_hash diverge em #{blk['height']}"
