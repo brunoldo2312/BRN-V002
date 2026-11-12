@@ -1,29 +1,24 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.34)
+server.py — Backend HTTP do nó BRN (v9.9.35)
 ================================================================
-v9.9.34 (2026-11-12) — PAINEL /sync + SIGN_INFO:
-  [NEW] /api/sync/live: snapshot consolidado (sync + peers + validators
-        + mining_gate + signing). Calcula taxa blocos/s entre chamadas
-        e ETA. Quando _HTTP_SYNC_STATE está ativo, prevalece sobre o
-        cálculo do DB (percent, local, target, best_peer).
-  [NEW] /api/validators/sign_info: variáveis necessárias para assinar
-        blocos (BRN_VALIDATOR_SK_HEX, SEED, .validator_sk,
-        BRN_NODE_PASSWORD, etc) com estado sim/não, valor mascarado,
-        obrigatoriedade e descrição + onde setar no Render.
-  [NEW] /sync: serve sync_panel.html da raiz do projeto. Fallback 404
-        com instruções se o arquivo não existir.
-  [NEW] _build_peers_detail(chain): converte listar_peers() em lista
-        pronta para o painel (ip, height, delta, age_s, stale, synced).
-  [NEW] _build_sign_info(chain): detecta fonte de SK ativa e monta a
-        tabela de variáveis.
-  [NEW] _SYNC_LIVE_HISTORY: memória do último (ts, height) para
-        calcular taxa de download entre chamadas 2s do painel.
-  [KEEP] v9.9.33: mining gate (height/SK/validators) em
-        /api/pool/start_local, /api/miner/start, /api/faucet;
-        /api/mine/gate; /api/status com fast_sync/validators/mining.
-  [KEEP] v9.9.32: /api/consensus/validators via diagnose_validators();
-        /health com validators summary.
-  [KEEP] v9.9.31: /api/sync-info expõe HTTP_SYNC_STATE.
+v9.9.35 (2026-11-12) — SYNC PERCENT CONSIDERA FAST-SYNC:
+  [FIX] /api/sync-info, /api/status e /api/sync/live agora usam
+        BRN_FAST_SYNC_UNTIL como target enquanto local_h < 6000.
+        Antes, o percent era calculado só contra os peers
+        (local_h / max_peer_h), então a GUI mostrava 100% mesmo com
+        a chain abaixo de 6000 e a mineração bloqueada pelo gate.
+        Agora a GUI mostra o progresso real do fast-sync
+        (ex.: 4520/6000 = 75.3%) e a barra só chega a 100% quando
+        cruza a meta. Depois de 6000, volta a comparar com peers.
+  [NEW] /api/sync-info retorna "fast_sync": {"active", "until",
+        "target_height", "percent"} para a GUI exibir banner
+        "Fast-sync até #6000".
+  [NEW] /api/sync/live percent segue a mesma lógica.
+  [KEEP] v9.9.34: painel /sync, /api/validators/sign_info,
+        /api/sync/live, mining gate.
+  [KEEP] v9.9.33: mining gate em /api/pool/start_local,
+        /api/miner/start, /api/faucet; /api/mine/gate.
+  [KEEP] v9.9.32: /api/consensus/validators via diagnose_validators().
 ================================================================
 """
 from __future__ import annotations
@@ -74,7 +69,7 @@ TXT_HISTORY_LIMIT_DEFAULT = 200
 TXT_HISTORY_LIMIT_MAX = 500
 BOOTSTRAP_HTTP_PORT = int(os.environ.get("BRN_BOOTSTRAP_HTTP_PORT", os.environ.get("BRN_WEB_PORT", "5000")))
 
-# Mining gate (v9.9.33)
+# Mining gate / fast-sync (v9.9.33 + v9.9.35)
 _MIN_FAST_SYNC_UNTIL = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "6000") or "0")
 _MIN_VALIDATORS_FOR_MINING = max(1, int(os.environ.get("BRN_MIN_VALIDATORS_FOR_MINING", "1") or "1"))
 _VALIDATOR_HEIGHT_TOLERANCE = max(0, int(os.environ.get("BRN_VALIDATOR_HEIGHT_TOLERANCE", "1") or "1"))
@@ -83,7 +78,6 @@ _MINE_GATE_CACHE_TTL = 2.0
 _MINE_GATE_CACHE = {"ts": 0.0, "result": None}
 _MINE_GATE_LOCK = threading.Lock()
 
-# Sync live (v9.9.34)
 _SYNC_LIVE_HISTORY = {"ts": 0.0, "height": -1}
 _SYNC_LIVE_LOCK = threading.Lock()
 
@@ -421,7 +415,7 @@ def _invalidate_mining_gate_cache():
 
 
 # ============================================================
-# SYNC LIVE helpers (v9.9.34)
+# SYNC LIVE helpers (v9.9.34 + v9.9.35)
 # ============================================================
 def _build_peers_detail(chain) -> list:
     now = time.time()
@@ -896,6 +890,7 @@ def sync_info():
         "sync": {"percent": 100.0, "height": 0, "target": 0, "peers": 0, "work": 0},
         "miner_target": "",
         "bridge": {"onramp_ativo": False, "taxa": 0, "btc_cofre": "", "offramp_ativo": False},
+        "fast_sync": {"active": False, "until": _MIN_FAST_SYNC_UNTIL, "target_height": 0, "percent": 100.0},
     }
     try:
         import btc_config
@@ -906,25 +901,45 @@ def sync_info():
     local_h = chain.db.height()
     result["sync"]["height"] = local_h
 
-    if _HTTP_SYNC_STATE and _HTTP_SYNC_STATE.get("syncing"):
-        result["sync"].update({
-            "percent": _HTTP_SYNC_STATE.get("percent", 0.0),
-            "height": _HTTP_SYNC_STATE.get("local_height", local_h),
-            "target": _HTTP_SYNC_STATE.get("target_height", 0),
-            "peers": 1,
-            "best_peer": _HTTP_SYNC_STATE.get("best_peer", "")
-        })
-        result["sync"]["active_peer"] = _HTTP_SYNC_STATE.get("best_peer", "")
+    # [v9.9.35] Alvo é o fast-sync se ainda não chegou lá
+    if _MIN_FAST_SYNC_UNTIL > 0 and local_h < _MIN_FAST_SYNC_UNTIL:
+        result["fast_sync"] = {
+            "active": True,
+            "until": _MIN_FAST_SYNC_UNTIL,
+            "target_height": _MIN_FAST_SYNC_UNTIL,
+            "percent": round((max(local_h, 0) / _MIN_FAST_SYNC_UNTIL) * 100.0, 1),
+        }
+        result["sync"]["target"] = _MIN_FAST_SYNC_UNTIL
+        result["sync"]["percent"] = result["fast_sync"]["percent"]
     else:
+        # Depois do fast-sync, compara com o topo dos peers
         try:
             result["sync"]["peers"] = chain.db.contar_peers(apenas_ativos=False)
             todos = chain.db.listar_peers(apenas_ativos=False)
             heights = [int(p.get("height", 0) or 0) for p in (todos or []) if isinstance(p, dict)]
             target_h = max([local_h] + heights) if heights else local_h
             result["sync"]["target"] = target_h
-            if target_h > 0: result["sync"]["percent"] = min(100.0, round(local_h / target_h * 100, 2))
+            if target_h > 0:
+                result["sync"]["percent"] = min(100.0, round(local_h / target_h * 100, 2))
             result["sync"]["active_peer"] = todos[0].get("address") if todos else ""
         except Exception: pass
+        result["fast_sync"] = {
+            "active": False,
+            "until": _MIN_FAST_SYNC_UNTIL,
+            "target_height": result["sync"]["target"],
+            "percent": result["sync"]["percent"],
+        }
+
+    # HTTP_SYNC_STATE (main.py) prevalece quando estiver sincronizando
+    if _HTTP_SYNC_STATE and _HTTP_SYNC_STATE.get("syncing"):
+        result["sync"].update({
+            "percent": _HTTP_SYNC_STATE.get("percent", result["sync"]["percent"]),
+            "height": _HTTP_SYNC_STATE.get("local_height", local_h),
+            "target": _HTTP_SYNC_STATE.get("target_height", result["sync"]["target"]),
+            "peers": 1,
+            "best_peer": _HTTP_SYNC_STATE.get("best_peer", ""),
+        })
+        result["sync"]["active_peer"] = _HTTP_SYNC_STATE.get("best_peer", "")
 
     try: result["miner_target"] = chain.db.get_meta("miner_address") or ""
     except Exception: pass
@@ -1385,8 +1400,8 @@ def peers_discovered():
 def root():
     try:
         chain = _get_chain()
-        return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.34", "height": chain.db.height(), "health": "/health", "sync_panel": "/sync", "status": "/api/status", "mine_gate": "/api/mine/gate", "dashboard": "/dashboard", "wallet": "/wallet", "monitor": "/monitor", "panel": "/panel"})
-    except Exception as e: return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.34", "error": str(e)})
+        return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.35", "height": chain.db.height(), "health": "/health", "sync_panel": "/sync", "status": "/api/status", "mine_gate": "/api/mine/gate", "dashboard": "/dashboard", "wallet": "/wallet", "monitor": "/monitor", "panel": "/panel"})
+    except Exception as e: return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.35", "error": str(e)})
 
 
 @app.route("/dashboard", methods=["GET"])
@@ -1461,7 +1476,7 @@ def health():
         return jsonify({
             "ok": True,
             "height": chain.db.height(),
-            "version": "9.9.34",
+            "version": "9.9.35",
             "chain_injected": _CHAIN is not None,
             "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
@@ -1675,7 +1690,7 @@ def bridge_status():
 
 
 # ============================================================
-# SYNC LIVE PANEL (v9.9.34)
+# SYNC LIVE PANEL (v9.9.34 + v9.9.35)
 # ============================================================
 @app.route("/api/sync/live", methods=["GET"])
 def api_sync_live():
@@ -1696,6 +1711,14 @@ def api_sync_live():
 
         peers = _build_peers_detail(chain)
         target_h = max([our_h] + [p["height"] for p in peers]) if peers else our_h
+
+        # [v9.9.35] Se estamos abaixo do fast-sync, o target da barra é
+        # BRN_FAST_SYNC_UNTIL, não o topo dos peers (senão a barra enche
+        # em 100% e a mineração fica bloqueada, confundindo o usuário).
+        fast_sync_active = (_MIN_FAST_SYNC_UNTIL > 0 and our_h < _MIN_FAST_SYNC_UNTIL)
+        if fast_sync_active:
+            target_h = max(target_h, _MIN_FAST_SYNC_UNTIL)
+
         remaining = max(0, target_h - our_h)
         pct = 100.0 if target_h == 0 else min(100.0, round((max(our_h, 0) / target_h) * 100.0, 1))
 
@@ -1720,13 +1743,6 @@ def api_sync_live():
         else:
             if peers and peers[0]["height"] > 0:
                 best_peer = peers[0]["address"]
-
-        fast_until = 0
-        try:
-            fast_until = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "6000"))
-        except (ValueError, TypeError):
-            fast_until = 6000
-        fast_active = (fast_until > 0 and our_h < fast_until)
 
         val = {}
         if hasattr(chain, "diagnose_validators"):
@@ -1760,7 +1776,7 @@ def api_sync_live():
             "node": {
                 "height": our_h,
                 "tip_hash": chain.db.tip_hash(),
-                "version": "13.9.17",
+                "version": "13.9.18",
                 "is_origin": os.environ.get("BRN_IS_ORIGIN", "0") == "1",
             },
             "sync": {
@@ -1774,9 +1790,9 @@ def api_sync_live():
                 "eta_s": eta_s,
             },
             "fast_sync": {
-                "active": fast_active,
-                "until": fast_until,
-                "finished": (not fast_active) and fast_until > 0,
+                "active": fast_sync_active,
+                "until": _MIN_FAST_SYNC_UNTIL,
+                "finished": (not fast_sync_active) and _MIN_FAST_SYNC_UNTIL > 0,
             },
             "peers": peers,
             "validators": val,
@@ -1812,5 +1828,5 @@ def serve_sync_panel():
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print("BRN Server v9.9.34 (Sync Panel + Mining Gate)")
+    print("BRN Server v9.9.35 (fast-sync percent)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
