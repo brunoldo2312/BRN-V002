@@ -1,27 +1,26 @@
-"""main.py — Entrypoint do nó BRN (v13.9.17)
+"""main.py — Entrypoint do nó BRN (v13.9.18)
 ================================================================
-v13.9.17 (2026-11-12) — FAST-SYNC ATÉ 6000 + GATE DE MINERAÇÃO:
-  [NEW] Fast-sync automático: se a altura do DB no boot for
-        < BRN_FAST_SYNC_UNTIL (default 6000), seta
-        BRN_ASSUME_VALID_UNTIL=6000 e BRN_BOOTSTRAP_SKIP_SIGS_UNTIL=6000
-        ANTES de importar o blockchain. Blocos 1..6000 aceitos sem
-        validação completa. Acima de 6000 validação FULL.
-  [NEW] _verify_validators_synced(): confere peers do DB na mesma
-        altura (tolerância configurável) e exige N validadores.
-  [NEW] _auto_mine_loop com 4 gates em sequência: SK → altura →
-        Origin → validadores. Só então chama /api/pool/start_local.
-        Os 4 gates são re-verificados a cada 30s; se algum cair,
-        PoolClient é parado.
-  [NEW] SK_VALIDATION_STATE ganhou local_height, fast_sync_active,
-        fast_sync_until, validators_ready, validators_reason,
-        validators_detail — exposto via /health.sk_validation.
-  [NEW] _start_web_server injeta SK_VALIDATION_STATE e
-        HTTP_SYNC_PROGRESS a cada 5s (server copia o dict).
-  [NEW] CLI: --fast-sync-until N, --no-fast-sync.
-  [NEW] Env: BRN_FAST_SYNC_UNTIL (6000),
-        BRN_MIN_VALIDATORS_FOR_MINING (1),
-        BRN_VALIDATOR_HEIGHT_TOLERANCE (1),
-        BRN_VALIDATOR_MAX_AGE_S (300).
+v13.9.18 (2026-11-12) — FIX GUI: servir via HTTP em vez de file://:
+  [FIX CRÍTICO] _start_gui() agora abre a interface em
+        http://127.0.0.1:5000/wallet em vez de file:///…/index_wallet.html.
+        Motivo: index_wallet.html faz fetch('/api/status'), que em
+        file:// resolve para file:///C:/api/status → "Failed to fetch"
+        → JS marca "Nó offline", peers=0, altura em branco. Com
+        http://127.0.0.1:5000/wallet, fetch('/api/status') vira
+        http://127.0.0.1:5000/api/status (mesmo origin, funciona).
+        Fallback automático para file:// se o servidor HTTP não
+        responder em 10s.
+  [NEW] _status_reporter_loop(): imprime no log a cada 30s uma
+        linha consolidada:
+          [STATUS 12:30:45] h=4800/6000 sync=80% peers=2 val=NO
+                            gate=fast_sync(4800/6000) sign=YES pk=02eeec
+        Útil no Render (log) e local.
+  [NEW] Thread StatusReporter injetada em main() logo após o
+        Wallet-Watchdog.
+  [NEW] BRN_STATUS_LOG_INTERVAL (default 30): intervalo do reporter.
+  [KEEP] v13.9.17: fast-sync até BRN_FAST_SYNC_UNTIL (6000) +
+        gate de mineração com 4 condições (SK, altura, Origin,
+        validadores sincronizados).
   [KEEP] v13.9.16: HTTP sync corrigido, --force-http-resync,
         truncate in-place.
 ================================================================
@@ -46,7 +45,7 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.17"
+    VERSION = "13.9.18"
     BUILD_DATE = "2026-11-12"
 
 try:
@@ -813,6 +812,15 @@ def _auto_unlock_gui(api, allow_interactive: bool = True) -> tuple:
 
 
 def _start_gui(allow_interactive: bool = True) -> bool:
+    """
+    [v13.9.18] Abre a GUI via HTTP em vez de file://.
+
+    Motivo: index_wallet.html faz fetch('/api/status'), que em file://
+    resolve para file:///C:/api/status → "Failed to fetch" → JS marca
+    "Nó offline", peers=0, altura em branco. Com
+    http://127.0.0.1:5000/wallet, fetch('/api/status') vira
+    http://127.0.0.1:5000/api/status (mesmo origin, funciona).
+    """
     try:
         import webview
         from app_wallet_v3 import WalletApi
@@ -829,11 +837,38 @@ def _start_gui(allow_interactive: bool = True) -> bool:
         else:
             log.info("[GUI] sem carteira aberta (%s) — janela abre vazia", source)
 
-        wallet_path = BASE_DIR / "index_wallet.html"
-        if not wallet_path.exists():
-            wallet_path = BASE_DIR / "panel.html"
-        url = wallet_path.as_uri() if wallet_path.exists() else "about:blank"
-        log.info("[gui] abrindo %s", wallet_path.name)
+        # ─── FIX v13.9.18: servir via HTTP ───────────────────────
+        web_port = int(os.environ.get("BRN_WEB_PORT", "5000"))
+        http_url = f"http://127.0.0.1:{web_port}/wallet"
+        url = http_url
+
+        if _HAS_REQUESTS:
+            # Espera o servidor HTTP subir (Flask leva ~1s)
+            for _ in range(20):  # até ~10s
+                try:
+                    r = _requests.get(http_url, timeout=1)
+                    if r.status_code < 500:
+                        log.info("[gui] servidor HTTP OK (%s) — abrindo via HTTP",
+                                 r.status_code)
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.5)
+            else:
+                log.warning("[gui] servidor HTTP não respondeu em 10s — "
+                            "caindo para file://")
+                wallet_path = BASE_DIR / "index_wallet.html"
+                if not wallet_path.exists():
+                    wallet_path = BASE_DIR / "panel.html"
+                url = wallet_path.as_uri() if wallet_path.exists() else "about:blank"
+        else:
+            # Sem requests: tenta file:// como fallback
+            wallet_path = BASE_DIR / "index_wallet.html"
+            if not wallet_path.exists():
+                wallet_path = BASE_DIR / "panel.html"
+            url = wallet_path.as_uri() if wallet_path.exists() else "about:blank"
+
+        log.info("[gui] abrindo %s", url)
         webview.create_window("BRN Wallet", url=url, width=1100, height=780,
                               js_api=api)
         webview.start()
@@ -933,7 +968,7 @@ def _ping_origin(timeout: float = 3.0) -> bool:
             import urllib.request
             req = urllib.request.Request(
                 f"{pool_url}/api/status",
-                headers={"User-Agent": "brn-main/13.9.17"},
+                headers={"User-Agent": "brn-main/13.9.18"},
             )
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.status == 200
@@ -1394,6 +1429,102 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
 
 
 # ============================================================
+# Status reporter (v13.9.18)
+# ============================================================
+def _status_reporter_loop(chain, stop_evt: threading.Event,
+                           interval: int = 30) -> None:
+    """
+    [v13.9.18] Log consolidado a cada N segundos:
+      [STATUS hh:mm:ss] h=6000/6000 sync=100% peers=3/3 val=YES gate=OK sign=YES pk=02eeec…
+    """
+    log = logging.getLogger("main")
+    try:
+        interval = max(10, int(os.environ.get(
+            "BRN_STATUS_LOG_INTERVAL", str(interval))))
+    except (ValueError, TypeError):
+        interval = 30
+
+    if stop_evt.wait(5):
+        return
+
+    while not stop_evt.wait(interval):
+        try:
+            h = int(chain.db.height())
+
+            try:
+                peers = chain.db.listar_peers(apenas_ativos=False) or []
+            except Exception:
+                peers = []
+            now = time.time()
+            target_h = h
+            fresh = 0
+            for p in peers:
+                if not isinstance(p, dict):
+                    continue
+                addr = (p.get("address") or "").strip()
+                if not addr:
+                    continue
+                ip = addr.rsplit(":", 1)[0] if ":" in addr else addr
+                if not ip or ip.startswith("127.") or ip == "0.0.0.0":
+                    continue
+                try:
+                    ph = int(p.get("height", 0) or 0)
+                    ls = float(p.get("last_seen", 0) or 0)
+                except (ValueError, TypeError):
+                    continue
+                if ls > 0 and (now - ls) > 300:
+                    continue
+                fresh += 1
+                if ph > target_h:
+                    target_h = ph
+
+            pct = 100.0 if target_h == 0 else min(
+                100.0, round((max(h, 0) / target_h) * 100.0, 1))
+
+            try:
+                ok_val, _reason_val, detail_val = _verify_validators_synced(
+                    chain, min_validators=1, tolerance=1, max_age_s=300)
+                n_synced = len(detail_val.get("synced_peers", []))
+            except Exception:
+                ok_val = False
+                n_synced = 0
+
+            try:
+                fast_until = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "6000"))
+            except (ValueError, TypeError):
+                fast_until = 6000
+            if fast_until > 0 and h < fast_until:
+                gate_s = f"fast_sync({h}/{fast_until})"
+            elif getattr(chain, "_local_validator_sk", None) is None:
+                gate_s = "no_sk"
+            elif not ok_val:
+                gate_s = f"val({n_synced}/1)"
+            else:
+                gate_s = "OK"
+
+            sk = getattr(chain, "_local_validator_sk", None)
+            if sk is None:
+                sign_s = "NO"
+                pk_s = "-"
+            else:
+                sign_s = "YES"
+                try:
+                    pk_s = (getattr(sk, "pub_hex", "") or "")[:16]
+                except Exception:
+                    pk_s = "?"
+
+            log.info(
+                "[STATUS %s] h=%d/%d sync=%.0f%% peers=%d val=%s gate=%s sign=%s pk=%s",
+                time.strftime("%H:%M:%S"),
+                h, target_h, pct, fresh,
+                "YES" if ok_val else "NO",
+                gate_s, sign_s, pk_s,
+            )
+        except Exception as e:
+            log.debug("[STATUS] reporter falhou: %s", e)
+
+
+# ============================================================
 # Auto-configure
 # ============================================================
 def _auto_configure(chain, p2p, trust, web_port: int, is_origin: bool,
@@ -1413,7 +1544,7 @@ def _auto_configure(chain, p2p, trust, web_port: int, is_origin: bool,
     })
 
     log.info("=" * 64)
-    log.info(" [SK RESOLUTION v13.9.17]")
+    log.info(" [SK RESOLUTION v13.9.18]")
     log.info("=" * 64)
     log.info("  source           : %s", source or "(nenhum)")
     log.info("  SK_HEX len       : %d", len(sk_hex) if sk_hex else 0)
@@ -1661,7 +1792,7 @@ def main() -> int:
     else:
         log.info("[trust] carregado (origin=%s)", is_origin)
 
-    log.info("[wallet] boot sem carteira (design v13.9.17) — "
+    log.info("[wallet] boot sem carteira (design v13.9.18) — "
              "GUI tentará abrir carteira salva")
 
     p2p = None
@@ -1700,6 +1831,14 @@ def main() -> int:
         args=(chain, p2p, trust, _stop_bg, 30),
         daemon=True, name="Wallet-Watchdog",
     ).start()
+
+    # [v13.9.18] Status reporter
+    threading.Thread(
+        target=_status_reporter_loop,
+        args=(chain, _stop_bg, 30),
+        daemon=True, name="StatusReporter",
+    ).start()
+    log.info("[STATUS] reporter iniciado (30s)")
 
     pool = _setup_pool(chain, is_origin)
 
