@@ -1,14 +1,19 @@
 """main.py — Entrypoint do nó BRN (v13.9.9)
 ================================================================
-v13.9.9 (2026-11-11) — GUI VIA HTTP:
-  [FIX] _start_gui() agora abre http://127.0.0.1:{web_port}/wallet
-        em vez do arquivo local (file://). Isso resolve o erro
-        "Failed to fetch" na janela do aplicativo, pois a carteira
-        web (index_wallet.html) precisa de um servidor HTTP
-        rodando para funcionar.
-  [KEEP] v13.9.8: seed determinístico (auto-resolve SK)
-  [KEEP] v13.9.7: validação de SK + /health
-  [KEEP] v13.9.6: auto-config (SK + mine via env vars)
+v13.9.9 (2026-11-11) — PING RÁPIDO NO ORIGIN:
+  [NEW] _ping_origin(): testa HTTP do Origin (BRN_POOL_URL) com
+        timeout de 3s antes de qualquer integração. Sem isso, o
+        wallet_integrator travava 10s e o requests travava 30s
+        cada vez que Origin estava offline → Render travava.
+  [NEW] _install_sk_local_only(): instala SK no chain sem chamar
+        integrate_and_propagate. Usado quando Origin está offline.
+  [NEW] _auto_mine_loop(): thread persistente que monitora Origin
+        a cada 30s. Quando Origin volta online, inicia PoolClient
+        automaticamente. Sobrevive a quedas/hibernação do Origin.
+  [NEW] Logs [AUTO-MINE] mostram status do monitoramento.
+  [KEEP] v13.9.8: seed determinístico (BRN_VALIDATOR_SEED)
+  [KEEP] v13.9.7: /health.sk_validation com motivo exato
+  [KEEP] v13.9.6: defaults bootstrap/pool
   [KEEP] v13.9.5: isolation_detector no watchdog
 ================================================================
 """
@@ -76,6 +81,8 @@ SK_VALIDATION_STATE = {
     "address_derived": "",
     "pubkey_configured": "",
     "pubkey_derived": "",
+    "origin_online": None,
+    "auto_mine_status": "idle",
 }
 
 
@@ -257,7 +264,7 @@ def _check_blockchain_version() -> bool:
 
 
 # ============================================================
-# TRUST
+# TRUST / P2P / SYNC / BROADCAST / POOL / WEB
 # ============================================================
 def _setup_trust(chain, node_id_priv, is_origin: bool):
     try:
@@ -270,9 +277,6 @@ def _setup_trust(chain, node_id_priv, is_origin: bool):
         return None
 
 
-# ============================================================
-# P2P
-# ============================================================
 def _setup_p2p(chain, node_id_priv, p2p_port: int):
     try:
         from p2p_unified import P2PManager
@@ -285,9 +289,6 @@ def _setup_p2p(chain, node_id_priv, p2p_port: int):
         return None
 
 
-# ============================================================
-# SYNC
-# ============================================================
 def _setup_sync(chain, p2p):
     try:
         from sync_manager import ChainSyncManager
@@ -299,9 +300,6 @@ def _setup_sync(chain, p2p):
         return None
 
 
-# ============================================================
-# BROADCAST
-# ============================================================
 def _setup_broadcast(chain, p2p):
     log = logging.getLogger("main")
     if not p2p:
@@ -315,9 +313,19 @@ def _setup_broadcast(chain, p2p):
         return False
 
 
-# ============================================================
-# WALLET WATCHDOG
-# ============================================================
+def _setup_pool(chain, is_origin: bool):
+    if not is_origin:
+        return None
+    try:
+        from mining_pool import PoolManager
+        pool = PoolManager(chain)
+        logging.getLogger("main").info("[pool] PoolManager ativo (origin)")
+        return pool
+    except Exception as e:
+        logging.getLogger("main").warning("[pool] init falhou: %s", e)
+        return None
+
+
 def _wallet_watchdog_loop(chain, p2p, trust, stop_evt: threading.Event, interval: int = 30):
     log = logging.getLogger("main")
     log.info("[watchdog] iniciado (interval=%ds)", interval)
@@ -363,9 +371,6 @@ def _wallet_watchdog_loop(chain, p2p, trust, stop_evt: threading.Event, interval
     log.info("[watchdog] encerrado")
 
 
-# ============================================================
-# TRUST DAEMON
-# ============================================================
 def _setup_trust_daemon(chain, trust, p2p, password: str, is_origin: bool,
                         stop_evt: threading.Event, interval: int = 30):
     log = logging.getLogger("main")
@@ -400,25 +405,6 @@ def _setup_trust_daemon(chain, trust, p2p, password: str, is_origin: bool,
     return t
 
 
-# ============================================================
-# POOL
-# ============================================================
-def _setup_pool(chain, is_origin: bool):
-    if not is_origin:
-        return None
-    try:
-        from mining_pool import PoolManager
-        pool = PoolManager(chain)
-        logging.getLogger("main").info("[pool] PoolManager ativo (origin)")
-        return pool
-    except Exception as e:
-        logging.getLogger("main").warning("[pool] init falhou: %s", e)
-        return None
-
-
-# ============================================================
-# WEB SERVER
-# ============================================================
 def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int):
     log = logging.getLogger("main")
     try:
@@ -468,9 +454,6 @@ def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int):
     return True
 
 
-# ============================================================
-# EXPLORER
-# ============================================================
 def _start_explorer(chain):
     try:
         import explorer as exp
@@ -488,17 +471,16 @@ def _start_explorer(chain):
         logging.getLogger("main").debug("[explorer] não iniciou: %s", e)
 
 
-# ============================================================
-# GUI (v13.9.9: agora abre via HTTP, resolvendo o "Failed to fetch")
-# ============================================================
-def _start_gui(web_port: int) -> bool:
+def _start_gui() -> bool:
     try:
         import webview
-        # Abre a URL do servidor local em vez do arquivo file://
-        url = f"http://127.0.0.1:{web_port}/wallet"
-        
-        logging.getLogger("main").info("[gui] abrindo %s", url)
-        webview.create_window("BRN Wallet", url=url, width=1100, height=780)
+        from app_wallet_v3 import WalletApi
+        api = WalletApi()
+        wallet_path = BASE_DIR / "index_wallet.html"
+        if not wallet_path.exists():
+            wallet_path = BASE_DIR / "panel.html"
+        url = wallet_path.as_uri() if wallet_path.exists() else "about:blank"
+        webview.create_window("BRN Wallet", url=url, width=1100, height=780, js_api=api)
         webview.start()
         return True
     except Exception as e:
@@ -510,6 +492,13 @@ def _start_gui(web_port: int) -> bool:
 # [v13.9.8] Resolve SK por seed / env / arquivo / geração
 # ============================================================
 def _resolve_validator_sk() -> tuple:
+    """
+    Resolve (sk_hex, address, pubkey, source) nesta ordem:
+      1. BRN_VALIDATOR_SK_HEX (64 hex explícito)
+      2. BRN_VALIDATOR_SEED   (SHA256(seed) → SK determinística)
+      3. .validator_sk        (arquivo salvo em disco)
+      4. gera aleatória e tenta salvar em .validator_sk
+    """
     log = logging.getLogger("main")
 
     if not _HAS_WALLET:
@@ -555,7 +544,7 @@ def _resolve_validator_sk() -> tuple:
         except Exception as e:
             log.warning("[SK] leitura de %s falhou: %s", sk_file.name, e)
 
-    # ─── 4. Gera nova e tenta salvar ───
+    # ─── 4. Gera nova ───
     try:
         w = _Wallet()
         sk_hex = w.priv_hex
@@ -579,10 +568,8 @@ def _resolve_validator_sk() -> tuple:
         log.warning("   pubkey : %s", pubkey)
         log.warning("   sk_hex : %s", sk_hex)
         log.warning("")
-        log.warning("   Para reusar esta carteira em outros boots, sete:")
-        log.warning("     BRN_VALIDATOR_SEED=<qualquer-senha-memoravel>")
-        log.warning("   Ou copie a sk_hex acima para:")
-        log.warning("     BRN_VALIDATOR_SK_HEX=%s", sk_hex)
+        log.warning("   Para reusar: BRN_VALIDATOR_SEED=<qualquer-senha>")
+        log.warning("   Ou copie a sk_hex para: BRN_VALIDATOR_SK_HEX=%s", sk_hex)
         log.warning("=" * 64)
 
         return sk_hex, address, pubkey, source
@@ -592,14 +579,197 @@ def _resolve_validator_sk() -> tuple:
 
 
 # ============================================================
-# [v13.9.8] AUTO-CONFIG (com resolve)
+# [v13.9.9] Ping rápido no Origin
 # ============================================================
-def _auto_configure(chain, p2p, trust, web_port: int) -> None:
+def _ping_origin(timeout: float = 3.0) -> bool:
+    """
+    Testa HTTP do Origin (BRN_POOL_URL/api/status) com timeout curto.
+    Retorna True se o Origin respondeu 200, False caso contrário.
+    Nunca lança exceção.
+    """
+    log = logging.getLogger("main")
+    pool_url = os.environ.get("BRN_POOL_URL", "").strip().rstrip("/")
+    if not pool_url:
+        log.debug("[ORIGIN] BRN_POOL_URL vazio — não posso pingar")
+        return False
+
+    if not _HAS_REQUESTS:
+        # fallback para urllib se requests não estiver instalado
+        try:
+            import urllib.request
+            import urllib.error
+            req = urllib.request.Request(
+                f"{pool_url}/api/status",
+                headers={"User-Agent": "brn-main/13.9.9"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status == 200
+        except Exception as e:
+            log.debug("[ORIGIN] urllib ping falhou: %s", e)
+            return False
+
+    try:
+        r = _requests.get(f"{pool_url}/api/status", timeout=timeout)
+        return r.status_code == 200
+    except Exception as e:
+        log.debug("[ORIGIN] requests ping falhou: %s", e)
+        return False
+
+
+# ============================================================
+# [v13.9.9] Instala SK local sem tentar propagar
+# ============================================================
+def _install_sk_local_only(chain, sk_hex: str, address: str, pubkey: str) -> bool:
+    """
+    Instala SK no chain (set_local_validator_sk) sem chamar
+    integrate_and_propagate. Não bloqueia em rede.
+    """
+    log = logging.getLogger("main")
+    try:
+        chain.set_local_validator_sk(sk_hex)
+        log.info("[SK] instalada localmente (sem propagar) pk=%s…", pubkey[:16])
+        return True
+    except Exception as e:
+        log.exception("[SK] set_local_validator_sk falhou: %s", e)
+        return False
+
+
+# ============================================================
+# [v13.9.9] Auto-mine loop (persistente, sobrevive a Origin offline)
+# ============================================================
+def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
+                    stop_evt: threading.Event) -> None:
+    """
+    Thread persistente. A cada 30s:
+      1. Se SK ainda não está no chain → continua esperando
+      2. Se Origin offline → dorme 30s, tenta de novo
+      3. Se Origin online → chama POST /api/pool/start_local
+      4. Se PoolClient já está rodando → dorme e monitora
+      5. Se PoolClient parou (crash, timeout) → reinicia
+    """
+    log = logging.getLogger("main")
+    SK_VALIDATION_STATE["auto_mine_status"] = "starting"
+    log.info("[AUTO-MINE] loop iniciado (checa Origin a cada 30s)")
+
+    pool_url = os.environ.get("BRN_POOL_URL", "").strip()
+    failures = 0
+
+    while not stop_evt.is_set():
+        try:
+            # ─── 1. SK no chain? ───
+            if getattr(chain, "_local_validator_sk", None) is None:
+                log.info("[AUTO-MINE] SK ainda ausente — aguardando instalação")
+                SK_VALIDATION_STATE["auto_mine_status"] = "waiting_sk"
+                if stop_evt.wait(10):
+                    break
+                continue
+
+            # ─── 2. PoolClient já rodando? ───
+            if _HAS_REQUESTS:
+                try:
+                    r = _requests.get(
+                        f"http://127.0.0.1:{web_port}/api/pool/local_status",
+                        timeout=5,
+                    )
+                    if r.status_code == 200:
+                        data = r.json()
+                        if data.get("running"):
+                            SK_VALIDATION_STATE["auto_mine_status"] = "running"
+                            log.debug(
+                                "[AUTO-MINE] PoolClient já rodando (miner_id=%s)",
+                                data.get("miner_id", "?"),
+                            )
+                            if stop_evt.wait(30):
+                                break
+                            continue
+                except Exception:
+                    pass
+
+            # ─── 3. Origin online? ───
+            origin_online = _ping_origin(timeout=3.0)
+            SK_VALIDATION_STATE["origin_online"] = origin_online
+
+            if not origin_online:
+                SK_VALIDATION_STATE["auto_mine_status"] = "waiting_origin"
+                if failures == 0 or failures % 4 == 0:
+                    log.warning(
+                        "[AUTO-MINE] Origin offline (%s) — aguardando 30s",
+                        pool_url or "(BRN_POOL_URL vazio)",
+                    )
+                failures += 1
+                if stop_evt.wait(30):
+                    break
+                continue
+
+            # ─── 4. Inicia PoolClient ───
+            SK_VALIDATION_STATE["auto_mine_status"] = "starting_pool"
+            log.info("[AUTO-MINE] Origin online — iniciando PoolClient...")
+
+            if not _HAS_REQUESTS:
+                log.error("[AUTO-MINE] requests indisponível — não posso chamar start_local")
+                SK_VALIDATION_STATE["auto_mine_status"] = "error_no_requests"
+                if stop_evt.wait(60):
+                    break
+                continue
+
+            try:
+                r = _requests.post(
+                    f"http://127.0.0.1:{web_port}/api/pool/start_local",
+                    json={"address": address, "pubkey": pubkey},
+                    timeout=15,
+                )
+                try:
+                    data = r.json() if r.content else {}
+                except Exception:
+                    data = {"ok": False, "msg": f"HTTP {r.status_code} sem JSON"}
+
+                if data.get("ok"):
+                    failures = 0
+                    SK_VALIDATION_STATE["auto_mine_status"] = "running"
+                    log.info(
+                        "[AUTO-MINE] ✅ PoolClient iniciado (miner_id=%s)",
+                        data.get("miner_id", "?"),
+                    )
+                else:
+                    failures += 1
+                    SK_VALIDATION_STATE["auto_mine_status"] = f"failed:{data.get('msg', '?')[:60]}"
+                    log.warning(
+                        "[AUTO-MINE] PoolClient falhou (%d): %s",
+                        failures, data.get("msg", "?"),
+                    )
+            except Exception as e:
+                failures += 1
+                SK_VALIDATION_STATE["auto_mine_status"] = f"error:{type(e).__name__}"
+                log.warning("[AUTO-MINE] start_local exception: %s", e)
+
+        except Exception as e:
+            log.exception("[AUTO-MINE] loop exceção: %s", e)
+
+        # Dorme antes da próxima rodada
+        if stop_evt.wait(30):
+            break
+
+    SK_VALIDATION_STATE["auto_mine_status"] = "stopped"
+    log.info("[AUTO-MINE] loop encerrado")
+
+
+# ============================================================
+# [v13.9.9] AUTO-CONFIG (com ping rápido)
+# ============================================================
+def _auto_configure(chain, p2p, trust, web_port: int,
+                    stop_evt: threading.Event) -> None:
+    """
+    Fluxo v13.9.9:
+      1. Resolve SK
+      2. Instala SK local (sempre)
+      3. Ping rápido no Origin (3s)
+         - Se online: propaga (integrate_and_propagate)
+         - Se offline: pula propagação, registra no /health
+      4. Inicia thread de auto-mine (independente)
+    """
     log = logging.getLogger("main")
 
-    auto_mine = os.environ.get("BRN_AUTO_MINE", "0") == "1"
-
-    # ─── 1. Resolve SK (env / seed / arquivo / gera) ───
+    # ─── 1. Resolve SK ───
     sk_hex, address, pubkey, source = _resolve_validator_sk()
 
     SK_VALIDATION_STATE["checked"] = True
@@ -611,9 +781,8 @@ def _auto_configure(chain, p2p, trust, web_port: int) -> None:
     SK_VALIDATION_STATE["pubkey_configured"] = pubkey[:40] if pubkey else ""
     SK_VALIDATION_STATE["pubkey_derived"] = pubkey
 
-    # Log detalhado
     log.info("=" * 64)
-    log.info(" [SK RESOLUTION v13.9.8]")
+    log.info(" [SK RESOLUTION v13.9.9]")
     log.info("=" * 64)
     log.info("  source           : %s", source or "(nenhum)")
     log.info("  SK_HEX len       : %d", len(sk_hex) if sk_hex else 0)
@@ -628,92 +797,71 @@ def _auto_configure(chain, p2p, trust, web_port: int) -> None:
     log.info("  RESULTADO        : ✅ SK resolvida")
     log.info("=" * 64)
 
-    # ─── 2. Instala SK ───
-    if not _HAS_WI:
-        log.error("[AUTO-CONFIG] wallet_integrator indisponível")
-        return
+    # ─── 2. Instala SK local (sempre) ───
+    _install_sk_local_only(chain, sk_hex, address, pubkey)
 
-    log.info("[AUTO-CONFIG] instalando SK via wallet_integrator...")
-    try:
-        r = _wi.integrate_and_propagate(
-            chain, sk_hex,
-            address=address, pubkey=pubkey,
-            p2p=p2p, trust=trust, logger=log,
-        )
-        if r.get("ok"):
-            log.info(
-                "[AUTO-CONFIG] ✅ SK instalada (sk=%s ms=%s pbft=%s in_trust=%s in_top5=%s)",
-                r.get("sk_installed"),
-                r.get("multisig_ready"),
-                r.get("pbft_ready"),
-                r.get("in_trust"),
-                r.get("in_top5"),
-            )
+    # ─── 3. Ping rápido no Origin ───
+    log.info("[AUTO-CONFIG] pingando Origin...")
+    t0 = time.time()
+    origin_online = _ping_origin(timeout=3.0)
+    dt_ms = (time.time() - t0) * 1000
+    SK_VALIDATION_STATE["origin_online"] = origin_online
+
+    if origin_online:
+        log.info("[AUTO-CONFIG] Origin ONLINE (%.0fms) — propagando SK...", dt_ms)
+        if not _HAS_WI:
+            log.error("[AUTO-CONFIG] wallet_integrator indisponível")
         else:
-            log.warning(
-                "[AUTO-CONFIG] ⚠️ SK falhou: %s",
-                r.get("errors") or r.get("msg"),
-            )
-    except Exception as e:
-        log.exception("[AUTO-CONFIG] integrate falhou: %s", e)
+            try:
+                r = _wi.integrate_and_propagate(
+                    chain, sk_hex,
+                    address=address, pubkey=pubkey,
+                    p2p=p2p, trust=trust, logger=log,
+                )
+                if r.get("ok"):
+                    log.info(
+                        "[AUTO-CONFIG] ✅ SK propagada (in_trust=%s in_top5=%s propagated=%s)",
+                        r.get("in_trust"), r.get("in_top5"), r.get("propagated"),
+                    )
+                else:
+                    log.warning(
+                        "[AUTO-CONFIG] ⚠️ propagate falhou: %s",
+                        r.get("errors") or r.get("msg"),
+                    )
+            except Exception as e:
+                log.exception("[AUTO-CONFIG] integrate_and_propagate falhou: %s", e)
+    else:
+        log.warning(
+            "[AUTO-CONFIG] ⚠️ Origin OFFLINE (%.0fms) — SK instalada localmente, "
+            "sem propagação. Auto-mine vai monitorar até Origin voltar.",
+            dt_ms,
+        )
 
-    # ─── 3. Auto-mine ───
+    # ─── 4. Thread de auto-mine (independente do Origin agora) ───
+    auto_mine = os.environ.get("BRN_AUTO_MINE", "0") == "1"
     if not auto_mine:
         log.info("[AUTO-CONFIG] BRN_AUTO_MINE desligado — não inicia mineração")
+        SK_VALIDATION_STATE["auto_mine_status"] = "disabled"
         return
 
     if not address or not pubkey:
         log.warning("[AUTO-CONFIG] BRN_AUTO_MINE=1 mas faltam ADDRESS/PUBKEY")
+        SK_VALIDATION_STATE["auto_mine_status"] = "error_no_addr"
         return
 
-    if not _HAS_REQUESTS:
-        log.warning("[AUTO-CONFIG] 'requests' não instalado")
-        return
-
-    for _ in range(30):
-        if getattr(chain, "_local_validator_sk", None) is not None:
-            break
-        time.sleep(1)
-
-    if getattr(chain, "_local_validator_sk", None) is None:
-        log.warning("[AUTO-CONFIG] SK ainda ausente após 30s — abortando auto-mine")
-        return
-
-    log.info("[AUTO-CONFIG] iniciando mineração no pool...")
-    for attempt in range(1, 4):
-        try:
-            r = _requests.post(
-                f"http://127.0.0.1:{web_port}/api/pool/start_local",
-                json={"address": address, "pubkey": pubkey},
-                timeout=30,
-            )
-            try:
-                data = r.json() if r.content else {}
-            except Exception:
-                data = {"ok": False, "msg": f"HTTP {r.status_code}"}
-
-            if data.get("ok"):
-                log.info(
-                    "[AUTO-CONFIG] ✅ PoolClient iniciado (miner_id=%s)",
-                    data.get("miner_id", "?"),
-                )
-                return
-            else:
-                log.warning(
-                    "[AUTO-CONFIG] PoolClient tentativa %d: %s",
-                    attempt, data.get("msg", "?"),
-                )
-        except Exception as e:
-            log.warning("[AUTO-CONFIG] PoolClient tentativa %d: %s", attempt, e)
-        time.sleep(5)
-
-    log.warning("[AUTO-CONFIG] PoolClient não iniciou após 3 tentativas")
+    threading.Thread(
+        target=_auto_mine_loop,
+        args=(chain, address, pubkey, web_port, stop_evt),
+        daemon=True,
+        name="AutoMine",
+    ).start()
 
 
-def _delayed_auto_configure(chain, p2p, trust, web_port: int) -> None:
+def _delayed_auto_configure(chain, p2p, trust, web_port: int,
+                            stop_evt: threading.Event) -> None:
     try:
         time.sleep(3)
-        _auto_configure(chain, p2p, trust, web_port)
+        _auto_configure(chain, p2p, trust, web_port, stop_evt)
     except Exception as e:
         logging.getLogger("main").exception("[AUTO-CONFIG] falhou: %s", e)
 
@@ -748,7 +896,7 @@ def main() -> int:
     log.info(" base=%s env_loaded=%d", BASE_DIR, loaded)
     log.info("=" * 64)
 
-    # [v13.9.6] Defaults de bootstrap e pool
+    # [v13.9.6] Defaults
     if not os.environ.get("BRN_BOOTSTRAP_PEERS"):
         os.environ["BRN_BOOTSTRAP_PEERS"] = "100.111.253.8:6001"
         log.info("[config] BRN_BOOTSTRAP_PEERS default: 100.111.253.8:6001")
@@ -844,24 +992,24 @@ def main() -> int:
     if not ok_http:
         log.error("[server] HTTP não subiu")
 
-    # [11.5] [AUTO-CONFIG v13.9.8] resolve + valida + instala + mine
+    # [11.5] [AUTO-CONFIG v13.9.9] resolve + valida + ping + instala + auto-mine
     if not args.no_pool_client:
         threading.Thread(
             target=_delayed_auto_configure,
-            args=(chain, p2p, trust, web_port),
+            args=(chain, p2p, trust, web_port, _stop_bg),
             daemon=True,
             name="AutoConfig",
         ).start()
-        log.info("[AUTO-CONFIG] agendado (3s para resolver SK + instalar + mine)")
+        log.info("[AUTO-CONFIG] agendado (3s: resolve SK + ping Origin + auto-mine)")
 
     # [12] Explorer
     if not args.no_explorer:
         _start_explorer(chain)
 
-    # [13] GUI ou modo headless
+    # [13] GUI ou headless
     if not args.headless:
         log.info("[gui] abrindo")
-        if _start_gui(web_port):  # <--- Alterado para passar a porta
+        if _start_gui():
             return 0
     else:
         log.info("=" * 64)
