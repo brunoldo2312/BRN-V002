@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BRN — Sync & Validators</title>
+<style>
+  :root {
+    --bg:#0f172a; --card:#1e293b; --card2:#243447; --fg:#e2e8f0; --muted:#94a3b8;
+    --ok:#16a34a; --warn:#ca8a04; --err:#dc2626; --info:#2563eb;
+    --border:#334155; --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  header { padding:16px 24px; background:var(--card); border-bottom:1px solid var(--border);
+           display:flex; align-items:center; gap:24px; flex-wrap:wrap; }
+  header h1 { margin:0; font-size:18px; letter-spacing:.5px; }
+  header .stat { font-size:13px; color:var(--muted); }
+  header .stat b { color:var(--fg); font-size:15px; }
+  header .spacer { flex:1; }
+  header .dot { width:10px; height:10px; border-radius:50%; display:inline-block; margin-right:6px; }
+  main { padding:20px 24px; max-width:1280px; margin:0 auto; display:grid; gap:16px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:16px 18px; }
+  .card h2 { margin:0 0 12px 0; font-size:14px; text-transform:uppercase; letter-spacing:.8px; color:var(--muted); font-weight:600; }
+  .row { display:grid; gap:12px; }
+  .grid-2 { grid-template-columns: repeat(auto-fit, minmax(340px,1fr)); }
+  .kv { display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border); font-size:14px; }
+  .kv:last-child { border-bottom:none; }
+  .kv .k { color:var(--muted); }
+  .kv .v { font-family:var(--mono); }
+  .progress { width:100%; height:22px; background:var(--card2); border-radius:6px; overflow:hidden; position:relative; }
+  .progress .bar { height:100%; transition: width .5s ease, background-color .3s; }
+  .progress .label { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:12px; font-family:var(--mono); font-weight:600; text-shadow:0 1px 2px rgba(0,0,0,.7); }
+  .ok    { color:var(--ok);    } .bg-ok    { background:var(--ok); }
+  .warn  { color:var(--warn);  } .bg-warn  { background:var(--warn); }
+  .err   { color:var(--err);   } .bg-err   { background:var(--err); }
+  .info  { color:var(--info);  } .bg-info  { background:var(--info); }
+  .badge { display:inline-block; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.5px; }
+  .badge.ok   { background:rgba(22,163,74,.15);  color:var(--ok); }
+  .badge.warn { background:rgba(202,138,4,.15);  color:var(--warn); }
+  .badge.err  { background:rgba(220,38,38,.15);  color:var(--err); }
+  .badge.info { background:rgba(37,99,235,.15);  color:var(--info); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th { text-align:left; color:var(--muted); font-weight:600; padding:8px 6px; border-bottom:1px solid var(--border); font-size:11px; text-transform:uppercase; }
+  td { padding:8px 6px; border-bottom:1px solid var(--border); font-family:var(--mono); }
+  tr:last-child td { border-bottom:none; }
+  tr.synced   td { color:var(--ok); }
+  tr.behind   td { color:var(--warn); }
+  tr.ahead    td { color:var(--info); }
+  tr.stale    td { color:var(--muted); }
+  .check { display:flex; align-items:center; gap:8px; padding:8px 0; font-size:14px; }
+  .check .icon { width:22px; height:22px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:700; }
+  .check .icon.ok  { background:rgba(22,163,74,.2);  color:var(--ok); }
+  .check .icon.err { background:rgba(220,38,38,.2);  color:var(--err); }
+  .check .label { flex:1; }
+  .check .detail { font-family:var(--mono); font-size:12px; color:var(--muted); }
+  .env-table td { font-size:12px; }
+  .env-table td.name { font-family:var(--mono); color:#fbbf24; white-space:nowrap; }
+  .env-table td.val { font-family:var(--mono); color:var(--muted); }
+  .env-table tr.set    td.val { color:var(--ok); }
+  .env-table tr.unset  td.val { color:var(--err); }
+  .env-table tr.optional td.val { color:var(--muted); font-style:italic; }
+  code { background:var(--card2); padding:2px 6px; border-radius:4px; font-family:var(--mono); font-size:12px; color:#fbbf24; }
+  .empty { padding:20px; text-align:center; color:var(--muted); font-size:13px; }
+  .finish-banner { padding:14px 18px; border-radius:8px; background:rgba(22,163,74,.12); border:1px solid rgba(22,163,74,.3); margin-bottom:12px; }
+  .finish-banner h3 { margin:0 0 4px 0; color:var(--ok); font-size:15px; }
+  .finish-banner p { margin:0; font-size:13px; color:var(--muted); }
+  footer { padding:12px 24px; text-align:center; color:var(--muted); font-size:11px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🔷 BRN Node</h1>
+  <div class="stat">altura <b id="h-height">–</b></div>
+  <div class="stat">sync <b id="h-sync">–</b></div>
+  <div class="stat">peers <b id="h-peers">–</b></div>
+  <div class="stat">gate <span id="h-gate" class="badge info">–</span></div>
+  <div class="stat">sign <span id="h-sign" class="badge info">–</span></div>
+  <div class="spacer"></div>
+  <div class="stat">atualizado <b id="last-update">–</b></div>
+</header>
+
+<main>
+
+  <!-- ════════ SYNC / ALTURA FINAL ════════ -->
+  <section class="card">
+    <h2>📥 Sincronização</h2>
+    <div id="finish-banner" style="display:none" class="finish-banner">
+      <h3>✅ Sincronizado</h3>
+      <p id="finish-text"></p>
+    </div>
+
+    <div style="margin-bottom:14px">
+      <div class="progress">
+        <div id="sync-bar" class="bar bg-info" style="width:0%"></div>
+        <div id="sync-label" class="label">–</div>
+      </div>
+    </div>
+
+    <div class="grid-2 row">
+      <div>
+        <div class="kv"><span class="k">altura local</span><span class="v" id="sync-local">–</span></div>
+        <div class="kv"><span class="k">altura alvo</span><span class="v" id="sync-target">–</span></div>
+        <div class="kv"><span class="k">faltam</span><span class="v" id="sync-remaining">–</span></div>
+      </div>
+      <div>
+        <div class="kv"><span class="k">melhor peer</span><span class="v" id="sync-best-peer">–</span></div>
+        <div class="kv"><span class="k">taxa</span><span class="v" id="sync-rate">–</span></div>
+        <div class="kv"><span class="k">ETA</span><span class="v" id="sync-eta">–</span></div>
+      </div>
+    </div>
+
+    <div style="margin-top:14px; padding-top:12px; border-top:1px solid var(--border)">
+      <div class="kv"><span class="k">fast-sync</span><span class="v" id="fast-sync-status">–</span></div>
+      <div class="kv"><span class="k">validação full a partir de</span><span class="v" id="fast-sync-until">–</span></div>
+    </div>
+  </section>
+
+  <!-- ════════ PEERS ════════ -->
+  <section class="card">
+    <h2>🌐 Peers conhecidos (<span id="peers-count">0</span>)</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>IP</th>
+          <th>endereço</th>
+          <th>altura</th>
+          <th>Δ</th>
+          <th>idade</th>
+          <th>status</th>
+        </tr>
+      </thead>
+      <tbody id="peers-body">
+        <tr><td colspan="6" class="empty">Nenhum peer conhecido</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <div class="grid-2">
+    <!-- ════════ VALIDADORES ════════ -->
+    <section class="card">
+      <h2>🧩 Validadores</h2>
+      <div class="kv"><span class="k">no trust</span><span class="v" id="val-n-trust">–</span></div>
+      <div class="kv"><span class="k">no consenso (active)</span><span class="v" id="val-n-active">–</span></div>
+      <div class="kv"><span class="k">assinaturas necessárias</span><span class="v" id="val-required">–</span></div>
+      <div class="kv"><span class="k">sua pubkey local</span><span class="v" id="val-local-pk">–</span></div>
+      <div class="kv"><span class="k">local instalada?</span><span class="v" id="val-local-installed">–</span></div>
+      <div class="kv"><span class="k">local no trust?</span><span class="v" id="val-local-in-trust">–</span></div>
+      <div class="kv"><span class="k">bootstrap bypass</span><span class="v" id="val-bootstrap">–</span></div>
+    </section>
+
+    <!-- ════════ GATE DE MINERAÇÃO ════════ -->
+    <section class="card">
+      <h2>⛏️ Gate de mineração</h2>
+      <div id="gate-checks">
+        <div class="check"><div class="icon ok">?</div><div class="label">altura</div><div class="detail">–</div></div>
+      </div>
+      <div class="kv" style="margin-top:12px"><span class="k">resultado</span><span class="v" id="gate-result">–</span></div>
+      <div class="kv"><span class="k">motivo</span><span class="v" id="gate-reason">–</span></div>
+    </section>
+  </div>
+
+  <!-- ════════ ASSINATURA / VARIÁVEIS ════════ -->
+  <section class="card">
+    <h2>✍️ Assinatura de blocos (variáveis necessárias)</h2>
+
+    <div id="sign-status" style="margin-bottom:14px; padding:12px 14px; border-radius:8px;"></div>
+
+    <table class="env-table">
+      <thead>
+        <tr>
+          <th>variável</th>
+          <th>estado</th>
+          <th>valor atual</th>
+          <th>obrigatória?</th>
+          <th>descrição / onde setar</th>
+        </tr>
+      </thead>
+      <tbody id="env-body">
+        <tr><td colspan="5" class="empty">Carregando…</td></tr>
+      </tbody>
+    </table>
+
+    <p style="margin-top:16px; font-size:12px; color:var(--muted); line-height:1.6">
+      <b>No Render:</b> Dashboard → seu serviço → <b>Environment</b> → <b>Add Environment Variable</b>.
+      Após adicionar, clique em <b>Manual Deploy → Deploy latest commit</b> para reiniciar o serviço.
+    </p>
+  </section>
+
+</main>
+
+<footer>
+  BRN Node Panel · atualiza a cada 2s · <span id="version-footer">–</span>
+</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmt = n => (n === null || n === undefined) ? '–' : String(n);
+const fmtAge = s => s < 0 ? 'nunca' : s < 60 ? `${s}s` : s < 3600 ? `${Math.round(s/60)}m` : `${Math.round(s/3600)}h`;
+const trunc = (s, n=32) => !s ? '–' : (s.length > n ? s.slice(0, n) + '…' : s);
+const setClass = (el, cls) => { el.className = cls; };
+
+let lastData = null;
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/sync/live', { cache: 'no-store' });
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.msg || 'falhou');
+    lastData = d;
+    render(d);
+    $('last-update').textContent = new Date().toLocaleTimeString('pt-BR');
+  } catch (e) {
+    $('last-update').textContent = 'erro: ' + e.message;
+  }
+}
+
+function render(d) {
+  const node = d.node || {};
+  const sync = d.sync || {};
+  const fast = d.fast_sync || {};
+  const peers = d.peers || [];
+  const val = d.validators || {};
+  const gate = d.mining_gate || {};
+  const sign = d.signing || {};
+
+  // Header
+  $('h-height').textContent = fmt(node.height);
+  $('h-sync').textContent = (sync.percent !== undefined) ? sync.percent.toFixed(1) + '%' : '–';
+  const syncedPeers = peers.filter(p => p.synced).length;
+  $('h-peers').textContent = `${syncedPeers}/${peers.length}`;
+  $('h-gate').textContent = gate.allowed ? 'liberado' : 'bloqueado';
+  setClass($('h-gate'), 'badge ' + (gate.allowed ? 'ok' : 'err'));
+  $('h-sign').textContent = sign.can_sign ? 'pronto' : 'sem SK';
+  setClass($('h-sign'), 'badge ' + (sign.can_sign ? 'ok' : 'warn'));
+  $('version-footer').textContent = `v${node.version || '?'} · ${node.is_origin ? 'ORIGIN' : 'CLIENTE'}`;
+
+  // ── Sync ──
+  const pct = Math.max(0, Math.min(100, sync.percent || 0));
+  $('sync-bar').style.width = pct + '%';
+  $('sync-bar').className = 'bar ' + (pct >= 100 ? 'bg-ok' : (pct >= 1 ? 'bg-info' : 'bg-warn'));
+  $('sync-label').textContent = pct.toFixed(1) + '%';
+
+  $('sync-local').textContent = fmt(sync.local_height);
+  $('sync-target').textContent = fmt(sync.target_height);
+  $('sync-remaining').textContent = (sync.remaining !== undefined)
+    ? (sync.remaining === 0 ? '0 (sincronizado)' : fmt(sync.remaining))
+    : '–';
+  $('sync-best-peer').textContent = sync.best_peer || '–';
+  $('sync-rate').textContent = (sync.download_rate_blocks_per_s > 0)
+    ? sync.download_rate_blocks_per_s.toFixed(2) + ' blocos/s' : '–';
+  $('sync-eta').textContent = (sync.eta_s > 0)
+    ? (sync.eta_s < 60 ? `${sync.eta_s}s` : sync.eta_s < 3600 ? `${Math.round(sync.eta_s/60)}min` : `${(sync.eta_s/3600).toFixed(1)}h`)
+    : (pct >= 100 ? 'concluído' : '–');
+
+  if (fast.active) {
+    $('fast-sync-status').textContent = `ATIVO (${fast.until} blocos sem validação full)`;
+    setClass($('fast-sync-status'), 'v warn');
+    $('fast-sync-until').textContent = `#${fast.until + 1} em diante`;
+  } else if (fast.until > 0) {
+    $('fast-sync-status').textContent = 'concluído (validação full ativa)';
+    setClass($('fast-sync-status'), 'v ok');
+    $('fast-sync-until').textContent = `#${fast.until + 1} em diante`;
+  } else {
+    $('fast-sync-status').textContent = 'desativado';
+    setClass($('fast-sync-status'), 'v');
+    $('fast-sync-until').textContent = 'desde #1 (validação full sempre)';
+  }
+
+  // ── Banner de sincronização concluída ──
+  if (sync.target_height > 0 && sync.local_height >= sync.target_height) {
+    $('finish-banner').style.display = 'block';
+    $('finish-text').innerHTML =
+      `Altura final: <b>#${sync.local_height}</b> (alvo #${sync.target_height}) · ` +
+      `tip <code>${trunc(node.tip_hash, 16)}</code> · ` +
+      `${peers.filter(p => p.synced).length}/${peers.length} peers na mesma altura`;
+  } else {
+    $('finish-banner').style.display = 'none';
+  }
+
+  // ── Peers ──
+  $('peers-count').textContent = peers.length;
+  const tbody = $('peers-body');
+  if (peers.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty">Nenhum peer conhecido. Verifique BRN_BOOTSTRAP_PEERS.</td></tr>';
+  } else {
+    tbody.innerHTML = peers.map(p => {
+      const cls = p.stale ? 'stale' : (p.synced ? 'synced' : (p.delta > 0 ? 'ahead' : 'behind'));
+      const badge = p.stale ? '<span class="badge warn">stale</span>'
+                  : p.synced ? '<span class="badge ok">sincronizado</span>'
+                  : p.delta > 0 ? '<span class="badge info">à frente</span>'
+                  : '<span class="badge warn">atrás</span>';
+      const delta = (p.delta === 0 ? '0' : (p.delta > 0 ? '+' + p.delta : String(p.delta)));
+      return `<tr class="${cls}">
+        <td>${p.ip}</td>
+        <td>${p.address}</td>
+        <td>${p.height}</td>
+        <td>${delta}</td>
+        <td>${fmtAge(p.age_s)}</td>
+        <td>${badge}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  // ── Validadores ──
+  $('val-n-trust').textContent = fmt(val.n_trust);
+  $('val-n-active').textContent = fmt(val.n_active);
+  $('val-required').textContent = fmt(val.required_sigs);
+  $('val-local-pk').textContent = trunc(val.local_pk, 20) || '(nenhuma)';
+  $('val-local-installed').innerHTML = val.local_pk_installed
+    ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>';
+  $('val-local-in-trust').innerHTML = val.local_in_trust
+    ? '<span class="badge ok">sim</span>' : '<span class="badge warn">não</span>';
+  $('val-bootstrap').innerHTML = val.bootstrap_would_fire
+    ? '<span class="badge warn">sim (rede pequena)</span>' : '<span class="badge ok">não</span>';
+
+  // ── Gate ──
+  const gateChecks = gate.checks || {};
+  const checks = [
+    { key: 'height',     label: 'altura >= fast_sync_until' },
+    { key: 'sk',         label: 'SK local instalada' },
+    { key: 'validators', label: 'validadores sincronizados' },
+  ];
+  $('gate-checks').innerHTML = checks.map(c => {
+    const info = gateChecks[c.key] || {};
+    const ok = !!info.ok;
+    let detail = '';
+    if (c.key === 'height') detail = `${info.current} / ${info.required}`;
+    else if (c.key === 'sk') detail = info.local_pk || 'sem chave';
+    else if (c.key === 'validators') detail = `${info.synced || 0}/${info.required || 0} (${info.reason || '?'})`;
+    return `<div class="check">
+      <div class="icon ${ok ? 'ok' : 'err'}">${ok ? '✓' : '✕'}</div>
+      <div class="label">${c.label}</div>
+      <div class="detail">${detail}</div>
+    </div>`;
+  }).join('');
+  $('gate-result').innerHTML = gate.allowed
+    ? '<span class="badge ok">liberado</span>' : '<span class="badge err">bloqueado</span>';
+  $('gate-reason').textContent = gate.reason || '–';
+
+  // ── Assinatura ──
+  const signBox = $('sign-status');
+  if (sign.can_sign) {
+    signBox.style.background = 'rgba(22,163,74,.12)';
+    signBox.style.border = '1px solid rgba(22,163,74,.3)';
+    signBox.innerHTML = `<b style="color:var(--ok)">✅ Este nó PODE assinar blocos</b><br>
+      <span style="font-size:13px;color:var(--muted)">SK instalada via <code>${sign.sk_source || '?'}</code> · pubkey ${trunc(sign.pubkey, 24)}</span>`;
+  } else {
+    signBox.style.background = 'rgba(220,38,38,.12)';
+    signBox.style.border = '1px solid rgba(220,38,38,.3)';
+    signBox.innerHTML = `<b style="color:var(--err)">❌ Este nó NÃO PODE assinar blocos</b><br>
+      <span style="font-size:13px;color:var(--muted)">Motivo: ${sign.reason || '?'}<br>Sem SK válida, o nó não produz assinatura em blocos (got=0 no log do consenso).</span>`;
+  }
+
+  // ── Tabela de variáveis ──
+  const envBody = $('env-body');
+  const vars = sign.variables || [];
+  if (vars.length === 0) {
+    envBody.innerHTML = '<tr><td colspan="5" class="empty">Nenhuma variável listada</td></tr>';
+  } else {
+    envBody.innerHTML = vars.map(v => {
+      let cls = 'unset';
+      let estadoBadge = '<span class="badge err">não</span>';
+      if (v.set) { cls = 'set'; estadoBadge = '<span class="badge ok">sim</span>'; }
+      else if (!v.required) { cls = 'optional'; estadoBadge = '<span class="badge info">opcional</span>'; }
+      const valStr = v.value_masked || (v.set ? '(definido)' : '(não definido)');
+      return `<tr class="${cls}">
+        <td class="name">${v.name}</td>
+        <td>${estadoBadge}</td>
+        <td class="val">${valStr}</td>
+        <td>${v.required ? '<b style="color:var(--err)">SIM</b>' : 'não'}</td>
+        <td style="font-family:inherit;font-size:12px;color:var(--muted);line-height:1.5">${v.description}</td>
+      </tr>`;
+    }).join('');
+  }
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
