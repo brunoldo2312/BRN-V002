@@ -1,16 +1,39 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.31)
+server.py — Backend HTTP do nó BRN (v9.9.32)
 ================================================================
-v9.9.31 (2026-11-12) — EXPOR PROGRESSO HTTP SYNC NO /api/sync-info:
-  [NEW] set_http_sync_state(state): recebe o dict do main.py com
-        o progresso do download via HTTP e o melhor peer.
-  [NEW] /api/sync-info agora retorna os dados do download HTTP
-        (percent, local_height, target_height, best_peer) para
-        o painel web exibir a barra de progresso corretamente.
+v9.9.32 (2026-11-12) — DIAGNÓSTICO DE VALIDADORES HONESTO:
+  [FIX] /api/consensus/validators agora usa
+        chain.diagnose_validators() (blockchain.py v9.5.8) como
+        fonte de verdade. Antes, o route chamava
+        trust.get_top_validators(count=5) direto, enquanto o
+        consenso usa _get_active_validators() (que tenta
+        get_active_validators() PRIMEIRO). Se TrustNetwork tiver os
+        dois métodos e retornarem sets diferentes, o painel web
+        mostrava um set e o consenso usava outro — exatamente o
+        cenário do #4301 (painel dizia 3 validadores, consenso
+        rejeitava como "estrangeiro").
+  [FIX] /api/consensus/validators agora retorna required_sigs
+        calculado por _required_signatures() (respeita
+        BRN_REQUIRE_ALL_SIGS e BRN_VALIDATOR_QUORUM) em vez de
+        len(top5). Antes, painel mostrava required_sigs=N mesmo
+        quando quórum era ceil(N*0.67).
+  [NEW] /api/consensus/validators agora inclui por validador:
+        in_active, in_trust, is_local. Assim você vê na hora
+        qual pk está no consenso, qual está só no trust, e qual é
+        sua SK local.
+  [NEW] /api/consensus/validators retorna campos top-level:
+        n_trust, n_active, n_bootstrap_local,
+        local_pk_installed, local_pk, bootstrap_would_fire,
+        diagnosis (snapshot cru de diagnose_validators).
+  [NEW] /health retorna validators={n_trust, n_active,
+        n_bootstrap_local, required_sigs, local_pk_installed,
+        bootstrap_would_fire} — 1 chamada para saber se o nó
+        está em bootstrap legítimo ou com trust divergente.
+  [KEEP] v9.9.31: /api/sync-info expõe HTTP_SYNC_STATE.
 ================================================================
 """
 from __future__ import annotations
-import os, time, json, atexit, hmac, logging, sys, threading
+import os, time, math, json, atexit, hmac, logging, sys, threading
 import urllib.request, urllib.error
 from decimal import Decimal, ROUND_DOWN
 from functools import wraps
@@ -104,7 +127,7 @@ def set_sk_validation_state(state):
     global _SK_VALIDATION_STATE
     _SK_VALIDATION_STATE = dict(state) if state else {}
 
-# [NOVO] Estado do progresso HTTP
+# Estado do progresso HTTP (v9.9.31)
 _HTTP_SYNC_STATE = {}
 def set_http_sync_state(state):
     global _HTTP_SYNC_STATE
@@ -408,18 +431,16 @@ def sync_info():
     local_h = chain.db.height()
     result["sync"]["height"] = local_h
 
-    # [NOVO] Usa o estado do HTTP SYNC se estiver ativo
     if _HTTP_SYNC_STATE and _HTTP_SYNC_STATE.get("syncing"):
         result["sync"].update({
             "percent": _HTTP_SYNC_STATE.get("percent", 0.0),
             "height": _HTTP_SYNC_STATE.get("local_height", local_h),
             "target": _HTTP_SYNC_STATE.get("target_height", 0),
-            "peers": 1, # o próprio origin
+            "peers": 1,
             "best_peer": _HTTP_SYNC_STATE.get("best_peer", "")
         })
         result["sync"]["active_peer"] = _HTTP_SYNC_STATE.get("best_peer", "")
     else:
-        # Fallback para o sync manager normal
         try:
             result["sync"]["peers"] = chain.db.contar_peers(apenas_ativos=False)
             todos = chain.db.listar_peers(apenas_ativos=False)
@@ -819,8 +840,8 @@ def peers_discovered():
 def root():
     try:
         chain = _get_chain()
-        return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.31", "height": chain.db.height(), "health": "/health", "status": "/api/status", "dashboard": "/dashboard", "wallet": "/wallet", "monitor": "/monitor", "panel": "/panel"})
-    except Exception as e: return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.31", "error": str(e)})
+        return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.32", "height": chain.db.height(), "health": "/health", "status": "/api/status", "dashboard": "/dashboard", "wallet": "/wallet", "monitor": "/monitor", "panel": "/panel"})
+    except Exception as e: return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.32", "error": str(e)})
 
 @app.route("/dashboard", methods=["GET"])
 def serve_dashboard():
@@ -854,7 +875,45 @@ def health():
         has_pbft = False
         try: has_pbft = getattr(chain, "_pbft", None) is not None
         except Exception: pass
-        return jsonify({"ok": True, "height": chain.db.height(), "version": "9.9.31", "chain_injected": _CHAIN is not None, "pool_injected": _POOL_MANAGER is not None, "trust_injected": _TRUST_NETWORK is not None, "pool_client_local": _POOL_CLIENT_LOCAL is not None, "p2p_injected": p2p is not None, "wallet_sk_installed": has_sk, "multisig_configured": has_multisig, "pbft_configured": has_pbft, "strict_multisig": STRICT_MULTISIG, "trust_download_require_sig": TRUST_DOWNLOAD_REQUIRE_SIG, "sk_validation": dict(_SK_VALIDATION_STATE)})
+
+        # [v9.9.32] Snapshot compacto do estado de validadores.
+        # Fonte de verdade: chain.diagnose_validators() (blockchain v9.5.8).
+        val_summary = {}
+        if hasattr(chain, "diagnose_validators"):
+            try:
+                d = chain.diagnose_validators()
+                val_summary = {
+                    "n_trust": int(d.get("n_trust", 0) or 0),
+                    "n_active": int(d.get("n_active", 0) or 0),
+                    "n_bootstrap_local": int(d.get("n_bootstrap_local", 0) or 0),
+                    "required_sigs": int(d.get("required_sigs", 0) or 0),
+                    "local_pk_installed": bool(d.get("local_pk")),
+                    "local_pk": (d.get("local_pk") or "")[:16] + ("..." if d.get("local_pk") else ""),
+                    "local_in_trust": bool(d.get("local_in_trust", False)),
+                    "bootstrap_would_fire": bool(d.get("bootstrap_would_fire", False)),
+                }
+            except Exception as e:
+                val_summary = {"error": str(e)}
+        else:
+            val_summary = {"error": "blockchain.py sem diagnose_validators()"}
+
+        return jsonify({
+            "ok": True,
+            "height": chain.db.height(),
+            "version": "9.9.32",
+            "chain_injected": _CHAIN is not None,
+            "pool_injected": _POOL_MANAGER is not None,
+            "trust_injected": _TRUST_NETWORK is not None,
+            "pool_client_local": _POOL_CLIENT_LOCAL is not None,
+            "p2p_injected": p2p is not None,
+            "wallet_sk_installed": has_sk,
+            "multisig_configured": has_multisig,
+            "pbft_configured": has_pbft,
+            "strict_multisig": STRICT_MULTISIG,
+            "trust_download_require_sig": TRUST_DOWNLOAD_REQUIRE_SIG,
+            "validators": val_summary,
+            "sk_validation": dict(_SK_VALIDATION_STATE),
+        })
     except Exception as e: return jsonify({"ok": False, "error": str(e)}), 500
 
 @atexit.register
@@ -911,16 +970,99 @@ def api_get_block(height):
 @app.route("/api/consensus/validators", methods=["GET"])
 @require_rate_limit("status")
 def consensus_validators():
+    """
+    [v9.9.32] Fonte de verdade: chain.diagnose_validators() (blockchain v9.5.8).
+
+    Antes: usava trust.get_top_validators(count=5) direto, o que
+    podia divergir de _get_active_validators() (que tenta
+    get_active_validators() PRIMEIRO). O painel web mostrava um set,
+    o consenso usava outro. Era exatamente o cenário do #4301:
+    painel "3 validadores", consenso rejeitava como estrangeiro.
+    """
     try:
+        chain = _get_chain()
         trust = _get_trust_network()
-        if trust is None: return jsonify({"ok": False, "msg": "TrustNetwork indisponivel"}), 503
-        top5_pubkeys = (trust.get_top_validators(count=5) if hasattr(trust, "get_top_validators") else [])
-        nodes = list(trust.nodes.values()) if hasattr(trust, "nodes") else []; validators = []
-        for n in nodes:
-            if getattr(n, "public_key", "") in top5_pubkeys:
-                validators.append({"pubkey": n.public_key[:32] + "...", "pubkey_full": n.public_key, "node_id": n.node_id, "address": getattr(n, "address", ""), "trust_score": round(getattr(n, "trust_score", 0), 1), "trust_level": getattr(n, "trust_level", "new"), "connected": getattr(n, "connected", False)})
-        validators.sort(key=lambda x: -x["trust_score"])
-        return jsonify({"ok": True, "required_sigs": len(top5_pubkeys), "all_required": True, "validators": validators[:5]})
+
+        diag = None
+        if hasattr(chain, "diagnose_validators"):
+            try:
+                diag = chain.diagnose_validators()
+            except Exception as e:
+                log.debug("[consensus] diagnose_validators falhou: %s", e)
+
+        if trust is None and diag is None:
+            return jsonify({"ok": False, "msg": "TrustNetwork indisponivel"}), 503
+
+        if diag is not None:
+            active_pks = diag.get("active_validators") or []
+            trust_pks = diag.get("trust_validators") or []
+            local_pk = diag.get("local_pk") or ""
+            required = int(diag.get("required_sigs", 0) or 0)
+            all_required = bool(diag.get("require_all_sigs", True))
+            bootstrap_fire = bool(diag.get("bootstrap_would_fire", False))
+        else:
+            # Fallback para o comportamento antigo (compat)
+            if trust is not None:
+                if hasattr(trust, "get_active_validators"):
+                    try: active_pks = list(trust.get_active_validators(count=5) or [])
+                    except Exception: active_pks = []
+                else:
+                    try: active_pks = list(trust.get_top_validators(count=5) or [])
+                    except Exception: active_pks = []
+            else:
+                active_pks = []
+            trust_pks = active_pks
+            local_pk = ""
+            required = len(active_pks)
+            all_required = True
+            bootstrap_fire = len(trust_pks) < 2
+
+        validators = []
+        if trust is not None and hasattr(trust, "nodes"):
+            for n in trust.nodes.values():
+                pk = (getattr(n, "public_key", "") or "").strip()
+                if not pk:
+                    continue
+                in_active = pk in active_pks
+                in_trust = pk in trust_pks
+                is_local = (pk == local_pk)
+                if not (in_active or in_trust):
+                    continue
+                validators.append({
+                    "pubkey": pk[:32] + "..." if len(pk) > 32 else pk,
+                    "pubkey_full": pk,
+                    "node_id": getattr(n, "node_id", ""),
+                    "address": getattr(n, "address", ""),
+                    "trust_score": round(float(getattr(n, "trust_score", 0) or 0), 1),
+                    "trust_level": getattr(n, "trust_level", "new"),
+                    "connected": bool(getattr(n, "connected", False)),
+                    "in_active": in_active,
+                    "in_trust": in_trust,
+                    "is_local": is_local,
+                })
+
+        # Local primeiro, depois active, depois score
+        validators.sort(key=lambda v: (
+            not v["is_local"],
+            not v["in_active"],
+            -v["trust_score"],
+        ))
+        top5 = validators[:5]
+
+        return jsonify({
+            "ok": True,
+            "required_sigs": required,
+            "all_required": all_required,
+            "bootstrap_would_fire": bootstrap_fire,
+            "n_trust": len(trust_pks),
+            "n_active": len(active_pks),
+            "n_bootstrap_local": max(0, len(active_pks) - len(trust_pks)),
+            "local_pk_installed": bool(local_pk),
+            "local_pk": local_pk[:32] + "..." if local_pk else "",
+            "local_pk_full": local_pk,
+            "validators": top5,
+            "diagnosis": diag,
+        })
     except Exception as e:
         log.exception("consensus_validators falhou")
         return jsonify({"ok": False, "msg": str(e)}), 500
@@ -963,5 +1105,5 @@ def bridge_status():
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print("BRN Server v9.9.31 (HTTP Sync Progress)")
+    print("BRN Server v9.9.32 (Honest Validator Diagnostics)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
