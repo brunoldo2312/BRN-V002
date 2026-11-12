@@ -3,7 +3,6 @@
 echo "[start.sh] iniciando..."
 
 if [ -z "${TAILSCALE_AUTHKEY}" ]; then
-  echo "[start.sh] ⚠️  TAILSCALE_AUTHKEY vazio"
   TS_ENABLED=0
 else
   TS_ENABLED=1
@@ -19,7 +18,6 @@ if [ "$TS_ENABLED" = "1" ]; then
     | tar xzf - --strip-components=1 -C /tmp/ts
   chmod +x /tmp/ts/tailscale /tmp/ts/tailscaled
 
-  # ATENÇÃO: Adicionado o --socks5-server de volta!
   /tmp/ts/tailscaled \
     --tun=userspace-networking \
     --socks5-server=127.0.0.1:1055 \
@@ -47,8 +45,7 @@ if [ "$TS_ENABLED" = "1" ]; then
   fi
 fi
 
-# Configura o Python para usar o SOCKS5 ao acessar IPs do Tailscale (100.x)
-# O NO_PROXY impede que o localhost (127.0.0.1) passe pelo proxy.
+# Configura o Python para usar o SOCKS5
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
 export ALL_PROXY="socks5://127.0.0.1:1055"
 export NO_PROXY="localhost,127.0.0.1,0.0.0.0,10.0.0.0/8,192.168.0.0/16"
