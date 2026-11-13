@@ -1,21 +1,23 @@
 """main.py — Entrypoint do nó BRN (v13.9.19)
 ================================================================
-v13.9.19 (2026-11-12) — FIX HTTP SERVER: waitress em vez de Uvicorn:
-  [FIX CRÍTICO] _start_web_server() agora usa waitress (production
-        WSGI server, já no requirements.txt) em vez de tentar
-        Uvicorn + server_fastapi.py. Motivo: server_fastapi.py
-        importa WSGIMiddleware de fastapi.middleware.wsgi, que foi
-        REMOVIDO no FastAPI >= 0.100 (movido para a2wsgi). Resultado:
-        log cheio de "[server] Uvicorn falhou: cannot import name
-        'WSGIMiddleware'" a cada boot, mesmo caindo no fallback Flask.
-        Waitress: sem warning de "development server", sem erro no
-        log, sem depender de FastAPI/a2wsgi. 100% compatível com
-        server.py (Flask).
-  [NEW] Flag --no-waitress: força fallback para srv.app.run()
-        (Flask dev server). Útil só para debug.
-  [KEEP] v13.9.18: GUI via HTTP (/wallet), status reporter 30s.
-  [KEEP] v13.9.17: fast-sync até 6000 + gate de mineração (4 condições).
-  [KEEP] v13.9.16: HTTP sync, --force-http-resync.
+v13.9.19 (2026-11-13) — INTEGRAÇÃO FINAL DO MULTI-SIG + CHECKPOINTS:
+  [NEW] Wire de checkpoints: após carregar node_identity, chama
+        set_checkpoints(load_checkpoints()) e
+        set_checkpoint_priv(node_id_priv). Sem isso,
+        _maybe_sign_checkpoint() e _create_auto_checkpoint() em
+        blockchain.py eram no-op — checkpoints ficavam desligados
+        mesmo com BRN_CHECKPOINT_AUTO_HEIGHT setado.
+  [NEW] chain.is_origin = is_origin explicitamente após criar o
+        Blockchain. O blockchain.py v9.5.8 não expõe esse atributo;
+        sync_manager.py v9.4 consulta getattr(chain, "is_origin").
+        Sem isso, o Origin entrava no loop de sync e tentava
+        "aguardar a si mesmo" via HTTP, queimando CPU.
+        (v9.5.9 do blockchain.py adiciona isso no __init__; este
+        main.py define de qualquer forma — redundância segura.)
+  [KEEP] v13.9.18: GUI via HTTP (fix "Failed to fetch"), reporter
+        de status consolidado, fast-sync gate com 4 condições.
+  [KEEP] v13.9.17: fast-sync até BRN_FAST_SYNC_UNTIL (6000).
+  [KEEP] v13.9.16: HTTP sync corrigido, --force-http-resync.
 ================================================================
 """
 from __future__ import annotations
@@ -39,7 +41,7 @@ try:
     from version import VERSION, BUILD_DATE
 except ImportError:
     VERSION = "13.9.19"
-    BUILD_DATE = "2026-11-12"
+    BUILD_DATE = "2026-11-13"
 
 try:
     from isolation_detector import IsolationDetector
@@ -68,13 +70,6 @@ try:
 except ImportError:
     _Wallet = None
     _HAS_WALLET = False
-
-try:
-    from waitress import serve as _waitress_serve
-    _HAS_WAITRESS = True
-except ImportError:
-    _waitress_serve = None
-    _HAS_WAITRESS = False
 
 
 SK_VALIDATION_STATE = {
@@ -110,8 +105,6 @@ def parse_args():
     p.add_argument("--no-interactive", action="store_true")
     p.add_argument("--no-p2p", action="store_true")
     p.add_argument("--no-explorer", action="store_true")
-    p.add_argument("--no-waitress", action="store_true",
-                   help="força Flask dev server (debug)")
     p.add_argument("--db", metavar="PATH", default=None)
     p.add_argument("--web-port", type=int, default=None)
     p.add_argument("--p2p-port", type=int, default=None)
@@ -582,20 +575,8 @@ def _setup_trust_daemon(chain, trust, p2p, password: str, is_origin: bool,
     return t
 
 
-# ============================================================
-# WEB SERVER — v13.9.19: waitress em vez de Uvicorn
-# ============================================================
 def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int,
-                       stop_evt: threading.Event = None,
-                       use_waitress: bool = True):
-    """
-    [v13.9.19] Sobe o server.py (Flask) via waitress (production).
-
-    - waitress: WSGI production server, sem warning "development server",
-      sem FastAPI/Uvicorn, sem server_fastapi.py (que está quebrado).
-    - Fallback: srv.app.run() (Flask dev) se waitress falhar ou se
-      --no-waitress for passado.
-    """
+                       stop_evt: threading.Event = None):
     log = logging.getLogger("main")
     try:
         import server as srv
@@ -630,7 +611,7 @@ def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int,
     except Exception as e:
         log.debug("[server] set_state falhou: %s", e)
 
-    if stop_evt is not None:
+    if stop_evt is not None and hasattr(srv, "set_sk_validation_state"):
         def _refresh():
             while not stop_evt.wait(5):
                 try:
@@ -643,37 +624,24 @@ def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int,
                           name="StateRefresh").start()
         log.info("[server] state refresh thread iniciada (5s)")
 
-    host = os.environ.get("BRN_WEB_HOST", "127.0.0.1")
-
     def _run():
-        # 1) waitress (production, preferido)
-        if use_waitress and _HAS_WAITRESS:
-            try:
-                log.info("[server] Usando waitress (production) na porta %d", web_port)
-                _waitress_serve(
-                    srv.app,
-                    host=host,
-                    port=web_port,
-                    threads=8,
-                    connection_limit=100,
-                    channel_timeout=30,
-                )
-                log.info("[server] waitress encerrou normalmente")
-                return
-            except Exception as e:
-                log.warning("[server] waitress falhou: %s — caindo para Flask dev", e)
-        elif use_waitress and not _HAS_WAITRESS:
-            log.warning("[server] waitress indisponível — usando Flask dev server")
-
-        # 2) Flask dev server (fallback)
         try:
-            log.info("[server] Usando Flask dev server na porta %d", web_port)
-            srv.app.run(
-                host=host, port=web_port,
-                threaded=True, use_reloader=False,
+            import uvicorn
+            from server_fastapi import app as fastapi_app
+            log.info("[server] Usando FastAPI + Uvicorn na porta %d", web_port)
+            uvicorn.run(
+                fastapi_app, 
+                host=os.environ.get("BRN_WEB_HOST", "127.0.0.1"), 
+                port=web_port, 
+                log_level="warning",
+                access_log=False
             )
         except Exception as e:
-            log.error("[server] app.run morreu: %s", e)
+            log.error("[server] Uvicorn falhou: %s", e)
+            try:
+                srv.app.run(host=os.environ.get("BRN_WEB_HOST", "127.0.0.1"), port=web_port, threaded=True, use_reloader=False)
+            except Exception as e2:
+                log.error("[server] app.run fallback morreu: %s", e2)
 
     threading.Thread(target=_run, daemon=True, name="HTTP").start()
     log.info("[server] HTTP ativo na porta %d", web_port)
@@ -849,7 +817,15 @@ def _auto_unlock_gui(api, allow_interactive: bool = True) -> tuple:
 
 
 def _start_gui(allow_interactive: bool = True) -> bool:
-    """Abre a GUI via HTTP em vez de file://."""
+    """
+    [v13.9.18] Abre a GUI via HTTP em vez de file://.
+
+    Motivo: index_wallet.html faz fetch('/api/status'), que em file://
+    resolve para file:///C:/api/status → "Failed to fetch" → JS marca
+    "Nó offline", peers=0, altura em branco. Com
+    http://127.0.0.1:5000/wallet, fetch('/api/status') vira
+    http://127.0.0.1:5000/api/status (mesmo origin, funciona).
+    """
     try:
         import webview
         from app_wallet_v3 import WalletApi
@@ -1261,6 +1237,7 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
                 fast_sync_until > 0 and local_h < fast_sync_until
             )
 
+            # Gate 1: SK
             if getattr(chain, "_local_validator_sk", None) is None:
                 SK_VALIDATION_STATE["auto_mine_status"] = "waiting_sk"
                 SK_VALIDATION_STATE["validators_ready"] = False
@@ -1278,6 +1255,7 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
                     break
                 continue
 
+            # Gate 2: altura
             if fast_sync_until > 0 and local_h < fast_sync_until:
                 SK_VALIDATION_STATE["auto_mine_status"] = "fast_sync"
                 SK_VALIDATION_STATE["validators_ready"] = False
@@ -1311,6 +1289,7 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
                 except Exception:
                     pass
 
+            # Gate 3: Origin
             origin_online = _ping_origin(timeout=3.0)
             SK_VALIDATION_STATE["origin_online"] = origin_online
 
@@ -1367,6 +1346,7 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
                         break
                     continue
 
+            # Gate 4: validadores
             ok_val, reason_val, detail_val = _verify_validators_synced(
                 chain,
                 min_validators=MIN_VALIDATORS,
@@ -1456,10 +1436,14 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
 
 
 # ============================================================
-# Status reporter
+# Status reporter (v13.9.18)
 # ============================================================
 def _status_reporter_loop(chain, stop_evt: threading.Event,
                            interval: int = 30) -> None:
+    """
+    [v13.9.18] Log consolidado a cada N segundos:
+      [STATUS hh:mm:ss] h=6000/6000 sync=100% peers=3/3 val=YES gate=OK sign=YES pk=02eeec…
+    """
     log = logging.getLogger("main")
     try:
         interval = max(10, int(os.environ.get(
@@ -1766,7 +1750,6 @@ def main() -> int:
     log.info(" BRN Node v%s (build %s) is_origin=%s",
              VERSION, BUILD_DATE, is_origin)
     log.info(" base=%s env_loaded=%d", BASE_DIR, loaded)
-    log.info(" waitress=%s", "OK" if _HAS_WAITRESS else "AUSENTE (fallback Flask)")
     if fast_sync_until > 0:
         log.info(" fast_sync_until=%d (mineração só libera após)",
                  fast_sync_until)
@@ -1796,10 +1779,33 @@ def main() -> int:
         log.error(str(e))
         return 3
 
+    # [INTEGRATION v13.9.19] Wire de checkpoints.
+    # Sem set_checkpoint_priv(), _maybe_sign_checkpoint() e
+    # _create_auto_checkpoint() em blockchain.py nunca rodam — checkpoints
+    # ficam desligados mesmo com BRN_CHECKPOINT_AUTO_HEIGHT setado.
+    try:
+        from blockchain import set_checkpoints, set_checkpoint_priv
+        from checkpoints import load_checkpoints
+        _cps = load_checkpoints()
+        set_checkpoints(_cps)
+        set_checkpoint_priv(node_id_priv)
+        log.info("[INTEGRATION] checkpoint priv injetada (%d carregados)",
+                 len(_cps))
+    except ImportError:
+        log.info("[INTEGRATION] checkpoints.py ausente — checkpoints desligados")
+    except Exception as e:
+        log.warning("[INTEGRATION] checkpoint init falhou: %s", e)
+
     try:
         from blockchain import Blockchain
         chain = Blockchain(db_path, auto_genesis=False)
-        log.info("[chain] aberta height=%d", chain.db.height())
+        # [INTEGRATION v13.9.19] Expõe is_origin explicitamente para
+        # sync_manager.py (que consulta getattr(chain, "is_origin", False)).
+        # blockchain.py v9.5.8 não define; v9.5.9 define no __init__.
+        # Este main.py cobre as duas versões.
+        chain.is_origin = is_origin
+        log.info("[chain] aberta height=%d is_origin=%s",
+                 chain.db.height(), is_origin)
         SK_VALIDATION_STATE["local_height"] = int(chain.db.height())
         SK_VALIDATION_STATE["fast_sync_active"] = (
             fast_sync_until > 0 and chain.db.height() < fast_sync_until
@@ -1856,6 +1862,7 @@ def main() -> int:
         daemon=True, name="Wallet-Watchdog",
     ).start()
 
+    # [v13.9.18] Status reporter
     threading.Thread(
         target=_status_reporter_loop,
         args=(chain, _stop_bg, 30),
@@ -1865,11 +1872,8 @@ def main() -> int:
 
     pool = _setup_pool(chain, is_origin)
 
-    ok_http = _start_web_server(
-        chain, p2p, pool, sync_mgr, trust, web_port,
-        stop_evt=_stop_bg,
-        use_waitress=not args.no_waitress,
-    )
+    ok_http = _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port,
+                                 stop_evt=_stop_bg)
     if not ok_http:
         log.error("[server] HTTP não subiu")
 
