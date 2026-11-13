@@ -1,28 +1,21 @@
-"""main.py — Entrypoint do nó BRN (v13.9.18)
+"""main.py — Entrypoint do nó BRN (v13.9.19)
 ================================================================
-v13.9.18 (2026-11-12) — FIX GUI: servir via HTTP em vez de file://:
-  [FIX CRÍTICO] _start_gui() agora abre a interface em
-        http://127.0.0.1:5000/wallet em vez de file:///…/index_wallet.html.
-        Motivo: index_wallet.html faz fetch('/api/status'), que em
-        file:// resolve para file:///C:/api/status → "Failed to fetch"
-        → JS marca "Nó offline", peers=0, altura em branco. Com
-        http://127.0.0.1:5000/wallet, fetch('/api/status') vira
-        http://127.0.0.1:5000/api/status (mesmo origin, funciona).
-        Fallback automático para file:// se o servidor HTTP não
-        responder em 10s.
-  [NEW] _status_reporter_loop(): imprime no log a cada 30s uma
-        linha consolidada:
-          [STATUS 12:30:45] h=4800/6000 sync=80% peers=2 val=NO
-                            gate=fast_sync(4800/6000) sign=YES pk=02eeec
-        Útil no Render (log) e local.
-  [NEW] Thread StatusReporter injetada em main() logo após o
-        Wallet-Watchdog.
-  [NEW] BRN_STATUS_LOG_INTERVAL (default 30): intervalo do reporter.
-  [KEEP] v13.9.17: fast-sync até BRN_FAST_SYNC_UNTIL (6000) +
-        gate de mineração com 4 condições (SK, altura, Origin,
-        validadores sincronizados).
-  [KEEP] v13.9.16: HTTP sync corrigido, --force-http-resync,
-        truncate in-place.
+v13.9.19 (2026-11-12) — FIX HTTP SERVER: waitress em vez de Uvicorn:
+  [FIX CRÍTICO] _start_web_server() agora usa waitress (production
+        WSGI server, já no requirements.txt) em vez de tentar
+        Uvicorn + server_fastapi.py. Motivo: server_fastapi.py
+        importa WSGIMiddleware de fastapi.middleware.wsgi, que foi
+        REMOVIDO no FastAPI >= 0.100 (movido para a2wsgi). Resultado:
+        log cheio de "[server] Uvicorn falhou: cannot import name
+        'WSGIMiddleware'" a cada boot, mesmo caindo no fallback Flask.
+        Waitress: sem warning de "development server", sem erro no
+        log, sem depender de FastAPI/a2wsgi. 100% compatível com
+        server.py (Flask).
+  [NEW] Flag --no-waitress: força fallback para srv.app.run()
+        (Flask dev server). Útil só para debug.
+  [KEEP] v13.9.18: GUI via HTTP (/wallet), status reporter 30s.
+  [KEEP] v13.9.17: fast-sync até 6000 + gate de mineração (4 condições).
+  [KEEP] v13.9.16: HTTP sync, --force-http-resync.
 ================================================================
 """
 from __future__ import annotations
@@ -45,7 +38,7 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.18"
+    VERSION = "13.9.19"
     BUILD_DATE = "2026-11-12"
 
 try:
@@ -75,6 +68,13 @@ try:
 except ImportError:
     _Wallet = None
     _HAS_WALLET = False
+
+try:
+    from waitress import serve as _waitress_serve
+    _HAS_WAITRESS = True
+except ImportError:
+    _waitress_serve = None
+    _HAS_WAITRESS = False
 
 
 SK_VALIDATION_STATE = {
@@ -110,6 +110,8 @@ def parse_args():
     p.add_argument("--no-interactive", action="store_true")
     p.add_argument("--no-p2p", action="store_true")
     p.add_argument("--no-explorer", action="store_true")
+    p.add_argument("--no-waitress", action="store_true",
+                   help="força Flask dev server (debug)")
     p.add_argument("--db", metavar="PATH", default=None)
     p.add_argument("--web-port", type=int, default=None)
     p.add_argument("--p2p-port", type=int, default=None)
@@ -580,8 +582,20 @@ def _setup_trust_daemon(chain, trust, p2p, password: str, is_origin: bool,
     return t
 
 
+# ============================================================
+# WEB SERVER — v13.9.19: waitress em vez de Uvicorn
+# ============================================================
 def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int,
-                       stop_evt: threading.Event = None):
+                       stop_evt: threading.Event = None,
+                       use_waitress: bool = True):
+    """
+    [v13.9.19] Sobe o server.py (Flask) via waitress (production).
+
+    - waitress: WSGI production server, sem warning "development server",
+      sem FastAPI/Uvicorn, sem server_fastapi.py (que está quebrado).
+    - Fallback: srv.app.run() (Flask dev) se waitress falhar ou se
+      --no-waitress for passado.
+    """
     log = logging.getLogger("main")
     try:
         import server as srv
@@ -616,7 +630,7 @@ def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int,
     except Exception as e:
         log.debug("[server] set_state falhou: %s", e)
 
-    if stop_evt is not None and hasattr(srv, "set_sk_validation_state"):
+    if stop_evt is not None:
         def _refresh():
             while not stop_evt.wait(5):
                 try:
@@ -629,11 +643,34 @@ def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int,
                           name="StateRefresh").start()
         log.info("[server] state refresh thread iniciada (5s)")
 
+    host = os.environ.get("BRN_WEB_HOST", "127.0.0.1")
+
     def _run():
+        # 1) waitress (production, preferido)
+        if use_waitress and _HAS_WAITRESS:
+            try:
+                log.info("[server] Usando waitress (production) na porta %d", web_port)
+                _waitress_serve(
+                    srv.app,
+                    host=host,
+                    port=web_port,
+                    threads=8,
+                    connection_limit=100,
+                    channel_timeout=30,
+                )
+                log.info("[server] waitress encerrou normalmente")
+                return
+            except Exception as e:
+                log.warning("[server] waitress falhou: %s — caindo para Flask dev", e)
+        elif use_waitress and not _HAS_WAITRESS:
+            log.warning("[server] waitress indisponível — usando Flask dev server")
+
+        # 2) Flask dev server (fallback)
         try:
+            log.info("[server] Usando Flask dev server na porta %d", web_port)
             srv.app.run(
-                host=os.environ.get("BRN_WEB_HOST", "127.0.0.1"),
-                port=web_port, threaded=True, use_reloader=False,
+                host=host, port=web_port,
+                threaded=True, use_reloader=False,
             )
         except Exception as e:
             log.error("[server] app.run morreu: %s", e)
@@ -812,15 +849,7 @@ def _auto_unlock_gui(api, allow_interactive: bool = True) -> tuple:
 
 
 def _start_gui(allow_interactive: bool = True) -> bool:
-    """
-    [v13.9.18] Abre a GUI via HTTP em vez de file://.
-
-    Motivo: index_wallet.html faz fetch('/api/status'), que em file://
-    resolve para file:///C:/api/status → "Failed to fetch" → JS marca
-    "Nó offline", peers=0, altura em branco. Com
-    http://127.0.0.1:5000/wallet, fetch('/api/status') vira
-    http://127.0.0.1:5000/api/status (mesmo origin, funciona).
-    """
+    """Abre a GUI via HTTP em vez de file://."""
     try:
         import webview
         from app_wallet_v3 import WalletApi
@@ -837,14 +866,12 @@ def _start_gui(allow_interactive: bool = True) -> bool:
         else:
             log.info("[GUI] sem carteira aberta (%s) — janela abre vazia", source)
 
-        # ─── FIX v13.9.18: servir via HTTP ───────────────────────
         web_port = int(os.environ.get("BRN_WEB_PORT", "5000"))
         http_url = f"http://127.0.0.1:{web_port}/wallet"
         url = http_url
 
         if _HAS_REQUESTS:
-            # Espera o servidor HTTP subir (Flask leva ~1s)
-            for _ in range(20):  # até ~10s
+            for _ in range(20):
                 try:
                     r = _requests.get(http_url, timeout=1)
                     if r.status_code < 500:
@@ -862,7 +889,6 @@ def _start_gui(allow_interactive: bool = True) -> bool:
                     wallet_path = BASE_DIR / "panel.html"
                 url = wallet_path.as_uri() if wallet_path.exists() else "about:blank"
         else:
-            # Sem requests: tenta file:// como fallback
             wallet_path = BASE_DIR / "index_wallet.html"
             if not wallet_path.exists():
                 wallet_path = BASE_DIR / "panel.html"
@@ -960,6 +986,8 @@ def _resolve_validator_sk() -> tuple:
 
 def _ping_origin(timeout: float = 3.0) -> bool:
     log = logging.getLogger("main")
+    if os.environ.get("BRN_IS_ORIGIN", "0") == "1":
+        return True
     pool_url = os.environ.get("BRN_POOL_URL", "").strip().rstrip("/")
     if not pool_url:
         return False
@@ -968,7 +996,7 @@ def _ping_origin(timeout: float = 3.0) -> bool:
             import urllib.request
             req = urllib.request.Request(
                 f"{pool_url}/api/status",
-                headers={"User-Agent": "brn-main/13.9.18"},
+                headers={"User-Agent": "brn-main/13.9.19"},
             )
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.status == 200
@@ -1215,6 +1243,9 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
         MAX_AGE_S = 300
 
     SK_VALIDATION_STATE["auto_mine_status"] = "starting"
+    if os.environ.get("BRN_IS_ORIGIN", "0") == "1":
+        log.info("[AUTO-MINE] Origin: mineração local pulada (usar pool)")
+        return
     SK_VALIDATION_STATE["fast_sync_until"] = fast_sync_until
     SK_VALIDATION_STATE["fast_sync_active"] = False
 
@@ -1230,7 +1261,6 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
                 fast_sync_until > 0 and local_h < fast_sync_until
             )
 
-            # Gate 1: SK
             if getattr(chain, "_local_validator_sk", None) is None:
                 SK_VALIDATION_STATE["auto_mine_status"] = "waiting_sk"
                 SK_VALIDATION_STATE["validators_ready"] = False
@@ -1248,7 +1278,6 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
                     break
                 continue
 
-            # Gate 2: altura
             if fast_sync_until > 0 and local_h < fast_sync_until:
                 SK_VALIDATION_STATE["auto_mine_status"] = "fast_sync"
                 SK_VALIDATION_STATE["validators_ready"] = False
@@ -1282,7 +1311,6 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
                 except Exception:
                     pass
 
-            # Gate 3: Origin
             origin_online = _ping_origin(timeout=3.0)
             SK_VALIDATION_STATE["origin_online"] = origin_online
 
@@ -1339,7 +1367,6 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
                         break
                     continue
 
-            # Gate 4: validadores
             ok_val, reason_val, detail_val = _verify_validators_synced(
                 chain,
                 min_validators=MIN_VALIDATORS,
@@ -1429,14 +1456,10 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
 
 
 # ============================================================
-# Status reporter (v13.9.18)
+# Status reporter
 # ============================================================
 def _status_reporter_loop(chain, stop_evt: threading.Event,
                            interval: int = 30) -> None:
-    """
-    [v13.9.18] Log consolidado a cada N segundos:
-      [STATUS hh:mm:ss] h=6000/6000 sync=100% peers=3/3 val=YES gate=OK sign=YES pk=02eeec…
-    """
     log = logging.getLogger("main")
     try:
         interval = max(10, int(os.environ.get(
@@ -1544,7 +1567,7 @@ def _auto_configure(chain, p2p, trust, web_port: int, is_origin: bool,
     })
 
     log.info("=" * 64)
-    log.info(" [SK RESOLUTION v13.9.18]")
+    log.info(" [SK RESOLUTION v13.9.19]")
     log.info("=" * 64)
     log.info("  source           : %s", source or "(nenhum)")
     log.info("  SK_HEX len       : %d", len(sk_hex) if sk_hex else 0)
@@ -1743,6 +1766,7 @@ def main() -> int:
     log.info(" BRN Node v%s (build %s) is_origin=%s",
              VERSION, BUILD_DATE, is_origin)
     log.info(" base=%s env_loaded=%d", BASE_DIR, loaded)
+    log.info(" waitress=%s", "OK" if _HAS_WAITRESS else "AUSENTE (fallback Flask)")
     if fast_sync_until > 0:
         log.info(" fast_sync_until=%d (mineração só libera após)",
                  fast_sync_until)
@@ -1792,7 +1816,7 @@ def main() -> int:
     else:
         log.info("[trust] carregado (origin=%s)", is_origin)
 
-    log.info("[wallet] boot sem carteira (design v13.9.18) — "
+    log.info("[wallet] boot sem carteira (design v13.9.19) — "
              "GUI tentará abrir carteira salva")
 
     p2p = None
@@ -1809,7 +1833,7 @@ def main() -> int:
 
     _stop_bg = threading.Event()
 
-    if cfg["pool_url"] and _HAS_REQUESTS:
+    if not is_origin and cfg["pool_url"] and _HAS_REQUESTS:
         threading.Thread(
             target=_force_http_sync_loop,
             args=(chain, cfg["pool_url"], _stop_bg),
@@ -1832,7 +1856,6 @@ def main() -> int:
         daemon=True, name="Wallet-Watchdog",
     ).start()
 
-    # [v13.9.18] Status reporter
     threading.Thread(
         target=_status_reporter_loop,
         args=(chain, _stop_bg, 30),
@@ -1842,8 +1865,11 @@ def main() -> int:
 
     pool = _setup_pool(chain, is_origin)
 
-    ok_http = _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port,
-                                 stop_evt=_stop_bg)
+    ok_http = _start_web_server(
+        chain, p2p, pool, sync_mgr, trust, web_port,
+        stop_evt=_stop_bg,
+        use_waitress=not args.no_waitress,
+    )
     if not ok_http:
         log.error("[server] HTTP não subiu")
 
