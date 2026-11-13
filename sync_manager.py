@@ -1,23 +1,25 @@
 """
-sync_manager.py — Sincronização + Reorg automático + Aguarda Origin (v9.4)
+sync_manager.py — Sincronização + Reorg automático + Aguarda Origin (v9.4.1)
 ================================================================
-v9.4 (2026-11-12) — AGUARDA ORIGIN + CONVERGÊNCIA DE ALTURA:
-  [NEW] _wait_origin_online(): em vez de só logar "Origin offline"
-        e tentar com outro peer, aguarda o Origin (BRN_POOL_URL)
-        voltar a responder. Só então começa a sincronizar.
-        Isso resolve o log cheio de "Origin inacessível: Conexão
-        recusada" que aparecia quando o Origin estava desligado.
-  [NEW] _check_peer_heights(): consulta a altura de todos os peers
-        via P2P antes de escolher de quem baixar.
-  [NEW] _wait_convergence(): aguarda até N peers reportarem a mesma
-        altura (configurável por BRN_CONVERGENCE_CYCLES) antes de
-        considerar "sincronizado". Evita declarar synced quando só
-        1 peer respondeu e os outros ainda estão subindo.
-  [FIX] _best_peer_by_work: prefere o Origin quando empatado em work.
-  [KEEP] v9.3: sync de trust assinado
-  [KEEP] v9.2: fix da ordem de pop dos campos
-  [KEEP] v9.1: sync do Trust Network via HTTP
-  [KEEP] v9.0: sync paralelo de blocos
+v9.4.1 (2026-11-13) — PAINEL HONESTO SOBRE FAST-SYNC:
+  [FIX] get_status() agora NÃO reporta synced=True quando o nó ainda
+        está abaixo de BRN_FAST_SYNC_UNTIL. Antes, num cliente com
+        DB em 4520 e fast-sync até 6000, target=local (só 1 peer, ele
+        mesmo) → synced=True, progress=100%. O painel /sync e
+        /api/sync/status mostravam "sincronizado" enquanto a mineração
+        continuava bloqueada pelo mining gate (que checa
+        fast_sync_until). Confusão idêntica à que o server.py v9.9.35
+        corrigiu em /api/sync-info e /api/sync/live, mas não em
+        /api/sync/status (que passa por aqui).
+  [FIX] get_status() retorna fast_sync_active, fast_sync_until e
+        fast_sync_percent para o painel /sync poder exibir
+        banner "Fast-sync até #6000 (4520/6000 = 75.3%)".
+  [FIX] sync_trust_network() docstring movida para o topo (estava
+        depois do `if is_origin: return False`, virando string morta
+        que o Python ignora).
+  [KEEP] v9.4: aguarda Origin online, convergence check, sync do
+        trust assinado, sync paralelo.
+  [KEEP] v9.3-v9.0: tudo.
 ================================================================
 """
 from __future__ import annotations
@@ -60,6 +62,9 @@ ORIGIN_WAIT_INTERVAL = float(os.environ.get("BRN_ORIGIN_WAIT_S", "30"))
 ORIGIN_WAIT_TIMEOUT  = float(os.environ.get("BRN_ORIGIN_TIMEOUT_S", "0"))  # 0 = infinito
 CONVERGENCE_CYCLES   = int(os.environ.get("BRN_CONVERGENCE_CYCLES", "3"))
 CONVERGENCE_INTERVAL = float(os.environ.get("BRN_CONVERGENCE_INTERVAL", "10"))
+
+# [v9.4.1] Fast-sync awareness
+FAST_SYNC_UNTIL = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "0") or "0")
 
 try:
     from blockchain import block_hash as _block_hash_fn, meets_difficulty as _meets_diff_fn
@@ -155,6 +160,10 @@ class ChainSyncManager:
         self._origin_url = os.environ.get("BRN_POOL_URL", "").strip().rstrip("/")
         self._origin_wait_start: float = 0.0
         self._last_origin_check: float = 0.0
+
+        # [v9.4.1] Fast-sync (lido uma vez, mas compatível com mudança
+        # runtime via env se o operador setar antes do boot)
+        self._fast_sync_until = FAST_SYNC_UNTIL
 
     def set_sync_mode(self, mode: str = "full") -> None:
         if mode not in ("full", "spv"):
@@ -262,17 +271,14 @@ class ChainSyncManager:
     # [v9.4] AGUARDAR ORIGIN ONLINE
     # =================================================================
     def _check_origin_online(self) -> bool:
-        """
-        Testa HTTP do Origin com timeout de 3s.
-        Retorna True se respondeu 200 em /api/status.
-        """
+        """Testa HTTP do Origin com timeout de 3s."""
         if not self._origin_url:
             return False
 
         try:
             req = urllib.request.Request(
                 f"{self._origin_url}/api/status",
-                headers={"User-Agent": "brn-sync/9.4"},
+                headers={"User-Agent": "brn-sync/9.4.1"},
             )
             with urllib.request.urlopen(req, timeout=3) as r:
                 return r.status == 200
@@ -283,11 +289,8 @@ class ChainSyncManager:
         """
         Aguarda o Origin ficar online. Se max_wait_s=None usa
         ORIGIN_WAIT_TIMEOUT (0=infinito).
-
-        Retorna True quando online, False se timeout.
         """
         if not self._origin_url:
-            # Sem Origin configurado, não podemos aguardar
             return False
 
         t_start = time.time()
@@ -320,12 +323,10 @@ class ChainSyncManager:
                 )
                 first_attempt = False
 
-            # Log periódico a cada ~2 min
             waited = time.time() - t_start
             if int(waited) % 120 < int(ORIGIN_WAIT_INTERVAL):
                 log.info("[SYNC] Aguardando Origin há %ds...", int(waited))
 
-            # Verifica timeout
             if max_wait_s > 0 and (time.time() - t_start) > max_wait_s:
                 log.warning(
                     "[SYNC] Origin não voltou em %ds — seguindo sem ele",
@@ -344,10 +345,6 @@ class ChainSyncManager:
     # [v9.4] CONSULTAR ALTURA DE TODOS OS PEERS
     # =================================================================
     def _check_peer_heights(self) -> dict:
-        """
-        Consulta a altura de cada peer via P2P (get_chain_height).
-        Atualiza self.peers e retorna {addr: (height, work)}.
-        """
         peers_with_height = {}
         with self.peer_lock:
             peers_snapshot = list(self.peers.values())
@@ -382,30 +379,22 @@ class ChainSyncManager:
     # [v9.4] AGUARDAR CONVERGÊNCIA
     # =================================================================
     def _wait_convergence(self, target_height: int) -> bool:
-        """
-        Aguarda N ciclos consecutivos onde a maioria dos peers reporta
-        a mesma altura (target_height ± 1).
-
-        Retorna True quando convergiu, False se timeout.
-        """
         if CONVERGENCE_CYCLES <= 0:
             return True
 
         self.status.convergence_cycles = 0
         consecutive = 0
 
-        for cycle in range(CONVERGENCE_CYCLES * 3):  # máximo 3x
+        for cycle in range(CONVERGENCE_CYCLES * 3):
             if self._stop_sync.is_set():
                 return False
 
             peers_h = self._check_peer_heights()
             if not peers_h:
-                log.debug("[SYNC] convergência: sem peers para checar")
                 if self._stop_sync.wait(CONVERGENCE_INTERVAL):
                     return False
                 continue
 
-            # Conta quantos estão na altura alvo
             at_target = sum(
                 1 for h, _w in peers_h.values()
                 if abs(h - target_height) <= 1
@@ -413,7 +402,7 @@ class ChainSyncManager:
             total = len(peers_h)
             ratio = at_target / max(1, total)
 
-            if ratio >= 0.6:  # 60%+ na mesma altura
+            if ratio >= 0.6:
                 consecutive += 1
                 self.status.convergence_cycles = consecutive
                 log.info(
@@ -449,6 +438,8 @@ class ChainSyncManager:
     # =================================================================
     def sync_trust_network(self) -> bool:
         """Baixa o trust_network.json do Origin e atualiza a memória local."""
+        if getattr(self.chain, "is_origin", False):
+            return False
         origin_url = self._origin_url
         if not origin_url or not origin_url.startswith("http"):
             return False
@@ -461,7 +452,7 @@ class ChainSyncManager:
         url = f"{origin_url}/api/trust/download"
 
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "brn-sync/9.4"})
+            req = urllib.request.Request(url, headers={"User-Agent": "brn-sync/9.4.1"})
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
 
@@ -919,7 +910,6 @@ class ChainSyncManager:
 
         def _loop():
             try:
-                # ─── 1. Se é Origin, não precisa aguardar ninguém ───
                 is_origin = bool(getattr(self.chain, "is_origin", False))
                 if is_origin:
                     log.info("[SYNC] este nó é Origin — sync loop desativado "
@@ -929,7 +919,6 @@ class ChainSyncManager:
                     self.status.target_height = self.status.local_height
                     return
 
-                # ─── 2. Se não é Origin, aguarda Origin online ───
                 if self._origin_url:
                     log.info(
                         "[SYNC] aguardando Origin (%s) ficar online...",
@@ -939,10 +928,8 @@ class ChainSyncManager:
                     if not online and self._stop_sync.is_set():
                         return
 
-                # ─── 3. Loop principal ───
                 while not self._stop_sync.is_set():
                     try:
-                        # 3a. Se Origin caiu durante operação, aguarda de novo
                         if self._origin_url and not self._check_origin_online():
                             self.status.origin_online = False
                             log.warning(
@@ -954,26 +941,19 @@ class ChainSyncManager:
                             continue
 
                         self.status.origin_online = True
-
-                        # 3b. Sync do trust
                         self.sync_trust_network()
-
-                        # 3c. Refresh peers
                         self._refresh_peers_from_p2p()
 
-                        # 3d. Detecta fork
                         fork_peer = self._detect_fork()
                         if fork_peer is not None:
                             self._resolve_fork(fork_peer)
                             continue
 
-                        # 3e. Escolhe melhor peer
                         best = self._best_peer_by_work()
                         if best is not None:
                             self.status.active_peer = best.node_id
                             self.sync_with_peer(best)
 
-                            # 3f. Aguarda convergência
                             if self.status.synced:
                                 target_h = self._safe_height()
                                 self._wait_convergence(target_h)
@@ -996,13 +976,10 @@ class ChainSyncManager:
             target=_loop, daemon=True, name="ChainSync",
         )
         self.sync_thread.start()
-        log.info("ChainSyncManager v9.4 (aguarda Origin + convergência) iniciado")
+        log.info("ChainSyncManager v9.4.1 (aguarda Origin + convergência "
+                 "+ fast-sync aware) iniciado")
 
     def _best_peer_by_work(self) -> Optional[PeerStatus]:
-        """
-        Escolhe o peer com maior work acumulado.
-        [v9.4] Prefere o Origin quando empatado.
-        """
         local_h = self._safe_height()
         local_work = self._local_work()
         with self.peer_lock:
@@ -1015,7 +992,6 @@ class ChainSyncManager:
         if not candidates:
             return None
 
-        # Ordena por (work, é_origin, height)
         candidates.sort(
             key=lambda p: (p.cumulative_work, p.is_origin, p.height),
             reverse=True,
@@ -1039,8 +1015,29 @@ class ChainSyncManager:
         if self.sync_thread and self.sync_thread.is_alive():
             self.sync_thread.join(timeout=5)
 
+    # =================================================================
+    # [v9.4.1] get_status agora é HONESTO sobre fast-sync
+    # =================================================================
     def get_status(self) -> Dict:
         local = self._safe_height()
+
+        # [v9.4.1] Fast-sync awareness: se o nó ainda está abaixo de
+        # BRN_FAST_SYNC_UNTIL, o "alvo real" para o operador é esse
+        # valor (não o topo dos peers). Sem isso, num cliente que acabou
+        # de bootar (DB vazio, 0 peers ainda), target=local → progress=100%
+        # → synced=True, mas a mineração continua bloqueada pelo gate.
+        # O painel /sync e /api/sync/status mostravam "sincronizado"
+        # mentindo.
+        fast_until = self._fast_sync_until
+        # Se o env mudou depois do __init__, respeitamos
+        try:
+            runtime = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "0") or "0")
+            if runtime > 0:
+                fast_until = runtime
+        except (TypeError, ValueError):
+            pass
+        fast_active = (fast_until > 0 and local < fast_until)
+
         target = local
         active = None
         with self.peer_lock:
@@ -1049,8 +1046,18 @@ class ChainSyncManager:
             if p.height > target:
                 target = p.height
                 active = p.addr
+
+        if fast_active:
+            target = max(target, fast_until)
+
         progress = 100.0 if target <= 0 else min(100.0, local / target * 100.0)
-        synced = (local >= target and target >= 0)
+        synced = (local >= target and target >= 0 and not fast_active)
+
+        fast_pct = (
+            round((max(local, 0) / fast_until) * 100.0, 1)
+            if fast_active else 100.0
+        )
+
         blocked = []
         with self._reorg_fails_lock:
             now = time.time()
@@ -1061,6 +1068,7 @@ class ChainSyncManager:
                         "seconds_left": int(entry["blocked_until"] - now),
                         "fails": entry.get("fails", 0),
                     })
+
         return {
             "mode":                self.status.mode,
             "local_height":        local,
@@ -1082,6 +1090,11 @@ class ChainSyncManager:
             "origin_online":       self.status.origin_online,
             "waiting_origin":      self.status.waiting_origin,
             "convergence_cycles":  self.status.convergence_cycles,
+            # [v9.4.1] Fast-sync (o painel /sync usa isso para exibir
+            # banner "Fast-sync até #6000: 4520/6000 = 75.3%")
+            "fast_sync_active":    fast_active,
+            "fast_sync_until":     fast_until,
+            "fast_sync_percent":   fast_pct,
         }
 
     def __enter__(self):
