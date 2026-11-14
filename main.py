@@ -1,25 +1,11 @@
-"""main.py — Entrypoint do nó BRN (v13.9.20)
+"""main.py — Entrypoint do nó BRN (v13.9.21)
 ================================================================
-v13.9.20 (2026-11-13) — SOLUÇÃO 2: caminho único de carteira por peer:
-  [NEW] PEER_ID = sha256(pubkey)[:16] derivado logo após carregar
-        node_identity. Injetado em os.environ["BRN_PEER_ID"].
-        server_fastapi.py usa para expor:
-          GET /wallet              → 307 /wallet/<peer_id>
-          GET /wallet/<peer_id>    → HTML da carteira (valida)
-          GET /peers               → menu HTML
-        Caminho único por peer; cada peer tem sua própria URL.
-  [FIX] web_port agora lê também PORT (Render injeta essa var;
-        antes só BRN_WEB_PORT funcionava).
-  [NEW] Log de boot mostra /wallet/<peer_id> e /peers.
-v13.9.19 — INTEGRAÇÃO FINAL DO MULTI-SIG + CHECKPOINTS:
-  [NEW] Wire de checkpoints: após carregar node_identity, chama
-        set_checkpoints(load_checkpoints()) e
-        set_checkpoint_priv(node_id_priv).
-  [NEW] chain.is_origin = is_origin explicitamente após criar o
-        Blockchain (sync_manager consulta getattr(chain, "is_origin")).
-  [KEEP] v13.9.18: GUI via HTTP, reporter de status, fast-sync gate.
-  [KEEP] v13.9.17: fast-sync até BRN_FAST_SYNC_UNTIL (6000).
-  [KEEP] v13.9.16: HTTP sync corrigido, --force-http-resync.
+v13.9.21 (2026-11-14) — CONSENSO DE ALTURA (SYNC REAL):
+  [FIX] O sistema não depende mais cegamente do bloco 6000 para 
+        considerar o nó "sincronizado". Se a altura local já for
+        igual à altura do Origin/Validadores (± tolerância), o 
+        Gate 2 do Auto-Mine é liberado e a UI mostra 100%.
+  [KEEP] v13.9.20: Solução 2 (peer_id único no caminho /wallet).
 ================================================================
 """
 from __future__ import annotations
@@ -42,8 +28,8 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.20"
-    BUILD_DATE = "2026-11-13"
+    VERSION = "13.9.21"
+    BUILD_DATE = "2026-11-14"
 
 try:
     from isolation_detector import IsolationDetector
@@ -819,9 +805,6 @@ def _auto_unlock_gui(api, allow_interactive: bool = True) -> tuple:
 
 
 def _start_gui(allow_interactive: bool = True) -> bool:
-    """
-    [v13.9.18] Abre a GUI via HTTP em vez de file://.
-    """
     try:
         import webview
         from app_wallet_v3 import WalletApi
@@ -972,7 +955,7 @@ def _ping_origin(timeout: float = 3.0) -> bool:
             import urllib.request
             req = urllib.request.Request(
                 f"{pool_url}/api/status",
-                headers={"User-Agent": "brn-main/13.9.20"},
+                headers={"User-Agent": "brn-main/13.9.21"},
             )
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.status == 200
@@ -1255,26 +1238,39 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
                     break
                 continue
 
-            # Gate 2: altura
+            # Gate 2: altura (Fast-Sync)
             if fast_sync_until > 0 and local_h < fast_sync_until:
-                SK_VALIDATION_STATE["auto_mine_status"] = "fast_sync"
-                SK_VALIDATION_STATE["validators_ready"] = False
-                SK_VALIDATION_STATE["validators_reason"] = (
-                    f"fast-sync ativo: {local_h}/{fast_sync_until}"
-                )
-                if currently_running:
-                    log.warning("[AUTO-MINE] caiu em fast-sync — "
-                                "parando PoolClient")
+                # [NOVO v13.9.21] Se já estamos sincronizados com o Origin, 
+                # ignoramos a espera do fast_sync_until.
+                origin_synced = False
+                if _HAS_REQUESTS and pool_url:
                     try:
-                        _requests.post(
-                            f"http://127.0.0.1:{web_port}/api/pool/stop_local",
-                            json={}, timeout=10)
+                        r = _requests.get(f"{pool_url}/api/status", timeout=3)
+                        remote_h = int(r.json().get("height", 0) or 0)
+                        if remote_h > 0 and local_h >= remote_h - TOLERANCE:
+                            origin_synced = True
                     except Exception:
                         pass
-                    currently_running = False
-                if stop_evt.wait(15):
-                    break
-                continue
+                
+                if not origin_synced:
+                    SK_VALIDATION_STATE["auto_mine_status"] = "fast_sync"
+                    SK_VALIDATION_STATE["validators_ready"] = False
+                    SK_VALIDATION_STATE["validators_reason"] = (
+                        f"fast-sync ativo: {local_h}/{fast_sync_until}"
+                    )
+                    if currently_running:
+                        log.warning("[AUTO-MINE] caiu em fast-sync — "
+                                    "parando PoolClient")
+                        try:
+                            _requests.post(
+                                f"http://127.0.0.1:{web_port}/api/pool/stop_local",
+                                json={}, timeout=10)
+                        except Exception:
+                            pass
+                        currently_running = False
+                    if stop_evt.wait(15):
+                        break
+                    continue
 
             pool_already = False
             if _HAS_REQUESTS:
@@ -1436,7 +1432,7 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
 
 
 # ============================================================
-# Status reporter (v13.9.18)
+# Status reporter
 # ============================================================
 def _status_reporter_loop(chain, stop_evt: threading.Event,
                            interval: int = 30) -> None:
@@ -1496,8 +1492,14 @@ def _status_reporter_loop(chain, stop_evt: threading.Event,
                 fast_until = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "6000"))
             except (ValueError, TypeError):
                 fast_until = 6000
+                
+            # [NOVO v13.9.21] Lógica de exibição baseada na altura real
             if fast_until > 0 and h < fast_until:
-                gate_s = f"fast_sync({h}/{fast_until})"
+                # Se já alcançamos a altura dos peers, o sync é 100%
+                if h >= 0 and target_h > 0 and h >= target_h - 1:
+                    gate_s = "OK"
+                else:
+                    gate_s = f"fast_sync({h}/{fast_until})"
             elif getattr(chain, "_local_validator_sk", None) is None:
                 gate_s = "no_sk"
             elif not ok_val:
@@ -1547,7 +1549,7 @@ def _auto_configure(chain, p2p, trust, web_port: int, is_origin: bool,
     })
 
     log.info("=" * 64)
-    log.info(" [SK RESOLUTION v13.9.19]")
+    log.info(" [SK RESOLUTION v13.9.21]")
     log.info("=" * 64)
     log.info("  source           : %s", source or "(nenhum)")
     log.info("  SK_HEX len       : %d", len(sk_hex) if sk_hex else 0)
@@ -1730,7 +1732,6 @@ def main() -> int:
 
     is_origin = os.environ.get("BRN_IS_ORIGIN", "0") == "1"
 
-    # ---- [FIX v13.9.20] web_port lê PORT do Render também ----
     web_port = int(
         os.environ.get("BRN_WEB_PORT")
         or os.environ.get("PORT")
@@ -1781,21 +1782,13 @@ def main() -> int:
         log.error(str(e))
         return 3
 
-    # ---- [PEER-ID v13.9.20] ID curto e estável derivado da pubkey ----
-    # sha256(pubkey)[:16] → 16 hex chars únicos por nó.
-    # Injetado em BRN_PEER_ID para o server_fastapi.py usar nas rotas:
-    #   GET /wallet          → redireciona 307 /wallet/<peer_id>
-    #   GET /wallet/<id>     → serve HTML (valida)
-    #   GET /peers           → menu HTML
     try:
         PEER_ID = hashlib.sha256(bytes.fromhex(node_id_pub)).hexdigest()[:16]
     except ValueError:
-        # fallback: pubkey não é hex (não deveria acontecer)
         PEER_ID = hashlib.sha256(node_id_pub.encode()).hexdigest()[:16]
     os.environ["BRN_PEER_ID"] = PEER_ID
     log.info("[identity] peer_id=%s", PEER_ID)
 
-    # [INTEGRATION v13.9.19] Wire de checkpoints.
     try:
         from blockchain import set_checkpoints, set_checkpoint_priv
         from checkpoints import load_checkpoints
@@ -1871,7 +1864,6 @@ def main() -> int:
         daemon=True, name="Wallet-Watchdog",
     ).start()
 
-    # [v13.9.18] Status reporter
     threading.Thread(
         target=_status_reporter_loop,
         args=(chain, _stop_bg, 30),
@@ -1940,7 +1932,6 @@ def main() -> int:
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    # ---- [PEER-ID v13.9.20] Log de boot com peer_id + /peers ----
     log.info("=" * 64)
     log.info(" NÓ ATIVO — Ctrl+C para encerrar")
     log.info("   API       : http://%s:%d",
