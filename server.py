@@ -1,24 +1,13 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.35)
+server.py — Backend HTTP do nó BRN (v9.9.36)
 ================================================================
-v9.9.35 (2026-11-12) — SYNC PERCENT CONSIDERA FAST-SYNC:
-  [FIX] /api/sync-info, /api/status e /api/sync/live agora usam
-        BRN_FAST_SYNC_UNTIL como target enquanto local_h < 6000.
-        Antes, o percent era calculado só contra os peers
-        (local_h / max_peer_h), então a GUI mostrava 100% mesmo com
-        a chain abaixo de 6000 e a mineração bloqueada pelo gate.
-        Agora a GUI mostra o progresso real do fast-sync
-        (ex.: 4520/6000 = 75.3%) e a barra só chega a 100% quando
-        cruza a meta. Depois de 6000, volta a comparar com peers.
-  [NEW] /api/sync-info retorna "fast_sync": {"active", "until",
-        "target_height", "percent"} para a GUI exibir banner
-        "Fast-sync até #6000".
-  [NEW] /api/sync/live percent segue a mesma lógica.
-  [KEEP] v9.9.34: painel /sync, /api/validators/sign_info,
-        /api/sync/live, mining gate.
-  [KEEP] v9.9.33: mining gate em /api/pool/start_local,
-        /api/miner/start, /api/faucet; /api/mine/gate.
-  [KEEP] v9.9.32: /api/consensus/validators via diagnose_validators().
+v9.9.36 (2026-11-13) — PEER-ID (caminho único por peer):
+  [NEW] set_peer_id() / _BRN_PEER_ID: main.py injeta o sha256(pubkey)[:16].
+  [NEW] /api/peer_id — retorna o ID do nó que serve a requisição.
+  [NEW] /wallet redireciona (307) para /wallet/<peer_id>.
+  [NEW] /wallet/<peer_id> — serve o HTML só para o ID local; 404 se for de outro.
+  [NEW] /peers — menu HTML listando peers conhecidos.
+  [KEEP] v9.9.35: sync percent considera fast-sync; mining gate; etc.
 ================================================================
 """
 from __future__ import annotations
@@ -27,7 +16,7 @@ import urllib.request, urllib.error
 from decimal import Decimal, ROUND_DOWN
 from functools import wraps
 from pathlib import Path
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, redirect
 from flask_cors import CORS
 from wallet import Wallet, WalletManager
 
@@ -69,6 +58,9 @@ TXT_HISTORY_LIMIT_DEFAULT = 200
 TXT_HISTORY_LIMIT_MAX = 500
 BOOTSTRAP_HTTP_PORT = int(os.environ.get("BRN_BOOTSTRAP_HTTP_PORT", os.environ.get("BRN_WEB_PORT", "5000")))
 
+# [v9.9.36] Peer-ID global
+_BRN_PEER_ID = ""
+
 # Mining gate / fast-sync (v9.9.33 + v9.9.35)
 _MIN_FAST_SYNC_UNTIL = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "6000") or "0")
 _MIN_VALIDATORS_FOR_MINING = max(1, int(os.environ.get("BRN_MIN_VALIDATORS_FOR_MINING", "1") or "1"))
@@ -92,6 +84,16 @@ if _MIN_FAST_SYNC_UNTIL > 0:
         _MIN_FAST_SYNC_UNTIL, _MIN_VALIDATORS_FOR_MINING,
         _VALIDATOR_HEIGHT_TOLERANCE, _VALIDATOR_MAX_AGE_S,
     )
+
+
+# ============================================================
+# [v9.9.36] PEER-ID
+# ============================================================
+def set_peer_id(peer_id: str) -> None:
+    """Injetado por main.py v13.9.20. sha256(pubkey)[:16]."""
+    global _BRN_PEER_ID
+    _BRN_PEER_ID = (peer_id or "").strip()
+    log.info("[server] peer_id=%s", _BRN_PEER_ID[:16] or "(vazio)")
 
 
 def _notify_bootstrap_peers(addr: str, pubkey: str, log_prefix: str = ""):
@@ -705,6 +707,80 @@ threading.Thread(target=_cleanup_loop, daemon=True, name="CacheCleanup").start()
 
 
 # ============================================================
+# [v9.9.36] ROTAS DE WALLET COM PEER_ID
+# ============================================================
+@app.route("/api/peer_id", methods=["GET"])
+def api_peer_id():
+    return jsonify({
+        "peer_id": _BRN_PEER_ID,
+        "node_online": True,
+        "served_by": "local",
+    })
+
+
+@app.route("/wallet", methods=["GET"])
+def serve_wallet_root():
+    """Redireciona pra /wallet/<peer_id> ou serve direto se vazio."""
+    if _BRN_PEER_ID:
+        return redirect(f"/wallet/{_BRN_PEER_ID}", code=307)
+    p = BASE_DIR / "index_wallet.html"
+    return send_file(p) if p.exists() else (
+        jsonify({"ok": False, "msg": "index_wallet.html não encontrado"}), 404
+    )[0]
+
+
+@app.route("/wallet/<peer_id>", methods=["GET"])
+def serve_wallet_peer(peer_id):
+    """Serve a GUI da carteira do peer indicado."""
+    if _BRN_PEER_ID and peer_id != _BRN_PEER_ID:
+        return jsonify({
+            "ok": False,
+            "msg": f"peer_id {peer_id} não é deste nó (é {_BRN_PEER_ID})"
+        }), 404
+    p = BASE_DIR / "index_wallet.html"
+    if not p.exists():
+        return jsonify({"ok": False, "msg": "index_wallet.html não encontrado"}), 404
+    html = p.read_text(encoding="utf-8")
+    if 'name="brn-peer-id"' not in html:
+        html = html.replace(
+            "</head>",
+            f'<meta name="brn-peer-id" content="{peer_id}">\n</head>',
+            1,
+        )
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.route("/peers", methods=["GET"])
+def serve_peers_page():
+    """Menu HTML listando peers conhecidos."""
+    pid = _BRN_PEER_ID or "local"
+    nodes_html = f"<li><a href='/wallet/{pid}'>{pid}</a> 🏠 (este nó)</li>"
+    try:
+        trust = _get_trust_network()
+        if trust is not None and hasattr(trust, "nodes"):
+            for pubkey, n in (trust.nodes or {}).items():
+                pk = (pubkey or "").strip().lower()
+                if len(pk) < 32: continue
+                import hashlib as _hl
+                try: other_pid = _hl.sha256(bytes.fromhex(pk)).hexdigest()[:16]
+                except ValueError: continue
+                if other_pid == pid: continue
+                addr = getattr(n, "address", "") or "?"
+                nodes_html += (
+                    f"<li><a href='/wallet/{other_pid}'>{other_pid}</a> "
+                    f"<code>{addr}</code></li>"
+                )
+    except Exception:
+        pass
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Peers BRN</title>
+<style>body{{background:#0d1117;color:#e6edf3;font-family:sans-serif;padding:20px}}
+h1{{color:#58a6ff}}li{{margin:8px 0}}a{{color:#58a6ff}}code{{background:#161b22;padding:2px 6px;border-radius:4px}}</style>
+</head><body><h1>🔷 Peers BRN</h1>
+<p>Este nó: <code>{pid}</code></p><ul>{nodes_html}</ul></body></html>"""
+
+
+# ============================================================
 # ROTAS BÁSICAS
 # ============================================================
 @app.route("/api/bootstrap/add", methods=["POST"])
@@ -870,6 +946,7 @@ def status():
             "validators_reason": gd.get("validators_reason", ""),
             "mining_allowed": bool(gate.get("mining_allowed", False)),
             "mining_gate_reason": gate.get("reason", ""),
+            "peer_id": _BRN_PEER_ID,
         })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -901,7 +978,6 @@ def sync_info():
     local_h = chain.db.height()
     result["sync"]["height"] = local_h
 
-    # [v9.9.35] Alvo é o fast-sync se ainda não chegou lá
     if _MIN_FAST_SYNC_UNTIL > 0 and local_h < _MIN_FAST_SYNC_UNTIL:
         result["fast_sync"] = {
             "active": True,
@@ -912,7 +988,6 @@ def sync_info():
         result["sync"]["target"] = _MIN_FAST_SYNC_UNTIL
         result["sync"]["percent"] = result["fast_sync"]["percent"]
     else:
-        # Depois do fast-sync, compara com o topo dos peers
         try:
             result["sync"]["peers"] = chain.db.contar_peers(apenas_ativos=False)
             todos = chain.db.listar_peers(apenas_ativos=False)
@@ -930,7 +1005,6 @@ def sync_info():
             "percent": result["sync"]["percent"],
         }
 
-    # HTTP_SYNC_STATE (main.py) prevalece quando estiver sincronizando
     if _HTTP_SYNC_STATE and _HTTP_SYNC_STATE.get("syncing"):
         result["sync"].update({
             "percent": _HTTP_SYNC_STATE.get("percent", result["sync"]["percent"]),
@@ -1400,8 +1474,8 @@ def peers_discovered():
 def root():
     try:
         chain = _get_chain()
-        return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.35", "height": chain.db.height(), "health": "/health", "sync_panel": "/sync", "status": "/api/status", "mine_gate": "/api/mine/gate", "dashboard": "/dashboard", "wallet": "/wallet", "monitor": "/monitor", "panel": "/panel"})
-    except Exception as e: return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.35", "error": str(e)})
+        return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.36", "height": chain.db.height(), "peer_id": _BRN_PEER_ID, "health": "/health", "sync_panel": "/sync", "status": "/api/status", "mine_gate": "/api/mine/gate", "dashboard": "/dashboard", "wallet": "/wallet", "monitor": "/monitor", "panel": "/panel"})
+    except Exception as e: return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.36", "peer_id": _BRN_PEER_ID, "error": str(e)})
 
 
 @app.route("/dashboard", methods=["GET"])
@@ -1420,12 +1494,6 @@ def serve_monitor():
 def serve_panel():
     p = BASE_DIR / "panel.html"
     return send_file(p) if p.exists() else (jsonify({"ok": False, "msg": "panel.html não encontrado"}), 404)[0]
-
-
-@app.route("/wallet", methods=["GET"])
-def serve_wallet():
-    p = BASE_DIR / "index_wallet.html"
-    return send_file(p) if p.exists() else (jsonify({"ok": False, "msg": "index_wallet.html não encontrado"}), 404)[0]
 
 
 @app.route("/health", methods=["GET"])
@@ -1476,7 +1544,8 @@ def health():
         return jsonify({
             "ok": True,
             "height": chain.db.height(),
-            "version": "9.9.35",
+            "version": "9.9.36",
+            "peer_id": _BRN_PEER_ID,
             "chain_injected": _CHAIN is not None,
             "pool_injected": _POOL_MANAGER is not None,
             "trust_injected": _TRUST_NETWORK is not None,
@@ -1712,9 +1781,6 @@ def api_sync_live():
         peers = _build_peers_detail(chain)
         target_h = max([our_h] + [p["height"] for p in peers]) if peers else our_h
 
-        # [v9.9.35] Se estamos abaixo do fast-sync, o target da barra é
-        # BRN_FAST_SYNC_UNTIL, não o topo dos peers (senão a barra enche
-        # em 100% e a mineração fica bloqueada, confundindo o usuário).
         fast_sync_active = (_MIN_FAST_SYNC_UNTIL > 0 and our_h < _MIN_FAST_SYNC_UNTIL)
         if fast_sync_active:
             target_h = max(target_h, _MIN_FAST_SYNC_UNTIL)
@@ -1773,10 +1839,11 @@ def api_sync_live():
         return jsonify({
             "ok": True,
             "now": int(now),
+            "peer_id": _BRN_PEER_ID,
             "node": {
                 "height": our_h,
                 "tip_hash": chain.db.tip_hash(),
-                "version": "13.9.18",
+                "version": "13.9.20",
                 "is_origin": os.environ.get("BRN_IS_ORIGIN", "0") == "1",
             },
             "sync": {
@@ -1828,5 +1895,5 @@ def serve_sync_panel():
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print("BRN Server v9.9.35 (fast-sync percent)")
+    print("BRN Server v9.9.36 (peer-id)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
