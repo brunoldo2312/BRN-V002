@@ -1,13 +1,25 @@
 """main.py — Entrypoint do nó BRN (v13.9.20)
 ================================================================
-v13.9.20 (2026-11-13) — PEER-ID ÚNICO POR NÓ:
-  [NEW] Deriva PEER_ID = sha256(node_id_pub)[:16] após carregar
-        identidade. Expõe em os.environ["BRN_PEER_ID"] e injeta
-        no server via srv.set_peer_id(). Cada máquina (PC, Render,
-        etc) gera o SEU — nunca colidem.
-  [NEW] Log de boot mostra URL /wallet/<peer_id> específica.
-  [NEW] web_port lê ordem: BRN_WEB_PORT → PORT (Render) → 5000.
-  [KEEP] v13.9.19: multi-sig, checkpoints wire, chain.is_origin.
+v13.9.20 (2026-11-13) — SOLUÇÃO 2: caminho único de carteira por peer:
+  [NEW] PEER_ID = sha256(pubkey)[:16] derivado logo após carregar
+        node_identity. Injetado em os.environ["BRN_PEER_ID"].
+        server_fastapi.py usa para expor:
+          GET /wallet              → 307 /wallet/<peer_id>
+          GET /wallet/<peer_id>    → HTML da carteira (valida)
+          GET /peers               → menu HTML
+        Caminho único por peer; cada peer tem sua própria URL.
+  [FIX] web_port agora lê também PORT (Render injeta essa var;
+        antes só BRN_WEB_PORT funcionava).
+  [NEW] Log de boot mostra /wallet/<peer_id> e /peers.
+v13.9.19 — INTEGRAÇÃO FINAL DO MULTI-SIG + CHECKPOINTS:
+  [NEW] Wire de checkpoints: após carregar node_identity, chama
+        set_checkpoints(load_checkpoints()) e
+        set_checkpoint_priv(node_id_priv).
+  [NEW] chain.is_origin = is_origin explicitamente após criar o
+        Blockchain (sync_manager consulta getattr(chain, "is_origin")).
+  [KEEP] v13.9.18: GUI via HTTP, reporter de status, fast-sync gate.
+  [KEEP] v13.9.17: fast-sync até BRN_FAST_SYNC_UNTIL (6000).
+  [KEEP] v13.9.16: HTTP sync corrigido, --force-http-resync.
 ================================================================
 """
 from __future__ import annotations
@@ -157,20 +169,6 @@ def _setup_logging(level: str = "INFO"):
             format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         )
         return logging.getLogger("main")
-
-
-# ============================================================
-# PEER-ID v13.9.20
-# ============================================================
-def _derive_peer_id(pubkey_hex: str, length: int = 16) -> str:
-    """Deriva ID curto e estável a partir da chave pública do nó."""
-    if not pubkey_hex:
-        return ""
-    try:
-        h = hashlib.sha256(bytes.fromhex(pubkey_hex)).hexdigest()
-    except ValueError:
-        h = hashlib.sha256(pubkey_hex.encode("utf-8")).hexdigest()
-    return h[:length]
 
 
 # ============================================================
@@ -605,21 +603,6 @@ def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int,
         except Exception as e:
             log.error("[server] %s falhou: %s", fn_name, e)
 
-    # [PEER-ID v13.9.20] injeta PEER_ID no server
-    if hasattr(srv, "set_peer_id"):
-        try:
-            _pid = os.environ.get("BRN_PEER_ID", "")
-            if _pid:
-                srv.set_peer_id(_pid)
-                log.info("[server] peer_id injetado: %s", _pid)
-            else:
-                log.warning("[server] BRN_PEER_ID vazio — /wallet ficará 503")
-        except Exception as e:
-            log.warning("[server] set_peer_id falhou: %s", e)
-    else:
-        log.warning("[server] server.py não tem set_peer_id() — "
-                    "aplique o patch em server.py também")
-
     try:
         if hasattr(srv, "set_sk_validation_state"):
             srv.set_sk_validation_state(SK_VALIDATION_STATE)
@@ -647,22 +630,18 @@ def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int,
         try:
             import uvicorn
             from server_fastapi import app as fastapi_app
-            _host = os.environ.get("BRN_WEB_HOST", "127.0.0.1")
-            log.info("[server] Usando FastAPI + Uvicorn %s:%d", _host, web_port)
+            log.info("[server] Usando FastAPI + Uvicorn na porta %d", web_port)
             uvicorn.run(
                 fastapi_app,
-                host=_host,
+                host=os.environ.get("BRN_WEB_HOST", "127.0.0.1"),
                 port=web_port,
                 log_level="warning",
-                access_log=False,
+                access_log=False
             )
         except Exception as e:
             log.error("[server] Uvicorn falhou: %s", e)
             try:
-                srv.app.run(
-                    host=os.environ.get("BRN_WEB_HOST", "127.0.0.1"),
-                    port=web_port, threaded=True, use_reloader=False,
-                )
+                srv.app.run(host=os.environ.get("BRN_WEB_HOST", "127.0.0.1"), port=web_port, threaded=True, use_reloader=False)
             except Exception as e2:
                 log.error("[server] app.run fallback morreu: %s", e2)
 
@@ -842,8 +821,6 @@ def _auto_unlock_gui(api, allow_interactive: bool = True) -> tuple:
 def _start_gui(allow_interactive: bool = True) -> bool:
     """
     [v13.9.18] Abre a GUI via HTTP em vez de file://.
-    [v13.9.20] Usa /wallet (redireciona) em vez de /wallet/<peer_id>
-               porque o redirect é mais robusto em pywebview.
     """
     try:
         import webview
@@ -866,14 +843,13 @@ def _start_gui(allow_interactive: bool = True) -> bool:
             or os.environ.get("PORT")
             or "5000"
         )
-        # [v13.9.20] /wallet redireciona pra /wallet/<peer_id>
         http_url = f"http://127.0.0.1:{web_port}/wallet"
         url = http_url
 
         if _HAS_REQUESTS:
             for _ in range(20):
                 try:
-                    r = _requests.get(http_url, timeout=1, allow_redirects=True)
+                    r = _requests.get(http_url, timeout=1)
                     if r.status_code < 500:
                         log.info("[gui] servidor HTTP OK (%s) — abrindo via HTTP",
                                  r.status_code)
@@ -894,8 +870,7 @@ def _start_gui(allow_interactive: bool = True) -> bool:
                 wallet_path = BASE_DIR / "panel.html"
             url = wallet_path.as_uri() if wallet_path.exists() else "about:blank"
 
-        _pid_gui = os.environ.get("BRN_PEER_ID", "")
-        log.info("[gui] abrindo %s (peer_id=%s)", url, _pid_gui[:16] or "?")
+        log.info("[gui] abrindo %s", url)
         webview.create_window("BRN Wallet", url=url, width=1100, height=780,
                               js_api=api)
         webview.start()
@@ -1461,7 +1436,7 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
 
 
 # ============================================================
-# Status reporter (v13.9.18 + peer_id em v13.9.20)
+# Status reporter (v13.9.18)
 # ============================================================
 def _status_reporter_loop(chain, stop_evt: threading.Event,
                            interval: int = 30) -> None:
@@ -1541,12 +1516,9 @@ def _status_reporter_loop(chain, stop_evt: threading.Event,
                 except Exception:
                     pk_s = "?"
 
-            # [v13.9.20] inclui peer_id no log
             log.info(
-                "[STATUS %s] peer=%s h=%d/%d sync=%.0f%% peers=%d val=%s "
-                "gate=%s sign=%s pk=%s",
+                "[STATUS %s] h=%d/%d sync=%.0f%% peers=%d val=%s gate=%s sign=%s pk=%s",
                 time.strftime("%H:%M:%S"),
-                os.environ.get("BRN_PEER_ID", "?")[:8],
                 h, target_h, pct, fresh,
                 "YES" if ok_val else "NO",
                 gate_s, sign_s, pk_s,
@@ -1575,8 +1547,7 @@ def _auto_configure(chain, p2p, trust, web_port: int, is_origin: bool,
     })
 
     log.info("=" * 64)
-    log.info(" [SK RESOLUTION v13.9.20] peer_id=%s",
-             os.environ.get("BRN_PEER_ID", "?")[:16])
+    log.info(" [SK RESOLUTION v13.9.19]")
     log.info("=" * 64)
     log.info("  source           : %s", source or "(nenhum)")
     log.info("  SK_HEX len       : %d", len(sk_hex) if sk_hex else 0)
@@ -1759,14 +1730,12 @@ def main() -> int:
 
     is_origin = os.environ.get("BRN_IS_ORIGIN", "0") == "1"
 
-    # [v13.9.20] web_port lê BRN_WEB_PORT → PORT (Render) → 5000
+    # ---- [FIX v13.9.20] web_port lê PORT do Render também ----
     web_port = int(
         os.environ.get("BRN_WEB_PORT")
         or os.environ.get("PORT")
         or "5000"
     )
-    os.environ["BRN_WEB_PORT"] = str(web_port)
-
     p2p_port = int(os.environ.get("BRN_P2P_PORT", "6001"))
     db_path = args.db or os.environ.get("BRN_DB", "brn_v2_chain.db")
 
@@ -1805,18 +1774,28 @@ def main() -> int:
     except Exception:
         pass
 
-    # [PEER-ID v13.9.20] identidade + derivar PEER_ID
     try:
         node_id_priv, node_id_pub = _load_or_create_node_identity()
         log.info("[identity] pub=%s…", node_id_pub[:16])
-        PEER_ID = _derive_peer_id(node_id_pub, length=16)
-        os.environ["BRN_PEER_ID"] = PEER_ID
-        log.info("[identity] peer_id=%s", PEER_ID)
     except RuntimeError as e:
         log.error(str(e))
         return 3
 
-    # [INTEGRATION v13.9.19] Wire de checkpoints
+    # ---- [PEER-ID v13.9.20] ID curto e estável derivado da pubkey ----
+    # sha256(pubkey)[:16] → 16 hex chars únicos por nó.
+    # Injetado em BRN_PEER_ID para o server_fastapi.py usar nas rotas:
+    #   GET /wallet          → redireciona 307 /wallet/<peer_id>
+    #   GET /wallet/<id>     → serve HTML (valida)
+    #   GET /peers           → menu HTML
+    try:
+        PEER_ID = hashlib.sha256(bytes.fromhex(node_id_pub)).hexdigest()[:16]
+    except ValueError:
+        # fallback: pubkey não é hex (não deveria acontecer)
+        PEER_ID = hashlib.sha256(node_id_pub.encode()).hexdigest()[:16]
+    os.environ["BRN_PEER_ID"] = PEER_ID
+    log.info("[identity] peer_id=%s", PEER_ID)
+
+    # [INTEGRATION v13.9.19] Wire de checkpoints.
     try:
         from blockchain import set_checkpoints, set_checkpoint_priv
         from checkpoints import load_checkpoints
@@ -1892,6 +1871,7 @@ def main() -> int:
         daemon=True, name="Wallet-Watchdog",
     ).start()
 
+    # [v13.9.18] Status reporter
     threading.Thread(
         target=_status_reporter_loop,
         args=(chain, _stop_bg, 30),
@@ -1960,19 +1940,20 @@ def main() -> int:
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    _pid_boot = os.environ.get("BRN_PEER_ID", "")
-    _host_boot = os.environ.get("BRN_WEB_HOST", "127.0.0.1")
+    # ---- [PEER-ID v13.9.20] Log de boot com peer_id + /peers ----
     log.info("=" * 64)
-    log.info(" NÓ ATIVO — Ctrl+C para encerrar  (peer_id=%s)", _pid_boot)
-    log.info("   API      : http://%s:%d", _host_boot, web_port)
-    log.info("   Wallet   : http://%s:%d/wallet/%s",
-             _host_boot, web_port, _pid_boot)
-    log.info("   Wallet   : http://%s:%d/wallet   (redireciona p/ local)",
-             _host_boot, web_port)
-    log.info("   Peers    : http://%s:%d/peers", _host_boot, web_port)
-    log.info("   PeerID   : http://%s:%d/api/peer_id", _host_boot, web_port)
-    log.info("   Health   : http://%s:%d/health", _host_boot, web_port)
-    log.info("   P2P      : :%d", p2p_port)
+    log.info(" NÓ ATIVO — Ctrl+C para encerrar")
+    log.info("   API       : http://%s:%d",
+             os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
+    log.info("   Wallet    : http://%s:%d/wallet/%s",
+             os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port, PEER_ID)
+    log.info("   Wallet(/) : http://%s:%d/wallet  (redireciona pro local)",
+             os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
+    log.info("   Peers     : http://%s:%d/peers",
+             os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
+    log.info("   Health    : http://%s:%d/health",
+             os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
+    log.info("   P2P       : :%d", p2p_port)
     log.info("=" * 64)
 
     try:
