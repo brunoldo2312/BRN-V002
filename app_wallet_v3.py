@@ -1,41 +1,25 @@
-"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.21)
+"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.22)
 ================================================================
-v3.21 (2026-11-12) — UNLOCK HONESTO SOBRE SK:
-  [FIX CRÍTICO] unlock_wallet() agora retorna warning explícito
-        e node_will_sign=False quando a SK NÃO foi instalada no nó.
-        Antes: unlock_wallet retornava ok:True silenciosamente
-        mesmo com sync_r={} (servidor offline, sk_hex inválida,
-        wallet_integrator quebrado). A GUI mostrava "carteira
-        aberta" e o operador descobria no log do consenso que o
-        nó assinava com 0 assinaturas — exatamente o cenário do
-        #4301 (got=0, faltam 02eeec..., 03244d..., 03b992d...).
-  [NEW] _verify_sk_on_node(pubkey_hex): após tentar instalar a
-        SK, confirma via /api/consensus/validators que o nó
-        REALMENTE viu a chave. Se /health.wallet_sk_installed=
-        False OU local_pk_full != pubkey_hex, retorna
-        installed=False. Fonte de verdade final.
-  [NEW] unlock_wallet() cross-check: se _sync_sk_to_chain falhou
-        com erro de rede mas o nó já tem a SK (de uma sessão
-        anterior), marca sk_installed=True com nota
-        "verified_after_sync_failure".
-  [NEW] retry_sk_sync(): método público para a GUI chamar quando
-        a rede voltar, sem fechar/abrir a carteira. Idempotente.
-  [NEW] load_wallet() também propaga sync_r (antes ignorava —
-        tinha o mesmo bug do unlock).
-  [NEW] create_and_unlock() e generate_wallet() idem.
-  [NEW] _sync_sk_to_chain retorna error_code
-        ("connection"|"timeout"|"server_offline"|"rejected"|
-        "no_requests"|"exception") para classificar warning vs
-        error.
-  [NEW] CLI --verify-sk: carrega senha do env, faz unlock, e
-        imprime o estado real (sk_installed, node_will_sign,
-        validators do nó). Útil para debugar o #4301 sem abrir
-        a GUI.
-  [KEEP] v3.20: FIX load_wallet() strip .wallet; save_wallet()
-        detecta 3 assinaturas; list_wallets() sempre lista de
-        dicts; fallback WalletManager; create_and_unlock em 3
-        lugares; unlock propaga SK ao Origin; has_wallet
-        considera wallets/*.wallet.
+v3.22 (2026-11-13) — GUARD CONTRA API_BASE REMOTO ACIDENTAL:
+  [FIX CRÍTICO] API_BASE agora passa por _resolve_api_base(). Se o
+        ambiente NÃO tem RENDER/RENDER_SERVICE_ID (ou seja, rodando
+        localmente), e BRN_API_BASE aponta pra um host remoto (ex:
+        onrender.com), o módulo FORÇA de volta pra 127.0.0.1:{porta}.
+        Antes, o app_wallet_v3.py herdava BRN_API_BASE do .env e
+        fazia UNLOCK/TRANSFER/POOL_START no servidor do Render,
+        mesmo com a GUI aberta em 127.0.0.1. Resultado: a carteira
+        do PC e a do Render ficavam misturadas e o operador não
+        entendia o que estava acontecendo.
+  [NEW] _resolve_api_base() — resolução com detecção de ambiente.
+  [NEW] Override explícito via BRN_API_BASE_ALLOW_REMOTE=1 quando
+        você REALMENTE quer que a GUI local fale com servidor remoto
+        (ex: para debug). Sem isso, remote é rejeitado com WARNING.
+  [NEW] Log de boot mostra claramente "API_BASE=..." e a fonte
+        ("env", "local-forced", "local-default").
+  [NEW] get_version() retorna {version, api_base, api_base_source,
+        has_requests, on_render}.
+  [KEEP] v3.21: unlock_wallet honesto sobre SK, retry_sk_sync(),
+        _verify_sk_on_node(), --verify-sk.
 ================================================================
 """
 from __future__ import annotations
@@ -49,7 +33,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "3.21"
+__version__ = "3.22"
 
 try:
     import requests
@@ -61,19 +45,97 @@ except ImportError:
 
 log = logging.getLogger("wallet-bridge")
 
-BASE_DIR     = Path(__file__).resolve().parent
-API_BASE     = os.environ.get("BRN_API_BASE", "http://127.0.0.1:5000").rstrip("/")
-API_TIMEOUT  = float(os.environ.get("BRN_API_TIMEOUT", "200"))
-GET_TIMEOUT  = float(os.environ.get("BRN_API_GET_TIMEOUT", "30"))
-MAX_RETRIES  = int(os.environ.get("BRN_API_RETRIES", "2"))
-RETRY_DELAY  = float(os.environ.get("BRN_API_RETRY_DELAY", "0.5"))
+BASE_DIR = Path(__file__).resolve().parent
+
+
+# ============================================================
+# [v3.22] RESOLUÇÃO SEGURA DE API_BASE
+# ============================================================
+def _is_running_on_render() -> bool:
+    """Detecta se estamos rodando no Render (que injeta essas envs)."""
+    return bool(
+        os.environ.get("RENDER")
+        or os.environ.get("RENDER_SERVICE_ID")
+        or os.environ.get("RENDER_EXTERNAL_URL")
+    )
+
+
+def _is_remote_url(url: str) -> bool:
+    """True se a URL NÃO aponta pra localhost/127.0.0.1/0.0.0.0."""
+    u = (url or "").strip().lower()
+    if not u:
+        return False
+    return not any(
+        h in u for h in ("127.0.0.1", "localhost", "0.0.0.0", "[::1]")
+    )
+
+
+def _resolve_api_base() -> tuple:
+    """
+    Resolve BRN_API_BASE com guard contra apontar pro Render sem querer.
+
+    Retorna (url, source):
+        url     — URL final (sempre termina com rstrip)
+        source  — "env" (usado como está), "env-forced-local" (override),
+                  "local-default" (sem BRN_API_BASE, assume local)
+
+    Regras:
+      1. Se não tem BRN_API_BASE → usa http://127.0.0.1:{BRN_WEB_PORT|PORT|5000}
+      2. Se tem BRN_API_BASE remoto:
+         a. Rodando no Render → aceita (é o caso esperado)
+         b. BRN_API_BASE_ALLOW_REMOTE=1 → aceita (debug explícito)
+         c. Caso contrário → FORÇA local e loga WARNING
+      3. Se tem BRN_API_BASE local → aceita
+    """
+    raw = (os.environ.get("BRN_API_BASE", "") or "").strip()
+    allow_remote = os.environ.get("BRN_API_BASE_ALLOW_REMOTE", "0") == "1"
+    on_render = _is_running_on_render()
+
+    port = (
+        os.environ.get("BRN_WEB_PORT")
+        or os.environ.get("PORT")
+        or "5000"
+    )
+    local_url = f"http://127.0.0.1:{port}"
+
+    if not raw:
+        return local_url, "local-default"
+
+    raw = raw.rstrip("/")
+
+    if _is_remote_url(raw):
+        if on_render:
+            return raw, "env"
+        if allow_remote:
+            log.warning(
+                "[api_base] usando REMOTO por BRN_API_BASE_ALLOW_REMOTE=1: %s",
+                raw,
+            )
+            return raw, "env"
+        log.warning(
+            "[api_base] BRN_API_BASE=%s aponta pra REMOTO, mas este processo "
+            "NÃO está no Render. FORÇANDO %s. "
+            "Se você REALMENTE quer conectar em servidor remoto da GUI local, "
+            "defina BRN_API_BASE_ALLOW_REMOTE=1 (com cuidado!).",
+            raw, local_url,
+        )
+        return local_url, "env-forced-local"
+
+    return raw, "env"
+
+
+API_BASE, _API_BASE_SOURCE = _resolve_api_base()
+API_TIMEOUT = float(os.environ.get("BRN_API_TIMEOUT", "200"))
+GET_TIMEOUT = float(os.environ.get("BRN_API_GET_TIMEOUT", "30"))
+MAX_RETRIES = int(os.environ.get("BRN_API_RETRIES", "2"))
+RETRY_DELAY = float(os.environ.get("BRN_API_RETRY_DELAY", "0.5"))
 
 _WALLET_SESSION: dict = {}
 
 
-# ═══════════════════════════════════════════════════════════════
+# ============================================================
 # Helpers HTTP
-# ═══════════════════════════════════════════════════════════════
+# ============================================================
 def _classify_post_error(msg: str) -> str:
     """Classifica a msg de erro de _post em error_code."""
     m = (msg or "").lower()
@@ -96,14 +158,8 @@ def _sync_sk_to_chain(sk_hex: str, address: str = "",
                       pubkey: str = "") -> dict:
     """
     Instala SK no nó via HTTP /api/wallet/set_validator_sk.
-
-    O server.py v9.9.32 chama wallet_integrator.integrate_and_propagate:
-      1. instala SK local
-      2. configura multisig
-      3. avisa o Origin (se cliente)
-
-    [v3.21] Retorna dict com error_code classificado + ok + sk_installed
-    + todos os campos do server. Sempre inclui "ok" (False quando falhou).
+    Retorna dict com error_code classificado + ok + sk_installed
+    + todos os campos do server.
     """
     if not sk_hex:
         return {"ok": False, "msg": "sk vazio", "error_code": "empty_sk",
@@ -115,8 +171,8 @@ def _sync_sk_to_chain(sk_hex: str, address: str = "",
             "pubkey":  pubkey or "",
         }, timeout=15.0)
         if not isinstance(r, dict):
-            return {"ok": False, "msg": "resposta inválida", "error_code": "bad_response",
-                    "sk_installed": False}
+            return {"ok": False, "msg": "resposta inválida",
+                    "error_code": "bad_response", "sk_installed": False}
         if not r.get("ok"):
             msg = r.get("msg", "") or str(r)
             r["error_code"] = _classify_post_error(msg)
@@ -140,13 +196,8 @@ def _sync_sk_to_chain(sk_hex: str, address: str = "",
 
 def _verify_sk_on_node(pubkey_hex: str) -> dict:
     """
-    [v3.21] Confirma via /api/consensus/validators que o NÓ realmente
-    tem a SK instalada com essa pubkey. Fonte de verdade final.
-
-    Retorna:
-      {"installed": bool, "local_pk_full": str, "source": "...",
-       "n_trust": int, "n_active": int, "required_sigs": int,
-       "bootstrap_would_fire": bool, "raw": dict}
+    Confirma via /api/consensus/validators que o NÓ realmente tem a SK
+    instalada com essa pubkey. Fonte de verdade final.
     """
     out = {"installed": False, "local_pk_full": "", "source": "unavailable",
            "n_trust": 0, "n_active": 0, "required_sigs": 0,
@@ -157,7 +208,6 @@ def _verify_sk_on_node(pubkey_hex: str) -> dict:
 
     pubkey_hex = pubkey_hex.strip().lower()
 
-    # Preferência: /api/consensus/validators (v9.9.32 traz local_pk_full)
     try:
         r = _get("/api/consensus/validators", timeout=5.0)
         if isinstance(r, dict) and r.get("ok"):
@@ -167,13 +217,13 @@ def _verify_sk_on_node(pubkey_hex: str) -> dict:
             out["n_trust"] = int(r.get("n_trust", 0) or 0)
             out["n_active"] = int(r.get("n_active", 0) or 0)
             out["required_sigs"] = int(r.get("required_sigs", 0) or 0)
-            out["bootstrap_would_fire"] = bool(r.get("bootstrap_would_fire", False))
+            out["bootstrap_would_fire"] = bool(
+                r.get("bootstrap_would_fire", False))
             if local_full and local_full == pubkey_hex:
                 out["installed"] = True
                 out["source"] = "consensus/validators:full_match"
                 return out
             if r.get("local_pk_installed") and not local_full:
-                # Servidor antigo (<v9.9.32) não retorna local_pk_full
                 out["source"] = "consensus/validators:truncated_only"
             elif local_full and local_full != pubkey_hex:
                 out["source"] = f"consensus/validators:mismatch({local_full[:16]})"
@@ -181,7 +231,6 @@ def _verify_sk_on_node(pubkey_hex: str) -> dict:
     except Exception as e:
         log.debug("_verify_sk_on_node: /api/consensus/validators falhou: %s", e)
 
-    # Fallback: /health
     try:
         r = _get("/health", timeout=5.0)
         if isinstance(r, dict) and r.get("ok"):
@@ -199,7 +248,6 @@ def _verify_sk_on_node(pubkey_hex: str) -> dict:
             if local_trunc and not pubkey_hex.startswith(local_trunc):
                 out["source"] = f"health:prefix_mismatch({local_trunc})"
                 return out
-            # wallet_sk_installed=True mas sem pk exposta: assume OK
             if installed_flag and not local_trunc:
                 out["installed"] = True
                 out["source"] = "health:flag_only"
@@ -294,11 +342,10 @@ def _get(path: str, timeout: float = None,
     return {"error": last_err or "erro desconhecido"}
 
 
-# ═══════════════════════════════════════════════════════════════
+# ============================================================
 # Helpers WalletManager
-# ═══════════════════════════════════════════════════════════════
+# ============================================================
 def _normalize_wallet_entry(w: dict) -> dict:
-    """Normaliza entrada de WalletManager.list_wallets() em {name, address, public_key}."""
     name = (
         w.get("name")
         or w.get("nome")
@@ -322,7 +369,6 @@ def _normalize_wallet_entry(w: dict) -> dict:
 
 
 def _list_wallet_names() -> list[str]:
-    """Lista nomes de carteiras via WalletManager (robusto a variações)."""
     names = []
     try:
         from wallet import WalletManager
@@ -368,12 +414,6 @@ def _list_wallet_names() -> list[str]:
 
 
 def _try_load_via_wallet_manager(password: str) -> dict | None:
-    """
-    Fallback: se load_current_wallet falhou, tenta decifrar cada
-    wallets/*.wallet com WalletManager.load_encrypted_wallet.
-
-    Retorna dict normalizado {address, private_key, public_key} ou None.
-    """
     try:
         from wallet import WalletManager
     except Exception:
@@ -412,11 +452,10 @@ def _try_load_via_wallet_manager(password: str) -> dict | None:
 
 
 def _populate_session_from_data(data: dict) -> None:
-    """Preenche _WALLET_SESSION com dados normalizados."""
     global _WALLET_SESSION
-    _WALLET_SESSION["address"]     = data.get("address", "")
+    _WALLET_SESSION["address"] = data.get("address", "")
     _WALLET_SESSION["private_key"] = data.get("private_key", "")
-    _WALLET_SESSION["public_key"]  = (
+    _WALLET_SESSION["public_key"] = (
         data.get("public_key") or data.get("pubkey") or data.get("pub_hex") or ""
     )
 
@@ -424,20 +463,8 @@ def _populate_session_from_data(data: dict) -> None:
 def _build_unlock_response(source: str, sync_r: dict,
                             verification: dict | None = None) -> dict:
     """
-    [v3.21] Monta a resposta de unlock_wallet/load_wallet/create
-    consolidando sync_r + verificação cruzada do nó.
-
-    Classifica erros:
-      - error_code em {connection, timeout, server_offline, no_requests}
-        → warning (transitório, GUI deve avisar mas não travar)
-      - error_code em {rejected, server_error, empty_sk, bad_response}
-        → error (o servidor recusou, precisa intervenção)
-
-    Sempre inclui:
-      - sk_installed (bool, com cross-check)
-      - node_will_sign (bool derivado)
-      - verification_source ("sync" | "cross_check" | "none")
-      - warnings, errors (listas)
+    Monta a resposta de unlock_wallet/load_wallet/create consolidando
+    sync_r + verificação cruzada do nó.
     """
     sk_installed = bool(sync_r.get("sk_installed", False))
     in_trust = bool(sync_r.get("in_trust", False))
@@ -452,8 +479,6 @@ def _build_unlock_response(source: str, sync_r: dict,
     msg = sync_r.get("msg", "")
 
     if not sk_installed:
-        # Cross-check com o nó — talvez a SK já estava instalada de
-        # uma sessão anterior e o _sync falhou por rede.
         verify_pubkey = (_WALLET_SESSION.get("public_key") or "").strip()
         if verify_pubkey:
             try:
@@ -507,20 +532,22 @@ def _build_unlock_response(source: str, sync_r: dict,
         "errors": errors,
         "sync_error_code": error_code,
         "verification": verification or {},
+        "api_base": API_BASE,
+        "api_base_source": _API_BASE_SOURCE,
     }
 
 
-# ═══════════════════════════════════════════════════════════════
+# ============================================================
 # WalletApi
-# ═══════════════════════════════════════════════════════════════
+# ============================================================
 class WalletApi:
     def __init__(self):
-        log.info("WalletApi v%s iniciada (API_BASE=%s)", __version__, API_BASE)
+        log.info("WalletApi v%s iniciada (API_BASE=%s source=%s)",
+                 __version__, API_BASE, _API_BASE_SOURCE)
         if not _HAS_REQUESTS:
             log.warning("requests NÃO instalado — pip install requests")
 
     def has_wallet(self) -> dict:
-        """Também considera wallets/*.wallet."""
         try:
             from secure_store import CURRENT_WALLET_ENC
             p = Path(CURRENT_WALLET_ENC)
@@ -538,22 +565,10 @@ class WalletApi:
             "exists": root_exists or has_named,
             "root_enc": root_exists,
             "named_wallets": _list_wallet_names(),
+            "api_base": API_BASE,
         }
 
     def unlock_wallet(self, password: str) -> dict:
-        """
-        Desbloqueia a carteira ativa.
-
-        Ordem:
-          1. load_current_wallet(pwd) em current_wallet.enc
-          2. Se falhar: WalletManager.load_encrypted_wallet em wallets/*.wallet
-          3. Se decifrou via WalletManager, salva em current_wallet.enc
-          4. POST /api/wallet/set_validator_sk (integra + propaga)
-
-        [v3.21] Retorna warning/error explícitos quando sk_installed=False
-        e node_will_sign=False. Antes retornava ok:True silencioso e a
-        GUI mostrava "aberta" mesmo com o nó sem SK (bug do #4301).
-        """
         global _WALLET_SESSION
         pwd = (password or "").strip() or _get_default_password()
         if not pwd:
@@ -620,14 +635,6 @@ class WalletApi:
         return _build_unlock_response(source or "unknown", sync_r)
 
     def retry_sk_sync(self) -> dict:
-        """
-        [v3.21] Reinstala a SK no nó para a carteira atualmente
-        desbloqueada. Idempotente. Use quando a rede voltar após um
-        unlock_wallet() com sk_installed=False.
-
-        Não fecha nem reabre a carteira — só refaz o POST e
-        re-verifica o estado do nó.
-        """
         if not _WALLET_SESSION.get("address"):
             return {"ok": False, "msg": "wallet não desbloqueada"}
         sk = _WALLET_SESSION.get("private_key", "")
@@ -733,11 +740,6 @@ class WalletApi:
         return {"ok": False, "msg": "locked"}
 
     def list_wallets(self) -> list:
-        """
-        Retorna [{name, address, public_key}] para a aba "arquivos".
-
-        [FIX v3.20] Sempre devolve lista de dicts (nunca strings soltas).
-        """
         entries = []
 
         try:
@@ -831,17 +833,8 @@ class WalletApi:
         except Exception as e:
             return {"erro": str(e)}
 
-    # ═══════════════════════════════════════════════════════════
-    # save_wallet com detecção de assinatura (v3.20 mantido)
-    # ═══════════════════════════════════════════════════════════
     def save_wallet(self, name: str, password: str,
                     address: str, sk: str, pk: str) -> dict:
-        """
-        Salva carteira em wallets/{name}.wallet via WalletManager.
-
-        Detecta 3 assinaturas possíveis de save_encrypted_wallet
-        (kwargs, positional 5-args, positional 3-args).
-        """
         if not name or not name.strip():
             return {"ok": False, "msg": "nome vazio"}
         if not password:
@@ -918,16 +911,7 @@ class WalletApi:
         log.error("[save_wallet] TODAS as tentativas falharam: %s", erros)
         return {"ok": False, "msg": " | ".join(erros[-2:])}
 
-    # ═══════════════════════════════════════════════════════════
-    # load_wallet com strip de .wallet (v3.20) + sync_r (v3.21)
-    # ═══════════════════════════════════════════════════════════
     def load_wallet(self, name: str, password: str) -> dict:
-        """
-        Carrega carteira nomeada.
-
-        [v3.20] Strip de ".wallet" ANTES de chamar o WalletManager.
-        [v3.21] Propaga sync_r (SK install) igual ao unlock_wallet.
-        """
         global _WALLET_SESSION
         if not name:
             return {"ok": False, "msg": "nome vazio"}
@@ -951,13 +935,10 @@ class WalletApi:
                     data = r
                     source = f"WalletManager:{name}"
                 else:
-                    # resposta estranha (True ou string) sem dict: não dá
-                    # pra popular a sessão. Retorna cru pra compat.
                     return r if isinstance(r, dict) else {"ok": True, "address": ""}
             else:
                 return r or {"ok": False, "msg": "resposta vazia"}
         except Exception as e_load:
-            # Fallback: _load_blob direto
             try:
                 from secure_store import _load_blob
                 path = BASE_DIR / "wallets" / f"{name}.wallet"
@@ -974,7 +955,6 @@ class WalletApi:
         if not data:
             return {"ok": False, "msg": "carteira carregada mas sem dados"}
 
-        # Normaliza e popula sessão
         if not data.get("private_key"):
             data["private_key"] = data.get("priv_hex") or data.get("sk") or ""
         if not data.get("public_key"):
@@ -1039,6 +1019,8 @@ class WalletApi:
                 "tip_hash": s.get("tip_hash", ""),
                 "fila_tamanho": s.get("fila_tamanho", 0),
                 "rede_descentralizada": s.get("rede_descentralizada", False),
+                "peer_id": s.get("peer_id", ""),
+                "api_base": API_BASE,
             }
         except Exception as e:
             return {"ok": False, "msg": str(e)}
@@ -1274,7 +1256,14 @@ class WalletApi:
             return {"ok": False, "msg": str(e)}
 
     def get_version(self) -> dict:
-        return {"version": __version__, "api_base": API_BASE, "has_requests": _HAS_REQUESTS}
+        return {
+            "version": __version__,
+            "api_base": API_BASE,
+            "api_base_source": _API_BASE_SOURCE,
+            "has_requests": _HAS_REQUESTS,
+            "on_render": _is_running_on_render(),
+            "allow_remote": os.environ.get("BRN_API_BASE_ALLOW_REMOTE", "0") == "1",
+        }
 
     def get_debug_info(self) -> dict:
         consensus_info = {}
@@ -1293,7 +1282,6 @@ class WalletApi:
         if _WALLET_SESSION.get("public_key"):
             try:
                 node_verification = _verify_sk_on_node(_WALLET_SESSION["public_key"])
-                # Não vaza o raw (pode ser grande)
                 node_verification = {
                     "installed": bool(node_verification.get("installed")),
                     "source": node_verification.get("source"),
@@ -1306,7 +1294,11 @@ class WalletApi:
                 node_verification = {"error": str(e)}
 
         return {
-            "version": __version__, "api_base": API_BASE,
+            "version": __version__,
+            "api_base": API_BASE,
+            "api_base_source": _API_BASE_SOURCE,
+            "on_render": _is_running_on_render(),
+            "allow_remote": os.environ.get("BRN_API_BASE_ALLOW_REMOTE", "0") == "1",
             "has_requests": _HAS_REQUESTS,
             "wallet_locked": not bool(_WALLET_SESSION.get("address")),
             "wallet_address": _WALLET_SESSION.get("address", ""),
@@ -1327,14 +1319,17 @@ class WalletApi:
         }
 
 
-# ═══════════════════════════════════════════════════════════════
+# ============================================================
 # Self-test
-# ═══════════════════════════════════════════════════════════════
+# ============================================================
 def _self_test() -> int:
     print(f"app_wallet_v3.py v{__version__}")
     print("=" * 60)
-    print(f"API_BASE:      {API_BASE}")
-    print(f"requests:      {'OK' if _HAS_REQUESTS else 'AUSENTE'}")
+    print(f"API_BASE:       {API_BASE}")
+    print(f"API_BASE source:{_API_BASE_SOURCE}")
+    print(f"on_render:      {_is_running_on_render()}")
+    print(f"allow_remote:   {os.environ.get('BRN_API_BASE_ALLOW_REMOTE', '0')}")
+    print(f"requests:       {'OK' if _HAS_REQUESTS else 'AUSENTE'}")
     print()
 
     if not _HAS_REQUESTS:
@@ -1352,6 +1347,9 @@ def _self_test() -> int:
                   f"n_active={val.get('n_active')} "
                   f"required_sigs={val.get('required_sigs')} "
                   f"bootstrap_would_fire={val.get('bootstrap_would_fire')}")
+        pid = r.get("peer_id", "")
+        if pid:
+            print(f"    peer_id: {pid}")
     else:
         print(f"[1] [X] ping: {r} (main.py offline?)")
 
@@ -1385,12 +1383,9 @@ def _self_test() -> int:
 
 
 def _cmd_verify_sk() -> int:
-    """
-    [v3.21] Carrega senha do env, faz unlock e imprime o estado
-    completo. Útil para debugar o #4301 sem abrir a GUI.
-    """
     print(f"app_wallet_v3.py v{__version__} — --verify-sk")
-    print(f"API_BASE: {API_BASE}")
+    print(f"API_BASE: {API_BASE} (source={_API_BASE_SOURCE})")
+    print(f"on_render: {_is_running_on_render()}")
     print("=" * 60)
 
     pw = _get_default_password()
@@ -1410,6 +1405,8 @@ def _cmd_verify_sk() -> int:
     print(f"\n    ok               = {r.get('ok')}")
     print(f"    address          = {r.get('address')}")
     print(f"    source           = {r.get('source')}")
+    print(f"    api_base         = {r.get('api_base')}")
+    print(f"    api_base_source  = {r.get('api_base_source')}")
     print(f"    sk_installed     = {r.get('sk_installed')}  <-- O QUE IMPORTA")
     print(f"    node_will_sign   = {r.get('node_will_sign')}  <-- DERIVADO")
     print(f"    verification     = {r.get('verification_source')}")
@@ -1433,20 +1430,12 @@ def _cmd_verify_sk() -> int:
         print(" [!] ATENÇÃO: SK NÃO INSTALADA — NÓ NÃO VAI ASSINAR")
         print("=" * 60)
         print(" Sem SK o nó fica com got=0 em validators_sig.")
-        print(" É exatamente o que o log do #4301 mostra:")
-        print("   'Bloco #4301 ... tem 0. Faltam: 02eeec..., 03244d..., 03b992d...'")
-        print()
-        print(" Diagnóstico:")
         ec = r.get("sync_error_code") or ""
         if ec in ("connection", "timeout", "server_offline", "no_requests"):
             print(f"  - _sync_sk_to_chain falhou com erro TRANSITÓRIO ({ec})")
             print("  - main.py pode estar offline ou o servidor em :5000 caiu")
-            print("  - rode 'python3 app_wallet_v3.py --verify-sk' de novo quando voltar")
-            print("  - ou chame retry_sk_sync() pela GUI")
         elif ec:
             print(f"  - _sync_sk_to_chain foi REJEITADA pelo servidor ({ec})")
-            print("  - verifique BRN_STRICT_MULTISIG e wallet_integrator")
-            print("  - os logs do main.py/server.py devem ter o motivo")
         else:
             print("  - sync_r veio vazio: carteira sem private_key?")
         return 2
@@ -1470,6 +1459,7 @@ if __name__ == "__main__":
 
     if args.version:
         print(f"app_wallet_v3.py v{__version__}")
+        print(f"api_base={API_BASE} source={_API_BASE_SOURCE}")
         sys.exit(0)
 
     if args.self_test:
