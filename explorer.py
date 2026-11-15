@@ -1,9 +1,11 @@
 """
 explorer.py — Backend do Explorer + Painéis + Block Explorer (v3.4)
 ================================================================
-v3.4 (2026-11-15):
-  [NEW] Adicionada a rota /api/dashboard para alimentar o painel estilo Nerva.
-  [KEEP] Todas as rotas existentes (dashboard, panel, monitor, proxy).
+v3.4 (2026-11-15) — ROBUSTEZ NO BANCO DE DADOS:
+  [FIX] Adicionado timeout=30.0 e PRAGMA busy_timeout=30000 no get_db()
+        para evitar erro "database is locked" quando o nó principal
+        estiver gravando blocos em massa.
+  [KEEP] v3.3: Template injection, proxy da API, etc.
 ================================================================
 """
 from __future__ import annotations
@@ -17,7 +19,6 @@ import zlib
 import orjson
 import os
 import requests
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -33,7 +34,7 @@ except (TypeError, ValueError):
     API_TIMEOUT = 15.0
 
 # ============================================================
-# LAYOUT (usado pelo helper render_page do Block Explorer)
+# LAYOUT (usado pelo helper render_page)
 # ============================================================
 LAYOUT_HTML = """
 <!DOCTYPE html>
@@ -69,11 +70,7 @@ LAYOUT_HTML = """
 <div class="container">
     <header>
         <h1>🔷 BRN Explorer</h1>
-        <div>
-            <a href="/">Home</a> | 
-            <a href="/dashboard">Dashboard ao Vivo</a> | 
-            <a href="/monitor">Monitor</a>
-        </div>
+        <div><a href="/">Home</a> | <a href="/dashboard">Dashboard ao Vivo</a> | <a href="/monitor">Monitor</a></div>
     </header>
     <form class="search-box" action="/search" method="GET">
         <input type="text" name="q" placeholder="Pesquisar por Bloco, TxID ou Endereço (brn1...)">
@@ -86,12 +83,13 @@ LAYOUT_HTML = """
 """
 
 def render_page(content_html: str, **context) -> str:
+    """Renderiza o conteúdo interno e injeta no layout."""
     content = render_template_string(content_html, **context)
     return render_template_string(LAYOUT_HTML, content=Markup(content))
 
 
 # ============================================================
-# CONTEÚDOS DAS PÁGINAS DO EXPLORER
+# CONTEÚDOS DAS PÁGINAS
 # ============================================================
 HOME_CONTENT = """
 <div class="grid">
@@ -202,12 +200,16 @@ TX_CONTENT = """
 
 
 # ============================================================
-# HELPERS DB
+# HELPERS DB (Otimizados para não travar durante sync)
 # ============================================================
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    # [FIX CRÍTICO] timeout=30.0 e busy_timeout evitam que o Explorer
+    # quebre com "database is locked" enquanto o main.py escreve blocos.
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.execute("PRAGMA busy_timeout=30000;")
     conn.row_factory = sqlite3.Row
     return conn
+
 
 def get_latest_blocks(n=10):
     conn = get_db()
@@ -226,6 +228,7 @@ def get_latest_blocks(n=10):
         except Exception:
             pass
     return out
+
 
 def get_latest_txs(n=10):
     conn = get_db()
@@ -246,81 +249,6 @@ def get_latest_txs(n=10):
         except Exception:
             pass
     return out
-
-
-# ============================================================
-# ROTA DE DADOS PARA O DASHBOARD (NÓ PRINCIPAL)
-# ============================================================
-@app.route("/api/dashboard")
-def api_dashboard():
-    try:
-        conn = get_db()
-        row_block = conn.execute("SELECT raw FROM blocks ORDER BY height DESC LIMIT 1").fetchone()
-        if not row_block:
-            conn.close()
-            return jsonify({"error": "Nenhum bloco encontrado"}), 404
-            
-        ultimo_bloco = orjson.loads(zlib.decompress(row_block["raw"]))
-        altura = ultimo_bloco["height"]
-        dificuldade = ultimo_bloco.get("difficulty", 0)
-        reward = ultimo_bloco.get("reward", 50)
-        
-        row_tx = conn.execute("SELECT COUNT(*) as total FROM transactions").fetchone()
-        total_txs = row_tx["total"] if row_tx else 0
-        
-        try:
-            row_mempool = conn.execute("SELECT COUNT(*) as total FROM mempool").fetchone()
-            mempool = row_mempool["total"] if row_mempool else 0
-        except:
-            mempool = 0
-            
-        supply = altura * reward
-        
-        rows_hist = conn.execute("SELECT raw FROM blocks ORDER BY height DESC LIMIT 60").fetchall()
-        conn.close()
-        
-        history = []
-        blocos_recentes = []
-        
-        for r in reversed(rows_hist):
-            b = orjson.loads(zlib.decompress(r["raw"]))
-            hashrate = b.get("difficulty", 0) * 1000000 
-            
-            history.append({
-                "height": b["height"],
-                "hashrate": hashrate,
-                "difficulty": b.get("difficulty", 0)
-            })
-            
-            if len(blocos_recentes) < 10:
-                blocos_recentes.append({
-                    "height": b["height"],
-                    "hash": b["hash"],
-                    "txs": len(b["transactions"]),
-                    "time": datetime.fromtimestamp(b["timestamp"]).strftime("%H:%M"),
-                    "reward": reward
-                })
-        
-        res = "0s"
-        if len(history) > 1:
-            tempo_total = ultimo_bloco["timestamp"] - orjson.loads(zlib.decompress(rows_hist[-1]["raw"]))["timestamp"]
-            res = f"{tempo_total / len(history):.1f}s"
-            
-        return jsonify({
-            "height": altura,
-            "difficulty": f"{dificuldade:,}".replace(",", "."),
-            "hashrate": f"{history[-1]['hashrate'] / 1e6:.2f} MH/s" if history else "0 MH/s",
-            "block_time": res,
-            "tx_count": total_txs,
-            "mempool": mempool,
-            "supply": f"{supply:,}".replace(",", "."),
-            "reward": f"{reward:.4f}",
-            "history": history,
-            "recent_blocks": blocos_recentes
-        })
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 
 # ============================================================
@@ -431,12 +359,14 @@ def serve_dashboard():
         return send_file(p)
     return "explorer.html não encontrado", 404
 
+
 @app.route("/panel")
 def serve_panel():
     p = BASE_DIR / "panel.html"
     if p.exists():
         return send_file(p)
     return "panel.html não encontrado", 404
+
 
 @app.route("/monitor")
 def serve_monitor():
@@ -447,9 +377,10 @@ def serve_monitor():
 
 
 # ============================================================
-# PROXY GENÉRICO PARA A API DO NÓ
+# PROXY GENÉRICO
 # ============================================================
 def _do_api_proxy(path: str):
+    """Repassa requisição /api/* para o nó principal."""
     if request.method == "OPTIONS":
         return "", 200
 
@@ -462,9 +393,11 @@ def _do_api_proxy(path: str):
         else:
             r = requests.get(target_url, params=request.args, timeout=API_TIMEOUT)
 
+        # Se a resposta for JSON, retorna JSON
         try:
             return jsonify(r.json()), r.status_code
         except ValueError:
+            # Não-JSON (ex: texto puro de /health)
             return Response(r.content, status=r.status_code,
                             content_type=r.headers.get("Content-Type", "text/plain"))
 
@@ -475,9 +408,12 @@ def _do_api_proxy(path: str):
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
+# IMPORTANTE: -proxy registrado PRIMEIRO para evitar conflito
 @app.route("/api/<path:path>-proxy", methods=["GET", "POST", "OPTIONS"])
 def api_proxy_compat(path):
     return _do_api_proxy(path)
+
 
 @app.route("/api/<path:path>", methods=["GET", "POST", "OPTIONS"])
 def api_proxy(path):
@@ -495,4 +431,12 @@ if __name__ == "__main__":
     print(f"  → Monitor:        http://127.0.0.1:{port}/monitor")
     print(f"  → Painel:         http://127.0.0.1:{port}/panel")
     print(f"  → API backend:    {API_BASE} (timeout={API_TIMEOUT}s)")
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    
+    # [MELHORIA] Usa Waitress se disponível, senão cai para Flask dev
+    try:
+        from waitress import serve
+        print("[*] Servidor rodando em modo PRODUÇÃO (Waitress)")
+        serve(app, host="0.0.0.0", port=port, threads=8)
+    except ImportError:
+        print("[!] Waitress não instalado. Rodando em modo DEV (Flask)")
+        app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
