@@ -1,11 +1,23 @@
-"""main.py — Entrypoint do nó BRN (v13.9.21)
+"""main.py — Entrypoint do nó BRN (v13.9.22)
 ================================================================
-v13.9.21 (2026-11-14) — CONSENSO DE ALTURA (SYNC REAL):
+v13.9.22 (2026-11-14) — DESCOBERTA AUTOMÁTICA DE PEERS (TAILSCALE):
+  [NEW] Ao iniciar, o nó chama auto_discovery.auto_configure_bootstrap()
+        para listar todos os IPs online na rede Tailscale e adicioná-los
+        automaticamente ao BRN_BOOTSTRAP_PEERS. Não precisa mais 
+        configurar IPs manualmente no .env ao adicionar novos computadores.
+v13.9.21 — CONSENSO DE ALTURA (SYNC REAL):
   [FIX] O sistema não depende mais cegamente do bloco 6000 para 
         considerar o nó "sincronizado". Se a altura local já for
         igual à altura do Origin/Validadores (± tolerância), o 
         Gate 2 do Auto-Mine é liberado e a UI mostra 100%.
-  [KEEP] v13.9.20: Solução 2 (peer_id único no caminho /wallet).
+v13.9.20 — SOLUÇÃO 2: caminho único de carteira por peer:
+  [NEW] PEER_ID = sha256(pubkey)[:16] derivado logo após carregar
+        node_identity. Injetado em os.environ["BRN_PEER_ID"].
+        server_fastapi.py usa para expor:
+          GET /wallet              → 307 /wallet/<peer_id>
+          GET /wallet/<peer_id>    → HTML da carteira (valida)
+          GET /peers               → menu HTML
+        Caminho único por peer; cada peer tem sua própria URL.
 ================================================================
 """
 from __future__ import annotations
@@ -28,7 +40,7 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.21"
+    VERSION = "13.9.22"
     BUILD_DATE = "2026-11-14"
 
 try:
@@ -955,7 +967,7 @@ def _ping_origin(timeout: float = 3.0) -> bool:
             import urllib.request
             req = urllib.request.Request(
                 f"{pool_url}/api/status",
-                headers={"User-Agent": "brn-main/13.9.21"},
+                headers={"User-Agent": "brn-main/13.9.22"},
             )
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.status == 200
@@ -1549,7 +1561,7 @@ def _auto_configure(chain, p2p, trust, web_port: int, is_origin: bool,
     })
 
     log.info("=" * 64)
-    log.info(" [SK RESOLUTION v13.9.21]")
+    log.info(" [SK RESOLUTION v13.9.22]")
     log.info("=" * 64)
     log.info("  source           : %s", source or "(nenhum)")
     log.info("  SK_HEX len       : %d", len(sk_hex) if sk_hex else 0)
@@ -1720,6 +1732,16 @@ def main() -> int:
         print("[main] --skip-verify ativo")
 
     loaded = _load_env_file()
+
+    # ---- [AUTO-DISCOVERY v13.9.22] Descobre peers via Tailscale ----
+    try:
+        import auto_discovery
+        auto_discovery.auto_configure_bootstrap()
+    except ImportError:
+        logging.getLogger("main").debug("[AUTO-DISCOVERY] auto_discovery.py não encontrado.")
+    except Exception as e:
+        logging.getLogger("main").warning("[AUTO-DISCOVERY] falhou: %s", e)
+    # -------------------------------------------------------------
 
     if args.client_mode:
         os.environ["BRN_IS_ORIGIN"] = "0"
