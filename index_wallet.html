@@ -1533,13 +1533,36 @@ async function enviar() {
 }
 
 // ============================================================
-// MINERAÇÃO LOCAL
+// MINERAÇÃO LOCAL (ATUALIZADO)
 // ============================================================
 async function minerar() {
   clearMsg("mMine");
   if (!wallet.address) { msg("mMine", "❌ Gere/carregue uma carteira.", "err"); return; }
   if (miningBusy) return;
 
+  // [NOVO] Verifica se o nó tem blockchain antes de minerar solo
+  try {
+    const st = await api("node_status");
+    const height = st.height || 0;
+    
+    if (height <= 0) {
+      msg("mMine", "⚠️ Nó sem blockchain local. Redirecionando para o Pool...", "warn", 5000);
+      
+      // Espera 1.5s para o usuário ler a mensagem e chama a função de pool
+      setTimeout(async () => {
+        await minerarPool();
+      }, 1500);
+      return;
+    }
+  } catch (e) {
+    msg("mMine", "⚠️ Falha ao checar rede. Tentando Pool por segurança...", "warn", 5000);
+    setTimeout(async () => {
+      await minerarPool();
+    }, 1500);
+    return;
+  }
+
+  // Se chegou aqui, tem blockchain. Segue com mineração solo normal.
   try {
     const poolSt = await api("pool_status");
     if (poolSt && poolSt.running) {
@@ -1571,7 +1594,7 @@ async function minerar() {
     try {
       const r = await api("start_mining", wallet.address, wallet.public_key);
       if (r && r.ok) {
-        msg("mMine", "⛏️ Mineração LOCAL iniciada.", "ok", 6000);
+        msg("mMine", "⛏️ Mineração LOCAL (Solo) iniciada.", "ok", 6000);
         miningRunning = true;
       } else {
         msg("mMine", "❌ " + ((r && r.msg) || "falha ao iniciar"), "err");
