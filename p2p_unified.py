@@ -1,16 +1,15 @@
 """
-p2p_unified.py — BRN P2P Network v6.7.14
+p2p_unified.py — BRN P2P Network v6.7.15
 ================================================================
-v6.7.14 (2026-11-12) — TOLERÂNCIA A FALHAS NO BOOTSTRAP:
-  [FIX CRÍTICO] _sync_incremental agora verifica a variável
-        BRN_BOOTSTRAP_SKIP_SIGS_UNTIL. Se o nó estiver baixando
-        blocos antigos (ex: até o 4300), um lote fora de sequência
-        retorna RETRYABLE (tenta de novo) em vez de FATAL (aborta).
-        Isso impede que o Render pare de sincronizar por causa de
-        um simples atraso de rede.
-  [KEEP] v6.7.13: Sync lock (impede sincronizações simultâneas) e
-        Socket Cleanup (evita vazamento de memória).
-  [KEEP] v6.7.12: SOCKS5 fallback para Tailscale.
+v6.7.15 (2026-11-15) — FIX CRÍTICO: LOOP INFINITO NO BLOCO GENESIS:
+  [FIX] _sync_incremental agora ignora a validação multi-sig para o
+        Bloco #0 (Genesis), que por definição não possui assinaturas
+        de validadores. Antes, o nó tentava validar o Genesis, falhava
+        e retornava RETRYABLE, criando um loop infinito que travava o
+        banco de dados SQLite e o servidor HTTP.
+  [FIX] A validação multi-sig também é pulada durante o período de
+        bootstrap (skip_until).
+  [KEEP] v6.7.14: Tolerância a falhas de sequência no bootstrap.
 ================================================================
 """
 from __future__ import annotations
@@ -1453,11 +1452,23 @@ class P2PManager:
             except Exception as e:
                 return SyncResult.FATAL, f"pré-validação falhou: {e}"
 
+        # ============================================================
+        # [FIX CRÍTICO v6.7.15] Pular validação multi-sig para o
+        # Bloco #0 (Genesis) e durante o bootstrap. O Genesis não
+        # possui assinaturas por definição, e validá-lo causava um
+        # loop infinito que travava o banco de dados SQLite.
+        # ============================================================
         try:
             validators = self.bc._get_active_validators() if hasattr(self.bc, "_get_active_validators") else []
             if validators:
                 for blk in blocks_to_apply:
                     try:
+                        # Pula a validação para o Genesis e blocos de bootstrap
+                        if int(blk.get("height", -1)) == 0:
+                            continue
+                        if skip_until > 0 and int(blk.get("height", -1)) <= skip_until:
+                            continue
+
                         _ok_sig, _msg_sig = self.bc._validate_validators_sig(blk, validators=validators)
                         if not _ok_sig:
                             log.warning(
