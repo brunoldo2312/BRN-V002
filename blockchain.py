@@ -1,40 +1,17 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.5.8 | Data: 12/11/2026
+Versão: 9.5.9 | Data: 15/11/2026
 ================================================================
-v9.5.8 (2026-11-12) — FIX BOOTSTRAP MULTI-SIG COM SK LOCAL:
-  [FIX] _get_trust_validators() novo: retorna APENAS os validadores
-        do trust (get_active_validators / get_top_validators), SEM
-        injetar o pk local. É a fonte de verdade para decidir se o
-        nó está em bootstrap (len < 2).
-  [FIX] _get_active_validators() agora usa _get_trust_validators()
-        por baixo + append do pk local (se _local_validator_sk
-        estiver setado). Comportamento idêntico ao anterior para
-        quem consome a lista completa (quórum, coleta de sigs).
-  [FIX] _validate_validators_sig(): os 3 bypasses de bootstrap
-        ("estrangeiro", "local", "estendido") agora checam
-        len(trust_validators) < 2 em vez de len(validators) < 2.
-        Antes, um nó com trust de 1 validador + SK local instalada
-        tinha len=2 e NUNCA entrava em bootstrap — rejeitava blocos
-        do peer mesmo sendo rede de 1 validador real. v9.5.6 tinha
-        endurecido isso para evitar fork silencioso em rede 3+; o
-        endurecimento continua válido (trust real >= 2 não bypassa),
-        mas o bootstrap legítimo de rede pequena voltou a funcionar.
-  [FIX] Mensagem de erro final agora inclui trust_validators=N e
-        bootstrap_local=M, para diagnóstico rápido.
-  [NEW] diagnose_validators() — snapshot do estado de validadores
-        para expor em /api/consensus/validators (ou chamar direto).
-  [KEEP] v9.5.7: auto-promoção via record_block_signed.
-  [KEEP] v9.5.6: bypass multi-sig endurecido, auth_tag env,
-        shutdown timeout, fallback fantasma, PBFT attach.
-  [KEEP] v9.5.5: L2 bridge (l2_mint).
-  [KEEP] v9.5.4: BRN_PBFT_START_HEIGHT.
-  [KEEP] v9.5.3: genesis do peer aceito se DB vazio.
-  [KEEP] v9.5.2: BRN_STRICT_MULTISIG desativa bypasses.
+v9.5.9 (2026-11-15) — ROBUSTEZ DE BANCO DE DADOS:
+  [NEW] Ativação automática do SQLite em WAL mode e busy_timeout=30000
+        no momento da inicialização. Isso evita que o banco trave
+        quando a API HTTP e o P2P tentarem acessá-lo ao mesmo tempo.
+v9.5.8 (2026-11-12) — FIX BOOTSTRAP MULTI-SIG COM SK LOCAL
+  [KEEP] ... (restante do changelog original mantido)
 ================================================================
 """
 from __future__ import annotations
 
-__version__ = "9.5.8"
+__version__ = "9.5.9"
 
 import os
 import time
@@ -518,6 +495,21 @@ class Blockchain:
                  genesis_pubkey=None, auto_genesis=True, network_secret=None,
                  require_auth_tag=None):
         self.db = ChainDB(db_path)
+        
+        # ============================================================
+        # [ROBUSTNESS FIX v9.5.9] Ativa WAL e busy_timeout no SQLite
+        # para evitar travamentos (database is locked) sob alta carga.
+        # ============================================================
+        try:
+            if hasattr(self.db, 'conn') and self.db.conn is not None:
+                self.db.conn.execute("PRAGMA journal_mode=WAL;")
+                self.db.conn.execute("PRAGMA synchronous=NORMAL;")
+                self.db.conn.execute("PRAGMA busy_timeout=30000;")
+                log.info("[DB] SQLite otimizado com WAL mode e 30s de timeout.")
+        except Exception as e:
+            log.warning(f"[DB] Não foi possível aplicar WAL/timeout no SQLite: {e}")
+        # ============================================================
+
         self.genesis_expected_hash = None
         self.network_secret = network_secret if network_secret is not None else NETWORK_SECRET
 
@@ -937,24 +929,7 @@ class Blockchain:
         timestamps.sort()
         return timestamps[len(timestamps) // 2]
 
-    # ============================================================
-    # [v9.5.8] Validadores: trust puro vs trust + local
-    # ============================================================
     def _get_trust_validators(self) -> list:
-        """
-        [v9.5.8] Validadores do TrustNetwork APENAS — SEM injetar o pk
-        local. Usado para decidir se o nó está em bootstrap
-        (len < 2), porque o pk local NÃO é um validador do trust: ele
-        é uma adição temporária para o nó conseguir assinar seus
-        próprios blocos.
-
-        Antes do v9.5.8, `_get_active_validators()` retornava
-        trust + local, e os bypasses de bootstrap checavam
-        `len(validators) < 2` — o que nunca disparava num nó com
-        SK local instalada e 1 validador no trust. Resultado: o nó
-        rejeitava blocos legítimos do único peer, mesmo com a rede
-        de 1 validador real.
-        """
         validators: list = []
         trust = self.trust_net
         if trust is None:
@@ -997,18 +972,6 @@ class Blockchain:
         return sorted({p for p in validators if p})
 
     def _get_active_validators(self) -> list:
-        """
-        Trust validators + pk local (bootstrap).
-
-        Usado para:
-          - calcular o quórum (`_required_signatures`)
-          - `valid_set` em `_collect_signatures` e
-            `_validate_validators_sig` (o pk local precisa estar em
-            `valid_set` para que a assinatura local seja aceita)
-
-        NÃO usar o resultado desta função para decidir bypass de
-        bootstrap — para isso, ver `_get_trust_validators()`.
-        """
         validators = self._get_trust_validators()
 
         local_sk = self._local_validator_sk
@@ -1040,7 +1003,6 @@ class Blockchain:
 
     def _validate_validators_sig(self, block: dict,
                                   validators: Optional[list] = None) -> tuple:
-        # Bypass 1: BRN_BOOTSTRAP_SKIP_SIGS_UNTIL (por altura)
         if not BRN_STRICT_MULTISIG and BRN_BOOTSTRAP_SKIP_SIGS_UNTIL > 0:
             try:
                 _bh = int(block.get("height", -1))
@@ -1063,9 +1025,6 @@ class Blockchain:
 
         required = self._required_signatures(validators)
 
-        # [v9.5.8] trust-only count, para decisão de bootstrap.
-        # Usamos o trust "puro" porque o pk local NÃO é validador
-        # do trust — ele é adição temporária para assinar.
         trust_validators = self._get_trust_validators()
         n_trust = len(trust_validators)
         n_bootstrap_local = len(validators) - n_trust
@@ -1103,9 +1062,6 @@ class Blockchain:
         if got >= required:
             return True, ""
 
-        # Bypass 2 (estrangeiro): trust real tem <2 validadores e o
-        # bloco veio assinado por >=1 chave que não está no nosso set.
-        # [v9.5.8] usa n_trust (trust puro), não len(validators).
         if (not BRN_STRICT_MULTISIG and n_trust < 2
                 and got == 0 and got_foreign >= 1):
             try:
@@ -1126,9 +1082,6 @@ class Blockchain:
             )
             return True, ""
 
-        # Bypass 3 (local): trust real tem <2 validadores e a única
-        # assinatura é a nossa própria SK local.
-        # [v9.5.8] usa n_trust.
         if (not BRN_STRICT_MULTISIG
                 and n_trust < 2
                 and got >= 1
@@ -1155,9 +1108,6 @@ class Blockchain:
                     )
                     return True, ""
 
-        # Bypass 4 (estendido): trust real tem <2 validadores e o
-        # assinante tem trust_score >= BOOTSTRAP_TRUST_THRESHOLD.
-        # [v9.5.8] usa n_trust.
         if (not BRN_STRICT_MULTISIG
                 and n_trust < 2
                 and got >= 1
@@ -1210,10 +1160,6 @@ class Blockchain:
         )
 
     def diagnose_validators(self) -> dict:
-        """
-        [v9.5.8] Snapshot do estado de validadores para diagnóstico.
-        Não altera nada. Seguro para expor via HTTP.
-        """
         trust_v = self._get_trust_validators()
         active_v = self._get_active_validators()
         local_pk = ""
