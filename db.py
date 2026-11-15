@@ -1,17 +1,17 @@
-"""db.py — Banco SQLite do BRN (v7.4 - Otimizado para Cloud/Nuvem)
+"""db.py — Banco SQLite do BRN (v7.5 - Robustez Cloud/Render)
 ================================================================
-v7.4 (2026-11-10) — PATCH PARA RENDER/CLOUD:
-  [FIX] READER connection agora usa modo read-only (URI) para evitar
-        conflitos de lock no Render.
-  [FIX] PRAGMAs separados: WRITER (synchronous=FULL) e READER (NORMAL).
-  [FIX] Adicionado PRAGMA optimize no close() para manter o DB rápido.
-  [FIX] Whitelist de tabelas no _count_table().
-  [KEEP] v7.3: batch seguro.
+v7.5 (2026-11-15) — MELHORIAS DE ROBUSTEZ:
+  [FIX] busy_timeout aumentado para 30000ms (evita falhas de API
+        durante sincronização P2P pesada).
+  [FIX] zlib.compress movido para fora da transação no _add_block_impl
+        (reduz o tempo de lock do banco de dados).
+  [FIX] Removido PRAGMA journal_mode=WAL do read_conn (é read-only).
+  [KEEP] v7.4: separação Writer/Reader, fila de escrita.
 ================================================================
 """
 from __future__ import annotations
 
-__version__ = "7.4"
+__version__ = "7.5"
 
 import os
 import time
@@ -64,13 +64,13 @@ class ChainDB:
         try:
             self.read_conn = sqlite3.connect(
                 f"file:///{path_uri}?mode=ro", check_same_thread=False,
-                isolation_level=None, timeout=5.0, uri=True,
+                isolation_level=None, timeout=30.0, uri=True,
             )
         except sqlite3.OperationalError:
             # Fallback normal na primeira execução (arquivo ainda não criado).
             self.read_conn = sqlite3.connect(
                 path, check_same_thread=False, isolation_level=None,
-                timeout=5.0,
+                timeout=30.0,
             )
         self.read_conn.row_factory = sqlite3.Row
         self.read_lock = threading.RLock()
@@ -81,17 +81,14 @@ class ChainDB:
             "PRAGMA cache_size=-64000",
             "PRAGMA mmap_size=268435456",
             "PRAGMA foreign_keys=ON",
-            "PRAGMA busy_timeout=5000",
+            "PRAGMA busy_timeout=30000", # [FIX] Aumentado para 30s
             "PRAGMA wal_autocheckpoint=1000",
             "PRAGMA journal_size_limit=67108864",
         )
 
         # Journal mode SÓ no writer (o reader é read-only)
         self.conn.execute("PRAGMA journal_mode=WAL")
-        try:
-            self.read_conn.execute("PRAGMA journal_mode=WAL")
-        except sqlite3.OperationalError:
-            pass
+        # [FIX] Não executa journal_mode no read_conn
 
         for p in common_pragmas:
             self.conn.execute(p)
@@ -401,10 +398,15 @@ class ChainDB:
         return self._enqueue(self._add_block_impl, block, batch_safe=False)
 
     def _add_block_impl(self, block):
+        # [FIX] Compressão movida para FORA da transação para reduzir lock
+        blob = zlib.compress(orjson.dumps(block), level=6)
+        tx_blobs = []
+        for tx in block["transactions"]:
+            tx_blobs.append((tx["txid"], zlib.compress(orjson.dumps(tx), level=6)))
+            
         with self.lock:
             self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
             try:
-                blob = zlib.compress(orjson.dumps(block), level=6)
                 self.conn.execute(
                     "INSERT INTO blocks(height,hash,prev_hash,timestamp,nonce,merkle,difficulty,raw) "
                     "VALUES (?,?,?,?,?,?,?,?)",
@@ -412,11 +414,10 @@ class ChainDB:
                      block["timestamp"], block["nonce"], block["merkle"],
                      block["difficulty"], blob),
                 )
-                for tx in block["transactions"]:
-                    tx_blob = zlib.compress(orjson.dumps(tx), level=6)
+                for txid_str, tx_blob in tx_blobs:
                     self.conn.execute(
                         "INSERT OR REPLACE INTO transactions(txid,block_height,raw) VALUES (?,?,?)",
-                        (tx["txid"], block["height"], tx_blob),
+                        (txid_str, block["height"], tx_blob),
                     )
                 self.conn.execute("COMMIT")
             except Exception:
@@ -1230,8 +1231,6 @@ class ChainDB:
             "l2_txs": self._count_table("l2_txs"),
         }
 
-    # [MELHORIA] Whitelist de tabelas — evita SQL injection se `table`
-    # um dia vier de entrada do usuário (hoje vem hardcoded, mas é defesa em profundidade).
     _COUNT_TABLES = frozenset({
         "blocks", "transactions", "utxos", "mempool", "meta", "peers",
         "network_events", "contracts", "contract_state", "contract_events",
@@ -1343,7 +1342,6 @@ class ChainDB:
         except Exception:
             pass
         
-        # [MELHORIA] PRAGMA optimize = ANALYZE seletivo baseado em query history.
         try:
             self.conn.execute("PRAGMA optimize")
         except Exception:
