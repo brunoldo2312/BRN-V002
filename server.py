@@ -1,17 +1,13 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.36)
+server.py — Backend HTTP do nó BRN (v9.9.37)
 ================================================================
-v9.9.36 (2026-11-13) — PEER-ID (caminho único por peer):
-  [NEW] set_peer_id() / _BRN_PEER_ID: main.py injeta o sha256(pubkey)[:16].
-  [NEW] /api/peer_id — retorna o ID do nó que serve a requisição.
-  [NEW] /wallet redireciona (307) para /wallet/<peer_id>.
-  [NEW] /wallet/<peer_id> — serve o HTML só para o ID local; 404 se for de outro.
-  [NEW] /peers — menu HTML listando peers conhecidos.
-  [KEEP] v9.9.35: sync percent considera fast-sync; mining gate; etc.
+v9.9.37 (2026-11-15) — SEGURANÇA AUTOMÁTICA DO FAUCET:
+  [NEW] Gera automaticamente um BRN_ADMIN_TOKEN se não existir
+        e salva em .brn_admin_token (ou usa env no Render).
 ================================================================
 """
 from __future__ import annotations
-import os, time, math, json, atexit, hmac, logging, sys, threading
+import os, time, math, json, atexit, hmac, logging, sys, threading, secrets
 import urllib.request, urllib.error
 from decimal import Decimal, ROUND_DOWN
 from functools import wraps
@@ -45,7 +41,6 @@ BASE_DIR = Path(__file__).resolve().parent
 WEB_HOST = os.environ.get("BRN_WEB_HOST", "127.0.0.1")
 BEHIND_PROXY = os.environ.get("BRN_BEHIND_PROXY", "0") == "1"
 CORS_ORIGINS = [o.strip() for o in os.environ.get("BRN_CORS_ORIGIN", "").split(",") if o.strip()]
-ADMIN_TOKEN = os.environ.get("BRN_ADMIN_TOKEN", "").strip()
 WALLETS_FILE = str(BASE_DIR / "user_wallets.json")
 CURRENT_WALLET_FILE = str(BASE_DIR / "current_wallet.json")
 FAUCET_MAX_PER_ADDRESS = 3
@@ -58,10 +53,50 @@ TXT_HISTORY_LIMIT_DEFAULT = 200
 TXT_HISTORY_LIMIT_MAX = 500
 BOOTSTRAP_HTTP_PORT = int(os.environ.get("BRN_BOOTSTRAP_HTTP_PORT", os.environ.get("BRN_WEB_PORT", "5000")))
 
+# ============================================================
+# SEGURANÇA AUTOMÁTICA DO FAUCET
+# ============================================================
+def _get_admin_token():
+    token = os.environ.get("BRN_ADMIN_TOKEN", "").strip()
+    if token:
+        return token
+        
+    token_file = BASE_DIR / ".brn_admin_token"
+    if token_file.exists():
+        try:
+            t = token_file.read_text(encoding="utf-8").strip()
+            if t:
+                os.environ["BRN_ADMIN_TOKEN"] = t
+                return t
+        except Exception:
+            pass
+            
+    novo_token = secrets.token_hex(16)
+    try:
+        token_file.write_text(novo_token, encoding="utf-8")
+        try: os.chmod(token_file, 0o600)
+        except Exception: pass
+    except Exception:
+        pass
+    
+    os.environ["BRN_ADMIN_TOKEN"] = novo_token
+    
+    print("\n" + "="*60)
+    print(" 🔐 FAUCET PROTEGIDO AUTOMATICAMENTE")
+    print(f" Senha gerada: {novo_token}")
+    print(f" Salva no arquivo: {token_file.name}")
+    print(" Para liberar tokens, use: Authorization: Bearer " + novo_token)
+    print("="*60 + "\n")
+    
+    return novo_token
+
+ADMIN_TOKEN = _get_admin_token()
+# ============================================================
+
 # [v9.9.36] Peer-ID global
 _BRN_PEER_ID = ""
 
-# Mining gate / fast-sync (v9.9.33 + v9.9.35)
+# Mining gate / fast-sync
 _MIN_FAST_SYNC_UNTIL = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "6000") or "0")
 _MIN_VALIDATORS_FOR_MINING = max(1, int(os.environ.get("BRN_MIN_VALIDATORS_FOR_MINING", "1") or "1"))
 _VALIDATOR_HEIGHT_TOLERANCE = max(0, int(os.environ.get("BRN_VALIDATOR_HEIGHT_TOLERANCE", "1") or "1"))
@@ -72,9 +107,6 @@ _MINE_GATE_LOCK = threading.Lock()
 
 _SYNC_LIVE_HISTORY = {"ts": 0.0, "height": -1}
 _SYNC_LIVE_LOCK = threading.Lock()
-
-if not ADMIN_TOKEN: log.warning("[server] BRN_ADMIN_TOKEN vazio. /api/faucet ABERTO.")
-elif len(ADMIN_TOKEN) < 16: log.warning("[server] BRN_ADMIN_TOKEN curto.")
 
 if _MIN_FAST_SYNC_UNTIL > 0:
     log.warning(
@@ -90,7 +122,6 @@ if _MIN_FAST_SYNC_UNTIL > 0:
 # [v9.9.36] PEER-ID
 # ============================================================
 def set_peer_id(peer_id: str) -> None:
-    """Injetado por main.py v13.9.20. sha256(pubkey)[:16]."""
     global _BRN_PEER_ID
     _BRN_PEER_ID = (peer_id or "").strip()
     log.info("[server] peer_id=%s", _BRN_PEER_ID[:16] or "(vazio)")
@@ -189,7 +220,7 @@ def _register_miner_in_trust(pubkey: str, address: str):
 
 
 # ============================================================
-# MINING GATE (v9.9.33)
+# MINING GATE
 # ============================================================
 def _check_validators_synced(chain, min_validators: int, tolerance: int,
                               max_age_s: int) -> tuple:
@@ -417,7 +448,7 @@ def _invalidate_mining_gate_cache():
 
 
 # ============================================================
-# SYNC LIVE helpers (v9.9.34 + v9.9.35)
+# SYNC LIVE helpers
 # ============================================================
 def _build_peers_detail(chain) -> list:
     now = time.time()
@@ -1759,7 +1790,7 @@ def bridge_status():
 
 
 # ============================================================
-# SYNC LIVE PANEL (v9.9.34 + v9.9.35)
+# SYNC LIVE PANEL
 # ============================================================
 @app.route("/api/sync/live", methods=["GET"])
 def api_sync_live():
@@ -1895,5 +1926,5 @@ def serve_sync_panel():
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print("BRN Server v9.9.36 (peer-id)")
+    print("BRN Server v9.9.37 (peer-id + faucet auto-security)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
