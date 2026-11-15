@@ -1,21 +1,19 @@
-"""trust_network.py — Rede de confiança e reputação do BRN (v3.12)
+"""trust_network.py — Rede de confiança e reputação do BRN (v3.13)
 ================================================================
-v3.12 (2026-11-10) — PATCH DE ESTABILIDADE:
-  [FIX] remove_ghosts e _prune_inactive agora PROTEGEM nós com
-        trust_score >= 500 (SCORE_PROTECTED). O Origin não vai mais
-        deletar a Mayra (ou qualquer validador) por inatividade.
-  [FIX] flush() de cliente agora salva também no trust_network.json
-        principal (com a flag client_written). Permite que a GUI e
-        scripts locais (validator_manager.py) leiam os dados.
-  [FIX] _load() de cliente aceita o arquivo principal se ele tiver
-        a flag client_written, evitando que o cliente se auto-apague
-        ao reiniciar.
-  [KEEP] v3.11: auto-promoção, record_block_signed, register_new.
+v3.13 (2026-11-15) — ROBUSTEZ DE I/O:
+  [FIX] flush() agora usa escrita atômica (os.replace) para evitar
+        corrupção do arquivo JSON se o nó desligar no meio.
+  [FIX] flush() não segura o _lock enquanto escreve no disco. Copia
+        os dados para fora do lock e grava depois.
+  [FIX] sync_local_validator e register_new_validator não forçam
+        mais o flush() a cada chamada. O salvamento é throttled.
+  [FIX] _load() captura JSONDecodeError e avisa, em vez de quebrar.
+  [KEEP] v3.12: Proteção de validadores com score >= 500.
 ================================================================
 """
 from __future__ import annotations
 
-__version__ = "3.12"
+__version__ = "3.13"
 
 import json
 import logging
@@ -24,7 +22,7 @@ import threading
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, Any
+from typing import Dict, List, Optional, Set
 
 from crypto import Ed25519PrivateKey, Ed25519PublicKey
 
@@ -54,7 +52,9 @@ DECAY_INTERVAL_SECONDS = 86400
 MAX_VALIDATORS = 21
 VALIDATOR_ROTATION_BLOCKS = 100
 DEFAULT_DATA_FILE = "trust_network.json"
-FLUSH_INTERVAL_S = 10.0
+
+# Aumentado para 15s para evitar I/O storm
+FLUSH_INTERVAL_S = 15.0
 
 NODE_TTL_SECONDS   = int(os.environ.get("BRN_TRUST_NODE_TTL",   "3600"))
 ACTIVE_TTL_SECONDS = int(os.environ.get("BRN_TRUST_ACTIVE_TTL", "300"))
@@ -115,11 +115,11 @@ class NodeRecord:
         else:
             self.trust_level = "new"
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "NodeRecord":
+    def from_dict(cls, data: Dict) -> "NodeRecord":
         campos = {
             "node_id", "address", "public_key", "peer_addr",
             "trust_score", "trust_level",
@@ -155,12 +155,24 @@ class TrustNetwork:
         self._dirty_local = False
         self._last_flush = 0.0
 
+        # [FIX v3.13] Timer de flush assíncrono em background
+        self._stop_flush = threading.Event()
+        self._flush_thread = threading.Thread(
+            target=self._flush_loop, daemon=True, name="Trust-Flush"
+        )
+        self._flush_thread.start()
+
         self._load()
         log.info("[TrustNetwork] v%s Inicializada — %d nós, %d validadores "
                  "(origin=%s, local_file=%s)",
                  __version__, len(self.nodes), len(self.active_validators),
                  "sim" if is_origin else "não",
                  str(self.local_file) if not is_origin else "n/a")
+
+    def _flush_loop(self) -> None:
+        """[FIX v3.13] Salva no disco a cada 15s APENAS se estiver sujo."""
+        while not self._stop_flush.wait(FLUSH_INTERVAL_S):
+            self.flush()
 
     def set_origin_pubkey(self, pk: str) -> None:
         self._origin_pubkey = (pk or "").strip().lower()
@@ -184,12 +196,8 @@ class TrustNetwork:
                 n.connected = True
                 n.last_connect_time = time.time()
                 n.update_trust_level()
+            # [FIX v3.13] Não força flush síncrono aqui. Deixa o _mark_dirty cuidar.
             self._mark_dirty()
-            try:
-                self._last_flush = 0.0
-                self.flush()
-            except Exception as e:
-                log.warning("[TrustNetwork] sync_local_validator flush falhou: %s", e)
 
         log.info("[TrustNetwork] sync_local_validator: %s… (origin=%s)",
                  pk[:16], "sim" if self.is_origin else "não")
@@ -229,10 +237,6 @@ class TrustNetwork:
                 if existing.trust_score < score and not existing.banned:
                     existing.trust_score = score
                     existing.update_trust_level()
-                    log.info(
-                        "[TrustNetwork] register_new_validator: %s… score %.0f → %.0f",
-                        pk[:16], existing.trust_score, score,
-                    )
                 existing.last_seen = time.time()
                 log.info(
                     "[TrustNetwork] register_new_validator: %s… já existe, last_seen atualizado",
@@ -241,11 +245,7 @@ class TrustNetwork:
 
             n = self.nodes[pk]
             self._mark_dirty()
-            try:
-                self._last_flush = 0.0
-                self.flush()
-            except Exception as e:
-                log.warning("[TrustNetwork] register_new_validator flush falhou: %s", e)
+            # [FIX v3.13] Não força flush aqui. _mark_dirty já agenda.
 
             return {
                 "ok": True,
@@ -264,15 +264,12 @@ class TrustNetwork:
 
         with self._lock:
             n = self.nodes.get(nid)
-            if n is None:
-                return
-            if n.banned:
+            if n is None or n.banned:
                 return
 
             n.blocks_signed += 1
             n.last_seen = time.time()
-            self._adjust_score(nid, GAIN_BLOCK_SIGNED,
-                               f"co-assinou #{block_height}")
+            self._adjust_score(nid, GAIN_BLOCK_SIGNED, f"co-assinou #{block_height}")
 
             if (n.blocks_signed >= AUTO_PROMOTE_MIN_BLOCKS
                     and n.trust_score < AUTO_PROMOTE_SCORE
@@ -294,29 +291,25 @@ class TrustNetwork:
         self.heartbeat(pubkey)
 
     def remove_ghosts(self, max_age_s: int = 300) -> int:
-        """[v3.12] Remove nós fantasmas, mas protege quem tem score >= 500."""
         now = time.time()
         to_remove = []
 
         with self._lock:
             for nid, n in list(self.nodes.items()):
-                age = now - n.last_seen
                 if self._origin_pubkey and n.public_key.lower() == self._origin_pubkey:
                     continue
-                # [v3.12] Proteção absoluta contra exclusão de validadores
                 if n.trust_score >= SCORE_PROTECTED:
                     continue
-                if age > max_age_s:
-                    to_remove.append((nid, age))
+                if (now - n.last_seen) > max_age_s:
+                    to_remove.append((nid, now - n.last_seen))
 
             for nid, age in to_remove:
-                log.info("[TrustNetwork] Auto-limpeza: removido fantasma %s… (inativo há %ds)",
+                log.info("[TrustNetwork] Auto-limpeza: removido %s… (inativo %ds)",
                          nid[:12], int(age))
                 del self.nodes[nid]
 
             if to_remove:
                 self._mark_dirty()
-                self.flush()
 
         return len(to_remove)
 
@@ -332,7 +325,6 @@ class TrustNetwork:
                 pk = (n.public_key or "").strip().lower()
                 if pk and pk == self._origin_pubkey:
                     continue
-                # [v3.12] Proteção absoluta contra exclusão de validadores
                 if n.trust_score >= SCORE_PROTECTED:
                     continue
                 if (now - n.last_seen) > NODE_TTL_SECONDS:
@@ -340,8 +332,6 @@ class TrustNetwork:
 
             for nid in to_remove:
                 del self.nodes[nid]
-                log.info("[TrustNetwork] pruned %s… (offline >%ds)",
-                         nid[:12], NODE_TTL_SECONDS)
 
             if to_remove:
                 self._mark_dirty()
@@ -349,69 +339,88 @@ class TrustNetwork:
         return len(to_remove)
 
     def _mark_dirty(self) -> None:
+        # [FIX v3.13] Apenas marca. O flush é feito pela thread de background.
         self._dirty = True
         if not self.is_origin:
             self._dirty_local = True
-        agora = time.time()
-        if agora - self._last_flush > FLUSH_INTERVAL_S:
-            self.flush()
 
     def flush(self) -> None:
+        # [FIX v3.13] Escreve atômicamente e não bloqueia leituras.
         with self._lock:
             if not self._dirty and not self._dirty_local:
                 return
 
             self._prune_inactive()
 
+            # Copia os dados para fora do lock
             data = {
                 "nodes": {nid: n.to_dict() for nid, n in self.nodes.items()},
                 "last_decay_time": self.last_decay_time,
                 "active_validators": list(self.active_validators),
                 "last_rotation_height": self._last_rotation_height,
             }
+            is_origin = self.is_origin
+            node_sk = self.node_sk
+            data_file = self.data_file
+            local_file = self.local_file
 
-            if not self.is_origin:
-                try:
-                    data["saved_at"] = time.time()
-                    data["client_written"] = True
-                    with open(self.local_file, "w", encoding="utf-8") as f:
-                        json.dump(data, f, indent=2, ensure_ascii=False)
-                    
-                    # [FIX v3.12] Salva também no principal para a GUI/scripts lerem
-                    with open(self.data_file, "w", encoding="utf-8") as f:
-                        json.dump(data, f, indent=2, ensure_ascii=False)
-                        
+        # Escreve no disco FORA do lock
+        if not is_origin:
+            try:
+                data["saved_at"] = time.time()
+                data["client_written"] = True
+                
+                # Escrita atômica local
+                tmp_local = local_file.with_suffix(f".tmp.{os.getpid()}")
+                with open(tmp_local, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                os.replace(tmp_local, local_file)
+
+                # Escrita atômica principal
+                tmp_main = data_file.with_suffix(f".tmp.{os.getpid()}")
+                with open(tmp_main, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                os.replace(tmp_main, data_file)
+                
+                with self._lock:
                     self._dirty_local = False
                     self._last_flush = time.time()
-                except Exception as e:
-                    log.error("[TrustNetwork] flush local falhou: %s", e)
-                return
+            except Exception as e:
+                log.error("[TrustNetwork] flush local falhou: %s", e)
+            return
 
+        try:
+            if node_sk is not None:
+                payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                sig = node_sk.sign(payload)
+                data["signature"] = sig.hex()
+                data["origin_pubkey"] = node_sk.public_key().public_bytes_raw().hex()
+
+            data["saved_at"] = time.time()
+
+            # Escrita atômica no Origin
+            tmp_main = data_file.with_suffix(f".tmp.{os.getpid()}")
+            with open(tmp_main, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_main, data_file)
+
+            tmp_local = local_file.with_suffix(f".tmp.{os.getpid()}")
             try:
-                if self.node_sk is not None:
-                    payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
-                    sig = self.node_sk.sign(payload)
-                    data["signature"] = sig.hex()
-                    data["origin_pubkey"] = self.node_sk.public_key().public_bytes_raw().hex()
-
-                data["saved_at"] = time.time()
-
-                with open(self.data_file, "w", encoding="utf-8") as f:
+                with open(tmp_local, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
+                os.replace(tmp_local, local_file)
+            except Exception:
+                pass
 
-                try:
-                    with open(self.local_file, "w", encoding="utf-8") as f:
-                        json.dump(data, f, indent=2, ensure_ascii=False)
-                except Exception:
-                    pass
-
+            with self._lock:
                 self._dirty = False
                 self._dirty_local = False
                 self._last_flush = time.time()
-            except Exception as e:
-                log.error("[TrustNetwork] flush falhou: %s", e)
+        except Exception as e:
+            log.error("[TrustNetwork] flush falhou: %s", e)
 
     def shutdown(self) -> None:
+        self._stop_flush.set()
         self.flush()
 
     def _load(self) -> None:
@@ -440,7 +449,6 @@ class TrustNetwork:
                             log.warning("[TrustNetwork] Origem ignorando falha de assinatura.")
                 else:
                     if not self.is_origin:
-                        # [FIX v3.12] Aceita se foi escrito por cliente
                         if client_written:
                             log.info("[TrustNetwork] main carregado (escrito por cliente)")
                         else:
@@ -459,6 +467,8 @@ class TrustNetwork:
                     self.active_validators = set(data.get("active_validators", []))
                     self._last_rotation_height = int(data.get("last_rotation_height", 0))
                 log.info("[TrustNetwork] main carregado — %d nós", len(self.nodes))
+            except json.JSONDecodeError as e:
+                log.error("[TrustNetwork] ARQUIVO CORROMPIDO (JSON): %s. Iniciando vazio.", e)
             except Exception as e:
                 log.error("[TrustNetwork] load main falhou: %s", e)
 
