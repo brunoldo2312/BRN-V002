@@ -14,13 +14,13 @@ class PoolManager:
         self.current_job = None
         self._generate_job()
 
-    def _generate_job(self):
+    def _generate_job(self, miner_address="brn1pooladdressplaceholder"):
         with self.lock:
             height = self.chain.db.height() + 1
             prev_hash = self.chain.db.tip_hash()
             reward = self.chain.current_reward(height)
-            # Endereço placeholder para o pool (será substituído pelo bloco real)
-            coinbase = make_coinbase("brn1pooladdressplaceholder", "0"*66, reward, height)
+            # [FIX CRÍTICO] Usa o endereço real do minerador no coinbase
+            coinbase = make_coinbase(miner_address, "0"*66, reward, height)
             txs = [coinbase] + self.chain.db.all_mempool(limit=100)
             merkle = compute_merkle_root(txs)
             diff = self.chain.current_difficulty()
@@ -32,7 +32,8 @@ class PoolManager:
                 "timestamp": int(time.time()),
                 "difficulty": diff,
                 "share_difficulty": max(1, diff - 1),
-                "txs": txs
+                "txs": txs,
+                "miner_address": miner_address
             }
 
     def register(self, address, pubkey, miner_id=None):
@@ -47,8 +48,11 @@ class PoolManager:
             if miner_id not in self.miners:
                 return {"ok": False, "msg": "miner desconhecido"}
             self.miners[miner_id]["last_seen"] = time.time()
-            if not self.current_job or time.time() - self.current_job["timestamp"] > 30:
-                self._generate_job()
+            
+            # [FIX] Gera o job com o endereço de quem pediu
+            miner_addr = self.miners[miner_id]["address"]
+            self._generate_job(miner_addr)
+            
             return {"ok": True, "job": self.current_job}
 
     def submit_share(self, miner_id, nonce, hash_hex):
@@ -74,11 +78,11 @@ class PoolManager:
                     "hash": hash_hex,
                     "transactions": job["txs"]
                 }
-                # Tenta aceitar o bloco na blockchain local (Origin)
                 try:
                     ok, msg = self.chain.accept_block(block)
                     if ok:
-                        self._generate_job()
+                        # Gera o próximo job para o mesmo minerador
+                        self._generate_job(job.get("miner_address", "brn1pooladdressplaceholder"))
                         return {"ok": True, "block_found": True, "msg": "bloco aceito"}
                     else:
                         log.warning(f"Bloco minerado rejeitado: {msg}")
