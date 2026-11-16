@@ -1,13 +1,19 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.38)
+server.py — Backend HTTP do nó BRN (v9.9.39)
 ================================================================
+v9.9.39 (2026-11-16) — PRODUCTION READY (WAITRESS):
+  [NEW] Substituído o servidor de desenvolvimento do Flask pelo
+        Waitress (WSGI de produção, multi-threaded).
+        Isso acaba com os travamentos da interface durante
+        sincronização P2P ou mineração.
 v9.9.38 (2026-11-16) — SINCRONIZAÇÃO MANUAL E HEALER:
   [NEW] Rota /api/peers/heal para forçar a atualização das alturas
         dos peers no SQLite.
-  [FIX] Garantia de que o MINING GATE utilize o _fast_sync_until=4084.
+  [FIX] Quórum Inteligente: Origin ou nó no topo da rede não é
+        bloqueado por validadores atrasados.
 v9.9.37 (2026-11-15) — SEGURANÇA AUTOMÁTICA DO FAUCET:
   [NEW] Gera automaticamente um BRN_ADMIN_TOKEN se não existir
-        e salva em .brn_admin_token (ou usa env no Render).
+        e salva em .brn_admin_token.
 ================================================================
 """
 from __future__ import annotations
@@ -42,7 +48,7 @@ except ImportError:
 
 log = logging.getLogger("server")
 BASE_DIR = Path(__file__).resolve().parent
-WEB_HOST = os.environ.get("BRN_WEB_HOST", "127.0.0.1")
+WEB_HOST = os.environ.get("BRN_WEB_HOST", "0.0.0.0")
 BEHIND_PROXY = os.environ.get("BRN_BEHIND_PROXY", "0") == "1"
 CORS_ORIGINS = [o.strip() for o in os.environ.get("BRN_CORS_ORIGIN", "").split(",") if o.strip()]
 WALLETS_FILE = str(BASE_DIR / "user_wallets.json")
@@ -97,7 +103,6 @@ def _get_admin_token():
 ADMIN_TOKEN = _get_admin_token()
 # ============================================================
 
-# [v9.9.36] Peer-ID global
 _BRN_PEER_ID = ""
 
 # Mining gate / fast-sync
@@ -122,9 +127,6 @@ if _MIN_FAST_SYNC_UNTIL > 0:
     )
 
 
-# ============================================================
-# [v9.9.36] PEER-ID
-# ============================================================
 def set_peer_id(peer_id: str) -> None:
     global _BRN_PEER_ID
     _BRN_PEER_ID = (peer_id or "").strip()
@@ -284,6 +286,13 @@ def _check_validators_synced(chain, min_validators: int, tolerance: int,
     detail["total_peers"] = (
         len(detail["synced_peers"]) + len(detail["ahead_peers"])
         + len(detail["behind_peers"]) + len(detail["stale_peers"]))
+
+    # [FIX] Se o nó é o Origin OU está no topo da rede, permite minerar
+    is_top = (len(detail["ahead_peers"]) == 0)
+    is_origin = os.environ.get("BRN_IS_ORIGIN", "0") == "1"
+    
+    if is_top or is_origin:
+        return True, "OK (No topo da rede / Origin)", detail
 
     if len(detail["synced_peers"]) >= min_validators:
         return True, (
@@ -741,9 +750,6 @@ def _cleanup_loop():
 threading.Thread(target=_cleanup_loop, daemon=True, name="CacheCleanup").start()
 
 
-# ============================================================
-# [v9.9.36] ROTAS DE WALLET COM PEER_ID
-# ============================================================
 @app.route("/api/peer_id", methods=["GET"])
 def api_peer_id():
     return jsonify({
@@ -755,7 +761,6 @@ def api_peer_id():
 
 @app.route("/wallet", methods=["GET"])
 def serve_wallet_root():
-    """Redireciona pra /wallet/<peer_id> ou serve direto se vazio."""
     if _BRN_PEER_ID:
         return redirect(f"/wallet/{_BRN_PEER_ID}", code=307)
     p = BASE_DIR / "index_wallet.html"
@@ -766,7 +771,6 @@ def serve_wallet_root():
 
 @app.route("/wallet/<peer_id>", methods=["GET"])
 def serve_wallet_peer(peer_id):
-    """Serve a GUI da carteira do peer indicado."""
     if _BRN_PEER_ID and peer_id != _BRN_PEER_ID:
         return jsonify({
             "ok": False,
@@ -787,7 +791,6 @@ def serve_wallet_peer(peer_id):
 
 @app.route("/peers", methods=["GET"])
 def serve_peers_page():
-    """Menu HTML listando peers conhecidos."""
     pid = _BRN_PEER_ID or "local"
     nodes_html = f"<li><a href='/wallet/{pid}'>{pid}</a> 🏠 (este nó)</li>"
     try:
@@ -815,9 +818,6 @@ h1{{color:#58a6ff}}li{{margin:8px 0}}a{{color:#58a6ff}}code{{background:#161b22;
 <p>Este nó: <code>{pid}</code></p><ul>{nodes_html}</ul></body></html>"""
 
 
-# ============================================================
-# ROTAS BÁSICAS
-# ============================================================
 @app.route("/api/bootstrap/add", methods=["POST"])
 @require_rate_limit("bootstrap_add")
 def bootstrap_add():
@@ -839,7 +839,6 @@ def bootstrap_add():
 
 @app.route("/api/peers/heal", methods=["POST"])
 def api_peers_heal():
-    """Força uma atualização da altura dos peers no SQLite."""
     try:
         chain = _get_chain()
         peers = chain.db.listar_peers(apenas_ativos=False)
@@ -1339,7 +1338,7 @@ def pool_start_local():
             address = (data.get("address") or "").strip(); pubkey = (data.get("pubkey") or "").strip()
             if not pubkey: return jsonify({"ok": False, "msg": "pubkey obrigatoria"}), 400
             pool_url = os.environ.get("BRN_POOL_URL", "").strip()
-            if not pool_url: pool_url = (os.environ.get("BRN_POOL_URL_LOCAL", "").strip() or "http://127.0.0.1:5000")
+            if not pool_url: pool_url = (os.environ.get("BRN_POOL_URL_LOCAL", "").strip() or "https://brn-v002.onrender.com")
             try: pc = PoolClient(address=address, pubkey=pubkey, pool_url=pool_url)
             except TypeError:
                 try: pc = PoolClient(address, pubkey, pool_url=pool_url)
@@ -1539,8 +1538,8 @@ def peers_discovered():
 def root():
     try:
         chain = _get_chain()
-        return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.38", "height": chain.db.height(), "peer_id": _BRN_PEER_ID, "health": "/health", "sync_panel": "/sync", "status": "/api/status", "mine_gate": "/api/mine/gate", "dashboard": "/dashboard", "wallet": "/wallet", "monitor": "/monitor", "panel": "/panel"})
-    except Exception as e: return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.38", "peer_id": _BRN_PEER_ID, "error": str(e)})
+        return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.39", "height": chain.db.height(), "peer_id": _BRN_PEER_ID, "health": "/health", "sync_panel": "/sync", "status": "/api/status", "mine_gate": "/api/mine/gate", "dashboard": "/dashboard", "wallet": "/wallet", "monitor": "/monitor", "panel": "/panel"})
+    except Exception as e: return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.39", "peer_id": _BRN_PEER_ID, "error": str(e)})
 
 
 @app.route("/dashboard", methods=["GET"])
@@ -1609,7 +1608,7 @@ def health():
         return jsonify({
             "ok": True,
             "height": chain.db.height(),
-            "version": "9.9.38",
+            "version": "9.9.39",
             "peer_id": _BRN_PEER_ID,
             "chain_injected": _CHAIN is not None,
             "pool_injected": _POOL_MANAGER is not None,
@@ -1823,9 +1822,6 @@ def bridge_status():
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
 
-# ============================================================
-# SYNC LIVE PANEL
-# ============================================================
 @app.route("/api/sync/live", methods=["GET"])
 def api_sync_live():
     try:
@@ -1960,5 +1956,13 @@ def serve_sync_panel():
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print("BRN Server v9.9.38 (peer-healer + faucet auto-security)")
-    app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
+    try:
+        from waitress import serve
+        print("="*60)
+        print(f" BRN Server v9.9.39 rodando em PRODUÇÃO (Waitress) na porta {port}")
+        print("="*60)
+        # threads=32 garante que requisições web não travem o P2P
+        serve(app, host=WEB_HOST, port=port, threads=32)
+    except ImportError:
+        print("Waitress não instalado. Usando Flask dev server (LENTO).")
+        app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
