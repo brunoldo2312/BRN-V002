@@ -3,7 +3,7 @@
 v7.2 (2026-11-12) — GATE DE MINERAÇÃO NO CLIENT:
   [NEW] _check_gates(): consulta /api/status e /health do pool e
         decide se pode minerar. Critérios:
-          1. pool_height >= BRN_POOL_FAST_SYNC_UNTIL (default 6000)
+          1. pool_height >= BRN_POOL_FAST_SYNC_UNTIL (default 4084)
           2. pool health: wallet_sk_installed == True
           3. pool health: validators_ready (quando exposto;
              senão assume OK para compat com server < v9.9.33)
@@ -19,7 +19,7 @@ v7.2 (2026-11-12) — GATE DE MINERAÇÃO NO CLIENT:
         (server copia o dict).
   [NEW] _http_get(): helper.
   [NEW] Env:
-          BRN_POOL_FAST_SYNC_UNTIL (default 6000)
+          BRN_POOL_FAST_SYNC_UNTIL (default 4084)
           BRN_POOL_GATE_POLL_INTERVAL (default 30s)
   [KEEP] v7.1: start_mining não-bloqueante, auto re-register,
         detecção de job desconhecido.
@@ -174,13 +174,13 @@ class PoolClient(threading.Thread):
     def _check_gates(self) -> tuple:
         """
         Consulta o pool e decide se pode minerar.
-
         Retorna (ok: bool, reason: str, detail: dict).
         """
         try:
-            fast_sync_until = int(os.environ.get("BRN_POOL_FAST_SYNC_UNTIL", "6000"))
+            # [FIX] Default alterado para 4084
+            fast_sync_until = int(os.environ.get("BRN_POOL_FAST_SYNC_UNTIL", "4084"))
         except (ValueError, TypeError):
-            fast_sync_until = 6000
+            fast_sync_until = 4084
 
         detail = {
             "pool_url": self.pool_url,
