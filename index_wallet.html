@@ -1403,6 +1403,7 @@ async function gerarCarteira() {
   }
 }
 
+// [FIX v3.21] Atualiza o endereço na caixa verde assim que a carteira é carregada/gerada
 function renderCarteira() {
   if (!wallet.address) return;
   $("walletBox").style.display = "block";
@@ -1412,6 +1413,10 @@ function renderCarteira() {
   $("wPub").textContent  = wallet.public_key;
   $("txFrom").value = wallet.address;
   $("brToBrn").value = wallet.address;
+  
+  // NOVO: Mostra o endereço no alvo de mineração imediatamente
+  const mt = $("minerTarget");
+  if (mt) mt.textContent = wallet.address;
 }
 
 async function atualizarSaldo() {
@@ -1533,14 +1538,14 @@ async function enviar() {
 }
 
 // ============================================================
-// MINERAÇÃO LOCAL (ATUALIZADO)
+// MINERAÇÃO LOCAL
 // ============================================================
 async function minerar() {
   clearMsg("mMine");
   if (!wallet.address) { msg("mMine", "❌ Gere/carregue uma carteira.", "err"); return; }
   if (miningBusy) return;
 
-  // [NOVO] Verifica se o nó tem blockchain antes de minerar solo
+  // Verifica se o nó tem blockchain antes de minerar solo
   try {
     const st = await api("node_status");
     const height = st.height || 0;
@@ -1548,7 +1553,6 @@ async function minerar() {
     if (height <= 0) {
       msg("mMine", "⚠️ Nó sem blockchain local. Redirecionando para o Pool...", "warn", 5000);
       
-      // Espera 1.5s para o usuário ler a mensagem e chama a função de pool
       setTimeout(async () => {
         await minerarPool();
       }, 1500);
@@ -1562,7 +1566,6 @@ async function minerar() {
     return;
   }
 
-  // Se chegou aqui, tem blockchain. Segue com mineração solo normal.
   try {
     const poolSt = await api("pool_status");
     if (poolSt && poolSt.running) {
@@ -1596,6 +1599,9 @@ async function minerar() {
       if (r && r.ok) {
         msg("mMine", "⛏️ Mineração LOCAL (Solo) iniciada.", "ok", 6000);
         miningRunning = true;
+        // [FIX v3.21] Garante que a caixa verde mostra o endereço
+        const mt = $("minerTarget");
+        if (mt) mt.textContent = wallet.address;
       } else {
         msg("mMine", "❌ " + ((r && r.msg) || "falha ao iniciar"), "err");
       }
@@ -1652,6 +1658,9 @@ async function minerarPool() {
       const r = await api("pool_start_mining", wallet.address, wallet.public_key);
       if (r && r.ok) {
         msg("mPool", "🌐 Ligado ao pool! Minerando com a pool da rede.", "ok", 6000);
+        // [FIX v3.21] Garante que a caixa verde mostra o endereço
+        const mt = $("minerTarget");
+        if (mt) mt.textContent = wallet.address;
       } else {
         msg("mPool", "❌ " + ((r && r.msg) || "falha ao ligar ao pool"), "err");
       }
@@ -1693,8 +1702,15 @@ async function updateMiningUI() {
       $("miningUptime").textContent = fmtUptime(st.uptime || 0);
       const hr = (st.hashrate_khs != null) ? st.hashrate_khs : ((st.hashrate || 0) / 1000);
       $("miningHashrate").textContent = Number(hr).toFixed(2);
+      
+      // [FIX v3.21] Se está minerando, mostra o endereço ativo
+      const mt = $("minerTarget");
+      if (mt) mt.textContent = st.address || wallet.address || "—";
     } else {
       box.classList.remove("show");
+      // [FIX v3.21] Se parou, mostra o endereço da carteira (se tiver)
+      const mt = $("minerTarget");
+      if (mt) mt.textContent = wallet.address || "—";
     }
   } catch (e) { /* silencioso */ }
 
@@ -2034,7 +2050,7 @@ async function boot() {
   setInterval(async () => {
     try {
       const d = await api("sync_info");
-      const forking = !!(d && d.sync && d.syncing === false && d.sync.forking);
+      const forking = !!(d && d.sync && d.sync.syncing === false && d.sync.forking);
       $("forkBanner").classList.toggle("show", forking);
       if (forking) {
         $("dot").className = "dot fork";
