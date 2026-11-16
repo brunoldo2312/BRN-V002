@@ -1,6 +1,10 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.37)
+server.py — Backend HTTP do nó BRN (v9.9.38)
 ================================================================
+v9.9.38 (2026-11-16) — SINCRONIZAÇÃO MANUAL E HEALER:
+  [NEW] Rota /api/peers/heal para forçar a atualização das alturas
+        dos peers no SQLite.
+  [FIX] Garantia de que o MINING GATE utilize o _fast_sync_until=4084.
 v9.9.37 (2026-11-15) — SEGURANÇA AUTOMÁTICA DO FAUCET:
   [NEW] Gera automaticamente um BRN_ADMIN_TOKEN se não existir
         e salva em .brn_admin_token (ou usa env no Render).
@@ -833,6 +837,36 @@ def bootstrap_add():
     except Exception as e: return jsonify({"ok": False, "msg": str(e)}), 500
 
 
+@app.route("/api/peers/heal", methods=["POST"])
+def api_peers_heal():
+    """Força uma atualização da altura dos peers no SQLite."""
+    try:
+        chain = _get_chain()
+        peers = chain.db.listar_peers(apenas_ativos=False)
+        updated = 0
+        for p in peers:
+            addr = (p.get("address") or "").strip()
+            if not addr or ":" not in addr: continue
+            ip, port_s = addr.rsplit(":", 1)
+            if ip.startswith("127.") or ip == "0.0.0.0": continue
+            try:
+                port = int(port_s)
+                from p2p_unified import P2PClient
+                resp, _ = P2PClient.send_message(ip, port, {"type": "get_chain_height"}, timeout=2.0)
+                if resp:
+                    h = int(resp.get("height", 0) or 0)
+                    node_id = p.get("node_id") or addr
+                    genesis = p.get("genesis_hash") or ""
+                    chain.db.upsert_peer(node_id, addr, genesis, height=h)
+                    updated += 1
+            except Exception:
+                pass
+        _invalidate_mining_gate_cache()
+        return jsonify({"ok": True, "updated": updated, "msg": f"{updated} peers atualizados no banco de dados."}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
 @app.route("/api/nova-carteira", methods=["POST"])
 @require_rate_limit("nova_carteira")
 def nova_carteira():
@@ -1505,8 +1539,8 @@ def peers_discovered():
 def root():
     try:
         chain = _get_chain()
-        return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.36", "height": chain.db.height(), "peer_id": _BRN_PEER_ID, "health": "/health", "sync_panel": "/sync", "status": "/api/status", "mine_gate": "/api/mine/gate", "dashboard": "/dashboard", "wallet": "/wallet", "monitor": "/monitor", "panel": "/panel"})
-    except Exception as e: return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.36", "peer_id": _BRN_PEER_ID, "error": str(e)})
+        return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.38", "height": chain.db.height(), "peer_id": _BRN_PEER_ID, "health": "/health", "sync_panel": "/sync", "status": "/api/status", "mine_gate": "/api/mine/gate", "dashboard": "/dashboard", "wallet": "/wallet", "monitor": "/monitor", "panel": "/panel"})
+    except Exception as e: return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.38", "peer_id": _BRN_PEER_ID, "error": str(e)})
 
 
 @app.route("/dashboard", methods=["GET"])
@@ -1575,7 +1609,7 @@ def health():
         return jsonify({
             "ok": True,
             "height": chain.db.height(),
-            "version": "9.9.36",
+            "version": "9.9.38",
             "peer_id": _BRN_PEER_ID,
             "chain_injected": _CHAIN is not None,
             "pool_injected": _POOL_MANAGER is not None,
@@ -1926,5 +1960,5 @@ def serve_sync_panel():
 
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print("BRN Server v9.9.37 (peer-id + faucet auto-security)")
+    print("BRN Server v9.9.38 (peer-healer + faucet auto-security)")
     app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
