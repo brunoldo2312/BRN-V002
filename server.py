@@ -97,7 +97,7 @@ ADMIN_TOKEN = _get_admin_token()
 _BRN_PEER_ID = ""
 
 # Mining gate / fast-sync
-_MIN_FAST_SYNC_UNTIL = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "6000") or "0")
+_MIN_FAST_SYNC_UNTIL = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "4084") or "0")
 _MIN_VALIDATORS_FOR_MINING = max(1, int(os.environ.get("BRN_MIN_VALIDATORS_FOR_MINING", "1") or "1"))
 _VALIDATOR_HEIGHT_TOLERANCE = max(0, int(os.environ.get("BRN_VALIDATOR_HEIGHT_TOLERANCE", "1") or "1"))
 _VALIDATOR_MAX_AGE_S = max(30, int(os.environ.get("BRN_VALIDATOR_MAX_AGE_S", "300") or "300"))
@@ -605,9 +605,9 @@ def _build_sign_info(chain) -> dict:
             "name": "BRN_FAST_SYNC_UNTIL",
             "required": False,
             "set": bool(os.environ.get("BRN_FAST_SYNC_UNTIL", "").strip()),
-            "value_masked": os.environ.get("BRN_FAST_SYNC_UNTIL", "6000"),
+            "value_masked": os.environ.get("BRN_FAST_SYNC_UNTIL", "4084"),
             "description": "Altura até a qual pular validação completa (PoW/merkle/sigs). "
-                           "Default 6000. Só afeta o boot — se o DB já passou, não ativa.",
+                           "Default 4084. Só afeta o boot — se o DB já passou, não ativa.",
         },
     ]
 
