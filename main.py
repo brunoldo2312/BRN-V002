@@ -1,8 +1,23 @@
-"""main.py — Entrypoint do nó BRN (v13.9.23 - CORRIGIDO)
+"""main.py — Entrypoint do nó BRN (v13.9.22)
 ================================================================
-Correções aplicadas:
-1. Força BRN_MIN_VALIDATORS_FOR_MINING=0 no código para destravar a mineração.
-2. Não tenta mais pedir permissão para o servidor local (evita HTTP 409).
+v13.9.23 — AUTO-HEALER DE PEERS (CONSENSO):
+  [NEW] Thread _peer_healer_loop rodando a cada 15s.
+        Ela pinga os peers via P2P, descobre a altura real e
+        atualiza o SQLite, destravando o Mining Gate sem
+        precisar de scripts externos.
+v13.9.22 (2026-11-14) — DESCOBERTA AUTOMÁTICA DE PEERS (TAILSCALE):
+  [NEW] Ao iniciar, o nó chama auto_discovery.auto_configure_bootstrap()
+        para listar todos os IPs online na rede Tailscale e adicioná-los
+        automaticamente ao BRN_BOOTSTRAP_PEERS. Não precisa mais 
+        configurar IPs manualmente no .env ao adicionar novos computadores.
+v13.9.21 — CONSENSO DE ALTURA (SYNC REAL):
+  [FIX] O sistema não depende mais cegamente do bloco 6000 para 
+        considerar o nó "sincronizado". Se a altura local já for
+        igual à altura do Origin/Validadores (± tolerância), o 
+        Gate 2 do Auto-Mine é liberado e a UI mostra 100%.
+v13.9.20 — SOLUÇÃO 2: caminho único de carteira por peer:
+  [NEW] PEER_ID = sha256(pubkey)[:16] derivado logo após carregar
+        node_identity. Injetado em os.environ["BRN_PEER_ID"].
 ================================================================
 """
 from __future__ import annotations
@@ -25,8 +40,8 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.23"
-    BUILD_DATE = "2026-11-16"
+    VERSION = "13.9.22"
+    BUILD_DATE = "2026-11-14"
 
 try:
     from isolation_detector import IsolationDetector
@@ -182,9 +197,9 @@ def _resolve_fast_sync_until(args) -> int:
         except (ValueError, TypeError):
             pass
     try:
-        return max(0, int(os.environ.get("BRN_FAST_SYNC_UNTIL", "6000")))
+        return max(0, int(os.environ.get("BRN_FAST_SYNC_UNTIL", "4084")))
     except (ValueError, TypeError):
-        return 6000
+        return 4084
 
 
 def _maybe_enable_fast_sync(fast_sync_until: int, args) -> None:
@@ -309,6 +324,67 @@ def _verify_validators_synced(chain, min_validators: int = 1,
         f"total={details['total_peers']})"
     ), details
 
+# ============================================================
+# PEER HEALER (O Forçador de Consenso Integrado)
+# ============================================================
+def _peer_healer_loop(chain, p2p, stop_evt: threading.Event, interval: int = 15):
+    """
+    Thread que roda em background para garantir que a tabela 'peers' 
+    no SQLite esteja sempre com as alturas reais (P2P) e 'last_seen' atualizado.
+    Isso destrava o Mining Gate sem precisar de scripts externos.
+    """
+    log = logging.getLogger("main")
+    log.info("[Peer-Healer] iniciado (interval=%ds)", interval)
+    
+    if not p2p:
+        log.warning("[Peer-Healer] P2P não inicializado — healer inativo.")
+        return
+
+    while not stop_evt.wait(interval):
+        try:
+            local_h = int(chain.db.height())
+            if local_h < 0:
+                continue
+            
+            peers = chain.db.listar_peers(apenas_ativos=False)
+            for p in peers:
+                addr = (p.get("address") or "").strip()
+                if not addr or ":" not in addr:
+                    continue
+                ip, port_s = addr.rsplit(":", 1)
+                if ip.startswith("127.") or ip == "0.0.0.0":
+                    continue
+                
+                try:
+                    port = int(port_s)
+                    from p2p_unified import P2PClient
+                    
+                    # Pinga o peer rapidamente
+                    resp, _ = P2PClient.send_message(ip, port, {"type": "get_chain_height"}, timeout=3.0)
+                    if resp:
+                        h = int(resp.get("height", 0) or 0)
+                        if h >= 0:
+                            node_id = p.get("node_id") or addr
+                            genesis = p.get("genesis_hash") or ""
+                            version = p.get("version") or "?"
+                            is_miner = bool(p.get("is_miner", False))
+                            public_key = p.get("public_key") or ""
+                            
+                            # Atualiza o SQLite via fila do Writer
+                            chain.db.upsert_peer(
+                                node_id=node_id, address=addr, genesis_hash=genesis,
+                                version=version, height=h, is_miner=is_miner,
+                                public_key=public_key
+                            )
+                            
+                            if abs(h - local_h) <= 1:
+                                log.info(f"[Peer-Healer] Peer {addr} sincronizado em {h} (local={local_h})")
+                            else:
+                                log.debug(f"[Peer-Healer] Peer {addr} altura {h} (local={local_h})")
+                except Exception as e:
+                    log.debug(f"[Peer-Healer] Falha ao pingar {addr}: {e}")
+        except Exception as e:
+            log.debug(f"[Peer-Healer] Erro no loop: {e}")
 
 # ============================================================
 # Identidade
@@ -952,7 +1028,7 @@ def _ping_origin(timeout: float = 3.0) -> bool:
             import urllib.request
             req = urllib.request.Request(
                 f"{pool_url}/api/status",
-                headers={"User-Agent": "brn-main/13.9.23"},
+                headers={"User-Agent": "brn-main/13.9.22"},
             )
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.status == 200
@@ -1172,16 +1248,19 @@ def _force_http_sync_loop(chain, pool_url, stop_evt):
 
 
 # ============================================================
-# AUTO-MINE com 4 gates (CORRIGIDO v13.9.23)
+# AUTO-MINE com 4 gates
 # ============================================================
 def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
                      stop_evt: threading.Event,
-                     fast_sync_until: int = 6000) -> None:
+                     fast_sync_until: int = 4084) -> None:
     log = logging.getLogger("main")
     log.info("[AUTO-MINE] loop iniciado (fast_sync_until=%d)", fast_sync_until)
 
-    # TRAVA REMOVIDA: Força 0 para permitir minerar sozinho
-    MIN_VALIDATORS = max(0, int(os.environ.get("BRN_MIN_VALIDATORS_FOR_MINING", "0")))
+    try:
+        MIN_VALIDATORS = max(1, int(os.environ.get(
+            "BRN_MIN_VALIDATORS_FOR_MINING", "1")))
+    except (ValueError, TypeError):
+        MIN_VALIDATORS = 1
 
     try:
         TOLERANCE = max(0, int(os.environ.get(
@@ -1234,6 +1313,8 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
 
             # Gate 2: altura (Fast-Sync)
             if fast_sync_until > 0 and local_h < fast_sync_until:
+                # [NOVO v13.9.21] Se já estamos sincronizados com o Origin, 
+                # ignoramos a espera do fast_sync_until.
                 origin_synced = False
                 if _HAS_REQUESTS and pool_url:
                     try:
@@ -1334,7 +1415,7 @@ def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
                         break
                     continue
 
-            # Gate 4: validadores (Aqui a mágica acontece, 0 é aceito)
+            # Gate 4: validadores
             ok_val, reason_val, detail_val = _verify_validators_synced(
                 chain,
                 min_validators=MIN_VALIDATORS,
@@ -1481,9 +1562,9 @@ def _status_reporter_loop(chain, stop_evt: threading.Event,
                 n_synced = 0
 
             try:
-                fast_until = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "6000"))
+                fast_until = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "4084"))
             except (ValueError, TypeError):
-                fast_until = 6000
+                fast_until = 4084
                 
             if fast_until > 0 and h < fast_until:
                 if h >= 0 and target_h > 0 and h >= target_h - 1:
@@ -1525,7 +1606,7 @@ def _status_reporter_loop(chain, stop_evt: threading.Event,
 def _auto_configure(chain, p2p, trust, web_port: int, is_origin: bool,
                      stop_evt: threading.Event,
                      force_auto_mine: bool = False,
-                     fast_sync_until: int = 6000) -> None:
+                     fast_sync_until: int = 4084) -> None:
     log = logging.getLogger("main")
     sk_hex, address, pubkey, source = _resolve_validator_sk()
 
@@ -1539,7 +1620,7 @@ def _auto_configure(chain, p2p, trust, web_port: int, is_origin: bool,
     })
 
     log.info("=" * 64)
-    log.info(" [SK RESOLUTION v13.9.23]")
+    log.info(" [SK RESOLUTION v13.9.22]")
     log.info("=" * 64)
     log.info("  source           : %s", source or "(nenhum)")
     log.info("  SK_HEX len       : %d", len(sk_hex) if sk_hex else 0)
@@ -1624,7 +1705,7 @@ def _auto_configure(chain, p2p, trust, web_port: int, is_origin: bool,
 def _delayed_auto_configure(chain, p2p, trust, web_port: int, is_origin: bool,
                              stop_evt: threading.Event,
                              force_auto_mine: bool = False,
-                             fast_sync_until: int = 6000) -> None:
+                             fast_sync_until: int = 4084) -> None:
     try:
         time.sleep(3)
         _auto_configure(
@@ -1860,6 +1941,13 @@ def main() -> int:
         target=_wallet_watchdog_loop,
         args=(chain, p2p, trust, _stop_bg, 30),
         daemon=True, name="Wallet-Watchdog",
+    ).start()
+
+    # INICIA O PEER-HEALER AQUI
+    threading.Thread(
+        target=_peer_healer_loop,
+        args=(chain, p2p, _stop_bg, 15),
+        daemon=True, name="Peer-Healer",
     ).start()
 
     threading.Thread(
