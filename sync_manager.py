@@ -4,7 +4,7 @@ sync_manager.py — Sincronização + Reorg automático + Aguarda Origin (v9.4.1
 v9.4.1 (2026-11-13) — PAINEL HONESTO SOBRE FAST-SYNC:
   [FIX] get_status() agora NÃO reporta synced=True quando o nó ainda
         está abaixo de BRN_FAST_SYNC_UNTIL. Antes, num cliente com
-        DB em 4520 e fast-sync até 6000, target=local (só 1 peer, ele
+        DB em 3000 e fast-sync até 4084, target=local (só 1 peer, ele
         mesmo) → synced=True, progress=100%. O painel /sync e
         /api/sync/status mostravam "sincronizado" enquanto a mineração
         continuava bloqueada pelo mining gate (que checa
@@ -13,7 +13,7 @@ v9.4.1 (2026-11-13) — PAINEL HONESTO SOBRE FAST-SYNC:
         /api/sync/status (que passa por aqui).
   [FIX] get_status() retorna fast_sync_active, fast_sync_until e
         fast_sync_percent para o painel /sync poder exibir
-        banner "Fast-sync até #6000 (4520/6000 = 75.3%)".
+        banner "Fast-sync até #4084 (3000/4084 = 73.4%)".
   [FIX] sync_trust_network() docstring movida para o topo (estava
         depois do `if is_origin: return False`, virando string morta
         que o Python ignora).
@@ -63,8 +63,8 @@ ORIGIN_WAIT_TIMEOUT  = float(os.environ.get("BRN_ORIGIN_TIMEOUT_S", "0"))  # 0 =
 CONVERGENCE_CYCLES   = int(os.environ.get("BRN_CONVERGENCE_CYCLES", "3"))
 CONVERGENCE_INTERVAL = float(os.environ.get("BRN_CONVERGENCE_INTERVAL", "10"))
 
-# [v9.4.1] Fast-sync awareness
-FAST_SYNC_UNTIL = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "0") or "0")
+# [v9.4.1] Fast-sync awareness (Default alterado para 4084)
+FAST_SYNC_UNTIL = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "4084") or "4084")
 
 try:
     from blockchain import block_hash as _block_hash_fn, meets_difficulty as _meets_diff_fn
@@ -1031,7 +1031,7 @@ class ChainSyncManager:
         fast_until = self._fast_sync_until
         # Se o env mudou depois do __init__, respeitamos
         try:
-            runtime = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "0") or "0")
+            runtime = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "4084") or "4084")
             if runtime > 0:
                 fast_until = runtime
         except (TypeError, ValueError):
@@ -1091,7 +1091,7 @@ class ChainSyncManager:
             "waiting_origin":      self.status.waiting_origin,
             "convergence_cycles":  self.status.convergence_cycles,
             # [v9.4.1] Fast-sync (o painel /sync usa isso para exibir
-            # banner "Fast-sync até #6000: 4520/6000 = 75.3%")
+            # banner "Fast-sync até #4084: 3000/4084 = 73.4%")
             "fast_sync_active":    fast_active,
             "fast_sync_until":     fast_until,
             "fast_sync_percent":   fast_pct,
