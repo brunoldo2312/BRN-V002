@@ -1,471 +1,556 @@
-"""
-miner_loop.py — Loop de mineração do BRN (v7.3)
+"""miner_pool_client.py — Pool client BRN (v7.2)
 ================================================================
-v7.3 (2026-11-16) — CONSENSO ROBUSTO:
-  [NEW] _network_is_ready() agora lê o SQLite (chain.db) em vez
-        do cache P2P, respeitando o Peer-Healer.
-  [NEW] Deadlock Breaker: se o nó local estiver no topo da rede,
-        ele ignora o quórum e minera para destravar a rede.
+v7.2 (2026-11-12) — GATE DE MINERAÇÃO NO CLIENT:
+  [NEW] _check_gates(): consulta /api/status e /health do pool e
+        decide se pode minerar. Critérios:
+          1. pool_height >= BRN_POOL_FAST_SYNC_UNTIL (default 4084)
+          2. pool health: wallet_sk_installed == True
+          3. pool health: validators_ready (quando exposto;
+             senão assume OK para compat com server < v9.9.33)
+        Retorna (ok, reason, detail).
+  [NEW] start_mining() não minera imediatamente. Spawna
+        _loop_gate_wait (30s). As threads de mineração
+        (_loop_heartbeat, _loop_work, run/PoW) só sobem quando os
+        gates passam. Se gates caem depois, as threads param
+        via _mining_active.clear() e _loop_gate_wait re-spawna
+        quando voltam.
+  [NEW] status() inclui waiting_for_gates, gate_reason,
+        gate_detail. /api/pool/local_status expõe isso direto
+        (server copia o dict).
+  [NEW] _http_get(): helper.
+  [NEW] Env:
+          BRN_POOL_FAST_SYNC_UNTIL (default 4084)
+          BRN_POOL_GATE_POLL_INTERVAL (default 30s)
+  [KEEP] v7.1: start_mining não-bloqueante, auto re-register,
+        detecção de job desconhecido.
 ================================================================
 """
+from __future__ import annotations
 import os
-import json
 import time
+import json
+import uuid
+import logging
 import threading
-import traceback
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-from typing import Optional
+import urllib.error
 
-try:
-    from brn_logger import get_logger
-    def _log(msg): get_logger("miner").info(msg)
-    def _log_dbg(msg): get_logger("miner").debug(msg)
-except Exception:
-    def _log(msg): print(f"[Miner] {msg}", flush=True)
-    def _log_dbg(msg): pass
+from blockchain import block_hash, target_from_difficulty
 
-print(f"[Miner] Modulo carregado: {os.path.abspath(__file__)}", flush=True)
+log = logging.getLogger("pool.client")
+__version__ = "7.2"
 
-MINER_INTERVAL      = int(os.environ.get("BRN_MINER_INTERVAL", "30"))
-MINER_AUTO          = os.environ.get("BRN_MINER_AUTO", "1") == "1"
-IS_ORIGIN           = os.environ.get("BRN_IS_ORIGIN", "0") == "1"
+_INSTANCE = None
+_INSTANCE_LOCK = threading.RLock()
 
-BASE_DIR                 = Path(__file__).resolve().parent
-CURRENT_WALLET_ENC_FILE  = str(BASE_DIR / "current_wallet.enc")
-CURRENT_WALLET_FILE      = str(BASE_DIR / "current_wallet.json")
 
-FORK_POLL_INTERVAL = float(os.environ.get("BRN_FORK_POLL_INTERVAL", "0.5"))
+def get_pool_client(address: str = None, pubkey: str = None) -> 'PoolClient':
+    global _INSTANCE
+    with _INSTANCE_LOCK:
+        if _INSTANCE is not None:
+            return _INSTANCE
+        if not address or not pubkey:
+            return None
+        _INSTANCE = PoolClient(address, pubkey)
+        return _INSTANCE
 
-BOOTSTRAP_HTTP_PORT_DEFAULT = int(os.environ.get("BRN_BOOTSTRAP_HTTP_PORT", "5000"))
-BOOTSTRAP_TIMEOUT_S = float(os.environ.get("BRN_BOOTSTRAP_TIMEOUT", "5.0"))
-BOOTSTRAP_MAX_FAILS = int(os.environ.get("BRN_BOOTSTRAP_MAX_FAILS", "3"))
-BOOTSTRAP_COOLDOWN_S = float(os.environ.get("BRN_BOOTSTRAP_COOLDOWN_S", "60"))
-BOOTSTRAP_LOG_INTERVAL_S = float(os.environ.get("BRN_BOOTSTRAP_LOG_INTERVAL", "60"))
 
-_MINER_INSTANCE = None
-_MINER_LOCK = threading.Lock()
+def set_pool_client(pc):
+    global _INSTANCE
+    with _INSTANCE_LOCK:
+        _INSTANCE = pc
 
-def get_miner(chain):
-    global _MINER_INSTANCE
-    with _MINER_LOCK:
-        if _MINER_INSTANCE is None:
-            _MINER_INSTANCE = Miner(chain)
-        else:
-            _MINER_INSTANCE.chain = chain
-        return _MINER_INSTANCE
 
-def _senha_sessao() -> str:
-    return (os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
-            or os.environ.get("BRN_NODE_PASSWORD", "").strip())
-
-def _ler_carteira_aberta():
-    senha = _senha_sessao()
-    if senha:
-        try:
-            from secure_store import load_current_wallet
-            r = load_current_wallet(senha)
-            if r and r.get("ok"):
-                addr = (r.get("address") or "").strip()
-                pub  = (r.get("pub_hex") or r.get("public_key") or r.get("pubkey") or "").strip()
-                if addr.startswith("brn1"):
-                    return {"address": addr, "pubkey": pub}
-        except Exception as e:
-            _log(f"_ler_carteira_aberta(.enc) falhou: {e}")
-
-    try:
-        p = Path(CURRENT_WALLET_FILE)
-        if p.exists():
-            with p.open("r", encoding="utf-8") as f:
-                d = json.load(f)
-            addr = (d.get("address") or "").strip()
-            pub  = (d.get("pub_hex") or d.get("pubkey") or d.get("public_key") or "").strip()
-            if addr.startswith("brn1"):
-                return {"address": addr, "pubkey": pub}
-    except Exception:
-        pass
-
-    return {}
-
-def _pubkey_no_db(bc, addr):
-    try:
-        utxos = bc.db.get_utxos(addr)
-        for u in utxos:
-            pk = (u.get("pubkey") or "").strip()
-            if pk and set(pk) != {"0"}:
-                return pk
-    except Exception:
-        pass
-    return ""
-
-def _parse_peer_endpoint(peer: str) -> Optional[tuple]:
-    if not peer or ":" not in peer: return None
-    s = peer.strip()
-    scheme = "http"
-    if "/" in s:
-        s, _, scheme_part = s.partition("/")
-        scheme = (scheme_part or "http").strip().lower()
-        if scheme not in ("http", "https"): return None
-    parts = s.split(":")
-    if len(parts) == 2:
-        host, p2p_s = parts
-        http_s = str(BOOTSTRAP_HTTP_PORT_DEFAULT)
-    elif len(parts) == 3:
-        host, p2p_s, http_s = parts
-    else:
-        return None
-    try:
-        p2p_port = int(p2p_s)
-        http_port = int(http_s)
-    except ValueError:
-        return None
-    if not (1 <= p2p_port <= 65535 and 1 <= http_port <= 65535): return None
-    if not host or len(host) > 255: return None
-    return host, p2p_port, http_port, scheme
-
-class Miner:
-    def __init__(self, chain):
-        self.chain = chain
-        self._thread = None
-        self._stop_evt = threading.Event()
-        self.address = ""
-        self.pubkey = ""
-        self.running = False
-        self.blocks_mined = 0
-        self.last_error = ""
-        self.last_height = None
-        self.started_at = 0.0
-        self.fork_aborts = 0
-        self.last_fork_at = 0.0
-        self._fork_aborts_for_signal = False
-        self.is_origin = IS_ORIGIN
-        self._bootstrap_fails: dict = {}
-        self._bootstrap_lock = threading.Lock()
-        self._last_queue_log = 0.0
-        self._last_queue_value = -1
-        
-        self.hashrate = 0.0
-        self.last_block_dt = 0.0
-
-    def start(self, address, pubkey_hex="", is_origin: Optional[bool] = None):
-        if self.running: return False, "ja rodando"
-        if not address: return False, "endereco obrigatorio"
-        if not pubkey_hex: pubkey_hex = _pubkey_no_db(self.chain, address)
-        if not pubkey_hex:
-            msg = f"pubkey desconhecida para {address} (receba uma tx antes)"
-            self.last_error = msg
-            _log(msg)
-            return False, msg
-
-        if is_origin is not None: self.is_origin = bool(is_origin)
-
-        self.address = address
-        self.pubkey = pubkey_hex
-        self.blocks_mined = 0
-        self.last_error = ""
-        self.last_height = None
-        self.started_at = time.time()
-        self.fork_aborts = 0
-        self.last_fork_at = 0.0
-        self._fork_aborts_for_signal = False
-        self._stop_evt.clear()
-        self.running = True
-        self.hashrate = 0.0
-        self.last_block_dt = 0.0
-
-        self._thread = threading.Thread(target=self._loop, daemon=True, name="Miner")
-        self._thread.start()
-        _log(f"Miner iniciado | addr={address[:16]}... | pub={pubkey_hex[:16]}... | is_origin={self.is_origin}")
-        return True, "iniciado"
-
-    def stop(self):
-        if not self.running: return False, "nao estava rodando"
-        self._stop_evt.set()
-        self.running = False
-        _log(f"Miner parado (total={self.blocks_mined})")
-        return True, "parado"
-
-    def status(self):
-        uptime = int(time.time() - self.started_at) if self.started_at else 0
-        fork_sig = getattr(self.chain, "_fork_signal", None)
-        forking = bool(fork_sig and fork_sig.is_set())
-
-        status_msg = ""
-        if not self.chain.rede_descentralizada and not self.is_origin:
-            status_msg = f"Aguardando Fila ({len(self.chain.fila_mineracao)}/20)"
-        elif not self.chain.rede_descentralizada and self.is_origin:
-            status_msg = "Validador (Bootstrap)"
-        else:
-            status_msg = "Descentralizada"
-
-        with self._bootstrap_lock:
-            n_peers = len(self._bootstrap_fails)
-            n_blocked = sum(1 for e in self._bootstrap_fails.values() if e.get("blocked_until", 0) > time.time())
-
-        return {
-            "running": self.running, "address": self.address, "pubkey": self.pubkey,
-            "blocks_mined": self.blocks_mined, "height": self.chain.db.height(),
-            "difficulty": self.chain.current_difficulty(), "last_error": self.last_error,
-            "count": self.blocks_mined, "last_height": self.last_height, "uptime": uptime,
-            "fork_aborts": self.fork_aborts, "last_fork_ago_s": (int(time.time() - self.last_fork_at) if self.last_fork_at else None),
-            "fork_in_progress": forking, "bootstrap_status": status_msg,
-            "rede_descentralizada": self.chain.rede_descentralizada, "is_origin": self.is_origin,
-            "bootstrap_peers_tracked": n_peers, "bootstrap_peers_blocked": n_blocked,
-            "hashrate_khs": round(self.hashrate / 1000.0, 2),
-            "hashrate": round(self.hashrate, 2),
-        }
-
-    def _network_is_ready(self) -> tuple[bool, str]:
-        """
-        [v7.3] Validação robusta usando SQLite (Peer-Healer) e
-        Deadlock Breaker.
-        """
-        try:
-            local_h = self.chain.db.height()
-            max_peer_h = local_h
-            
-            # [FIX] Lê do SQLite (atualizado pelo Peer-Healer) em vez do cache P2P
-            peers = self.chain.db.listar_peers(apenas_ativos=False)
-            for p in peers:
-                if not isinstance(p, dict): continue
-                addr = (p.get("address") or "").strip()
-                if not addr or addr.startswith("127.") or addr == "0.0.0.0": continue
-                
-                ph = int(p.get("height", 0) or 0)
-                ls = float(p.get("last_seen", 0) or 0)
-                # Considera apenas peers ativos (vistos nos últimos 5 min)
-                if ls > 0 and (time.time() - ls) < 300:
-                    if ph > max_peer_h: max_peer_h = ph
-                    
-            if max_peer_h > local_h + 2:
-                return False, f"Sincronizando (Local: {local_h}, Rede: {max_peer_h})"
-                
-            # Deadlock Breaker: Se estamos no topo, não bloqueia por quórum
-            if local_h >= max_peer_h:
-                return True, "OK (No topo da rede)"
-                
-        except Exception as e:
-            _log_dbg(f"Falha ao checar altura dos peers no SQLite: {e}")
-
-        try:
-            validators = self.chain._get_active_validators()
-            if validators:
-                required = self.chain._required_signatures(validators)
-                trust = getattr(self.chain, "trust_net", None)
-                if trust and hasattr(trust, "nodes"):
-                    online_validators = 0
-                    for pk in validators:
-                        node = trust.nodes.get(pk)
-                        if node and getattr(node, "connected", False):
-                            online_validators += 1
-                    if online_validators < required:
-                        # Se o Origin estiver online, ele quebra o deadlock
-                        if self.is_origin:
-                             return True, "OK (Origin bypass quorum)"
-                        return False, f"Sem quórum para minerar (Validadores online: {online_validators}/{required})"
-        except Exception as e:
-            _log_dbg(f"Falha ao checar quórum de validadores: {e}")
-
-        return True, "OK"
-
-    def _should_continue(self) -> bool:
-        if self._stop_evt.is_set(): return False
-        fork_sig = getattr(self.chain, "_fork_signal", None)
-        if fork_sig is not None and fork_sig.is_set():
-            if not self._fork_aborts_for_signal:
-                self.fork_aborts += 1
-                self.last_fork_at = time.time()
-                _log("[FORK] abortando bloco atual — reorg em andamento")
-                self._fork_aborts_for_signal = True
+def stop_pool_client() -> bool:
+    global _INSTANCE
+    with _INSTANCE_LOCK:
+        if _INSTANCE is None:
             return False
-        self._fork_aborts_for_signal = False
+        if _INSTANCE.is_running():
+            _INSTANCE.stop_mining()
         return True
 
-    def _peer_is_blocked(self, key: str) -> bool:
-        with self._bootstrap_lock:
-            e = self._bootstrap_fails.get(key)
-            return e and e.get("blocked_until", 0) > time.time()
 
-    def _peer_record_fail(self, key: str) -> None:
-        now = time.time()
-        with self._bootstrap_lock:
-            e = self._bootstrap_fails.setdefault(key, {"fails": 0, "blocked_until": 0})
-            e["fails"] = e.get("fails", 0) + 1
-            if e["fails"] >= BOOTSTRAP_MAX_FAILS:
-                e["blocked_until"] = now + BOOTSTRAP_COOLDOWN_S
-                _log(f"[BOOTSTRAP] {key} bloqueado por {BOOTSTRAP_COOLDOWN_S:.0f}s ({e['fails']} falhas)")
-
-    def _peer_record_success(self, key: str) -> None:
-        with self._bootstrap_lock:
-            self._bootstrap_fails.pop(key, None)
-
-    def _load_bootstrap_peers(self) -> list:
+def _http_get(url, timeout=10):
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
         try:
-            from brn_config import get_config
-            cfg = get_config()
-            peers = cfg.get("bootstrap_peers", []) if cfg else []
-            if peers: return [str(p).strip() for p in peers if str(p).strip()]
-        except Exception: pass
-        env = os.environ.get("BRN_BOOTSTRAP_PEERS", "")
-        return [p.strip() for p in env.split(",") if p.strip()]
+            return json.loads(e.read().decode("utf-8"))
+        except Exception:
+            return {"ok": False, "msg": f"HTTP {e.code}"}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
 
-    def _enviar_para_fila(self) -> bool:
-        peers = self._load_bootstrap_peers()
-        if not peers:
-            self._log_bootstrap_status("Sem peers de bootstrap configurados", 0, force=True)
-            return False
 
-        endpoints = []
-        for p in peers:
-            ep = _parse_peer_endpoint(p)
-            if ep: endpoints.append((p, ep))
-
-        if not endpoints: return False
-
-        body = json.dumps({"address": self.address, "pubkey": self.pubkey}).encode("utf-8")
-
-        def _call_one(item):
-            raw, (host, _p2p, http_port, scheme) = item
-            key = f"{host}:{http_port}/{scheme}"
-            if self._peer_is_blocked(key): return (item, None, "cooldown")
-            url = f"{scheme}://{host}:{http_port}/api/bootstrap/add"
-            try:
-                req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
-                with urllib.request.urlopen(req, timeout=BOOTSTRAP_TIMEOUT_S) as resp:
-                    return (item, json.loads(resp.read().decode("utf-8")), None)
-            except Exception as e:
-                return (item, None, str(e))
-
-        results = []
-        if len(endpoints) == 1:
-            results = [_call_one(endpoints[0])]
-        else:
-            with ThreadPoolExecutor(max_workers=min(len(endpoints), 8)) as ex:
-                results = list(ex.map(_call_one, endpoints))
-
-        confirmed_desc = False
-        best_queue = 0
-        for item, data, err in results:
-            raw_peer, (host, _p2p, http_port, scheme) = item
-            key = f"{host}:{http_port}/{scheme}"
-            if err:
-                if err != "cooldown": self._peer_record_fail(key)
-                continue
-            if not data or not data.get("ok"):
-                self._peer_record_fail(key)
-                continue
-            self._peer_record_success(key)
-            fila = int(data.get("fila_tamanho", 0) or 0)
-            desc = bool(data.get("rede_descentralizada", False))
-            if fila > best_queue: best_queue = fila
-            if desc: confirmed_desc = True
-
-        if confirmed_desc:
-            if not self.chain.rede_descentralizada:
-                self.chain.rede_descentralizada = True
-                try: self.chain.db.set_meta("rede_descentralizada", "1")
-                except Exception: pass
-            return True
-
-        self._log_bootstrap_status(f"Aguardando descentralização (fila máx: {best_queue}/20)", best_queue)
-        return False
-
-    def _log_bootstrap_status(self, msg: str, queue: int, force: bool = False) -> None:
-        now = time.time()
-        if force or (queue != self._last_queue_value) or (now - self._last_queue_log >= BOOTSTRAP_LOG_INTERVAL_S):
-            _log(f"[BOOTSTRAP] {msg}")
-            self._last_queue_log = now
-            self._last_queue_value = queue
-
-    def _loop(self):
+def _http_post(url, data, timeout=10):
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(data).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
         try:
-            db_flag = self.chain.db.get_meta("rede_descentralizada")
-            if db_flag is not None and str(db_flag) in ("1", "true", "True"):
-                if not self.chain.rede_descentralizada:
-                    self.chain.rede_descentralizada = True
-                    _log("[BOOT] rede_descentralizada=1 lido do DB")
-        except Exception: pass
+            return json.loads(e.read().decode("utf-8"))
+        except Exception:
+            return {"ok": False, "msg": f"HTTP {e.code}"}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
 
-        while not self._stop_evt.is_set():
+
+class HashrateMeter:
+    def __init__(self, window=10.0):
+        self.window = window
+        self._samples = []
+        self._lock = threading.Lock()
+
+    def add(self, total_hashes):
+        now = time.time()
+        with self._lock:
+            self._samples.append((now, int(total_hashes)))
+            cutoff = now - self.window
+            self._samples = [(t, h) for (t, h) in self._samples if t >= cutoff]
+
+    def rate(self):
+        with self._lock:
+            if len(self._samples) < 2:
+                return 0.0
+            t0, h0 = self._samples[0]
+            t1, h1 = self._samples[-1]
+            dt = t1 - t0
+            if dt <= 0:
+                return 0.0
+            return max(0.0, (h1 - h0) / dt)
+
+
+class PoolClient(threading.Thread):
+    def __init__(self, address: str, pubkey: str,
+                 pool_url: str = None, miner_id: str = None):
+        super().__init__(daemon=True, name="Pool-Client")
+        global _INSTANCE
+        with _INSTANCE_LOCK:
+            if _INSTANCE is None:
+                _INSTANCE = self
+
+        self.address = address
+        self.pubkey = pubkey
+        default_url = "http://127.0.0.1:5000"
+        self.pool_url = (pool_url or os.environ.get("BRN_POOL_URL", default_url)).rstrip("/")
+        self.miner_id = miner_id or uuid.uuid4().hex[:12]
+
+        self._stop = threading.Event()
+        self._running = False
+        self._lock = threading.RLock()
+
+        # [v7.2] Estado de gate
+        self._mining_active = threading.Event()  # só minera quando setado
+        self._gate_reason = "not_checked"
+        self._gate_detail = {}
+        self._mining_threads_spawned = False
+
+        self.hashrate_meter = HashrateMeter()
+        self.hashes_total = 0
+        self.shares_submitted = 0
+        self.shares_accepted = 0
+        self.shares_rejected = 0
+        self.blocks_found = 0
+        self.last_share_at = 0.0
+        self.last_block_at = 0.0
+        self.last_error = ""
+        self.started_at = 0.0
+
+        self._job = None
+        self._job_lock = threading.RLock()
+
+    # --------------------------------------------------------
+    # [v7.2] Gate
+    # --------------------------------------------------------
+    def _check_gates(self) -> tuple:
+        """
+        Consulta o pool e decide se pode minerar.
+        Retorna (ok: bool, reason: str, detail: dict).
+        """
+        try:
+            # [FIX] Default alterado para 4084
+            fast_sync_until = int(os.environ.get("BRN_POOL_FAST_SYNC_UNTIL", "4084"))
+        except (ValueError, TypeError):
+            fast_sync_until = 4084
+
+        detail = {
+            "pool_url": self.pool_url,
+            "fast_sync_until": fast_sync_until,
+            "pool_height": -1,
+            "pool_sk_installed": None,
+            "validators_ready": None,
+            "fast_sync_active": None,
+        }
+
+        # 1. Altura + status do pool
+        try:
+            r = _http_get(f"{self.pool_url}/api/status", timeout=5.0)
+            if not isinstance(r, dict):
+                return False, "pool_status_invalid", detail
+            if r.get("error"):
+                return False, f"pool_status_error:{r['error']}", detail
+            detail["pool_height"] = int(r.get("height", -1) or -1)
+        except Exception as e:
+            detail["error"] = str(e)
+            return False, "pool_offline", detail
+
+        # 2. Gate de altura (fast-sync)
+        if fast_sync_until > 0 and detail["pool_height"] < fast_sync_until:
+            return False, f"fast_sync_below_{fast_sync_until}", detail
+
+        # 3. Consulta /health (SK + validadores)
+        try:
+            h = _http_get(f"{self.pool_url}/health", timeout=5.0)
+            if isinstance(h, dict):
+                detail["pool_sk_installed"] = bool(h.get("wallet_sk_installed", False))
+
+                # sk_validation (main.py v13.9.17 expõe)
+                sk_val = h.get("sk_validation") or {}
+                if isinstance(sk_val, dict):
+                    detail["fast_sync_active"] = bool(sk_val.get("fast_sync_active", False))
+                    if sk_val.get("local_height") is not None:
+                        # usa a altura mais atualizada
+                        try:
+                            lh = int(sk_val.get("local_height"))
+                            if lh > detail["pool_height"]:
+                                detail["pool_height"] = lh
+                        except (ValueError, TypeError):
+                            pass
+                    if "validators_ready" in sk_val:
+                        detail["validators_ready"] = bool(sk_val["validators_ready"])
+                    if sk_val.get("validators_reason"):
+                        detail["validators_reason"] = sk_val["validators_reason"]
+
+                # validators (server v9.9.33 expõe)
+                val = h.get("validators") or {}
+                if isinstance(val, dict) and "validators_ready" in val:
+                    detail["validators_ready"] = bool(val["validators_ready"])
+                elif isinstance(val, dict) and "n_active" in val:
+                    # fallback: se n_active > 0, considera OK
+                    try:
+                        detail["validators_ready"] = int(val.get("n_active", 0)) > 0
+                    except (ValueError, TypeError):
+                        pass
+        except Exception as e:
+            # /health indisponível: não bloqueia (compat com server antigo)
+            detail["health_error"] = str(e)
+
+        # 4. Gate de SK
+        if detail["pool_sk_installed"] is False:
+            return False, "pool_no_sk", detail
+
+        # 5. Gate de validadores (só se explicitamente False)
+        if detail["validators_ready"] is False:
+            return False, "validators_not_synced", detail
+
+        return True, "gates_ok", detail
+
+    # --------------------------------------------------------
+    # Ciclo de vida
+    # --------------------------------------------------------
+    def start_mining(self) -> tuple:
+        """
+        [v7.2] Não minera imediatamente. Spawna _loop_gate_wait.
+        As threads de mineração só sobem quando os gates passam.
+        """
+        if self._running:
+            return False, "ja rodando"
+
+        self._stop.clear()
+        self._mining_active.clear()
+        self._running = True
+        self.started_at = time.time()
+        self._mining_threads_spawned = False
+        self._gate_reason = "checking"
+
+        threading.Thread(target=self._loop_gate_wait, daemon=True,
+                         name="Pool-Gate").start()
+
+        log.info("pool client: iniciado (miner_id=%s) — aguardando gates",
+                 self.miner_id)
+        return True, "iniciado (aguardando gates)"
+
+    def stop_mining(self) -> tuple:
+        if not self._running:
+            return False, "nao estava rodando"
+        self._stop.set()
+        self._mining_active.clear()
+        self._running = False
+        try:
+            _http_post(f"{self.pool_url}/api/pool/disconnect",
+                       {"miner_id": self.miner_id})
+        except Exception:
+            pass
+        log.info("pool client: parado")
+        return True, "parado"
+
+    def is_running(self) -> bool:
+        return self._running
+
+    def is_mining(self) -> bool:
+        """[v7.2] True só quando gates passaram E thread de PoW está viva."""
+        return self._running and self._mining_active.is_set()
+
+    # --------------------------------------------------------
+    # Loop de gate: espera gates → spawna mineração
+    # --------------------------------------------------------
+    def _loop_gate_wait(self):
+        """
+        Re-checa gates a cada POLL_GATE_S. Quando passam, spawna as
+        threads de mineração (uma vez). Se caem, para as threads
+        via _mining_active.clear() e marca como não-spawned para
+        re-spawnar quando voltarem.
+        """
+        try:
+            poll_gate_s = float(os.environ.get("BRN_POOL_GATE_POLL_INTERVAL", "30"))
+        except (ValueError, TypeError):
+            poll_gate_s = 30.0
+        poll_gate_s = max(5.0, poll_gate_s)
+
+        gate_ok_prev = False
+
+        # Primeira checagem imediata
+        while not self._stop.is_set():
             try:
-                if self.chain.db.height() < 0:
-                    if self._stop_evt.wait(timeout=5): break
-                    continue
+                ok, reason, detail = self._check_gates()
+                self._gate_reason = reason
+                self._gate_detail = detail
 
-                if not self.pubkey:
-                    self.running = False
-                    return
-
-                if not self.is_origin and not self.chain.rede_descentralizada:
-                    t_call = time.time()
-                    self._enviar_para_fila()
-                    if self._stop_evt.wait(timeout=max(1.0, 15.0 - (time.time() - t_call))): break
-                    continue
-
-                fork_sig = getattr(self.chain, "_fork_signal", None)
-                if fork_sig is not None and fork_sig.is_set():
-                    waited = 0.0
-                    while fork_sig.is_set() and waited < 60.0 and not self._stop_evt.is_set():
-                        if self._stop_evt.wait(FORK_POLL_INTERVAL): break
-                        waited += FORK_POLL_INTERVAL
-                    if self._stop_evt.is_set(): break
-                    continue
-
-                ready, reason = self._network_is_ready()
-                if not ready:
-                    self.last_error = reason
-                    _log(f"[MINER] Pausado: {reason}")
-                    if self._stop_evt.wait(5.0): break
-                    continue
-
-                self.last_error = ""
-                _t0 = time.time()
-                block = self.chain.mine_block_interruptible(
-                    self.address, self.pubkey, should_continue=self._should_continue,
-                )
-                
-                if block is not None:
-                    _dt = time.time() - _t0
-                    self.last_block_dt = _dt
-                    if _dt > 0:
-                        diff = block.get("difficulty", self.chain.current_difficulty())
-                        expected_hashes = 16 ** diff
-                        self.hashrate = expected_hashes / _dt
-
-                if block is None:
-                    if self._stop_evt.is_set(): break
-                    continue
-
-                self.blocks_mined += 1
-                self.last_height = block.get("height")
-                _log(f"OK Bloco #{self.last_height} minerado (total={self.blocks_mined})")
-
-            except ValueError as e:
-                self.last_error = f"ValueError: {e}"
-                _log(f"Miner ValueError (retry em 5s): {e}")
-                if self._stop_evt.wait(timeout=5): break
-                continue
+                if ok and not gate_ok_prev:
+                    log.info("pool client: ✅ gates OK (%s) — iniciando mineração",
+                             reason)
+                    self._mining_active.set()
+                    if not self._mining_threads_spawned:
+                        self._spawn_mining_threads()
+                        self._mining_threads_spawned = True
+                    gate_ok_prev = True
+                elif ok and gate_ok_prev:
+                    # Continua OK, sem log
+                    self._mining_active.set()
+                elif not ok:
+                    if gate_ok_prev:
+                        log.warning("pool client: ⚠️ gates caíram (%s) — "
+                                    "parando mineração", reason)
+                        self._mining_active.clear()
+                        self._mining_threads_spawned = False
+                    # Loga a primeira vez e a cada 10 polls
+                    elif self._gate_reason != "not_checked":
+                        pass  # já logado
+                    gate_ok_prev = False
             except Exception as e:
-                self.last_error = str(e)
-                _log(f"Miner exception: {e}")
-                traceback.print_exc()
-                if self._stop_evt.wait(timeout=3): break
+                log.warning("pool client: gate check falhou: %s", e)
 
-        self.running = False
-        _log("Miner loop encerrado")
+            if self._stop.wait(poll_gate_s):
+                break
 
-def loop_mineracao(chain, intervalo=None):
-    if not MINER_AUTO: return
-    time.sleep(5)
-    m = get_miner(chain)
-    w = _ler_carteira_aberta()
-    if w.get("address"):
-        m.start(w["address"], w.get("pubkey", ""))
+    def _spawn_mining_threads(self):
+        """
+        Spawna _loop_heartbeat, _loop_work e a thread `run` (PoW).
+        Chamado quando gates passam pela primeira vez.
+        """
+        threading.Thread(target=self._loop_heartbeat, daemon=True,
+                         name="Pool-HB").start()
+        threading.Thread(target=self._loop_work, daemon=True,
+                         name="Pool-Work").start()
+        if not self.is_alive():
+            try:
+                self.start()
+            except RuntimeError:
+                # já foi startado antes; spawna um novo wrapper
+                threading.Thread(target=self.run, daemon=True,
+                                 name="Pool-PoW").start()
 
-def iniciar_mineracao(chain, intervalo=None):
-    t = threading.Thread(target=loop_mineracao, args=(chain, intervalo), daemon=True, name="MinerLoop")
-    t.start()
-    return t
+    # --------------------------------------------------------
+    # Loops internos
+    # --------------------------------------------------------
+    def _loop_heartbeat(self):
+        # Registra ao iniciar
+        if not self._mining_active.is_set():
+            return
+        self._reregister()
 
-start_miner = start_mining = iniciar_miner = iniciar_miner_loop = iniciar_mineracao
+        while not self._stop.wait(5.0):
+            if not self._mining_active.is_set():
+                return
+            try:
+                h = self.hashrate_meter.rate()
+                r = _http_post(f"{self.pool_url}/api/pool/heartbeat", {
+                    "miner_id":     self.miner_id,
+                    "hashrate":     h,
+                    "hashes_total": self.hashes_total,
+                }, timeout=5.0)
+                if not r.get("ok"):
+                    msg = (r.get("msg") or "").lower()
+                    if "desconhecido" in msg:
+                        self._reregister()
+            except Exception:
+                pass
+
+    def _loop_work(self):
+        while not self._stop.wait(15.0):
+            if not self._mining_active.is_set():
+                return
+            try:
+                self._fetch_work()
+            except Exception:
+                pass
+
+    def _fetch_work(self):
+        r = _http_post(f"{self.pool_url}/api/pool/work",
+                       {"miner_id": self.miner_id})
+        if not r.get("ok"):
+            self.last_error = r.get("msg", "work falhou")
+            if "desconhecido" in self.last_error.lower():
+                self._reregister()
+            return
+        job = r.get("job") or {}
+        if "share_difficulty" not in job:
+            job["share_difficulty"] = job.get("share_diff", 4)
+        with self._job_lock:
+            if self._job is None or self._job.get("job_id") != job.get("job_id"):
+                self._job = job
+
+    def _reregister(self):
+        try:
+            r = _http_post(f"{self.pool_url}/api/pool/register", {
+                "miner_id": self.miner_id,
+                "address":  self.address,
+                "pubkey":   self.pubkey,
+            })
+            if r.get("ok"):
+                self.miner_id = r.get("miner_id", self.miner_id)
+                self._fetch_work()
+        except Exception:
+            pass
+
+    # --------------------------------------------------------
+    # PoW
+    # --------------------------------------------------------
+    def run(self):
+        # Espera o primeiro job
+        for _ in range(10):
+            if self._stop.is_set() or not self._mining_active.is_set():
+                return
+            try:
+                self._fetch_work()
+            except Exception:
+                pass
+            with self._job_lock:
+                if self._job:
+                    break
+            time.sleep(1.0)
+
+        nonce = 0
+        last_job_id = None
+
+        while not self._stop.is_set():
+            if not self._mining_active.is_set():
+                # Gates caíram; sai. _loop_gate_wait vai re-spawnar
+                # quando voltarem.
+                log.info("pool client: PoW pausado (gates caíram)")
+                return
+
+            with self._job_lock:
+                job = self._job
+
+            if not job:
+                time.sleep(1.0)
+                continue
+
+            if job.get("job_id") != last_job_id:
+                last_job_id = job.get("job_id")
+                nonce = 0
+
+            share_diff = int(job.get("share_difficulty", 4))
+            diff = int(job.get("difficulty", 5))
+            target_int = target_from_difficulty(share_diff)
+
+            prev = job["prev_hash"]
+            merkle = job["merkle"]
+            ts = int(job["timestamp"])
+
+            batch = 50000
+            for i in range(batch):
+                if self._stop.is_set() or not self._mining_active.is_set():
+                    break
+                h = block_hash(prev, merkle, ts, nonce, diff)
+
+                if int(h, 16) <= target_int:
+                    self.shares_submitted += 1
+                    self.last_share_at = time.time()
+
+                    r = _http_post(f"{self.pool_url}/api/pool/submit", {
+                        "miner_id": self.miner_id,
+                        "job_id":   job.get("job_id"),
+                        "nonce":    int(nonce),
+                        "hash":     h,
+                    })
+
+                    if r.get("ok"):
+                        self.shares_accepted += 1
+                        if r.get("block_found"):
+                            self.blocks_found += 1
+                            self.last_block_at = time.time()
+                            self._fetch_work()
+                            break
+                    else:
+                        self.shares_rejected += 1
+                        self.last_error = r.get("msg", "rejeitado")
+                        if ("job expirado" in self.last_error.lower()
+                                or "desconhecido" in self.last_error.lower()):
+                            self._fetch_work()
+                            break
+                nonce += 1
+
+            self.hashes_total += batch
+            self.hashrate_meter.add(self.hashes_total)
+
+    # --------------------------------------------------------
+    # Status
+    # --------------------------------------------------------
+    def status(self) -> dict:
+        with self._lock:
+            job = self._job or {}
+            sdiff = job.get("share_difficulty", 4)
+            mining_active = self._mining_active.is_set()
+            return {
+                "ok": True,
+                "running": self._running,
+                "mining_active": mining_active,
+                "waiting_for_gates": self._running and not mining_active,
+                "gate_reason": self._gate_reason,
+                "gate_detail": self._gate_detail,
+                "miner_id": self.miner_id,
+                "address": self.address,
+                "hashrate": round(self.hashrate_meter.rate(), 2),
+                "hashrate_khs": round(self.hashrate_meter.rate() / 1000, 3),
+                "hashes_total": self.hashes_total,
+                "shares_submitted": self.shares_submitted,
+                "shares_accepted": self.shares_accepted,
+                "shares_rejected": self.shares_rejected,
+                "blocks_found": self.blocks_found,
+                "uptime_s": (int(time.time() - self.started_at)
+                             if self.started_at else 0),
+                "last_error": self.last_error,
+                "job_id": job.get("job_id"),
+                "job_height": job.get("height"),
+                "pool_url": self.pool_url,
+                "share_difficulty": sdiff,
+                "active_share_difficulty": sdiff,
+                "job_share_diff": sdiff,
+            }
+
+
+try:
+    from mining_pool import PoolManager
+except Exception:
+    PoolManager = None
