@@ -1,14 +1,11 @@
 """
-miner_loop.py — Loop de mineração do BRN (v7.2)
+miner_loop.py — Loop de mineração do BRN (v7.3)
 ================================================================
-v7.2 (2026-11-10):
-  [NEW] Adicionado cálculo de Hashrate para Mineração Solo (Local).
-        Agora a GUI consegue exibir a velocidade (kH/s) baseada no
-        tempo gasto para encontrar o bloco e na dificuldade.
-  [NEW] _network_is_ready(): O minerador pausa se estiver
-        atrasado (esperando sync) ou se não houver quórum de
-        validadores online no Trust Network.
-  [KEEP] Toda a lógica de bootstrap, backoff, fila e forks.
+v7.3 (2026-11-16) — CONSENSO ROBUSTO:
+  [NEW] _network_is_ready() agora lê o SQLite (chain.db) em vez
+        do cache P2P, respeitando o Peer-Healer.
+  [NEW] Deadlock Breaker: se o nó local estiver no topo da rede,
+        ele ignora o quórum e minera para destravar a rede.
 ================================================================
 """
 import os
@@ -148,7 +145,6 @@ class Miner:
         self._last_queue_log = 0.0
         self._last_queue_value = -1
         
-        # Variáveis de Hashrate
         self.hashrate = 0.0
         self.last_block_dt = 0.0
 
@@ -216,26 +212,41 @@ class Miner:
             "fork_in_progress": forking, "bootstrap_status": status_msg,
             "rede_descentralizada": self.chain.rede_descentralizada, "is_origin": self.is_origin,
             "bootstrap_peers_tracked": n_peers, "bootstrap_peers_blocked": n_blocked,
-            # Hashrate
             "hashrate_khs": round(self.hashrate / 1000.0, 2),
             "hashrate": round(self.hashrate, 2),
         }
 
     def _network_is_ready(self) -> tuple[bool, str]:
+        """
+        [v7.3] Validação robusta usando SQLite (Peer-Healer) e
+        Deadlock Breaker.
+        """
         try:
             local_h = self.chain.db.height()
             max_peer_h = local_h
-            p2p = getattr(self.chain, "p2p", None)
-            if p2p and hasattr(p2p, "discovery"):
-                peers = p2p.discovery.listar_peers_com_altura()
-                if peers:
-                    for p in peers:
-                        h = int(p.get("height", 0) or 0)
-                        if h > max_peer_h: max_peer_h = h
+            
+            # [FIX] Lê do SQLite (atualizado pelo Peer-Healer) em vez do cache P2P
+            peers = self.chain.db.listar_peers(apenas_ativos=False)
+            for p in peers:
+                if not isinstance(p, dict): continue
+                addr = (p.get("address") or "").strip()
+                if not addr or addr.startswith("127.") or addr == "0.0.0.0": continue
+                
+                ph = int(p.get("height", 0) or 0)
+                ls = float(p.get("last_seen", 0) or 0)
+                # Considera apenas peers ativos (vistos nos últimos 5 min)
+                if ls > 0 and (time.time() - ls) < 300:
+                    if ph > max_peer_h: max_peer_h = ph
+                    
             if max_peer_h > local_h + 2:
                 return False, f"Sincronizando (Local: {local_h}, Rede: {max_peer_h})"
+                
+            # Deadlock Breaker: Se estamos no topo, não bloqueia por quórum
+            if local_h >= max_peer_h:
+                return True, "OK (No topo da rede)"
+                
         except Exception as e:
-            _log_dbg(f"Falha ao checar altura dos peers: {e}")
+            _log_dbg(f"Falha ao checar altura dos peers no SQLite: {e}")
 
         try:
             validators = self.chain._get_active_validators()
@@ -249,6 +260,9 @@ class Miner:
                         if node and getattr(node, "connected", False):
                             online_validators += 1
                     if online_validators < required:
+                        # Se o Origin estiver online, ele quebra o deadlock
+                        if self.is_origin:
+                             return True, "OK (Origin bypass quorum)"
                         return False, f"Sem quórum para minerar (Validadores online: {online_validators}/{required})"
         except Exception as e:
             _log_dbg(f"Falha ao checar quórum de validadores: {e}")
@@ -406,15 +420,11 @@ class Miner:
                     continue
 
                 self.last_error = ""
-                
-                # Início da contagem de tempo para o Hashrate
                 _t0 = time.time()
-                
                 block = self.chain.mine_block_interruptible(
                     self.address, self.pubkey, should_continue=self._should_continue,
                 )
                 
-                # Cálculo do Hashrate após minerar
                 if block is not None:
                     _dt = time.time() - _t0
                     self.last_block_dt = _dt
