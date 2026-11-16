@@ -1,44 +1,109 @@
-"""
-minerar_pool.py — Inicia mineração no pool para uma carteira específica.
-Roda com: python minerar_pool.py
-"""
-import json
-import urllib.request
-import urllib.error
+import time
+import uuid
+import logging
+import threading
+from blockchain import block_hash, compute_merkle_root, make_coinbase, meets_difficulty
 
-URL = "https://brn-v002.onrender.com/api/pool/start_local"
+log = logging.getLogger("pool")
 
-BODY = {
-    "address": "brn1ufzzzwu4ulwx5lygc67lfky5nye7tk2wytfjv0",
-    "pubkey":  "0248505dcf910a62775788220315a3ba02dab78f16f3cd83e37c3c16db896b9355",
-}
+class PoolManager:
+    def __init__(self, chain):
+        self.chain = chain
+        self.miners = {}
+        self.lock = threading.RLock()
+        self.current_job = None
+        self._generate_job()
 
-print("=" * 60)
-print(" Iniciando mineração no pool")
-print("=" * 60)
-print(f" URL:     {URL}")
-print(f" address: {BODY['address']}")
-print(f" pubkey:  {BODY['pubkey'][:32]}...")
-print()
+    def _generate_job(self):
+        with self.lock:
+            height = self.chain.db.height() + 1
+            prev_hash = self.chain.db.tip_hash()
+            reward = self.chain.current_reward(height)
+            # Endereço placeholder para o pool (será substituído pelo bloco real)
+            coinbase = make_coinbase("brn1pooladdressplaceholder", "0"*66, reward, height)
+            txs = [coinbase] + self.chain.db.all_mempool(limit=100)
+            merkle = compute_merkle_root(txs)
+            diff = self.chain.current_difficulty()
+            self.current_job = {
+                "job_id": uuid.uuid4().hex[:16],
+                "height": height,
+                "prev_hash": prev_hash,
+                "merkle": merkle,
+                "timestamp": int(time.time()),
+                "difficulty": diff,
+                "share_difficulty": max(1, diff - 1),
+                "txs": txs
+            }
 
-req = urllib.request.Request(
-    URL,
-    data=json.dumps(BODY).encode("utf-8"),
-    headers={"Content-Type": "application/json", "User-Agent": "brn-miner/1.0"},
-    method="POST",
-)
+    def register(self, address, pubkey, miner_id=None):
+        with self.lock:
+            if not miner_id:
+                miner_id = uuid.uuid4().hex[:12]
+            self.miners[miner_id] = {"address": address, "pubkey": pubkey, "last_seen": time.time()}
+            return {"ok": True, "miner_id": miner_id}
 
-try:
-    with urllib.request.urlopen(req, timeout=60) as r:
-        status = r.status
-        body = r.read().decode("utf-8")
-        print(f"[HTTP {status}]")
-        print(json.dumps(json.loads(body), indent=2, ensure_ascii=False))
-except urllib.error.HTTPError as e:
-    print(f"[HTTP {e.code}] erro:")
-    try:
-        print(json.dumps(json.loads(e.read().decode()), indent=2, ensure_ascii=False))
-    except Exception:
-        print(e.read().decode(errors="replace")[:500])
-except Exception as e:
-    print(f"[ERRO] {type(e).__name__}: {e}")
+    def get_work(self, miner_id):
+        with self.lock:
+            if miner_id not in self.miners:
+                return {"ok": False, "msg": "miner desconhecido"}
+            self.miners[miner_id]["last_seen"] = time.time()
+            if not self.current_job or time.time() - self.current_job["timestamp"] > 30:
+                self._generate_job()
+            return {"ok": True, "job": self.current_job}
+
+    def submit_share(self, miner_id, nonce, hash_hex):
+        with self.lock:
+            if miner_id not in self.miners:
+                return {"ok": False, "msg": "miner desconhecido"}
+            job = self.current_job
+            if not job:
+                return {"ok": False, "msg": "sem job ativo"}
+            
+            expected = block_hash(job["prev_hash"], job["merkle"], job["timestamp"], nonce, job["difficulty"])
+            if expected != hash_hex:
+                return {"ok": False, "msg": "hash invalido"}
+            
+            if meets_difficulty(hash_hex, job["difficulty"]):
+                block = {
+                    "height": job["height"],
+                    "prev_hash": job["prev_hash"],
+                    "merkle": job["merkle"],
+                    "timestamp": job["timestamp"],
+                    "nonce": nonce,
+                    "difficulty": job["difficulty"],
+                    "hash": hash_hex,
+                    "transactions": job["txs"]
+                }
+                # Tenta aceitar o bloco na blockchain local (Origin)
+                try:
+                    ok, msg = self.chain.accept_block(block)
+                    if ok:
+                        self._generate_job()
+                        return {"ok": True, "block_found": True, "msg": "bloco aceito"}
+                    else:
+                        log.warning(f"Bloco minerado rejeitado: {msg}")
+                        return {"ok": False, "msg": f"bloco rejeitado: {msg}"}
+                except Exception as e:
+                    return {"ok": False, "msg": str(e)}
+            return {"ok": True, "block_found": False}
+
+    def heartbeat(self, miner_id, hashrate, hashes_total):
+        with self.lock:
+            if miner_id in self.miners:
+                self.miners[miner_id]["last_seen"] = time.time()
+                self.miners[miner_id]["hashrate"] = hashrate
+                return {"ok": True}
+            return {"ok": False, "msg": "miner desconhecido"}
+
+    def disconnect(self, miner_id):
+        with self.lock:
+            self.miners.pop(miner_id, None)
+            return {"ok": True}
+
+    def stats(self):
+        with self.lock:
+            return {"ok": True, "miners": len(self.miners), "height": self.chain.db.height()}
+
+    def miners_list(self):
+        with self.lock:
+            return list(self.miners.values())
