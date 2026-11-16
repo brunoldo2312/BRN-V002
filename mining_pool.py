@@ -12,7 +12,8 @@ class PoolManager:
         self.miners = {}
         self.lock = threading.RLock()
         self.current_job = None
-        self._generate_job()
+        # Endereço inicial placeholder (só será usado até o primeiro minerador se registrar)
+        self._generate_job("brn1pooladdressplaceholder")
 
     def _generate_job(self, miner_address="brn1pooladdressplaceholder"):
         with self.lock:
