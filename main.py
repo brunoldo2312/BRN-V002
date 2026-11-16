@@ -197,9 +197,9 @@ def _resolve_fast_sync_until(args) -> int:
         except (ValueError, TypeError):
             pass
     try:
-        return max(0, int(os.environ.get("BRN_FAST_SYNC_UNTIL", "6000")))
+        return max(0, int(os.environ.get("BRN_FAST_SYNC_UNTIL", "4084")))
     except (ValueError, TypeError):
-        return 6000
+        return 4084
 
 
 def _maybe_enable_fast_sync(fast_sync_until: int, args) -> None:
@@ -1191,7 +1191,7 @@ def _force_http_sync_loop(chain, pool_url, stop_evt):
 # ============================================================
 def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
                      stop_evt: threading.Event,
-                     fast_sync_until: int = 6000) -> None:
+                     fast_sync_until: int = 4084) -> None:
     log = logging.getLogger("main")
     log.info("[AUTO-MINE] loop iniciado (fast_sync_until=%d)", fast_sync_until)
 
@@ -1501,9 +1501,9 @@ def _status_reporter_loop(chain, stop_evt: threading.Event,
                 n_synced = 0
 
             try:
-                fast_until = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "6000"))
+                fast_until = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "4084"))
             except (ValueError, TypeError):
-                fast_until = 6000
+                fast_until = 4084
                 
             # [NOVO v13.9.21] Lógica de exibição baseada na altura real
             if fast_until > 0 and h < fast_until:
@@ -1547,7 +1547,7 @@ def _status_reporter_loop(chain, stop_evt: threading.Event,
 def _auto_configure(chain, p2p, trust, web_port: int, is_origin: bool,
                      stop_evt: threading.Event,
                      force_auto_mine: bool = False,
-                     fast_sync_until: int = 6000) -> None:
+                     fast_sync_until: int = 4084) -> None:
     log = logging.getLogger("main")
     sk_hex, address, pubkey, source = _resolve_validator_sk()
 
@@ -1646,7 +1646,7 @@ def _auto_configure(chain, p2p, trust, web_port: int, is_origin: bool,
 def _delayed_auto_configure(chain, p2p, trust, web_port: int, is_origin: bool,
                              stop_evt: threading.Event,
                              force_auto_mine: bool = False,
-                             fast_sync_until: int = 6000) -> None:
+                             fast_sync_until: int = 4084) -> None:
     try:
         time.sleep(3)
         _auto_configure(
