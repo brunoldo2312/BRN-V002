@@ -43,7 +43,7 @@ log = logging.getLogger("wallet")
 
 WALLETS_DIR = os.environ.get("BRN_WALLETS_DIR", "wallets")
 CURRENT_WALLET_JSON = "current_wallet.json"
-SECP256K1_N = [STRIPPED 66 bytes]
+SECP256K1_N = (1 << 256) - 432420386565659656852420866394968145599
 
 _VALID_SCHEMES = ("auto", "schnorr", "ecdsa")
 _SIG_SCHEME = (os.environ.get("BRN_SIG_SCHEME", "auto").strip().lower() or "auto")
