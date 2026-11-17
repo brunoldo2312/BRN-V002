@@ -1,15 +1,12 @@
 # db.py — Banco de Dados SQLite para o Nó BRN
-# Versão: 9.6.2 | Data: 2026-11-17
+# Versão: 9.6.3 | Data: 2026-11-17
 # ============================================================
-# Correções v9.6.2:
-#   • [FIX CRÍTICO] Adicionado ChainDB — main.py / blockchain.py /
-#     version.py fazem "from db import ChainDB" e quebravam
-#   • [FIX] Criada tabela blocks — height() agora funciona de verdade
-#   • [FIX] VACUUM movido para FORA da transação (SQLite proíbe dentro)
-#   • [FIX] truncate_to() agora realmente apaga blocos > target
-#   • [NEW] Métodos para bootstrap_peers (add/list/remove/clear)
-#   • [FIX] close() reseta _initialized + _instance
-#   • [KEEP] WAL + busy_timeout + singleton + mesma API pública
+# Correções v9.6.3:
+#   • [FIX CRÍTICO] Adicionado get_meta / set_meta / delete_meta /
+#     get_all_meta — blockchain.py faz db.get_meta() e quebrava com
+#     "'ChainDB' object has no attribute 'get_meta'"
+#   • [KEEP] v9.6.2: ChainDB, tabela blocks, VACUUM fora da transação,
+#     truncate_to() real, bootstrap_peers, close() resetando singleton
 # ============================================================
 from __future__ import annotations
 
@@ -312,6 +309,61 @@ class Database:
             cur = conn.execute("SELECT value FROM sync_status WHERE key = ?", (key,))
             row = cur.fetchone()
             return row[0] if row else default
+
+    # ============================================================
+    # META — [FIX v9.6.3] É O QUE O blockchain.py USA
+    # Usa a mesma tabela sync_status, só com nome que o blockchain espera.
+    # Aceita qualquer tipo: str / int / float / bool / dict / list
+    # ============================================================
+    def set_meta(self, key: str, value: Any) -> None:
+        import json as _json
+        if isinstance(value, (dict, list)):
+            v = _json.dumps(value, ensure_ascii=False)
+        elif isinstance(value, bool):
+            v = "1" if value else "0"
+        elif value is None:
+            v = ""
+        else:
+            v = str(value)
+        self.set_sync_value(str(key), v)
+
+    def get_meta(self, key: str, default: Any = None) -> Any:
+        import json as _json
+        v = self.get_sync_value(str(key), None)
+        if v is None:
+            return default
+        # Tenta devolver no tipo original: JSON / int / float / bool
+        s = v.strip()
+        if s.startswith("{") or s.startswith("["):
+            try:
+                return _json.loads(s)
+            except Exception:
+                return v
+        if s in ("1", "0") and default is True or default is False:
+            return s == "1"
+        try:
+            if "." in s:
+                return float(s)
+            return int(s)
+        except (ValueError, TypeError):
+            return v
+
+    def delete_meta(self, key: str) -> bool:
+        with self._write_lock, self._get_connection(write=True) as conn:
+            cur = conn.execute("DELETE FROM sync_status WHERE key = ?", (str(key),))
+            return cur.rowcount > 0
+
+    def get_all_meta(self) -> Dict[str, Any]:
+        with self._get_connection() as conn:
+            rows = conn.execute("SELECT key, value FROM sync_status").fetchall()
+            return {k: self.get_meta(k) for k, _v in rows for k in [k]}
+
+    # Aliases — caso blockchain.py use outro nome
+    def get_metadata(self, key: str, default: Any = None) -> Any:
+        return self.get_meta(key, default)
+
+    def set_metadata(self, key: str, value: Any) -> None:
+        return self.set_meta(key, value)
 
     # ============================================================
     # MINING GATE
