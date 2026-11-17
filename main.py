@@ -1,6 +1,29 @@
-"""main.py — Entrypoint do nó BRN (v13.9.24)
+"""main.py — Entrypoint do nó BRN (v13.9.25)
 ================================================================
-v13.9.24 (2026-11-14) — LIMPEZA:
+v13.9.25 (2026-11-17) — PROPAGAÇÃO DE ENV PRO SERVER.PY:
+  [FIX CRÍTICO] _maybe_enable_fast_sync() agora SEMPRE escreve
+        os.environ["BRN_FAST_SYNC_UNTIL"], inclusive quando desativado
+        (--no-fast-sync ou --fast-sync-until 0). Antes só setava
+        BRN_ASSUME_VALID_UNTIL / BRN_BOOTSTRAP_SKIP_SIGS_UNTIL.
+        server.py lê BRN_FAST_SYNC_UNTIL no IMPORT (constante módulo-global
+        _MIN_FAST_SYNC_UNTIL), então com --no-fast-sync o main.py liberava
+        o auto-mine mas /api/pool/start_local retornava 409
+        "fast_sync_below_4084" em loop eterno. Sintoma: "PoolClient
+        falhou (1)" a cada 30s no log do auto-mine.
+  [FIX CRÍTICO] _start_web_server() agora chama srv.set_peer_id() com
+        BRN_PEER_ID (derivado logo após node_identity). Sem isto,
+        server._BRN_PEER_ID ficava vazio e, quando FastAPI falhava e o
+        main.py caía no fallback Flask (srv.app.run()), a rota /wallet
+        do Flask não redirecionava → operador perdia a GUI no browser.
+        Também /api/peer_id retornava peer_id="" nos health checks.
+  [FIX] main() agora propaga a porta HTTP resolvida (BRN_WEB_PORT ou
+        PORT ou 5000) para os.environ["BRN_WEB_PORT"]. server.py lê
+        BRN_WEB_PORT pra BOOTSTRAP_HTTP_PORT — no Render (PORT=10000,
+        sem BRN_WEB_PORT) os notify de bootstrap iam pra porta 5000.
+  [KEEP] v13.9.24: auto_discovery DEPOIS de _setup_logging;
+        _do_force_http_resync(headless=...) explícito;
+        _setup_logging() sempre retorna Logger.
+v13.9.24 (2026-11-17) — LIMPEZA:
   [FIX] auto_discovery.auto_configure_bootstrap() movido para
         DEPOIS de _setup_logging() — antes seus logs eram
         descartados no logger raiz.
@@ -44,8 +67,8 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.24"
-    BUILD_DATE = "2026-11-14"
+    VERSION = "13.9.25"
+    BUILD_DATE = "2026-11-17"
 
 try:
     from isolation_detector import IsolationDetector
@@ -215,6 +238,13 @@ def _resolve_fast_sync_until(args) -> int:
 
 def _maybe_enable_fast_sync(fast_sync_until: int, args) -> None:
     log = logging.getLogger("main")
+
+    # [FIX v13.9.25] Sempre propagar BRN_FAST_SYNC_UNTIL pro server.py.
+    # server.py lê no IMPORT em _MIN_FAST_SYNC_UNTIL; sem isto,
+    # --no-fast-sync / --fast-sync-until 0 deixava main.py liberado
+    # mas /api/mine/gate retornava 409 "fast_sync_below_4084" para sempre.
+    os.environ["BRN_FAST_SYNC_UNTIL"] = str(fast_sync_until)
+
     no_fast_sync = getattr(args, "no_fast_sync", False)
     cli_explicit = getattr(args, "fast_sync_until", None) is not None
 
@@ -353,7 +383,7 @@ def _peer_healer_loop(chain, p2p, stop_evt: threading.Event, interval: int = 15)
 
     if not hasattr(chain.db, "upsert_peer"):
         log.warning("[Peer-Healer] chain.db não tem upsert_peer() — "
-                    "healer inativo (instale/atualize db.py para v13.9.23+)")
+                    "healer inativo (atualize db.py para v13.9.23+)")
         return
 
     while not stop_evt.wait(interval):
@@ -664,6 +694,14 @@ def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int,
         return False
 
     srv.set_chain(chain)
+
+    # [FIX v13.9.25] Injeta PEER_ID no Flask.
+    # Sem isto, server._BRN_PEER_ID ficava "" e, quando o FastAPI caía
+    # para o fallback Flask, /wallet não redirecionava e /api/peer_id
+    # retornava vazio — operador perdia a GUI no browser.
+    if hasattr(srv, "set_peer_id"):
+        srv.set_peer_id(os.environ.get("BRN_PEER_ID", ""))
+
     for fn_name, obj in (
         ("set_p2p_manager", p2p),
         ("set_pool_manager", pool),
@@ -1051,7 +1089,7 @@ def _ping_origin(timeout: float = 3.0) -> bool:
             import urllib.request
             req = urllib.request.Request(
                 f"{pool_url}/api/status",
-                headers={"User-Agent": "brn-main/13.9.24"},
+                headers={"User-Agent": "brn-main/13.9.25"},
             )
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.status == 200
@@ -1641,7 +1679,7 @@ def _auto_configure(chain, p2p, trust, web_port: int, is_origin: bool,
     })
 
     log.info("=" * 64)
-    log.info(" [SK RESOLUTION v13.9.24]")
+    log.info(" [SK RESOLUTION v13.9.25]")
     log.info("=" * 64)
     log.info("  source           : %s", source or "(nenhum)")
     log.info("  SK_HEX len       : %d", len(sk_hex) if sk_hex else 0)
@@ -1830,6 +1868,13 @@ def main() -> int:
         or os.environ.get("PORT")
         or "5000"
     )
+
+    # [FIX v13.9.25] Garante que server.py leia a mesma porta HTTP.
+    # server.py faz BOOTSTRAP_HTTP_PORT = int(os.environ.get("BRN_BOOTSTRAP_HTTP_PORT",
+    #   os.environ.get("BRN_WEB_PORT", "5000"))) no import. No Render
+    # (PORT=10000, sem BRN_WEB_PORT) os notify de bootstrap iam pra :5000.
+    os.environ["BRN_WEB_PORT"] = str(web_port)
+
     p2p_port = int(os.environ.get("BRN_P2P_PORT", "6001"))
     db_path = args.db or os.environ.get("BRN_DB", "brn_v2_chain.db")
 
@@ -1838,7 +1883,7 @@ def main() -> int:
 
     log = _setup_logging()
 
-    # [FIX v13.9.24] AUTO-DISCOVERY roda DEPOIS do logging configurado.
+    # AUTO-DISCOVERY DEPOIS do logging configurado (v13.9.24).
     try:
         import auto_discovery
         auto_discovery.auto_configure_bootstrap()
