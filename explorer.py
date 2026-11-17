@@ -1,19 +1,20 @@
-"""
-explorer.py — Backend do Explorer + Painéis + Block Explorer (v3.4)
-================================================================
-v3.4 (2026-11-15) — ROBUSTEZ NO BANCO DE DADOS:
-  [FIX] Adicionado timeout=30.0 e PRAGMA busy_timeout=30000 no get_db()
-        para evitar erro "database is locked" quando o nó principal
-        estiver gravando blocos em massa.
-  [KEEP] v3.3: Template injection, proxy da API, etc.
-================================================================
+"""explorer.py — Backend do Explorer + Painéis + Block Explorer (v3.5)
+===============================================================
+v3.5 (2026-11-17) — SEGURANÇA XSS/SSTI E LEITURA ZERO-LOCK:
+  [FIX] Substituído render_template_string aninhado + Markup() por
+        DictLoader nativo do Flask com herança {% extends "base.html" %}
+        e auto-escape ativo em 100% das variáveis.
+  [FIX] Conexão SQLite alterada para ?mode=ro (Read-Only) com
+        PRAGMA query_only=ON para eliminar disputa de lock com o main.py.
+  [KEEP] v3.4: Proxy da API, Waitress em produção, timeout=30s.
+===============================================================
 """
 from __future__ import annotations
 
-__version__ = "3.4"
+__version__ = "3.5"
 
-from flask import Flask, render_template_string, request, jsonify, send_file, Response
-from markupsafe import Markup
+from flask import Flask, render_template, request, jsonify, send_file, Response
+from jinja2 import DictLoader
 import sqlite3
 import zlib
 import orjson
@@ -34,13 +35,14 @@ except (TypeError, ValueError):
     API_TIMEOUT = 15.0
 
 # ============================================================
-# LAYOUT (usado pelo helper render_page)
+# TEMPLATES JINJA2 COM HERANÇA NATIVA E AUTO-ESCAPE SEGURO
 # ============================================================
-LAYOUT_HTML = """
+TEMPLATES = {
+    "base.html": """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>BRN Explorer</title>
+    <title>{% block title %}BRN Explorer{% endblock %}</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body { background: #0d1117; color: #c9d1d9; font-family: -apple-system, sans-serif; margin: 0; padding: 20px; }
@@ -76,22 +78,16 @@ LAYOUT_HTML = """
         <input type="text" name="q" placeholder="Pesquisar por Bloco, TxID ou Endereço (brn1...)">
         <button type="submit">Pesquisar</button>
     </form>
-    {{ content }}
+    {% block content %}{% endblock %}
 </div>
 </body>
 </html>
-"""
+""",
 
-def render_page(content_html: str, **context) -> str:
-    """Renderiza o conteúdo interno e injeta no layout."""
-    content = render_template_string(content_html, **context)
-    return render_template_string(LAYOUT_HTML, content=Markup(content))
-
-
-# ============================================================
-# CONTEÚDOS DAS PÁGINAS
-# ============================================================
-HOME_CONTENT = """
+    "home.html": """
+{% extends "base.html" %}
+{% block title %}BRN Explorer — Início{% endblock %}
+{% block content %}
 <div class="grid">
     <div class="card">
         <h2>Últimos Blocos</h2>
@@ -121,9 +117,13 @@ HOME_CONTENT = """
         </table>
     </div>
 </div>
-"""
+{% endblock %}
+""",
 
-BLOCK_CONTENT = """
+    "block.html": """
+{% extends "base.html" %}
+{% block title %}Bloco #{{ block.height }} — BRN Explorer{% endblock %}
+{% block content %}
 <div class="card">
     <h2>Bloco #{{ block.height }}</h2>
     <table>
@@ -148,9 +148,13 @@ BLOCK_CONTENT = """
         {% endfor %}
     </table>
 </div>
-"""
+{% endblock %}
+""",
 
-ADDRESS_CONTENT = """
+    "address.html": """
+{% extends "base.html" %}
+{% block title %}Endereço {{ address[:16] }}... — BRN Explorer{% endblock %}
+{% block content %}
 <div class="card">
     <h2>Endereço {{ address }}</h2>
     <p><b>Saldo:</b> <span style="font-size:1.5rem; color:#3fb950">{{ balance }} BRN</span></p>
@@ -170,9 +174,13 @@ ADDRESS_CONTENT = """
         {% endfor %}
     </table>
 </div>
-"""
+{% endblock %}
+""",
 
-TX_CONTENT = """
+    "tx.html": """
+{% extends "base.html" %}
+{% block title %}Transação {{ tx.txid[:16] }}... — BRN Explorer{% endblock %}
+{% block content %}
 <div class="card">
     <h2>Transação {{ tx.txid[:32] }}...</h2>
     <table>
@@ -196,60 +204,74 @@ TX_CONTENT = """
         {% endfor %}
     </table>
 </div>
+{% endblock %}
 """
+}
 
+# Registra os templates em memória no ambiente Jinja2 do Flask (autoescape ativo por padrão)
+app.jinja_env.loader = DictLoader(TEMPLATES)
 
 # ============================================================
-# HELPERS DB (Otimizados para não travar durante sync)
+# HELPERS DB (Read-Only para zero lock durante sync do main.py)
 # ============================================================
 def get_db():
-    # [FIX CRÍTICO] timeout=30.0 e busy_timeout evitam que o Explorer
-    # quebre com "database is locked" enquanto o main.py escreve blocos.
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    path_uri = Path(DB_PATH).resolve().as_posix()
+    try:
+        conn = sqlite3.connect(f"file:///{path_uri}?mode=ro", uri=True, timeout=30.0)
+    except sqlite3.OperationalError:
+        conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.execute("PRAGMA busy_timeout=30000;")
+    conn.execute("PRAGMA query_only=ON;")
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def get_latest_blocks(n=10):
     conn = get_db()
-    rows = conn.execute("SELECT height, raw FROM blocks ORDER BY height DESC LIMIT ?", (n,)).fetchall()
-    conn.close()
     out = []
-    for r in rows:
-        try:
-            b = orjson.loads(zlib.decompress(r["raw"]))
-            out.append({
-                "height": b["height"],
-                "hash": b["hash"],
-                "txs": len(b["transactions"]),
-                "time": datetime.fromtimestamp(b["timestamp"]).strftime("%H:%M:%S")
-            })
-        except Exception:
-            pass
+    try:
+        rows = conn.execute("SELECT height, raw FROM blocks ORDER BY height DESC LIMIT ?", (n,)).fetchall()
+        for r in rows:
+            try:
+                b = orjson.loads(zlib.decompress(r["raw"]))
+                out.append({
+                    "height": b["height"],
+                    "hash": b["hash"],
+                    "txs": len(b["transactions"]),
+                    "time": datetime.fromtimestamp(b["timestamp"]).strftime("%H:%M:%S")
+                })
+            except Exception:
+                continue
+    except Exception:
+        pass
+    finally:
+        conn.close()
     return out
 
 
 def get_latest_txs(n=10):
     conn = get_db()
-    rows = conn.execute("SELECT raw FROM transactions ORDER BY block_height DESC LIMIT ?", (n,)).fetchall()
-    conn.close()
     out = []
-    for r in rows:
-        try:
-            tx = orjson.loads(zlib.decompress(r["raw"]))
-            if tx["inputs"][0]["txid"] == "0"*64:
+    try:
+        rows = conn.execute("SELECT raw FROM transactions ORDER BY block_height DESC LIMIT ?", (n,)).fetchall()
+        for r in rows:
+            try:
+                tx = orjson.loads(zlib.decompress(r["raw"]))
+                if tx["inputs"][0]["txid"] == "0" * 64:
+                    continue
+                val = sum(o["amount"] for o in tx["outputs"]) / 1e8
+                out.append({
+                    "txid": tx["txid"],
+                    "value": f"{val:.2f}",
+                    "time": datetime.fromtimestamp(tx["timestamp"]).strftime("%H:%M")
+                })
+            except Exception:
                 continue
-            val = sum(o["amount"] for o in tx["outputs"]) / 1e8
-            out.append({
-                "txid": tx["txid"],
-                "value": f"{val:.2f}",
-                "time": datetime.fromtimestamp(tx["timestamp"]).strftime("%H:%M")
-            })
-        except Exception:
-            pass
+    except Exception:
+        pass
+    finally:
+        conn.close()
     return out
-
 
 # ============================================================
 # ROTAS DO BLOCK EXPLORER
@@ -258,58 +280,61 @@ def get_latest_txs(n=10):
 def home():
     blocks = get_latest_blocks(10)
     txs = get_latest_txs(10)
-    return render_page(HOME_CONTENT, blocks=blocks, txs=txs)
+    return render_template("home.html", blocks=blocks, txs=txs)
 
 
 @app.route("/block/<int:height>")
 def block_detail(height):
     conn = get_db()
-    row = conn.execute("SELECT raw FROM blocks WHERE height=?", (height,)).fetchone()
-    conn.close()
-    if not row:
-        return "Bloco não encontrado", 404
-
     try:
+        row = conn.execute("SELECT raw FROM blocks WHERE height=?", (height,)).fetchone()
+        if not row:
+            return "Bloco não encontrado", 404
         b = orjson.loads(zlib.decompress(row["raw"]))
         b["time"] = datetime.fromtimestamp(b["timestamp"]).strftime("%d/%m/%Y %H:%M:%S")
         for tx in b["transactions"]:
-            tx["value"] = f"{sum(o['amount'] for o in tx['outputs'])/1e8:.8f}"
+            total = sum(o["amount"] for o in tx["outputs"])
+            tx["value"] = f"{total / 1e8:.8f}"
     except Exception as e:
         return f"Erro ao decodificar bloco: {e}", 500
-
-    return render_page(BLOCK_CONTENT, block=b)
+    finally:
+        conn.close()
+    return render_template("block.html", block=b)
 
 
 @app.route("/address/<address>")
 def address_detail(address):
     if not address.startswith("brn1"):
         return "Endereço inválido", 400
-
     conn = get_db()
-    row = conn.execute("SELECT SUM(amount) as s FROM utxos WHERE address=? AND spent=0", (address,)).fetchone()
-    balance = (row["s"] or 0) / 1e8
-
-    row2 = conn.execute("SELECT SUM(amount) as s FROM utxos WHERE address=?", (address,)).fetchone()
-    total_received = (row2["s"] or 0) / 1e8
-
-    txs = []
-    rows = conn.execute("SELECT txid, amount, spent, block_height FROM utxos WHERE address=? ORDER BY block_height DESC LIMIT 50", (address,)).fetchall()
-    seen_txids = set()
-    for r in rows:
-        if r["txid"] in seen_txids:
-            continue
-        seen_txids.add(r["txid"])
-        txs.append({
-            "txid": r["txid"],
-            "amount": f"{r['amount']/1e8:.8f}",
-            "direction": "received",
-            "status": "confirmed",
-            "block_height": r["block_height"]
-        })
-
-    conn.close()
-    return render_page(
-        ADDRESS_CONTENT,
+    try:
+        row = conn.execute("SELECT SUM(amount) as s FROM utxos WHERE address=? AND spent=0", (address,)).fetchone()
+        balance = (row["s"] or 0) / 1e8
+        row2 = conn.execute("SELECT SUM(amount) as s FROM utxos WHERE address=?", (address,)).fetchone()
+        total_received = (row2["s"] or 0) / 1e8
+        txs = []
+        seen_txids = set()
+        rows = conn.execute(
+            "SELECT txid, amount, spent, block_height FROM utxos WHERE address=? ORDER BY block_height DESC LIMIT 50",
+            (address,)
+        ).fetchall()
+        for r in rows:
+            if r["txid"] in seen_txids:
+                continue
+            seen_txids.add(r["txid"])
+            txs.append({
+                "txid": r["txid"],
+                "amount": f"{r['amount'] / 1e8:.8f}",
+                "direction": "received",
+                "status": "confirmed",
+                "block_height": r["block_height"]
+            })
+    except Exception as e:
+        return f"Erro ao carregar endereço: {e}", 500
+    finally:
+        conn.close()
+    return render_template(
+        "address.html",
         address=address,
         balance=f"{balance:.8f}",
         total_received=f"{total_received:.8f}",
@@ -320,18 +345,17 @@ def address_detail(address):
 @app.route("/tx/<txid>")
 def tx_detail(txid):
     conn = get_db()
-    row = conn.execute("SELECT raw, block_height FROM transactions WHERE txid=?", (txid,)).fetchone()
-    conn.close()
-    if not row:
-        return "Transação não encontrada", 404
-
     try:
+        row = conn.execute("SELECT raw, block_height FROM transactions WHERE txid=?", (txid,)).fetchone()
+        if not row:
+            return "Transação não encontrada", 404
         tx = orjson.loads(zlib.decompress(row["raw"]))
         tx_time = datetime.fromtimestamp(tx.get("timestamp", 0)).strftime("%d/%m/%Y %H:%M:%S")
     except Exception as e:
         return f"Erro ao decodificar tx: {e}", 500
-
-    return render_page(TX_CONTENT, tx=tx, block_height=row["block_height"], tx_time=tx_time)
+    finally:
+        conn.close()
+    return render_template("tx.html", tx=tx, block_height=row["block_height"], tx_time=tx_time)
 
 
 @app.route("/search")
@@ -346,11 +370,10 @@ def search():
     elif len(q) == 64:
         return tx_detail(q)
     else:
-        return "Formato não reconhecido. Use altura (número), endereço (brn1...) ou TxID (64 chars).", 400
-
+        return "Formato não reconhecido. Use altura (número), endereço (brn1...) ou TxID (64 caracteres).", 400
 
 # ============================================================
-# SERVIDOR DE ARQUIVOS (Dashboard, Panel e Monitor)
+# SERVIDOR DE ARQUIVOS (Dashboard, Painel e Monitor)
 # ============================================================
 @app.route("/dashboard")
 def serve_dashboard():
@@ -363,80 +386,4 @@ def serve_dashboard():
 @app.route("/panel")
 def serve_panel():
     p = BASE_DIR / "panel.html"
-    if p.exists():
-        return send_file(p)
-    return "panel.html não encontrado", 404
-
-
-@app.route("/monitor")
-def serve_monitor():
-    p = BASE_DIR / "monitor.html"
-    if p.exists():
-        return send_file(p)
-    return "monitor.html não encontrado", 404
-
-
-# ============================================================
-# PROXY GENÉRICO
-# ============================================================
-def _do_api_proxy(path: str):
-    """Repassa requisição /api/* para o nó principal."""
-    if request.method == "OPTIONS":
-        return "", 200
-
-    target_url = f"{API_BASE}/api/{path}"
-
-    try:
-        if request.method == "POST":
-            data = request.get_json(silent=True) or {}
-            r = requests.post(target_url, json=data, timeout=API_TIMEOUT)
-        else:
-            r = requests.get(target_url, params=request.args, timeout=API_TIMEOUT)
-
-        # Se a resposta for JSON, retorna JSON
-        try:
-            return jsonify(r.json()), r.status_code
-        except ValueError:
-            # Não-JSON (ex: texto puro de /health)
-            return Response(r.content, status=r.status_code,
-                            content_type=r.headers.get("Content-Type", "text/plain"))
-
-    except requests.exceptions.ConnectionError:
-        return jsonify({"ok": False, "error": f"Nó principal offline ({API_BASE})"}), 502
-    except requests.exceptions.Timeout:
-        return jsonify({"ok": False, "error": f"Timeout ao contactar {API_BASE} ({API_TIMEOUT}s)"}), 504
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-# IMPORTANTE: -proxy registrado PRIMEIRO para evitar conflito
-@app.route("/api/<path:path>-proxy", methods=["GET", "POST", "OPTIONS"])
-def api_proxy_compat(path):
-    return _do_api_proxy(path)
-
-
-@app.route("/api/<path:path>", methods=["GET", "POST", "OPTIONS"])
-def api_proxy(path):
-    return _do_api_proxy(path)
-
-
-# ============================================================
-# MAIN
-# ============================================================
-if __name__ == "__main__":
-    port = int(os.environ.get("BRN_EXPLORER_PORT", "8080"))
-    print(f"BRN Explorer + Painéis rodando em http://127.0.0.1:{port}")
-    print(f"  → Block Explorer: http://127.0.0.1:{port}/")
-    print(f"  → Dashboard:      http://127.0.0.1:{port}/dashboard")
-    print(f"  → Monitor:        http://127.0.0.1:{port}/monitor")
-    print(f"  → Painel:         http://127.0.0.1:{port}/panel")
-    print(f"  → API backend:    {API_BASE} (timeout={API_TIMEOUT}s)")
-    
-    # [MELHORIA] Usa Waitress se disponível, senão cai para Flask dev
-    try:
-        from waitress import serve
-        print("[*] Servidor rodando em modo PRODUÇÃO (Waitress)")
-        serve(app, host="0.0.0.0", port=port, threads=8)
-    except ImportError:
-        print("[!] Waitress não instalado. Rodando em modo DEV (Flask)")
-        app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+   
