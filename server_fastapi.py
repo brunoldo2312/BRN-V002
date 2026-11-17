@@ -1,5 +1,20 @@
-"""server_fastapi.py — Ponte FastAPI para o servidor Flask legado (v13.9.20)
+"""server_fastapi.py — Ponte FastAPI para o servidor Flask legado (v13.9.21)
 ================================================================================
+v13.9.21 (2026-11-17) — [FIX CRÍTICO] Menu /peers mostrava 0 peers remotos:
+  [FIX] peers_menu() importava 'chain' minúsculo de server.py, mas server.py
+        só exporta 'CHAIN' (lazy) e a função '_get_chain()'. O ImportError
+        era engolido por 'except Exception' → menu mostrava só o peer local.
+  [FIX] peers_menu() lia p.get("pubkey") or p.get("pub"), mas TODAS as linhas
+        de listar_peers() (db.py, main.py, auto_trust_daemon.py) usam a chave
+        "public_key". Mesmo com o import correto, 'pub' ficava vazio e o
+        loop fazia 'continue' pra cada peer — menu continuava vazio.
+  [FIX] WSGIMiddleware importado com fallback para 'a2wsgi' — em Starlette
+        >= 0.33 o módulo fastapi.middleware.wsgi emite DeprecationWarning;
+        em >= 0.36 pode sumir. Se sumir, main.py cai no fallback Flask e a
+        GUI /wallet do browser quebra (porque _BRN_PEER_ID do server.py pode
+        estar vazio sem o set_peer_id do main.py).
+  [FIX] _wallet_html_path() anotado como '-> Path | None' (retorna None
+        quando nenhum HTML existe). Só cosmético — mypy/pylance não gritam.
 v13.9.20 (2026-11-13) — [NOVO] Rotas de carteira com peer_id único no caminho.
   - GET /wallet            → redireciona 307 pra /wallet/<peer_id-deste-nó>
   - GET /wallet/{peer_id}  → serve a carteira, valida que é ESTE peer
@@ -9,6 +24,8 @@ v13.9.20 (2026-11-13) — [NOVO] Rotas de carteira com peer_id único no caminho
   O restante das rotas continua indo pro Flask (compatibilidade total).
 ================================================================================
 """
+from __future__ import annotations
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.middleware.wsgi import WSGIMiddleware
@@ -17,6 +34,7 @@ from pathlib import Path
 import hashlib
 import logging
 import os
+from typing import Optional
 
 log = logging.getLogger("fastapi_bridge")
 
@@ -24,7 +42,7 @@ log = logging.getLogger("fastapi_bridge")
 app = FastAPI(
     title="BRN Node API",
     description="API de produção BRN (FastAPI + Uvicorn + Flask WSGI)",
-    version="13.9.20",
+    version="13.9.21",
 )
 
 
@@ -37,8 +55,8 @@ def _peer_id() -> str:
     return (os.environ.get("BRN_PEER_ID") or "").strip()
 
 
-def _wallet_html_path() -> Path:
-    """Localiza o HTML da carteira no disco."""
+def _wallet_html_path() -> Optional[Path]:
+    """Localiza o HTML da carteira no disco. Retorna None se ausente."""
     base = Path(__file__).resolve().parent
     for name in ("index_wallet.html", "panel.html"):
         p = base / name
@@ -128,6 +146,12 @@ def peers_menu():
     """
     Menu HTML com os peers conhecidos — prático para abrir no celular.
     Sempre mostra o peer local; se houver peers no DB, adiciona.
+
+    [FIX v13.9.21] Antes usava 'from server import chain' (ImportError — a
+    variável é CHAIN lazy, e a API pública é _get_chain()) e lia
+    p.get("pubkey")/p.get("pub"), mas listar_peers() expõe "public_key".
+    Resultado: menu SEMPRE vazio (só o peer local aparecia). Agora lê
+    corretamente via _get_chain() e "public_key".
     """
     meu = _peer_id()
     if not meu:
@@ -139,17 +163,21 @@ def peers_menu():
 
     peers = [{"id": meu, "url": f"/wallet/{meu}", "local": True}]
 
-    # Tenta ler peers remotos do Flask (que tem a chain global)
+    # Tenta ler peers remotos do Flask (que tem a chain global).
+    # [FIX v13.9.21] _get_chain() em vez de "import chain" inexistente.
     try:
-        from server import chain as _chain  # noqa: F401
-        if _chain is not None:
-            for p in _chain.db.listar_peers(apenas_ativos=False) or []:
-                pub = (p.get("pubkey") or p.get("pub") or "").strip()
+        from server import _get_chain
+        chain = _get_chain()
+        if chain is not None:
+            for p in (chain.db.listar_peers(apenas_ativos=False) or []):
+                # [FIX v13.9.21] listar_peers() expõe "public_key", não "pubkey"/"pub".
+                pub = (p.get("public_key") or "").strip().lower()
                 if not pub:
                     continue
                 try:
                     pid = hashlib.sha256(bytes.fromhex(pub)).hexdigest()[:16]
                 except ValueError:
+                    # pubkey não é hex válido (dado legado) — ignora este peer.
                     continue
                 if pid != meu:
                     peers.append(
