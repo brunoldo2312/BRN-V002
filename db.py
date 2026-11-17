@@ -1,15 +1,21 @@
 # db.py — Banco de Dados SQLite para o Nó BRN
-# Versão: 9.6.3 | Data: 2026-11-17
+# Versão: 9.7.0 | Data: 2026-11-17
 # ============================================================
-# Correções v9.6.3:
-#   • [FIX CRÍTICO] Adicionado get_meta / set_meta / delete_meta /
-#     get_all_meta — blockchain.py faz db.get_meta() e quebrava com
-#     "'ChainDB' object has no attribute 'get_meta'"
-#   • [KEEP] v9.6.2: ChainDB, tabela blocks, VACUUM fora da transação,
-#     truncate_to() real, bootstrap_peers, close() resetando singleton
+# v9.7.0 — COMPATIBILIDADE TOTAL COM blockchain.py 9.5.9:
+#   • add_block(block: dict) / get_block / get_block_by_hash / tip_hash
+#   • UTXO: apply_tx / get_utxo / get_nonce_for_pubkey
+#   • MEMPOOL: add / has / count / stats / all / remove /
+#     utxos_gastos_na_mempool
+#   • TX INDEX: get_tx_block_height
+#   • CONTRATOS: contract_get / contract_put / contract_list (stub persistente)
+#   • META: get_meta / set_meta / delete_meta / get_all_meta
+#   • COMPAT: db.lock + db.conn (cumulative_work usa os dois)
+#   • KEEP: ChainDB, peers, bootstrap_peers, mining_gate, truncate_to,
+#     WAL + busy_timeout
 # ============================================================
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -21,6 +27,34 @@ from typing import Any, Dict, List, Optional
 import logging
 
 logger = logging.getLogger("db")
+
+# ------------------------------------------------------------
+# Cursor fake para db.conn.execute() usado em cumulative_work()
+# ------------------------------------------------------------
+class _FakeCursor:
+    def __init__(self, rows):
+        self._rows = rows
+    def fetchall(self):
+        return self._rows
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+class _ConnAdapter:
+    """db.conn.execute(...) abre conexão curta, executa e fecha."""
+    def __init__(self, db):
+        self._db = db
+    def execute(self, sql, params=()):
+        with self._db._get_connection() as conn:
+            cur = conn.execute(sql, params)
+            rows = cur.fetchall()
+            # Converte Row -> dict-like simples (blockchain usa r["difficulty"])
+            out = []
+            for r in rows:
+                try:
+                    out.append(dict(r))
+                except Exception:
+                    out.append(r)
+            return _FakeCursor(out)
 
 class Database:
     _instance: Optional["Database"] = None
@@ -38,6 +72,10 @@ class Database:
             return
         self.db_path = self._resolve_path(db_path)
         self._write_lock = threading.Lock()
+        # blockchain.py usa self.db.lock
+        self.lock = self._write_lock
+        # blockchain.py usa self.db.conn.execute(...)
+        self.conn = _ConnAdapter(self)
         self._initialized = True
         self._init_database()
 
@@ -52,11 +90,8 @@ class Database:
 
     @contextmanager
     def _get_connection(self, write: bool = False):
-        conn = sqlite3.connect(
-            self.db_path,
-            timeout=30.0,
-            isolation_level=None,
-        )
+        conn = sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA busy_timeout = 30000;")
         conn.execute("PRAGMA foreign_keys = ON;")
@@ -77,7 +112,6 @@ class Database:
             conn.close()
 
     def _vacuum(self):
-        """VACUUM tem que rodar SEM transação aberta."""
         conn = sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None)
         try:
             conn.execute("PRAGMA busy_timeout = 30000;")
@@ -101,6 +135,48 @@ class Database:
                 hash TEXT NOT NULL DEFAULT '',
                 prev_hash TEXT NOT NULL DEFAULT '',
                 timestamp REAL NOT NULL DEFAULT 0,
+                nonce INTEGER NOT NULL DEFAULT 0,
+                merkle TEXT NOT NULL DEFAULT '',
+                difficulty INTEGER NOT NULL DEFAULT 1,
+                cumulative_work INTEGER NOT NULL DEFAULT 0,
+                data TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL DEFAULT (strftime('%s','now'))
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS utxos (
+                txid TEXT NOT NULL,
+                vout INTEGER NOT NULL,
+                address TEXT NOT NULL DEFAULT '',
+                amount INTEGER NOT NULL DEFAULT 0,
+                pubkey TEXT NOT NULL DEFAULT '',
+                height INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (txid, vout)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tx_index (
+                txid TEXT PRIMARY KEY,
+                height INTEGER NOT NULL DEFAULT -1
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS mempool (
+                txid TEXT PRIMARY KEY,
+                tx TEXT NOT NULL DEFAULT '{}',
+                fee INTEGER NOT NULL DEFAULT 0,
+                added_at REAL NOT NULL DEFAULT (strftime('%s','now'))
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS nonces (
+                pubkey TEXT PRIMARY KEY,
+                nonce INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS contracts (
+                contract_id TEXT PRIMARY KEY,
                 data TEXT NOT NULL DEFAULT '{}',
                 created_at REAL NOT NULL DEFAULT (strftime('%s','now'))
             )
@@ -147,67 +223,294 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_peers_height ON peers(height);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen DESC);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_utxos_address ON utxos(address);")
         conn.execute("INSERT OR IGNORE INTO mining_gate (id) VALUES (1)")
 
     def _migrate_schema(self, conn: sqlite3.Connection):
         tables = {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-        if "blocks" not in tables:
-            logger.info("[DB MIGRATION] Criando tabela blocks (faltava no DB antigo)")
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS blocks (
-                    height INTEGER PRIMARY KEY,
-                    hash TEXT NOT NULL DEFAULT '',
-                    prev_hash TEXT NOT NULL DEFAULT '',
-                    timestamp REAL NOT NULL DEFAULT 0,
-                    data TEXT NOT NULL DEFAULT '{}',
-                    created_at REAL NOT NULL DEFAULT (strftime('%s','now'))
-                )
-            """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash);")
-
-        cursor = conn.execute("PRAGMA table_info(peers)")
-        columns = [row[1] for row in cursor.fetchall()]
-        if "genesis_hash" not in columns:
-            logger.info("[DB MIGRATION] Adicionando coluna genesis_hash")
-            conn.execute("ALTER TABLE peers ADD COLUMN genesis_hash TEXT NOT NULL DEFAULT ''")
-        if "version" not in columns:
-            logger.info("[DB MIGRATION] Adicionando coluna version")
-            conn.execute("ALTER TABLE peers ADD COLUMN version TEXT NOT NULL DEFAULT ''")
-        if "public_key" not in columns:
-            logger.info("[DB MIGRATION] Adicionando coluna public_key")
-            conn.execute("ALTER TABLE peers ADD COLUMN public_key TEXT NOT NULL DEFAULT ''")
+        # DB antigo tinha blocks com outro formato -> recria se não tiver coluna data
+        if "blocks" in tables:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(blocks)").fetchall()]
+            if "data" not in cols:
+                logger.info("[DB MIGRATION] Recriando tabela blocks no formato novo")
+                conn.execute("DROP TABLE IF EXISTS blocks")
+                conn.execute("""
+                    CREATE TABLE blocks (
+                        height INTEGER PRIMARY KEY,
+                        hash TEXT NOT NULL DEFAULT '',
+                        prev_hash TEXT NOT NULL DEFAULT '',
+                        timestamp REAL NOT NULL DEFAULT 0,
+                        nonce INTEGER NOT NULL DEFAULT 0,
+                        merkle TEXT NOT NULL DEFAULT '',
+                        difficulty INTEGER NOT NULL DEFAULT 1,
+                        cumulative_work INTEGER NOT NULL DEFAULT 0,
+                        data TEXT NOT NULL DEFAULT '{}',
+                        created_at REAL NOT NULL DEFAULT (strftime('%s','now'))
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash);")
+        for name, ddl in [
+            ("utxos", """CREATE TABLE IF NOT EXISTS utxos (
+                txid TEXT NOT NULL, vout INTEGER NOT NULL, address TEXT NOT NULL DEFAULT '',
+                amount INTEGER NOT NULL DEFAULT 0, pubkey TEXT NOT NULL DEFAULT '',
+                height INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (txid, vout))"""),
+            ("tx_index", "CREATE TABLE IF NOT EXISTS tx_index (txid TEXT PRIMARY KEY, height INTEGER NOT NULL DEFAULT -1)"),
+            ("mempool", """CREATE TABLE IF NOT EXISTS mempool (
+                txid TEXT PRIMARY KEY, tx TEXT NOT NULL DEFAULT '{}',
+                fee INTEGER NOT NULL DEFAULT 0, added_at REAL NOT NULL DEFAULT (strftime('%s','now')))"""),
+            ("nonces", "CREATE TABLE IF NOT EXISTS nonces (pubkey TEXT PRIMARY KEY, nonce INTEGER NOT NULL DEFAULT 0)"),
+            ("contracts", "CREATE TABLE IF NOT EXISTS contracts (contract_id TEXT PRIMARY KEY, data TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL DEFAULT (strftime('%s','now')))"),
+        ]:
+            if name not in tables:
+                logger.info("[DB MIGRATION] Criando tabela %s", name)
+                conn.execute(ddl)
+        # peers: colunas novas
+        if "peers" in tables:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(peers)").fetchall()]
+            for col in ("genesis_hash", "version", "public_key"):
+                if col not in cols:
+                    conn.execute(f"ALTER TABLE peers ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
 
     # ============================================================
-    # BLOCKS
+    # BLOCKS — formato que blockchain.py espera (dict completo)
     # ============================================================
-    def save_block(self, height: int, hash_: str = "", prev_hash: str = "",
+    def add_block(self, block: dict) -> None:
+        """blockchain.py chama add_block(block_dict)."""
+        if isinstance(block, dict) and "height" in block:
+            self.save_block(block)
+            return
+        raise TypeError("add_block espera dict de bloco com 'height'")
+
+    def save_block(self, block_or_height, hash_: str = "", prev_hash: str = "",
                     timestamp: float = 0, data: str = "{}") -> None:
+        # Aceita os 2 formatos: save_block(dict) ou save_block(height, hash, ...)
+        if isinstance(block_or_height, dict):
+            block = block_or_height
+            height = int(block["height"])
+            hash_v = block.get("hash", "")
+            prev_v = block.get("prev_hash", "")
+            ts_v = block.get("timestamp", 0)
+            nonce_v = block.get("nonce", 0)
+            merkle_v = block.get("merkle", "")
+            diff_v = block.get("difficulty", 1)
+            work_v = block.get("cumulative_work", 0)
+            data_v = json.dumps(block, ensure_ascii=False)
+        else:
+            height = int(block_or_height)
+            hash_v, prev_v, ts_v = hash_, prev_hash, timestamp
+            nonce_v, merkle_v, diff_v, work_v = 0, "", 1, 0
+            data_v = data if isinstance(data, str) else json.dumps(data)
         with self._write_lock, self._get_connection(write=True) as conn:
             conn.execute("""
-                INSERT INTO blocks (height, hash, prev_hash, timestamp, data)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO blocks (height, hash, prev_hash, timestamp, nonce, merkle, difficulty, cumulative_work, data)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(height) DO UPDATE SET
-                    hash = excluded.hash,
-                    prev_hash = excluded.prev_hash,
-                    timestamp = excluded.timestamp,
-                    data = excluded.data
-            """, (int(height), hash_, prev_hash, float(timestamp or 0), data))
+                    hash=excluded.hash, prev_hash=excluded.prev_hash,
+                    timestamp=excluded.timestamp, nonce=excluded.nonce,
+                    merkle=excluded.merkle, difficulty=excluded.difficulty,
+                    cumulative_work=excluded.cumulative_work, data=excluded.data
+            """, (height, hash_v, prev_v, float(ts_v or 0), int(nonce_v or 0),
+                  merkle_v, int(diff_v or 1), int(work_v or 0), data_v))
+
+    def _row_to_block(self, row) -> Optional[Dict[str, Any]]:
+        if not row:
+            return None
+        d = dict(row)
+        raw = d.get("data") or "{}"
+        try:
+            block = json.loads(raw)
+        except Exception:
+            block = {}
+        # Garante campos que blockchain.py lê direto
+        block.setdefault("height", d.get("height"))
+        block.setdefault("hash", d.get("hash", ""))
+        block.setdefault("prev_hash", d.get("prev_hash", ""))
+        block.setdefault("timestamp", d.get("timestamp", 0))
+        block.setdefault("nonce", d.get("nonce", 0))
+        block.setdefault("merkle", d.get("merkle", ""))
+        block.setdefault("difficulty", d.get("difficulty", 1))
+        block.setdefault("cumulative_work", d.get("cumulative_work", 0))
+        block.setdefault("transactions", [])
+        block.setdefault("validators_sig", [])
+        return block
 
     def get_block(self, height: int) -> Optional[Dict[str, Any]]:
         with self._get_connection() as conn:
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT * FROM blocks WHERE height = ?", (int(height),)).fetchone()
-            return dict(row) if row else None
+            row = conn.execute("SELECT * FROM blocks WHERE height = ?", (int(height),)).fetchone()
+            return self._row_to_block(row)
+
+    def get_block_by_hash(self, h: str) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT * FROM blocks WHERE hash = ?", (h,)).fetchone()
+            return self._row_to_block(row)
+
+    def get_block_by_height(self, height: int):
+        return self.get_block(height)
+
+    def get_last_block(self):
+        h = self.height()
+        return self.get_block(h) if h >= 0 else None
 
     def list_blocks(self, start: int = 0, limit: int = 50) -> List[Dict[str, Any]]:
         with self._get_connection() as conn:
-            conn.row_factory = sqlite3.Row
             cur = conn.execute(
                 "SELECT * FROM blocks WHERE height >= ? ORDER BY height ASC LIMIT ?",
                 (int(start), int(limit)))
-            return [dict(r) for r in cur.fetchall()]
+            return [b for b in (self._row_to_block(r) for r in cur.fetchall()) if b]
+
+    def tip_hash(self) -> str:
+        b = self.get_last_block()
+        return b.get("hash", "0" * 64) if b else "0" * 64
+
+    def height(self) -> int:
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT MAX(height) FROM blocks").fetchone()
+            return int(row[0]) if row and row[0] is not None else -1
+
+    def get_height(self) -> int:
+        return self.height()
+
+    def get_chain_height(self) -> int:
+        return self.height()
+
+    # ============================================================
+    # UTXO / NONCE / TX INDEX — usado por validate_tx / apply_tx
+    # ============================================================
+    def get_utxo(self, txid: str, vout: int) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM utxos WHERE txid = ? AND vout = ?", (txid, int(vout))).fetchone()
+            return dict(row) if row else None
+
+    def get_nonce_for_pubkey(self, pubkey: str) -> int:
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT nonce FROM nonces WHERE pubkey = ?", (pubkey,)).fetchone()
+            return int(row[0]) if row else 0
+
+    def get_tx_block_height(self, txid_str: str) -> int:
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT height FROM tx_index WHERE txid = ?", (txid_str,)).fetchone()
+            return int(row[0]) if row else -1
+
+    def apply_tx(self, tx: dict, height: int, coinbase: bool = False) -> None:
+        """Aplica tx: gasta inputs, cria outputs, registra tx_index, avança nonce."""
+        txid = tx.get("txid", "")
+        with self._write_lock, self._get_connection(write=True) as conn:
+            if txid:
+                conn.execute(
+                    "INSERT INTO tx_index (txid, height) VALUES (?, ?) "
+                    "ON CONFLICT(txid) DO UPDATE SET height = excluded.height",
+                    (txid, int(height)))
+            if not coinbase:
+                # Gasta UTXOs + avança nonce de cada pubkey de input
+                for inp in (tx.get("inputs") or []):
+                    conn.execute("DELETE FROM utxos WHERE txid = ? AND vout = ?",
+                                 (inp.get("txid", ""), int(inp.get("vout", 0))))
+                    pk = inp.get("pubkey", "")
+                    if pk:
+                        conn.execute(
+                            "INSERT INTO nonces (pubkey, nonce) VALUES (?, 1) "
+                            "ON CONFLICT(pubkey) DO UPDATE SET nonce = nonce + 1", (pk,))
+            for vout, out in enumerate(tx.get("outputs") or []):
+                conn.execute("""
+                    INSERT INTO utxos (txid, vout, address, amount, pubkey, height)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(txid, vout) DO UPDATE SET
+                        address=excluded.address, amount=excluded.amount,
+                        pubkey=excluded.pubkey, height=excluded.height
+                """, (txid, vout, out.get("address", ""), int(out.get("amount", 0)),
+                      out.get("pubkey", ""), int(height)))
+
+    # ============================================================
+    # MEMPOOL
+    # ============================================================
+    def add_mempool(self, tx: dict, fee: int = 0) -> bool:
+        try:
+            txid = tx.get("txid", "")
+            if not txid:
+                return False
+            with self._write_lock, self._get_connection(write=True) as conn:
+                conn.execute("""
+                    INSERT INTO mempool (txid, tx, fee) VALUES (?, ?, ?)
+                    ON CONFLICT(txid) DO UPDATE SET tx=excluded.tx, fee=excluded.fee
+                """, (txid, json.dumps(tx, ensure_ascii=False), int(fee or 0)))
+            return True
+        except Exception as e:
+            logger.warning("[DB] add_mempool falhou: %s", e)
+            return False
+
+    def has_mempool(self, txid: str) -> bool:
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT 1 FROM mempool WHERE txid = ?", (txid,)).fetchone()
+            return row is not None
+
+    def mempool_count(self) -> int:
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM mempool").fetchone()
+            return int(row[0]) if row else 0
+
+    def mempool_stats(self) -> Dict[str, Any]:
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT COUNT(*), COALESCE(SUM(fee),0) FROM mempool").fetchone()
+            fees = [r[0] for r in conn.execute("SELECT fee FROM mempool").fetchall()]
+            return {"count": int(row[0]) if row else 0, "fees": fees}
+
+    def all_mempool(self, limit: int = 500) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cur = conn.execute("SELECT tx FROM mempool ORDER BY added_at ASC LIMIT ?", (int(limit),))
+            out = []
+            for r in cur.fetchall():
+                try:
+                    out.append(json.loads(r[0]))
+                except Exception:
+                    continue
+            return out
+
+    def remove_mempool(self, txid: str) -> bool:
+        with self._write_lock, self._get_connection(write=True) as conn:
+            cur = conn.execute("DELETE FROM mempool WHERE txid = ?", (txid,))
+            return cur.rowcount > 0
+
+    def utxos_gastos_na_mempool(self) -> set:
+        gastos = set()
+        for tx in self.all_mempool(limit=5000):
+            for inp in (tx.get("inputs") or []):
+                try:
+                    gastos.add((inp["txid"], int(inp["vout"])))
+                except Exception:
+                    continue
+        return gastos
+
+    # ============================================================
+    # CONTRATOS (stub persistente — contracts.py usa se precisar)
+    # ============================================================
+    def contract_get(self, contract_id: str) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT data FROM contracts WHERE contract_id = ?", (contract_id,)).fetchone()
+            if not row:
+                return None
+            try:
+                return json.loads(row[0])
+            except Exception:
+                return None
+
+    def contract_put(self, contract_id: str, data: dict) -> None:
+        with self._write_lock, self._get_connection(write=True) as conn:
+            conn.execute("""
+                INSERT INTO contracts (contract_id, data) VALUES (?, ?)
+                ON CONFLICT(contract_id) DO UPDATE SET data = excluded.data
+            """, (contract_id, json.dumps(data or {}, ensure_ascii=False)))
+
+    def contract_list(self) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            out = []
+            for r in conn.execute("SELECT contract_id, data FROM contracts").fetchall():
+                try:
+                    out.append(json.loads(r[1]))
+                except Exception:
+                    out.append({"contract_id": r[0]})
+            return out
 
     # ============================================================
     # PEERS
@@ -218,25 +521,18 @@ class Database:
         now = time.time()
         with self._write_lock, self._get_connection(write=True) as conn:
             conn.execute("""
-                INSERT INTO peers (
-                    node_id, address, genesis_hash, version,
-                    height, is_miner, public_key, last_seen
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO peers (node_id, address, genesis_hash, version, height, is_miner, public_key, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(node_id) DO UPDATE SET
-                    address = excluded.address,
-                    genesis_hash = excluded.genesis_hash,
-                    version = excluded.version,
-                    height = excluded.height,
-                    is_miner = excluded.is_miner,
-                    public_key = excluded.public_key,
-                    last_seen = excluded.last_seen
-            """, (node_id, address, genesis_hash, version,
-                  height, int(is_miner), public_key, now))
+                    address=excluded.address, genesis_hash=excluded.genesis_hash,
+                    version=excluded.version, height=excluded.height,
+                    is_miner=excluded.is_miner, public_key=excluded.public_key,
+                    last_seen=excluded.last_seen
+            """, (node_id, address, genesis_hash, version, height, int(is_miner), public_key, now))
 
     def listar_peers(self, apenas_ativos: bool = True, max_age_s: int = 300) -> List[Dict[str, Any]]:
         now = time.time()
         with self._get_connection() as conn:
-            conn.row_factory = sqlite3.Row
             cursor = conn.execute("SELECT * FROM peers ORDER BY last_seen DESC")
             peers = []
             for row in cursor.fetchall():
@@ -257,10 +553,7 @@ class Database:
         limite = time.time() - max_age_s
         with self._write_lock, self._get_connection(write=True) as conn:
             cur = conn.execute("DELETE FROM peers WHERE last_seen < ?", (limite,))
-            count = cur.rowcount
-            if count > 0:
-                logger.info("[DB] Removidos %d peers inativos (>%ds)", count, max_age_s)
-            return count
+            return cur.rowcount
 
     # ============================================================
     # BOOTSTRAP PEERS
@@ -268,14 +561,12 @@ class Database:
     def add_bootstrap_peer(self, address: str, priority: int = 0) -> None:
         with self._write_lock, self._get_connection(write=True) as conn:
             conn.execute("""
-                INSERT INTO bootstrap_peers (address, priority, enabled)
-                VALUES (?, ?, 1)
-                ON CONFLICT(address) DO UPDATE SET priority = excluded.priority, enabled = 1
+                INSERT INTO bootstrap_peers (address, priority, enabled) VALUES (?, ?, 1)
+                ON CONFLICT(address) DO UPDATE SET priority=excluded.priority, enabled=1
             """, (address, int(priority)))
 
     def listar_bootstrap_peers(self, only_enabled: bool = True) -> List[Dict[str, Any]]:
         with self._get_connection() as conn:
-            conn.row_factory = sqlite3.Row
             q = "SELECT * FROM bootstrap_peers"
             if only_enabled:
                 q += " WHERE enabled = 1"
@@ -293,32 +584,25 @@ class Database:
             return cur.rowcount
 
     # ============================================================
-    # SYNC STATUS
+    # SYNC STATUS + META
     # ============================================================
     def set_sync_value(self, key: str, value: str):
         now = time.time()
         with self._write_lock, self._get_connection(write=True) as conn:
             conn.execute("""
-                INSERT INTO sync_status (key, value, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?
+                INSERT INTO sync_status (key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=?, updated_at=?
             """, (key, value, now, value, now))
 
     def get_sync_value(self, key: str, default: str = None) -> Optional[str]:
         with self._get_connection() as conn:
-            cur = conn.execute("SELECT value FROM sync_status WHERE key = ?", (key,))
-            row = cur.fetchone()
+            row = conn.execute("SELECT value FROM sync_status WHERE key = ?", (key,)).fetchone()
             return row[0] if row else default
 
-    # ============================================================
-    # META — [FIX v9.6.3] É O QUE O blockchain.py USA
-    # Usa a mesma tabela sync_status, só com nome que o blockchain espera.
-    # Aceita qualquer tipo: str / int / float / bool / dict / list
-    # ============================================================
     def set_meta(self, key: str, value: Any) -> None:
-        import json as _json
+        # blockchain.py passa json.dumps() já pronto OU string "1" — guarda como veio
         if isinstance(value, (dict, list)):
-            v = _json.dumps(value, ensure_ascii=False)
+            v = json.dumps(value, ensure_ascii=False)
         elif isinstance(value, bool):
             v = "1" if value else "0"
         elif value is None:
@@ -328,25 +612,10 @@ class Database:
         self.set_sync_value(str(key), v)
 
     def get_meta(self, key: str, default: Any = None) -> Any:
-        import json as _json
+        # IMPORTANTE: blockchain.py faz json.loads(db.get_meta("fila_mineracao"))
+        # então devolve a string crua, NÃO tenta converter.
         v = self.get_sync_value(str(key), None)
-        if v is None:
-            return default
-        # Tenta devolver no tipo original: JSON / int / float / bool
-        s = v.strip()
-        if s.startswith("{") or s.startswith("["):
-            try:
-                return _json.loads(s)
-            except Exception:
-                return v
-        if s in ("1", "0") and default is True or default is False:
-            return s == "1"
-        try:
-            if "." in s:
-                return float(s)
-            return int(s)
-        except (ValueError, TypeError):
-            return v
+        return v if v is not None else default
 
     def delete_meta(self, key: str) -> bool:
         with self._write_lock, self._get_connection(write=True) as conn:
@@ -355,10 +624,8 @@ class Database:
 
     def get_all_meta(self) -> Dict[str, Any]:
         with self._get_connection() as conn:
-            rows = conn.execute("SELECT key, value FROM sync_status").fetchall()
-            return {k: self.get_meta(k) for k, _v in rows for k in [k]}
+            return {r[0]: r[1] for r in conn.execute("SELECT key, value FROM sync_status").fetchall()}
 
-    # Aliases — caso blockchain.py use outro nome
     def get_metadata(self, key: str, default: Any = None) -> Any:
         return self.get_meta(key, default)
 
@@ -372,9 +639,8 @@ class Database:
         now = time.time()
         with self._write_lock, self._get_connection(write=True) as conn:
             conn.execute("""
-                UPDATE mining_gate
-                SET gate_open = 1, reason = ?, opened_at = ?, updated_at = ?, closed_at = NULL
-                WHERE id = 1 AND gate_open = 0
+                UPDATE mining_gate SET gate_open=1, reason=?, opened_at=?, updated_at=?, closed_at=NULL
+                WHERE id=1 AND gate_open=0
             """, (reason, now, now))
             if conn.total_changes > 0:
                 logger.info("[MINING-GATE] ✅ ABERTO — %s", reason)
@@ -383,16 +649,14 @@ class Database:
         now = time.time()
         with self._write_lock, self._get_connection(write=True) as conn:
             conn.execute("""
-                UPDATE mining_gate
-                SET gate_open = 0, reason = ?, closed_at = ?, updated_at = ?
-                WHERE id = 1 AND gate_open = 1
+                UPDATE mining_gate SET gate_open=0, reason=?, closed_at=?, updated_at=?
+                WHERE id=1 AND gate_open=1
             """, (reason, now, now))
             if conn.total_changes > 0:
                 logger.info("[MINING-GATE] 🔒 FECHADO — %s", reason)
 
     def get_mining_gate(self) -> Dict[str, Any]:
         with self._get_connection() as conn:
-            conn.row_factory = sqlite3.Row
             row = conn.execute("SELECT * FROM mining_gate WHERE id = 1").fetchone()
             if row:
                 d = dict(row)
@@ -402,31 +666,24 @@ class Database:
                     "closed_at": None, "updated_at": 0}
 
     # ============================================================
-    # TRUNCATE / PRUNE (Fast-Sync & HTTP Re-Sync)
+    # TRUNCATE / PRUNE
     # ============================================================
-    def height(self) -> int:
-        with self._get_connection() as conn:
-            row = conn.execute("SELECT MAX(height) FROM blocks").fetchone()
-            return int(row[0]) if row and row[0] is not None else -1
-
     def truncate_to(self, target_height: int) -> bool:
         if target_height < 0:
-            logger.error("[DB] truncate_to: altura alvo inválida: %d", target_height)
             return False
         current = self.height()
         if current <= 0:
-            logger.warning("[DB] truncate_to: DB vazio — nada a fazer")
             return True
         if target_height >= current:
-            logger.info("[DB] truncate_to: %d >= %d — nada a remover", target_height, current)
             return True
-        logger.warning("[DB] TRUNCANDO blocos > %d (atual: %d)", target_height, current)
         try:
             with self._write_lock, self._get_connection(write=True) as conn:
                 conn.execute("DELETE FROM blocks WHERE height > ?", (target_height,))
+                conn.execute("DELETE FROM utxos WHERE height > ?", (target_height,))
+                conn.execute("DELETE FROM tx_index WHERE height > ?", (target_height,))
                 removed = conn.total_changes
             self._vacuum()
-            logger.info("[DB] Removidos %d blocos. Nova altura: %d", removed, self.height())
+            logger.info("[DB] Truncado > %d. Nova altura: %d (removidos ~%d)", target_height, self.height(), removed)
             return True
         except Exception as e:
             logger.error("[DB] truncate_to falhou: %s", e)
@@ -441,9 +698,6 @@ class Database:
     def reset_to_height(self, target_height: int) -> bool:
         return self.truncate_to(target_height)
 
-    # ============================================================
-    # FECHAMENTO
-    # ============================================================
     def close(self):
         Database._instance = None
         self._initialized = False
@@ -451,30 +705,10 @@ class Database:
 
 # ============================================================
 # COMPATIBILIDADE — ChainDB
-# main.py / blockchain.py / version.py usam:
-#   from db import ChainDB
 # ============================================================
 class ChainDB(Database):
-    """ChainDB é o Database. Mesma classe, nome que o main.py espera."""
+    """ChainDB é o Database. Nome que main.py / blockchain.py esperam."""
 
-    def add_block(self, height: int, hash_: str = "", prev_hash: str = "",
-                  timestamp: float = 0, data: str = "{}"):
-        return self.save_block(height, hash_, prev_hash, timestamp, data)
-
-    def get_block_by_height(self, height: int):
-        return self.get_block(height)
-
-    def get_last_block(self):
-        h = self.height()
-        return self.get_block(h) if h >= 0 else None
-
-    def get_height(self) -> int:
-        return self.height()
-
-    def get_chain_height(self) -> int:
-        return self.height()
-
-# Aliases para qualquer import antigo
 DB = Database
 ChainDatabase = Database
 
@@ -485,13 +719,8 @@ def get_chain_db(db_path: str = None) -> ChainDB:
     return ChainDB(db_path)
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     db = get_db()
-    print(f"✅ Banco inicializado em: {db.db_path}")
-    print(f"📊 Altura atual: {db.height()}")
-    print(f"👥 Peers ativos: {len(db.listar_peers())}")
-    print(f"🔓 Mining Gate: {'ABERTO' if db.get_mining_gate()['gate_open'] else 'FECHADO'}")
-    print(f"🌐 Bootstrap peers: {len(db.listar_bootstrap_peers())}")
+    print(f"✅ Banco: {db.db_path} | Altura: {db.height()} | tip: {db.tip_hash()[:16]}...")
+    print(f"👥 Peers: {len(db.listar_peers())} | Mempool: {db.mempool_count()}")
