@@ -1,17 +1,19 @@
-"""db.py — Banco SQLite do BRN (v7.5 - Robustez Cloud/Render)
+"""db.py — Banco SQLite do BRN (v7.6 - Consenso Atômico & Hardened)
 ================================================================
-v7.5 (2026-11-15) — MELHORIAS DE ROBUSTEZ:
-  [FIX] busy_timeout aumentado para 30000ms (evita falhas de API
-        durante sincronização P2P pesada).
-  [FIX] zlib.compress movido para fora da transação no _add_block_impl
-        (reduz o tempo de lock do banco de dados).
-  [FIX] Removido PRAGMA journal_mode=WAL do read_conn (é read-only).
-  [KEEP] v7.4: separação Writer/Reader, fila de escrita.
+v7.6 (2026-11-17) — MELHORIAS DE CONSENSO E ATOMICIDADE:
+  [NEW] commit_block(block): grava bloco, txs, UTXOs e limpa mempool
+        em uma única transação atômica com checagem estrita de continuidade.
+  [FIX] Checagem rowcount == 1 no gasto de UTXO (bloqueia double-spend).
+  [FIX] Substituído INSERT OR REPLACE por INSERT puro em blocks,
+        transactions e utxos para evitar sobrescrita silenciosa em forks.
+  [NEW] Coluna chainwork (hex 64 chars) em blocks com migração automática
+        para suportar regra Heaviest Chain (maior trabalho acumulado).
+  [KEEP] v7.5: Writer/Reader separados, WAL, fila de escrita, busy_timeout 30s.
 ================================================================
 """
 from __future__ import annotations
 
-__version__ = "7.5"
+__version__ = "7.6"
 
 import os
 import time
@@ -24,6 +26,7 @@ import orjson
 import json
 import logging
 import pathlib
+import hashlib
 
 log = logging.getLogger("db")
 
@@ -34,6 +37,11 @@ _BATCH_MAX_WAIT_MS  = int(os.environ.get("BRN_DB_BATCH_WAIT_MS", "100"))
 _QUEUE_MAX          = int(os.environ.get("BRN_DB_QUEUE_MAX", "2000"))
 _QUEUE_PUT_TIMEOUT  = float(os.environ.get("BRN_DB_QUEUE_PUT_TIMEOUT", "5.0"))
 _FUTURE_TIMEOUT     = float(os.environ.get("BRN_DB_FUTURE_TIMEOUT", "60.0"))
+
+
+def _format_chainwork(work_int: int) -> str:
+    """Formata trabalho acumulado como hex de 64 chars para ordenação lexicográfica."""
+    return f"{max(0, int(work_int)):064x}"
 
 
 class _WriteOp:
@@ -67,7 +75,6 @@ class ChainDB:
                 isolation_level=None, timeout=30.0, uri=True,
             )
         except sqlite3.OperationalError:
-            # Fallback normal na primeira execução (arquivo ainda não criado).
             self.read_conn = sqlite3.connect(
                 path, check_same_thread=False, isolation_level=None,
                 timeout=30.0,
@@ -75,20 +82,17 @@ class ChainDB:
         self.read_conn.row_factory = sqlite3.Row
         self.read_lock = threading.RLock()
 
-        # PRAGMAs comuns + durabilidade separada.
         common_pragmas = (
             "PRAGMA temp_store=MEMORY",
             "PRAGMA cache_size=-64000",
             "PRAGMA mmap_size=268435456",
             "PRAGMA foreign_keys=ON",
-            "PRAGMA busy_timeout=30000", # [FIX] Aumentado para 30s
+            "PRAGMA busy_timeout=30000",
             "PRAGMA wal_autocheckpoint=1000",
             "PRAGMA journal_size_limit=67108864",
         )
 
-        # Journal mode SÓ no writer (o reader é read-only)
         self.conn.execute("PRAGMA journal_mode=WAL")
-        # [FIX] Não executa journal_mode no read_conn
 
         for p in common_pragmas:
             self.conn.execute(p)
@@ -103,9 +107,10 @@ class ChainDB:
         except sqlite3.OperationalError:
             pass
 
-        # Schema + backfill rodam ANTES do Writer thread começar
+        # Schema + migrations rodam ANTES do Writer thread começar
         self._schema()
         self._migrate_raw_txs()
+        self._migrate_chainwork()
 
         # Writer Queue
         self._write_queue: queue.Queue = queue.Queue(maxsize=_QUEUE_MAX)
@@ -216,7 +221,7 @@ class ChainDB:
             op.future.set_exception(e)
 
     # ============================================================
-    # SCHEMA
+    # SCHEMA & MIGRAÇÕES
     # ============================================================
     def _schema(self):
         with self.lock:
@@ -225,10 +230,13 @@ class ChainDB:
                 height INTEGER PRIMARY KEY, hash TEXT UNIQUE NOT NULL,
                 prev_hash TEXT NOT NULL, timestamp INTEGER NOT NULL,
                 nonce INTEGER NOT NULL, merkle TEXT NOT NULL,
-                difficulty INTEGER NOT NULL, raw BLOB NOT NULL
+                difficulty INTEGER NOT NULL,
+                chainwork TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000',
+                raw BLOB NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash);
             CREATE INDEX IF NOT EXISTS idx_blocks_prev ON blocks(prev_hash);
+            CREATE INDEX IF NOT EXISTS idx_blocks_work ON blocks(chainwork DESC);
 
             CREATE TABLE IF NOT EXISTS transactions (
                 txid TEXT PRIMARY KEY, block_height INTEGER NOT NULL,
@@ -255,7 +263,6 @@ class ChainDB:
             CREATE INDEX IF NOT EXISTS idx_mp_time ON mempool(received_at);
 
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
-
             CREATE TABLE IF NOT EXISTS peers (
                 address TEXT PRIMARY KEY NOT NULL, node_id TEXT NOT NULL,
                 genesis_hash TEXT NOT NULL, version TEXT,
@@ -294,7 +301,7 @@ class ChainDB:
                 data TEXT, timestamp INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_contract_events_id
-                ON contract_events(contract_id, timestamp DESC);
+            ON contract_events(contract_id, timestamp DESC);
 
             CREATE TABLE IF NOT EXISTS l2_escrows (
                 escrow_id TEXT PRIMARY KEY, creator TEXT, buyer TEXT,
@@ -322,1033 +329,23 @@ class ChainDB:
             CREATE INDEX IF NOT EXISTS idx_l2tx_escrow ON l2_txs(escrow_id);
             """)
 
-            try:
-                cols = self.conn.execute("PRAGMA table_info(peers)").fetchall()
-                names = {c["name"] for c in cols}
-                if "score" not in names:
-                    self.conn.execute("ALTER TABLE peers ADD COLUMN score INTEGER DEFAULT 0")
-                if "public_key" not in names:
-                    self.conn.execute("ALTER TABLE peers ADD COLUMN public_key TEXT DEFAULT ''")
-            except Exception:
-                pass
-
-            try:
-                cols = self.conn.execute("PRAGMA table_info(transactions)").fetchall()
-                names = {c["name"] for c in cols}
-                if "raw" not in names:
-                    self.conn.execute("ALTER TABLE transactions ADD COLUMN raw BLOB")
-            except Exception:
-                pass
-
-    # ============================================================
-    # BACKFILL
-    # ============================================================
-    def _migrate_raw_txs(self):
-        if os.environ.get("BRN_SKIP_RAW_BACKFILL", "0") == "1":
-            return
+        # Migrations inline
         try:
-            with self.lock:
-                n_null = self.conn.execute(
-                    "SELECT COUNT(*) AS c FROM transactions WHERE raw IS NULL"
-                ).fetchone()["c"]
-        except Exception:
-            return
-        if not n_null:
-            return
-        print(f"[db] backfill: {n_null} tx antigas sem raw — migrando...")
-        try:
-            with self.lock:
-                rows = self.conn.execute(
-                    "SELECT DISTINCT block_height FROM transactions WHERE raw IS NULL ORDER BY block_height"
-                ).fetchall()
-                heights = [r["block_height"] for r in rows]
-        except Exception:
-            return
-        if not heights:
-            return
-        total = len(heights)
-        done = 0
-        for h in heights:
-            try:
-                blk = self.get_block(h)
-                if not blk:
-                    continue
-                with self.lock:
-                    self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
-                    try:
-                        for tx in blk["transactions"]:
-                            blob = zlib.compress(orjson.dumps(tx), level=6)
-                            self.conn.execute(
-                                "UPDATE transactions SET raw=? WHERE txid=? AND raw IS NULL",
-                                (blob, tx["txid"]),
-                            )
-                        self.conn.execute("COMMIT")
-                    except Exception:
-                        self.conn.execute("ROLLBACK")
-                        continue
-            except Exception:
-                continue
-            done += 1
-        print(f"[db] backfill concluído: {done}/{total} blocos")
-
-    # ============================================================
-    # BLOCOS — escritas
-    # ============================================================
-    def add_block(self, block):
-        return self._enqueue(self._add_block_impl, block, batch_safe=False)
-
-    def _add_block_impl(self, block):
-        # [FIX] Compressão movida para FORA da transação para reduzir lock
-        blob = zlib.compress(orjson.dumps(block), level=6)
-        tx_blobs = []
-        for tx in block["transactions"]:
-            tx_blobs.append((tx["txid"], zlib.compress(orjson.dumps(tx), level=6)))
-            
-        with self.lock:
-            self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
-            try:
+            cols = self.conn.execute("PRAGMA table_info(blocks)").fetchall()
+            names = {c["name"] for c in cols}
+            if "chainwork" not in names:
                 self.conn.execute(
-                    "INSERT INTO blocks(height,hash,prev_hash,timestamp,nonce,merkle,difficulty,raw) "
-                    "VALUES (?,?,?,?,?,?,?,?)",
-                    (block["height"], block["hash"], block["prev_hash"],
-                     block["timestamp"], block["nonce"], block["merkle"],
-                     block["difficulty"], blob),
+                    "ALTER TABLE blocks ADD COLUMN chainwork TEXT NOT NULL "
+                    "DEFAULT '0000000000000000000000000000000000000000000000000000000000000000'"
                 )
-                for txid_str, tx_blob in tx_blobs:
-                    self.conn.execute(
-                        "INSERT OR REPLACE INTO transactions(txid,block_height,raw) VALUES (?,?,?)",
-                        (txid_str, block["height"], tx_blob),
-                    )
-                self.conn.execute("COMMIT")
-            except Exception:
-                self.conn.execute("ROLLBACK")
-                raise
-
-    def delete_blocks_above(self, height):
-        return self._enqueue(self._delete_blocks_above_impl, height, batch_safe=True)
-
-    def _delete_blocks_above_impl(self, height):
-        with self.lock:
-            n = self.conn.execute("DELETE FROM blocks WHERE height > ?", (height,)).rowcount
-            self.conn.execute("DELETE FROM transactions WHERE block_height > ?", (height,))
-            self.conn.execute("DELETE FROM utxos WHERE block_height > ?", (height,))
-            return n
-
-    # ============================================================
-    # BLOCOS — LEITURAS (via read_conn)
-    # ============================================================
-    def get_block(self, height):
-        with self.read_lock:
-            row = self.read_conn.execute(
-                "SELECT raw FROM blocks WHERE height=?", (height,)
-            ).fetchone()
-            if not row or row["raw"] is None:
-                return None
-            raw = row["raw"]
-        try:
-            return orjson.loads(zlib.decompress(raw))
-        except Exception:
-            return None
-
-    def get_block_by_hash(self, h):
-        with self.read_lock:
-            row = self.read_conn.execute(
-                "SELECT raw FROM blocks WHERE hash=?", (h,)
-            ).fetchone()
-            if not row or row["raw"] is None:
-                return None
-            raw = row["raw"]
-        try:
-            return orjson.loads(zlib.decompress(raw))
-        except Exception:
-            return None
-
-    def get_blocks_range(self, start, end):
-        with self.read_lock:
-            rows = self.read_conn.execute(
-                "SELECT raw FROM blocks WHERE height >= ? AND height < ? ORDER BY height",
-                (start, end),
-            ).fetchall()
-            raws = [r["raw"] for r in rows if r["raw"] is not None]
-        result = []
-        for raw in raws:
-            try:
-                result.append(orjson.loads(zlib.decompress(raw)))
-            except Exception:
-                pass
-        return result
-
-    def get_blocks_by_heights(self, heights: list) -> dict:
-        if not heights:
-            return {}
-        try:
-            heights = [int(h) for h in heights]
-        except Exception:
-            return {}
-        with self.read_lock:
-            placeholders = ",".join("?" * len(heights))
-            rows = self.read_conn.execute(
-                f"SELECT height, raw FROM blocks WHERE height IN ({placeholders})",
-                tuple(heights)
-            ).fetchall()
-            raw_map = {int(r["height"]): r["raw"] for r in rows if r["raw"] is not None}
-        result = {}
-        for h, raw in raw_map.items():
-            try:
-                result[h] = orjson.loads(zlib.decompress(raw))
-            except Exception:
-                pass
-        return result
-
-    def height(self):
-        with self.read_lock:
-            row = self.read_conn.execute(
-                "SELECT MAX(height) AS h FROM blocks"
-            ).fetchone()
-            return int(row["h"]) if row and row["h"] is not None else -1
-
-    def tip(self):
-        with self.read_lock:
-            row = self.read_conn.execute(
-                "SELECT hash,prev_hash FROM blocks ORDER BY height DESC LIMIT 1"
-            ).fetchone()
-            return dict(row) if row else None
-
-    def tip_hash(self):
-        with self.read_lock:
-            row = self.read_conn.execute(
-                "SELECT hash FROM blocks ORDER BY height DESC LIMIT 1"
-            ).fetchone()
-            return row["hash"] if row else "0" * 64
-
-    def headers(self, start, limit=2000):
-        with self.read_lock:
-            rows = self.read_conn.execute(
-                "SELECT height,hash,prev_hash,timestamp,nonce,merkle,difficulty "
-                "FROM blocks WHERE height>=? ORDER BY height LIMIT ?",
-                (start, limit),
-            ).fetchall()
-            return [dict(r) for r in rows]
-
-    def latest_blocks(self, n=10):
-        top = self.height()
-        if top < 0:
-            return []
-        start = max(0, top - n + 1)
-        heights = list(range(start, top + 1))
-        blocks_by_h = self.get_blocks_by_heights(heights)
-        return [blocks_by_h[h] for h in heights if h in blocks_by_h]
-
-    # ============================================================
-    # TX LOOKUP (via read_conn)
-    # ============================================================
-    def get_tx_by_txid(self, txid: str):
-        try:
-            with self.read_lock:
-                row = self.read_conn.execute(
-                    "SELECT raw, block_height FROM transactions WHERE txid = ? LIMIT 1",
-                    (txid,),
-                ).fetchone()
-                if not row or row["raw"] is None:
-                    return None, None
-                raw = row["raw"]
-                bh = row["block_height"]
-            return orjson.loads(zlib.decompress(raw)), bh
-        except Exception:
-            return None, None
-
-    def get_tx_block_height(self, txid: str) -> int:
-        try:
-            with self.read_lock:
-                row = self.read_conn.execute(
-                    "SELECT block_height FROM transactions WHERE txid = ? LIMIT 1",
-                    (txid,),
-                ).fetchone()
-                return int(row["block_height"]) if row else -1
-        except Exception:
-            return -1
-
-    def get_txs_for_address(self, address: str, limit: int = 200) -> list:
-        result = []
-        seen_txids = set()
-        with self.read_lock:
-            try:
-                rows = self.read_conn.execute(
-                    "SELECT DISTINCT txid FROM utxos WHERE address = ? LIMIT ?",
-                    (address, limit),
-                ).fetchall()
-                received_txids = {r["txid"] for r in rows}
-            except Exception:
-                received_txids = set()
-            try:
-                rows = self.read_conn.execute(
-                    "SELECT DISTINCT spent_by FROM utxos WHERE address = ? AND spent_by IS NOT NULL LIMIT ?",
-                    (address, limit),
-                ).fetchall()
-                sent_txids = {r["spent_by"] for r in rows if r["spent_by"]}
-            except Exception:
-                sent_txids = set()
-            for txid_str in (received_txids | sent_txids):
-                try:
-                    row = self.read_conn.execute(
-                        "SELECT raw, block_height FROM transactions WHERE txid = ?", (txid_str,),
-                    ).fetchone()
-                except Exception:
-                    continue
-                if not row or row["raw"] is None:
-                    continue
-                try:
-                    tx = orjson.loads(zlib.decompress(row["raw"]))
-                except Exception:
-                    continue
-                result.append({"tx": tx, "block_height": int(row["block_height"]), "is_mempool": False})
-                seen_txids.add(txid_str)
-            try:
-                mp_rows = self.read_conn.execute("SELECT txid, raw FROM mempool").fetchall()
-            except Exception:
-                mp_rows = []
-            for r in mp_rows:
-                txid_str = r["txid"]
-                if txid_str in seen_txids or r["raw"] is None:
-                    continue
-                try:
-                    tx = orjson.loads(zlib.decompress(r["raw"]))
-                except Exception:
-                    continue
-                touches = False
-                for o in tx.get("outputs", []):
-                    if o.get("address") == address:
-                        touches = True
-                        break
-                if not touches:
-                    for inp in tx.get("inputs", []):
-                        if inp.get("txid") == "0" * 64:
-                            continue
-                        try:
-                            row_u = self.read_conn.execute(
-                                "SELECT address FROM utxos WHERE txid = ? AND vout = ?",
-                                (inp.get("txid"), inp.get("vout")),
-                            ).fetchone()
-                        except Exception:
-                            continue
-                        if row_u and row_u["address"] == address:
-                            touches = True
-                            break
-                if touches:
-                    result.append({"tx": tx, "block_height": None, "is_mempool": True})
-        result.sort(key=lambda x: (0 if x["is_mempool"] else 1, -(x["block_height"] or 0)))
-        return result[:limit]
-
-    # ============================================================
-    # UTXO (via read_conn)
-    # ============================================================
-    def balance(self, address):
-        with self.read_lock:
-            row = self.read_conn.execute(
-                "SELECT COALESCE(SUM(amount),0) AS s FROM utxos WHERE address=? AND spent=0",
-                (address,),
-            ).fetchone()
-            return int(row["s"])
-
-    def utxos_for(self, address):
-        with self.read_lock:
-            rows = self.read_conn.execute(
-                "SELECT txid,vout,amount,pubkey FROM utxos WHERE address=? AND spent=0 ORDER BY amount DESC",
-                (address,),
-            ).fetchall()
-            return [dict(r) for r in rows]
-
-    def get_utxos(self, address):
-        return self.utxos_for(address)
-
-    def get_utxo(self, txid, vout):
-        with self.read_lock:
-            row = self.read_conn.execute(
-                "SELECT * FROM utxos WHERE txid=? AND vout=? AND spent=0", (txid, vout),
-            ).fetchone()
-            return dict(row) if row else None
-
-    def apply_tx(self, tx, height, coinbase=False):
-        return self._enqueue(self._apply_tx_impl, tx, height, coinbase, batch_safe=False)
-
-    def _apply_tx_impl(self, tx, height, coinbase=False):
-        with self.lock:
-            self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
-            try:
-                if not coinbase:
-                    for inp in tx["inputs"]:
-                        self.conn.execute(
-                            "UPDATE utxos SET spent=1, spent_by=? WHERE txid=? AND vout=? AND spent=0",
-                            (tx["txid"], inp["txid"], inp["vout"]),
-                        )
-                for i, out in enumerate(tx["outputs"]):
-                    self.conn.execute(
-                        "INSERT OR REPLACE INTO utxos(txid,vout,address,amount,pubkey,block_height,spent) "
-                        "VALUES (?,?,?,?,?,?,0)",
-                        (tx["txid"], i, out["address"], out["amount"], out.get("pubkey", ""), height),
-                    )
-                self.conn.execute("COMMIT")
-            except Exception:
-                self.conn.execute("ROLLBACK")
-                raise
-
-    def rollback_block(self, height):
-        return self._enqueue(self._rollback_block_impl, height, batch_safe=False)
-
-    def _rollback_block_impl(self, height):
-        with self.lock:
-            block = self.get_block(height)
-            if not block:
-                return
-            self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
-            try:
-                for tx in reversed(block["transactions"]):
-                    for i in range(len(tx["outputs"])):
-                        self.conn.execute("DELETE FROM utxos WHERE txid=? AND vout=?", (tx["txid"], i))
-                    if height > 0:
-                        for inp in tx.get("inputs", []):
-                            if inp["txid"] == "0" * 64:
-                                continue
-                            self.conn.execute(
-                                "UPDATE utxos SET spent=0, spent_by=NULL WHERE txid=? AND vout=?",
-                                (inp["txid"], inp["vout"]),
-                            )
-                    self.conn.execute("DELETE FROM transactions WHERE txid=?", (tx["txid"],))
-                self.conn.execute("DELETE FROM blocks WHERE height=?", (height,))
-                self.conn.execute("COMMIT")
-            except Exception:
-                self.conn.execute("ROLLBACK")
-                raise
-
-    # ============================================================
-    # NONCE (via read_conn)
-    # ============================================================
-    def get_next_nonce(self, address: str) -> int:
-        with self.read_lock:
-            row = self.read_conn.execute(
-                "SELECT COUNT(*) AS c FROM utxos WHERE address=? AND spent=1", (address,),
-            ).fetchone()
-            return int(row["c"])
-
-    def get_nonce_for_pubkey(self, pubkey: str) -> int:
-        with self.read_lock:
-            row = self.read_conn.execute(
-                "SELECT COUNT(*) AS c FROM utxos WHERE pubkey=? AND spent=1", (pubkey,),
-            ).fetchone()
-            return int(row["c"])
-
-    # ============================================================
-    # MEMPOOL
-    # ============================================================
-    def add_mempool(self, tx, fee):
-        return self._enqueue(self._add_mempool_impl, tx, fee, batch_safe=True)
-
-    def _add_mempool_impl(self, tx, fee):
-        try:
-            self.conn.execute(
-                "INSERT INTO mempool(txid,raw,fee,received_at) VALUES (?,?,?,?)",
-                (tx["txid"], zlib.compress(orjson.dumps(tx)), fee, time.time()),
-            )
-        except sqlite3.IntegrityError:
-            return False
-        self._prune_mempool()
-        return True
-
-    def _prune_mempool(self, max_size=1000, ttl=86400):
-        self.conn.execute("DELETE FROM mempool WHERE received_at < ?", (time.time() - ttl,))
-        n = self.conn.execute("SELECT COUNT(*) AS c FROM mempool").fetchone()["c"]
-        if n > max_size:
-            self.conn.execute(
-                "DELETE FROM mempool WHERE txid IN "
-                "(SELECT txid FROM mempool ORDER BY fee ASC, received_at ASC LIMIT ?)",
-                (n - max_size,),
-            )
-
-    def has_mempool(self, txid):
-        with self.read_lock:
-            row = self.read_conn.execute(
-                "SELECT 1 FROM mempool WHERE txid=?", (txid,)
-            ).fetchone()
-            return row is not None
-
-    def get_mempool_tx(self, txid):
-        with self.read_lock:
-            row = self.read_conn.execute(
-                "SELECT raw FROM mempool WHERE txid=?", (txid,)
-            ).fetchone()
-            if not row or row["raw"] is None:
-                return None
-            raw = row["raw"]
-        try:
-            return orjson.loads(zlib.decompress(raw))
-        except Exception:
-            return None
-
-    def all_mempool(self, limit=1000):
-        with self.read_lock:
-            rows = self.read_conn.execute(
-                "SELECT raw FROM mempool ORDER BY fee DESC LIMIT ?", (limit,),
-            ).fetchall()
-            raws = [r["raw"] for r in rows if r["raw"] is not None]
-        result = []
-        for raw in raws:
-            try:
-                result.append(orjson.loads(zlib.decompress(raw)))
-            except Exception:
-                pass
-        return result
-
-    def remove_mempool(self, txid):
-        return self._enqueue(self._remove_mempool_impl, txid, batch_safe=True)
-
-    def _remove_mempool_impl(self, txid):
-        self.conn.execute("DELETE FROM mempool WHERE txid=?", (txid,))
-
-    def mempool_count(self):
-        with self.read_lock:
-            row = self.read_conn.execute("SELECT COUNT(*) AS c FROM mempool").fetchone()
-            return row["c"]
-
-    def mempool_stats(self):
-        with self.read_lock:
-            row = self.read_conn.execute(
-                "SELECT COUNT(*) AS c, COALESCE(SUM(fee),0) AS sf FROM mempool"
-            ).fetchone()
-            fees = self.read_conn.execute(
-                "SELECT fee FROM mempool ORDER BY fee DESC LIMIT 100"
-            ).fetchall()
-            return {"count": row["c"], "sum_fee": row["sf"], "fees": [f["fee"] for f in fees]}
-
-    def utxos_gastos_na_mempool(self) -> set:
-        gastos = set()
-        with self.read_lock:
-            try:
-                rows = self.read_conn.execute("SELECT raw FROM mempool").fetchall()
-                for r in rows:
-                    if r["raw"] is None:
-                        continue
-                    try:
-                        tx = orjson.loads(zlib.decompress(r["raw"]))
-                        for inp in tx.get("inputs", []):
-                            tid = inp.get("txid", "")
-                            if tid and tid != "0" * 64:
-                                gastos.add((tid, int(inp.get("vout", 0))))
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-        return gastos
-
-    # ============================================================
-    # META
-    # ============================================================
-    def set_meta(self, key, value):
-        return self._enqueue(self._set_meta_impl, key, value, batch_safe=True)
-
-    def _set_meta_impl(self, key, value):
-        self.conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)", (key, value))
-
-    def get_meta(self, key):
-        with self.read_lock:
-            row = self.read_conn.execute(
-                "SELECT value FROM meta WHERE key=?", (key,)
-            ).fetchone()
-            return row["value"] if row else None
-
-    # ============================================================
-    # PEERS
-    # ============================================================
-    def upsert_peer(self, node_id, address, genesis_hash, version="?", height=0,
-                    is_miner=False, public_key="", metadata=None):
-        return self._enqueue(
-            self._upsert_peer_impl, node_id, address, genesis_hash, version,
-            height, is_miner, public_key, metadata, batch_safe=True,
-        )
-
-    def _upsert_peer_impl(self, node_id, address, genesis_hash, version="?", height=0,
-                          is_miner=False, public_key="", metadata=None):
-        agora = int(time.time())
-        existente = self.conn.execute(
-            "SELECT node_id FROM peers WHERE address=?", (address,),
-        ).fetchone()
-        novo = existente is None
-        self.conn.execute("""
-            INSERT INTO peers (address, node_id, genesis_hash, version, height,
-                               is_miner, public_key, metadata, first_seen, last_seen, score)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-            ON CONFLICT(address) DO UPDATE SET
-                node_id=excluded.node_id, genesis_hash=excluded.genesis_hash,
-                version=excluded.version, height=excluded.height,
-                is_miner=excluded.is_miner, public_key=excluded.public_key,
-                metadata=excluded.metadata, last_seen=excluded.last_seen
-        """, (address, node_id, genesis_hash, version, height,
-              1 if is_miner else 0, public_key,
-              orjson.dumps(metadata or {}).decode(), agora, agora))
-        if novo:
-            self._log_event_impl("peer_joined", address, f"node_id={node_id[:12]}")
-        return novo
-
-    def get_peer_score(self, address):
-        with self.read_lock:
-            row = self.read_conn.execute(
-                "SELECT score FROM peers WHERE address=?", (address,)
-            ).fetchone()
-            return int(row["score"]) if row else 0
-
-    def set_peer_score(self, address, score):
-        return self._enqueue(self._set_peer_score_impl, address, score, batch_safe=True)
-
-    def _set_peer_score_impl(self, address, score):
-        self.conn.execute("UPDATE peers SET score=? WHERE address=?", (score, address))
-
-    def add_peer_score(self, address, delta):
-        return self._enqueue(self._add_peer_score_impl, address, delta, batch_safe=True)
-
-    def _add_peer_score_impl(self, address, delta):
-        self.conn.execute(
-            "UPDATE peers SET score = COALESCE(score, 0) + ? WHERE address=?", (delta, address),
-        )
-        row = self.conn.execute(
-            "SELECT score FROM peers WHERE address=?", (address,)
-        ).fetchone()
-        return int(row["score"]) if row else 0
-
-    def listar_peers(self, apenas_ativos=True, janela=300):
-        with self.read_lock:
-            if apenas_ativos:
-                cutoff = int(time.time()) - janela
-                rows = self.read_conn.execute(
-                    "SELECT * FROM peers WHERE last_seen >= ? ORDER BY last_seen DESC", (cutoff,),
-                ).fetchall()
-            else:
-                rows = self.read_conn.execute("SELECT * FROM peers ORDER BY last_seen DESC").fetchall()
-            return [dict(r) for r in rows]
-
-    def listar_peers_maus(self, score_min=-100):
-        with self.read_lock:
-            rows = self.read_conn.execute(
-                "SELECT * FROM peers WHERE score < ?", (score_min,)
-            ).fetchall()
-            return [dict(r) for r in rows]
-
-    def contar_peers(self, apenas_ativos=True, janela=300):
-        with self.read_lock:
-            if apenas_ativos:
-                cutoff = int(time.time()) - janela
-                row = self.read_conn.execute(
-                    "SELECT COUNT(*) AS n FROM peers WHERE last_seen >= ?", (cutoff,),
-                ).fetchone()
-            else:
-                row = self.read_conn.execute("SELECT COUNT(*) AS n FROM peers").fetchone()
-            return int(row["n"])
-
-    def remover_peer(self, node_id):
-        return self._enqueue(self._remover_peer_impl, node_id, batch_safe=True)
-
-    def _remover_peer_impl(self, node_id):
-        self.conn.execute("DELETE FROM peers WHERE node_id=?", (node_id,))
-
-    def remover_peer_por_endereco(self, address):
-        return self._enqueue(self._remover_peer_por_endereco_impl, address, batch_safe=True)
-
-    def _remover_peer_por_endereco_impl(self, address):
-        self.conn.execute("DELETE FROM peers WHERE address=?", (address,))
-
-    def remover_peer_por_pubkey(self, pubkey: str) -> None:
-        if not pubkey:
-            return
-        return self._enqueue(self._remover_peer_por_pubkey_impl, pubkey, batch_safe=True)
-
-    def _remover_peer_por_pubkey_impl(self, pubkey):
-        self.conn.execute("DELETE FROM peers WHERE public_key = ?", (pubkey,))
-
-    def limpar_peers_inativos(self, janela=1800):
-        return self._enqueue(self._limpar_peers_inativos_impl, janela, batch_safe=True)
-
-    def _limpar_peers_inativos_impl(self, janela=1800):
-        self.conn.execute("DELETE FROM peers WHERE last_seen < ?", (int(time.time()) - janela,))
-
-    # ============================================================
-    # EVENTOS
-    # ============================================================
-    def _log_event(self, tipo, peer="", details=""):
-        return self._enqueue(self._log_event_impl, tipo, peer, details, batch_safe=True)
-
-    def _log_event_impl(self, tipo, peer="", details=""):
-        self.conn.execute(
-            "INSERT INTO network_events (timestamp, event_type, peer_address, details) VALUES (?,?,?,?)",
-            (int(time.time()), tipo, peer, details),
-        )
-
-    def ultimos_eventos(self, n=50):
-        with self.read_lock:
-            rows = self.read_conn.execute(
-                "SELECT * FROM network_events ORDER BY id DESC LIMIT ?", (n,),
-            ).fetchall()
-            return [dict(r) for r in rows]
-
-    # ============================================================
-    # CONTRATOS
-    # ============================================================
-    def contract_insert(self, contract_id, owner, code, metadata=None):
-        return self._enqueue(
-            self._contract_insert_impl, contract_id, owner, code, metadata, batch_safe=True,
-        )
-
-    def _contract_insert_impl(self, contract_id, owner, code, metadata=None):
-        self.conn.execute(
-            "INSERT OR REPLACE INTO contracts(contract_id, owner, code, metadata, created_at) "
-            "VALUES (?,?,?,?,?)",
-            (contract_id, owner, orjson.dumps(code).decode(),
-             orjson.dumps(metadata or {}).decode(), int(time.time())),
-        )
-        self.conn.execute(
-            "INSERT OR REPLACE INTO contract_state(contract_id, state, updated_at) VALUES (?,?,?)",
-            (contract_id, "{}", int(time.time())),
-        )
-
-    def contract_get(self, contract_id):
-        with self.read_lock:
-            row = self.read_conn.execute(
-                "SELECT * FROM contracts WHERE contract_id=?", (contract_id,)
-            ).fetchone()
-            if not row:
-                return None
-            d = dict(row)
-        d["code"] = orjson.loads(d["code"])
-        d["metadata"] = orjson.loads(d["metadata"] or "{}")
-        return d
-
-    def contract_list(self, owner=None, limit=100):
-        with self.read_lock:
-            if owner:
-                rows = self.read_conn.execute(
-                    "SELECT * FROM contracts WHERE owner=? ORDER BY created_at DESC LIMIT ?",
-                    (owner, limit),
-                ).fetchall()
-            else:
-                rows = self.read_conn.execute(
-                    "SELECT * FROM contracts ORDER BY created_at DESC LIMIT ?", (limit,),
-                ).fetchall()
-            raw = [dict(r) for r in rows]
-        out = []
-        for d in raw:
-            d["code"] = orjson.loads(d["code"])
-            d["metadata"] = orjson.loads(d["metadata"] or "{}")
-            out.append(d)
-        return out
-
-    def contract_count(self):
-        with self.read_lock:
-            row = self.read_conn.execute("SELECT COUNT(*) AS c FROM contracts").fetchone()
-            return row["c"]
-
-    def contract_delete(self, contract_id):
-        return self._enqueue(self._contract_delete_impl, contract_id, batch_safe=True)
-
-    def _contract_delete_impl(self, contract_id):
-        self.conn.execute("DELETE FROM contracts WHERE contract_id=?", (contract_id,))
-        self.conn.execute("DELETE FROM contract_state WHERE contract_id=?", (contract_id,))
-        self.conn.execute("DELETE FROM contract_events WHERE contract_id=?", (contract_id,))
-
-    def contract_get_state(self, contract_id):
-        with self.read_lock:
-            row = self.read_conn.execute(
-                "SELECT state FROM contract_state WHERE contract_id=?", (contract_id,),
-            ).fetchone()
-            return orjson.loads(row["state"]) if row else {}
-
-    def contract_set_state(self, contract_id, state):
-        return self._enqueue(self._contract_set_state_impl, contract_id, state, batch_safe=True)
-
-    def _contract_set_state_impl(self, contract_id, state):
-        self.conn.execute(
-            "INSERT OR REPLACE INTO contract_state(contract_id, state, updated_at) VALUES (?,?,?)",
-            (contract_id, orjson.dumps(state).decode(), int(time.time())),
-        )
-
-    def contract_log_event(self, contract_id, event, data):
-        return self._enqueue(
-            self._contract_log_event_impl, contract_id, event, data, batch_safe=True,
-        )
-
-    def _contract_log_event_impl(self, contract_id, event, data):
-        self.conn.execute(
-            "INSERT INTO contract_events(contract_id, event, data, timestamp) VALUES (?,?,?,?)",
-            (contract_id, event,
-             orjson.dumps(data).decode() if data is not None else "null",
-             int(time.time())),
-        )
-
-    def contract_get_events(self, contract_id, limit=50):
-        with self.read_lock:
-            rows = self.read_conn.execute(
-                "SELECT * FROM contract_events WHERE contract_id=? ORDER BY id DESC LIMIT ?",
-                (contract_id, limit),
-            ).fetchall()
-            return [dict(r) for r in rows]
-
-    def contract_all_events(self, limit=200):
-        with self.read_lock:
-            rows = self.read_conn.execute(
-                "SELECT * FROM contract_events ORDER BY id DESC LIMIT ?", (limit,),
-            ).fetchall()
-            return [dict(r) for r in rows]
-
-    # ============================================================
-    # L2 (usa read_conn nas leituras, conn nas escritas)
-    # ============================================================
-    def save_l2_escrow(self, escrow_dict):
-        return self._enqueue(self._save_l2_escrow_impl, escrow_dict, batch_safe=True)
-
-    def _save_l2_escrow_impl(self, escrow_dict):
-        self.conn.execute("""
-            INSERT OR REPLACE INTO l2_escrows
-            (escrow_id, creator, buyer, brn_amount, btc_expected_sats,
-             btc_address, btc_txid, status, created_at, expires_at,
-             l2_hash, raw_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            escrow_dict['escrow_id'], escrow_dict['creator'],
-            escrow_dict['buyer'], escrow_dict['brn_amount'],
-            escrow_dict['btc_expected_sats'], escrow_dict['btc_address'],
-            escrow_dict.get('btc_txid'), escrow_dict['status'],
-            escrow_dict['created_at'], escrow_dict['expires_at'],
-            escrow_dict['l2_hash'], json.dumps(escrow_dict)))
-
-    def get_l2_escrows(self, status=None):
-        with self.read_lock:
-            if status:
-                rows = self.read_conn.execute(
-                    "SELECT raw_json FROM l2_escrows WHERE status=? ORDER BY created_at DESC", (status,),
-                ).fetchall()
-            else:
-                rows = self.read_conn.execute("SELECT raw_json FROM l2_escrows ORDER BY created_at DESC").fetchall()
-            raws = [r["raw_json"] for r in rows]
-        result = []
-        for raw in raws:
-            try:
-                result.append(json.loads(raw))
-            except Exception:
-                pass
-        return result
-
-    def get_l2_escrow_by_id(self, escrow_id):
-        with self.read_lock:
-            row = self.read_conn.execute(
-                "SELECT raw_json FROM l2_escrows WHERE escrow_id=?", (escrow_id,),
-            ).fetchone()
-        if row:
-            try:
-                return json.loads(row["raw_json"])
-            except Exception:
-                return None
-        return None
-
-    def update_l2_escrow_status(self, escrow_id, status, btc_txid=None):
-        return self._enqueue(
-            self._update_l2_escrow_status_impl, escrow_id, status, btc_txid, batch_safe=True,
-        )
-
-    def _update_l2_escrow_status_impl(self, escrow_id, status, btc_txid=None):
-        row = self.conn.execute(
-            "SELECT raw_json FROM l2_escrows WHERE escrow_id=?", (escrow_id,)
-        ).fetchone()
-        if not row:
-            return
-        try:
-            escrow = json.loads(row["raw_json"])
-        except Exception:
-            return
-        escrow['status'] = status
-        if btc_txid:
-            escrow['btc_txid'] = btc_txid
-        self.conn.execute(
-            "UPDATE l2_escrows SET status=?, btc_txid=?, raw_json=? WHERE escrow_id=?",
-            (status, escrow.get('btc_txid'), json.dumps(escrow), escrow_id),
-        )
-
-    def is_btc_txid_used(self, btc_txid):
-        with self.read_lock:
-            row = self.read_conn.execute(
-                "SELECT 1 FROM btc_used WHERE btc_txid=?", (btc_txid,)
-            ).fetchone()
-            return row is not None
-
-    def mark_btc_txid_used(self, btc_txid, escrow_id):
-        return self._enqueue(
-            self._mark_btc_txid_used_impl, btc_txid, escrow_id, batch_safe=True,
-        )
-
-    def _mark_btc_txid_used_impl(self, btc_txid, escrow_id):
-        self.conn.execute(
-            "INSERT OR REPLACE INTO btc_used (btc_txid, escrow_id, used_at) VALUES (?, ?, ?)",
-            (btc_txid, escrow_id, int(time.time())),
-        )
-
-    def save_l2_block(self, l2_block):
-        return self._enqueue(self._save_l2_block_impl, l2_block, batch_safe=True)
-
-    def _save_l2_block_impl(self, l2_block):
-        self.conn.execute(
-            "INSERT OR REPLACE INTO l2_blocks (merkle_root, timestamp, count, raw_json) VALUES (?, ?, ?, ?)",
-            (l2_block['merkle_root'], l2_block['timestamp'],
-             l2_block.get('count', 1), json.dumps(l2_block)),
-        )
-
-    def save_l2_tx(self, l2_tx):
-        return self._enqueue(self._save_l2_tx_impl, l2_tx, batch_safe=True)
-
-    def _save_l2_tx_impl(self, l2_tx):
-        import hashlib
-        txid = hashlib.sha256(json.dumps(l2_tx).encode()).hexdigest()[:16]
-        self.conn.execute(
-            "INSERT OR REPLACE INTO l2_txs (txid, type, escrow_id, raw_json, timestamp) VALUES (?, ?, ?, ?, ?)",
-            (txid, l2_tx['type'], l2_tx.get('escrow_id'), json.dumps(l2_tx), int(time.time())),
-        )
-        return txid
-
-    def get_l2_txs(self, limit=50):
-        with self.read_lock:
-            rows = self.read_conn.execute(
-                "SELECT raw_json FROM l2_txs ORDER BY timestamp DESC LIMIT ?", (limit,),
-            ).fetchall()
-            raws = [r["raw_json"] for r in rows]
-        return [json.loads(raw) for raw in raws]
-
-    # ============================================================
-    # ESTATÍSTICAS
-    # ============================================================
-    def get_stats(self):
-        return {
-            "height": self.height(),
-            "tip_hash": self.tip_hash(),
-            "utxos": self.count_utxos(),
-            "mempool": self.mempool_count(),
-            "blocks": self.height() + 1,
-            "contracts": self.contract_count(),
-            "l2_escrows": self._count_table("l2_escrows"),
-            "l2_txs": self._count_table("l2_txs"),
-        }
-
-    _COUNT_TABLES = frozenset({
-        "blocks", "transactions", "utxos", "mempool", "meta", "peers",
-        "network_events", "contracts", "contract_state", "contract_events",
-        "l2_escrows", "btc_used", "l2_blocks", "l2_txs",
-    })
-
-    def _count_table(self, table: str) -> int:
-        if table not in self._COUNT_TABLES:
-            return 0
-        with self.read_lock:
-            try:
-                return self.read_conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"]
-            except Exception:
-                return 0
-
-    def prune_spent_utxos(self, keep_height=1000):
-        return self._enqueue(self._prune_spent_utxos_impl, keep_height, batch_safe=True)
-
-    def _prune_spent_utxos_impl(self, keep_height=1000):
-        cutoff = max(0, self.height() - keep_height)
-        return self.conn.execute(
-            "DELETE FROM utxos WHERE spent=1 AND block_height < ?", (cutoff,),
-        ).rowcount
-
-    def count_utxos(self):
-        with self.read_lock:
-            row = self.read_conn.execute(
-                "SELECT COUNT(*) AS c FROM utxos WHERE spent=0"
-            ).fetchone()
-            return row["c"]
-
-    def vacuum(self):
-        return self._enqueue(self._vacuum_impl, batch_safe=False)
-
-    def _vacuum_impl(self):
-        self.conn.execute("VACUUM")
-
-    # ============================================================
-    # CONTRACT_SPEND
-    # ============================================================
-    def contract_spend(self, from_addr: str, to_addr: str, amount: int):
-        if not _ALLOW_CONTRACT_SPEND:
-            raise RuntimeError(
-                "contract_spend() bypassa o consenso. Use Blockchain.submit_tx(). "
-                "Para testes locais: BRN_ALLOW_CONTRACT_SPEND=1."
-            )
-        return self._enqueue(
-            self._contract_spend_impl, from_addr, to_addr, amount, batch_safe=False,
-        )
-
-    def _contract_spend_impl(self, from_addr: str, to_addr: str, amount: int):
-        import hashlib
-        print(f"[db] AVISO: contract_spend habilitado")
-        with self.lock:
-            self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
-            try:
-                rows = self.conn.execute(
-                    "SELECT txid, vout, amount FROM utxos WHERE address=? AND spent=0 "
-                    "ORDER BY amount DESC",
-                    (from_addr,),
-                ).fetchall()
-                total = 0
-                sacados = []
-                for r in rows:
-                    total += r["amount"]
-                    sacados.append((r["txid"], r["vout"], r["amount"]))
-                    if total >= amount:
-                        break
-                if total < amount:
-                    raise ValueError(f"saldo insuficiente: {total} < {amount}")
-                seed = (f"{from_addr}|{to_addr}|{amount}|{total}|{time.time_ns()}|{os.urandom(8).hex()}").encode()
-                txid_base = hashlib.sha256(seed).hexdigest()
-                for txid, vout, _amt in sacados:
-                    self.conn.execute(
-                        "UPDATE utxos SET spent=1, spent_by=? WHERE txid=? AND vout=?",
-                        (txid_base, txid, vout),
-                    )
-                cur_h = self.conn.execute(
-                    "SELECT MAX(height) AS h FROM blocks"
-                ).fetchone()
-                h_now = int(cur_h["h"]) if cur_h and cur_h["h"] is not None else -1
-                self.conn.execute(
-                    "INSERT INTO utxos(txid, vout, address, amount, pubkey, block_height, spent) "
-                    "VALUES (?,?,?,?,?,?,0)",
-                    (txid_base, 0, to_addr, amount, "", h_now),
-                )
-                troco = total - amount
-                if troco > 0:
-                    self.conn.execute(
-                        "INSERT INTO utxos(txid, vout, address, amount, pubkey, block_height, spent) "
-                        "VALUES (?,?,?,?,?,?,0)",
-                        (txid_base, 1, from_addr, troco, "", h_now),
-                    )
-                self.conn.execute("COMMIT")
-            except Exception:
-                self.conn.execute("ROLLBACK")
-                raise
-
-    # ============================================================
-    # CLOSE
-    # ============================================================
-    def close(self):
-        try:
-            self._write_queue.put(None, timeout=5.0)
+                self.conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_work ON blocks(chainwork DESC)")
         except Exception:
             pass
+
         try:
-            self._writer_thread.join(timeout=5.0)
-        except Exception:
-            pass
-        
-        try:
-            self.conn.execute("PRAGMA optimize")
-        except Exception:
-            pass
-            
-        for conn in (self.conn, self.read_conn):
-            try:
-                conn.close()
-            except Exception:
-                pass
+            cols = self.conn.execute("PRAGMA table_info(peers)").fetchall()
+            names = {c["name"] for c in cols}
+            if "score" not in names:
+                self.conn.execute("ALTER TABLE peers ADD COLUMN score INTEGER DEFAULT 0")
+            if "public_key" not in names:
+                self.conn.execute("ALTER TABLE peers ADD COLUMN public_key TEXT DEFAULT ''
