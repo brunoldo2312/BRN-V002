@@ -1,16 +1,22 @@
 # db.py — Banco de Dados SQLite para o Nó BRN
 # Versão: 9.7.0 | Data: 2026-11-17
 # ============================================================
-# v9.7.0 — COMPATIBILIDADE TOTAL COM blockchain.py 9.5.9:
-#   • add_block(block: dict) / get_block / get_block_by_hash / tip_hash
+# v9.7.0 — COMPATIBILIDADE TOTAL COM blockchain.py 9.5.9 + l2_manager.py v1.2:
+#   • BLOCKS: add_block(dict) / get_block / get_block_by_hash / tip_hash
 #   • UTXO: apply_tx / get_utxo / get_nonce_for_pubkey
 #   • MEMPOOL: add / has / count / stats / all / remove /
 #     utxos_gastos_na_mempool
 #   • TX INDEX: get_tx_block_height
-#   • CONTRATOS: contract_get / contract_put / contract_list (stub persistente)
+#   • CONTRATOS: contract_get / contract_put / contract_list
+#   • L2 ESCROW (BTC->BRN): save_l2_escrow / get_l2_escrow_by_id /
+#     get_l2_escrows / update_l2_escrow_status /
+#     is_btc_txid_used / mark_btc_txid_used (anti-replay)
 #   • META: get_meta / set_meta / delete_meta / get_all_meta
+#     (get_meta devolve STRING CRUA — blockchain.py faz json.loads())
 #   • COMPAT: db.lock + db.conn (cumulative_work usa os dois)
-#   • KEEP: ChainDB, peers, bootstrap_peers, mining_gate, truncate_to,
+#   • TRUNCATE: recalcula nonces a partir dos blocos que sobraram
+#     (senão reorg/restore conta nonce 2x)
+#   • KEEP: ChainDB, peers, bootstrap_peers, mining_gate,
 #     WAL + busy_timeout
 # ============================================================
 from __future__ import annotations
@@ -34,20 +40,23 @@ logger = logging.getLogger("db")
 class _FakeCursor:
     def __init__(self, rows):
         self._rows = rows
+
     def fetchall(self):
         return self._rows
+
     def fetchone(self):
         return self._rows[0] if self._rows else None
 
 class _ConnAdapter:
     """db.conn.execute(...) abre conexão curta, executa e fecha."""
+
     def __init__(self, db):
         self._db = db
+
     def execute(self, sql, params=()):
         with self._db._get_connection() as conn:
             cur = conn.execute(sql, params)
             rows = cur.fetchall()
-            # Converte Row -> dict-like simples (blockchain usa r["difficulty"])
             out = []
             for r in rows:
                 try:
@@ -112,6 +121,7 @@ class Database:
             conn.close()
 
     def _vacuum(self):
+        """VACUUM tem que rodar SEM transação aberta."""
         conn = sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None)
         try:
             conn.execute("PRAGMA busy_timeout = 30000;")
@@ -181,6 +191,29 @@ class Database:
                 created_at REAL NOT NULL DEFAULT (strftime('%s','now'))
             )
         """)
+        # --- L2 ESCROW (BTC -> BRN) ---
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS l2_escrows (
+                escrow_id TEXT PRIMARY KEY,
+                creator TEXT NOT NULL DEFAULT '',
+                buyer TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'OPEN',
+                btc_address TEXT NOT NULL DEFAULT '',
+                btc_txid TEXT NOT NULL DEFAULT '',
+                btc_amount_sats INTEGER NOT NULL DEFAULT 0,
+                brn_amount_sats INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT 0,
+                expires_at INTEGER NOT NULL DEFAULT 0,
+                l2_hash TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS btc_txids_used (
+                btc_txid TEXT PRIMARY KEY,
+                escrow_id TEXT NOT NULL DEFAULT '',
+                used_at INTEGER NOT NULL DEFAULT 0
+            )
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS peers (
                 node_id TEXT PRIMARY KEY,
@@ -224,6 +257,8 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen DESC);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_utxos_address ON utxos(address);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_l2_status ON l2_escrows(status);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_l2_buyer ON l2_escrows(buyer);")
         conn.execute("INSERT OR IGNORE INTO mining_gate (id) VALUES (1)")
 
     def _migrate_schema(self, conn: sqlite3.Connection):
@@ -261,6 +296,14 @@ class Database:
                 fee INTEGER NOT NULL DEFAULT 0, added_at REAL NOT NULL DEFAULT (strftime('%s','now')))"""),
             ("nonces", "CREATE TABLE IF NOT EXISTS nonces (pubkey TEXT PRIMARY KEY, nonce INTEGER NOT NULL DEFAULT 0)"),
             ("contracts", "CREATE TABLE IF NOT EXISTS contracts (contract_id TEXT PRIMARY KEY, data TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL DEFAULT (strftime('%s','now')))"),
+            ("l2_escrows", """CREATE TABLE IF NOT EXISTS l2_escrows (
+                escrow_id TEXT PRIMARY KEY, creator TEXT NOT NULL DEFAULT '',
+                buyer TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'OPEN',
+                btc_address TEXT NOT NULL DEFAULT '', btc_txid TEXT NOT NULL DEFAULT '',
+                btc_amount_sats INTEGER NOT NULL DEFAULT 0, brn_amount_sats INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL DEFAULT 0,
+                l2_hash TEXT NOT NULL DEFAULT '')"""),
+            ("btc_txids_used", "CREATE TABLE IF NOT EXISTS btc_txids_used (btc_txid TEXT PRIMARY KEY, escrow_id TEXT NOT NULL DEFAULT '', used_at INTEGER NOT NULL DEFAULT 0)"),
         ]:
             if name not in tables:
                 logger.info("[DB MIGRATION] Criando tabela %s", name)
@@ -271,6 +314,8 @@ class Database:
             for col in ("genesis_hash", "version", "public_key"):
                 if col not in cols:
                     conn.execute(f"ALTER TABLE peers ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_l2_status ON l2_escrows(status);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_l2_buyer ON l2_escrows(buyer);")
 
     # ============================================================
     # BLOCKS — formato que blockchain.py espera (dict completo)
@@ -322,7 +367,6 @@ class Database:
             block = json.loads(raw)
         except Exception:
             block = {}
-        # Garante campos que blockchain.py lê direto
         block.setdefault("height", d.get("height"))
         block.setdefault("hash", d.get("hash", ""))
         block.setdefault("prev_hash", d.get("prev_hash", ""))
@@ -403,7 +447,6 @@ class Database:
                     "ON CONFLICT(txid) DO UPDATE SET height = excluded.height",
                     (txid, int(height)))
             if not coinbase:
-                # Gasta UTXOs + avança nonce de cada pubkey de input
                 for inp in (tx.get("inputs") or []):
                     conn.execute("DELETE FROM utxos WHERE txid = ? AND vout = ?",
                                  (inp.get("txid", ""), int(inp.get("vout", 0))))
@@ -511,6 +554,109 @@ class Database:
                 except Exception:
                     out.append({"contract_id": r[0]})
             return out
+
+    # ============================================================
+    # L2 ESCROW (BTC -> BRN) — usado por l2_manager.py v1.2
+    # ============================================================
+    def _ensure_l2_tables(self):
+        with self._get_connection(write=True) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS l2_escrows (
+                    escrow_id TEXT PRIMARY KEY,
+                    creator TEXT NOT NULL DEFAULT '',
+                    buyer TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'OPEN',
+                    btc_address TEXT NOT NULL DEFAULT '',
+                    btc_txid TEXT NOT NULL DEFAULT '',
+                    btc_amount_sats INTEGER NOT NULL DEFAULT 0,
+                    brn_amount_sats INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL DEFAULT 0,
+                    expires_at INTEGER NOT NULL DEFAULT 0,
+                    l2_hash TEXT NOT NULL DEFAULT ''
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS btc_txids_used (
+                    btc_txid TEXT PRIMARY KEY,
+                    escrow_id TEXT NOT NULL DEFAULT '',
+                    used_at INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+
+    def save_l2_escrow(self, d: dict) -> None:
+        self._ensure_l2_tables()
+        with self._write_lock, self._get_connection(write=True) as conn:
+            conn.execute("""
+                INSERT INTO l2_escrows
+                (escrow_id, creator, buyer, status, btc_address, btc_txid,
+                 btc_amount_sats, brn_amount_sats, created_at, expires_at, l2_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(escrow_id) DO UPDATE SET
+                    creator=excluded.creator, buyer=excluded.buyer,
+                    status=excluded.status, btc_address=excluded.btc_address,
+                    btc_txid=excluded.btc_txid,
+                    btc_amount_sats=excluded.btc_amount_sats,
+                    brn_amount_sats=excluded.brn_amount_sats,
+                    created_at=excluded.created_at, expires_at=excluded.expires_at,
+                    l2_hash=excluded.l2_hash
+            """, (d.get("escrow_id", ""), d.get("creator", ""), d.get("buyer", ""),
+                  d.get("status", "OPEN"), d.get("btc_address", ""), d.get("btc_txid", ""),
+                  int(d.get("btc_amount_sats") or 0), int(d.get("brn_amount_sats") or 0),
+                  int(d.get("created_at") or 0), int(d.get("expires_at") or 0),
+                  d.get("l2_hash", "")))
+
+    def get_l2_escrow_by_id(self, escrow_id: str):
+        self._ensure_l2_tables()
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM l2_escrows WHERE escrow_id = ?", (escrow_id,)).fetchone()
+            return dict(row) if row else None
+
+    def get_l2_escrows(self, status: str | None = None):
+        self._ensure_l2_tables()
+        with self._get_connection() as conn:
+            if status:
+                cur = conn.execute(
+                    "SELECT * FROM l2_escrows WHERE status = ? ORDER BY created_at DESC", (status,))
+            else:
+                cur = conn.execute("SELECT * FROM l2_escrows ORDER BY created_at DESC")
+            return [dict(r) for r in cur.fetchall()]
+
+    def update_l2_escrow_status(self, escrow_id: str, status: str, btc_txid: str | None = None):
+        self._ensure_l2_tables()
+        with self._write_lock, self._get_connection(write=True) as conn:
+            if btc_txid is not None:
+                conn.execute(
+                    "UPDATE l2_escrows SET status = ?, btc_txid = ? WHERE escrow_id = ?",
+                    (status, btc_txid, escrow_id))
+            else:
+                conn.execute(
+                    "UPDATE l2_escrows SET status = ? WHERE escrow_id = ?",
+                    (status, escrow_id))
+            return conn.total_changes > 0
+
+    def is_btc_txid_used(self, btc_txid: str) -> bool:
+        if not btc_txid:
+            return False
+        self._ensure_l2_tables()
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM btc_txids_used WHERE btc_txid = ?", (btc_txid,)).fetchone()
+            return row is not None
+
+    def mark_btc_txid_used(self, btc_txid: str, escrow_id: str = "") -> bool:
+        """Marca txid como usado. Retorna False se JÁ estava usado (anti-replay)."""
+        if not btc_txid:
+            return False
+        self._ensure_l2_tables()
+        try:
+            with self._write_lock, self._get_connection(write=True) as conn:
+                conn.execute(
+                    "INSERT INTO btc_txids_used (btc_txid, escrow_id, used_at) VALUES (?, ?, ?)",
+                    (btc_txid, escrow_id, int(time.time())))
+            return True
+        except Exception:
+            return False
 
     # ============================================================
     # PEERS
@@ -666,7 +812,7 @@ class Database:
                     "closed_at": None, "updated_at": 0}
 
     # ============================================================
-    # TRUNCATE / PRUNE
+    # TRUNCATE / PRUNE (Fast-Sync, HTTP Re-Sync, Reorg)
     # ============================================================
     def truncate_to(self, target_height: int) -> bool:
         if target_height < 0:
@@ -681,6 +827,25 @@ class Database:
                 conn.execute("DELETE FROM blocks WHERE height > ?", (target_height,))
                 conn.execute("DELETE FROM utxos WHERE height > ?", (target_height,))
                 conn.execute("DELETE FROM tx_index WHERE height > ?", (target_height,))
+                # [FIX] Nonces voltam ao estado de fork_h, senão restore
+                # com apply_tx() conta 2x e validate_tx rejeita a próxima tx.
+                conn.execute("DELETE FROM nonces")
+                rows = conn.execute("SELECT data FROM blocks ORDER BY height ASC").fetchall()
+                counts = {}
+                for (raw,) in rows:
+                    try:
+                        blk = json.loads(raw or "{}")
+                    except Exception:
+                        continue
+                    for idx, tx in enumerate(blk.get("transactions") or []):
+                        if idx == 0:
+                            continue  # coinbase não avança nonce
+                        for inp in (tx.get("inputs") or []):
+                            pk = inp.get("pubkey", "")
+                            if pk:
+                                counts[pk] = counts.get(pk, 0) + 1
+                for pk, n in counts.items():
+                    conn.execute("INSERT INTO nonces (pubkey, nonce) VALUES (?, ?)", (pk, n))
                 removed = conn.total_changes
             self._vacuum()
             logger.info("[DB] Truncado > %d. Nova altura: %d (removidos ~%d)", target_height, self.height(), removed)
@@ -723,4 +888,4 @@ if __name__ == "__main__":
                         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     db = get_db()
     print(f"✅ Banco: {db.db_path} | Altura: {db.height()} | tip: {db.tip_hash()[:16]}...")
-    print(f"👥 Peers: {len(db.listar_peers())} | Mempool: {db.mempool_count()}")
+    print(f"👥 Peers: {len(db.listar_peers())} | Mempool: {db.mempool_count()} | L2 OPEN: {len(db.get_l2_escrows(status='OPEN'))}")
