@@ -1,12 +1,14 @@
 # db.py — Banco de Dados SQLite para o Nó BRN
-# Versão: 9.6.1 | Data: 2026-11-17
+# Versão: 9.6.2 | Data: 2026-11-17
 # ============================================================
-# Correções v9.6.1:
+# Correções v9.6.2:
+#   • [FIX CRÍTICO] Adicionado ChainDB — main.py / blockchain.py /
+#     version.py fazem "from db import ChainDB" e quebravam
 #   • [FIX] Criada tabela blocks — height() agora funciona de verdade
 #   • [FIX] VACUUM movido para FORA da transação (SQLite proíbe dentro)
 #   • [FIX] truncate_to() agora realmente apaga blocos > target
 #   • [NEW] Métodos para bootstrap_peers (add/list/remove/clear)
-#   • [FIX] close() reseta _initialized + _instance (permite reabrir com outro path)
+#   • [FIX] close() reseta _initialized + _instance
 #   • [KEEP] WAL + busy_timeout + singleton + mesma API pública
 # ============================================================
 from __future__ import annotations
@@ -56,7 +58,7 @@ class Database:
         conn = sqlite3.connect(
             self.db_path,
             timeout=30.0,
-            isolation_level=None,  # autocommit, controlamos BEGIN/COMMIT
+            isolation_level=None,
         )
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA busy_timeout = 30000;")
@@ -96,7 +98,6 @@ class Database:
         logger.info("[DB] Inicializado em: %s", self.db_path)
 
     def _create_tables(self, conn: sqlite3.Connection):
-        # --- BLOCO: era a tabela que faltava e quebrava height()/truncate_to() ---
         conn.execute("""
             CREATE TABLE IF NOT EXISTS blocks (
                 height INTEGER PRIMARY KEY,
@@ -152,7 +153,6 @@ class Database:
         conn.execute("INSERT OR IGNORE INTO mining_gate (id) VALUES (1)")
 
     def _migrate_schema(self, conn: sqlite3.Connection):
-        # Garante blocks em DBs antigos que foram criados sem ela
         tables = {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         if "blocks" not in tables:
@@ -182,7 +182,7 @@ class Database:
             conn.execute("ALTER TABLE peers ADD COLUMN public_key TEXT NOT NULL DEFAULT ''")
 
     # ============================================================
-    # BLOCKS — usados por height() / truncate_to() / fast-sync
+    # BLOCKS
     # ============================================================
     def save_block(self, height: int, hash_: str = "", prev_hash: str = "",
                     timestamp: float = 0, data: str = "{}") -> None:
@@ -266,7 +266,7 @@ class Database:
             return count
 
     # ============================================================
-    # BOOTSTRAP PEERS — antes existia a tabela mas nenhum método
+    # BOOTSTRAP PEERS
     # ============================================================
     def add_bootstrap_peer(self, address: str, priority: int = 0) -> None:
         with self._write_lock, self._get_connection(write=True) as conn:
@@ -353,7 +353,6 @@ class Database:
     # TRUNCATE / PRUNE (Fast-Sync & HTTP Re-Sync)
     # ============================================================
     def height(self) -> int:
-        """Altura = MAX(height) da tabela blocks. -1 se vazia."""
         with self._get_connection() as conn:
             row = conn.execute("SELECT MAX(height) FROM blocks").fetchone()
             return int(row[0]) if row and row[0] is not None else -1
@@ -374,7 +373,6 @@ class Database:
             with self._write_lock, self._get_connection(write=True) as conn:
                 conn.execute("DELETE FROM blocks WHERE height > ?", (target_height,))
                 removed = conn.total_changes
-            # VACUUM FORA da transação — se ficar dentro, o SQLite rejeita
             self._vacuum()
             logger.info("[DB] Removidos %d blocos. Nova altura: %d", removed, self.height())
             return True
@@ -399,8 +397,40 @@ class Database:
         self._initialized = False
         logger.info("[DB] instância fechada")
 
-def get_db(db_path: str = None) -> Database:
-    return Database(db_path)
+# ============================================================
+# COMPATIBILIDADE — ChainDB
+# main.py / blockchain.py / version.py usam:
+#   from db import ChainDB
+# ============================================================
+class ChainDB(Database):
+    """ChainDB é o Database. Mesma classe, nome que o main.py espera."""
+
+    def add_block(self, height: int, hash_: str = "", prev_hash: str = "",
+                  timestamp: float = 0, data: str = "{}"):
+        return self.save_block(height, hash_, prev_hash, timestamp, data)
+
+    def get_block_by_height(self, height: int):
+        return self.get_block(height)
+
+    def get_last_block(self):
+        h = self.height()
+        return self.get_block(h) if h >= 0 else None
+
+    def get_height(self) -> int:
+        return self.height()
+
+    def get_chain_height(self) -> int:
+        return self.height()
+
+# Aliases para qualquer import antigo
+DB = Database
+ChainDatabase = Database
+
+def get_db(db_path: str = None) -> ChainDB:
+    return ChainDB(db_path)
+
+def get_chain_db(db_path: str = None) -> ChainDB:
+    return ChainDB(db_path)
 
 if __name__ == "__main__":
     logging.basicConfig(
