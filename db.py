@@ -1,27 +1,27 @@
 # db.py — Banco de Dados SQLite para o Nó BRN
-# Versão: 9.6.0 | Data: 2026-11-17
+# Versão: 9.6.1 | Data: 2026-11-17
 # ============================================================
-# Recursos:
-#   • WAL mode + busy timeout para concorrência segura
-#   • Tabelas: peers, bootstrap_peers, sync_status, mining_gate
-#   • Upsert de peers com altura e última visualização
-#   • Truncate/prune para fast-sync e re-sync HTTP
-#   • Migração automática de esquema
+# Correções v9.6.1:
+#   • [FIX] Criada tabela blocks — height() agora funciona de verdade
+#   • [FIX] VACUUM movido para FORA da transação (SQLite proíbe dentro)
+#   • [FIX] truncate_to() agora realmente apaga blocos > target
+#   • [NEW] Métodos para bootstrap_peers (add/list/remove/clear)
+#   • [FIX] close() reseta _initialized + _instance (permite reabrir com outro path)
+#   • [KEEP] WAL + busy_timeout + singleton + mesma API pública
 # ============================================================
-
 from __future__ import annotations
+
 import os
 import sqlite3
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import logging
 
 logger = logging.getLogger("db")
-
 
 class Database:
     _instance: Optional["Database"] = None
@@ -35,10 +35,9 @@ class Database:
         return cls._instance
 
     def __init__(self, db_path: str = None):
-        if hasattr(self, "_initialized") and self._initialized:
+        if getattr(self, "_initialized", False):
             return
         self.db_path = self._resolve_path(db_path)
-        self._conn: Optional[sqlite3.Connection] = None
         self._write_lock = threading.Lock()
         self._initialized = True
         self._init_database()
@@ -57,7 +56,7 @@ class Database:
         conn = sqlite3.connect(
             self.db_path,
             timeout=30.0,
-            isolation_level=None,
+            isolation_level=None,  # autocommit, controlamos BEGIN/COMMIT
         )
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA busy_timeout = 30000;")
@@ -70,19 +69,44 @@ class Database:
                 conn.commit()
         except Exception:
             if write:
-                conn.rollback()
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
             raise
         finally:
             conn.close()
 
+    def _vacuum(self):
+        """VACUUM tem que rodar SEM transação aberta."""
+        conn = sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None)
+        try:
+            conn.execute("PRAGMA busy_timeout = 30000;")
+            conn.execute("VACUUM")
+        finally:
+            conn.close()
+
     def _init_database(self):
-        os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
+        parent = os.path.dirname(self.db_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with self._get_connection(write=True) as conn:
             self._create_tables(conn)
             self._migrate_schema(conn)
         logger.info("[DB] Inicializado em: %s", self.db_path)
 
     def _create_tables(self, conn: sqlite3.Connection):
+        # --- BLOCO: era a tabela que faltava e quebrava height()/truncate_to() ---
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS blocks (
+                height INTEGER PRIMARY KEY,
+                hash TEXT NOT NULL DEFAULT '',
+                prev_hash TEXT NOT NULL DEFAULT '',
+                timestamp REAL NOT NULL DEFAULT 0,
+                data TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL DEFAULT (strftime('%s','now'))
+            )
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS peers (
                 node_id TEXT PRIMARY KEY,
@@ -96,7 +120,6 @@ class Database:
                 created_at REAL NOT NULL DEFAULT (strftime('%s','now'))
             )
         """)
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS bootstrap_peers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,7 +129,6 @@ class Database:
                 created_at REAL NOT NULL DEFAULT (strftime('%s','now'))
             )
         """)
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS sync_status (
                 key TEXT PRIMARY KEY,
@@ -114,7 +136,6 @@ class Database:
                 updated_at REAL NOT NULL DEFAULT (strftime('%s','now'))
             )
         """)
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS mining_gate (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -125,20 +146,31 @@ class Database:
                 updated_at REAL NOT NULL DEFAULT (strftime('%s','now'))
             )
         """)
-
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_peers_height ON peers(height);
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen DESC);
-        """)
-
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_peers_height ON peers(height);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen DESC);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash);")
         conn.execute("INSERT OR IGNORE INTO mining_gate (id) VALUES (1)")
 
     def _migrate_schema(self, conn: sqlite3.Connection):
+        # Garante blocks em DBs antigos que foram criados sem ela
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "blocks" not in tables:
+            logger.info("[DB MIGRATION] Criando tabela blocks (faltava no DB antigo)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS blocks (
+                    height INTEGER PRIMARY KEY,
+                    hash TEXT NOT NULL DEFAULT '',
+                    prev_hash TEXT NOT NULL DEFAULT '',
+                    timestamp REAL NOT NULL DEFAULT 0,
+                    data TEXT NOT NULL DEFAULT '{}',
+                    created_at REAL NOT NULL DEFAULT (strftime('%s','now'))
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash);")
+
         cursor = conn.execute("PRAGMA table_info(peers)")
         columns = [row[1] for row in cursor.fetchall()]
-
         if "genesis_hash" not in columns:
             logger.info("[DB MIGRATION] Adicionando coluna genesis_hash")
             conn.execute("ALTER TABLE peers ADD COLUMN genesis_hash TEXT NOT NULL DEFAULT ''")
@@ -150,19 +182,42 @@ class Database:
             conn.execute("ALTER TABLE peers ADD COLUMN public_key TEXT NOT NULL DEFAULT ''")
 
     # ============================================================
+    # BLOCKS — usados por height() / truncate_to() / fast-sync
+    # ============================================================
+    def save_block(self, height: int, hash_: str = "", prev_hash: str = "",
+                    timestamp: float = 0, data: str = "{}") -> None:
+        with self._write_lock, self._get_connection(write=True) as conn:
+            conn.execute("""
+                INSERT INTO blocks (height, hash, prev_hash, timestamp, data)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(height) DO UPDATE SET
+                    hash = excluded.hash,
+                    prev_hash = excluded.prev_hash,
+                    timestamp = excluded.timestamp,
+                    data = excluded.data
+            """, (int(height), hash_, prev_hash, float(timestamp or 0), data))
+
+    def get_block(self, height: int) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM blocks WHERE height = ?", (int(height),)).fetchone()
+            return dict(row) if row else None
+
+    def list_blocks(self, start: int = 0, limit: int = 50) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                "SELECT * FROM blocks WHERE height >= ? ORDER BY height ASC LIMIT ?",
+                (int(start), int(limit)))
+            return [dict(r) for r in cur.fetchall()]
+
+    # ============================================================
     # PEERS
     # ============================================================
-    def upsert_peer(
-        self,
-        node_id: str,
-        address: str,
-        genesis_hash: str = "",
-        version: str = "",
-        height: int = 0,
-        is_miner: bool = False,
-        public_key: str = "",
-    ) -> None:
-        """Atualiza ou insere um peer. Usado pelo Peer-Healer."""
+    def upsert_peer(self, node_id: str, address: str, genesis_hash: str = "",
+                    version: str = "", height: int = 0, is_miner: bool = False,
+                    public_key: str = "") -> None:
         now = time.time()
         with self._write_lock, self._get_connection(write=True) as conn:
             conn.execute("""
@@ -178,10 +233,8 @@ class Database:
                     is_miner = excluded.is_miner,
                     public_key = excluded.public_key,
                     last_seen = excluded.last_seen
-            """, (
-                node_id, address, genesis_hash, version,
-                height, int(is_miner), public_key, now
-            ))
+            """, (node_id, address, genesis_hash, version,
+                  height, int(is_miner), public_key, now))
 
     def listar_peers(self, apenas_ativos: bool = True, max_age_s: int = 300) -> List[Dict[str, Any]]:
         now = time.time()
@@ -211,6 +264,36 @@ class Database:
             if count > 0:
                 logger.info("[DB] Removidos %d peers inativos (>%ds)", count, max_age_s)
             return count
+
+    # ============================================================
+    # BOOTSTRAP PEERS — antes existia a tabela mas nenhum método
+    # ============================================================
+    def add_bootstrap_peer(self, address: str, priority: int = 0) -> None:
+        with self._write_lock, self._get_connection(write=True) as conn:
+            conn.execute("""
+                INSERT INTO bootstrap_peers (address, priority, enabled)
+                VALUES (?, ?, 1)
+                ON CONFLICT(address) DO UPDATE SET priority = excluded.priority, enabled = 1
+            """, (address, int(priority)))
+
+    def listar_bootstrap_peers(self, only_enabled: bool = True) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            q = "SELECT * FROM bootstrap_peers"
+            if only_enabled:
+                q += " WHERE enabled = 1"
+            q += " ORDER BY priority DESC, id ASC"
+            return [dict(r) for r in conn.execute(q).fetchall()]
+
+    def remover_bootstrap_peer(self, address: str) -> bool:
+        with self._write_lock, self._get_connection(write=True) as conn:
+            cur = conn.execute("DELETE FROM bootstrap_peers WHERE address = ?", (address,))
+            return cur.rowcount > 0
+
+    def limpar_bootstrap_peers(self) -> int:
+        with self._write_lock, self._get_connection(write=True) as conn:
+            cur = conn.execute("DELETE FROM bootstrap_peers")
+            return cur.rowcount
 
     # ============================================================
     # SYNC STATUS
@@ -260,80 +343,64 @@ class Database:
             conn.row_factory = sqlite3.Row
             row = conn.execute("SELECT * FROM mining_gate WHERE id = 1").fetchone()
             if row:
-                return dict(row)
-            return {
-                "gate_open": 0, "reason": "",
-                "opened_at": None, "closed_at": None, "updated_at": 0
-            }
+                d = dict(row)
+                d["gate_open"] = bool(d["gate_open"])
+                return d
+            return {"gate_open": False, "reason": "", "opened_at": None,
+                    "closed_at": None, "updated_at": 0}
 
     # ============================================================
     # TRUNCATE / PRUNE (Fast-Sync & HTTP Re-Sync)
     # ============================================================
     def height(self) -> int:
-        """Retorna a altura atual da cadeia lida da tabela blocks."""
+        """Altura = MAX(height) da tabela blocks. -1 se vazia."""
         with self._get_connection() as conn:
-            try:
-                row = conn.execute("SELECT MAX(height) FROM blocks").fetchone()
-                return int(row[0]) if row and row[0] is not None else -1
-            except sqlite3.OperationalError:
-                return -1
+            row = conn.execute("SELECT MAX(height) FROM blocks").fetchone()
+            return int(row[0]) if row and row[0] is not None else -1
 
     def truncate_to(self, target_height: int) -> bool:
-        """Remove todos os blocos acima de target_height. Retorna True se sucesso."""
         if target_height < 0:
             logger.error("[DB] truncate_to: altura alvo inválida: %d", target_height)
             return False
-
         current = self.height()
         if current <= 0:
             logger.warning("[DB] truncate_to: DB vazio — nada a fazer")
             return True
-
         if target_height >= current:
             logger.info("[DB] truncate_to: %d >= %d — nada a remover", target_height, current)
             return True
-
         logger.warning("[DB] TRUNCANDO blocos > %d (atual: %d)", target_height, current)
-
         try:
             with self._write_lock, self._get_connection(write=True) as conn:
                 conn.execute("DELETE FROM blocks WHERE height > ?", (target_height,))
                 removed = conn.total_changes
-                conn.execute("VACUUM")
-                logger.info("[DB] Removidos %d blocos. Nova altura: %d",
-                            removed, self.height())
-                return True
+            # VACUUM FORA da transação — se ficar dentro, o SQLite rejeita
+            self._vacuum()
+            logger.info("[DB] Removidos %d blocos. Nova altura: %d", removed, self.height())
+            return True
         except Exception as e:
             logger.error("[DB] truncate_to falhou: %s", e)
             return False
 
     def remove_blocks_above(self, target_height: int) -> bool:
-        """Alias compatível com main.py v13.9.25+"""
         return self.truncate_to(target_height)
 
     def prune_above(self, target_height: int) -> bool:
-        """Alias compatível"""
         return self.truncate_to(target_height)
 
     def reset_to_height(self, target_height: int) -> bool:
-        """Alias compatível"""
         return self.truncate_to(target_height)
 
     # ============================================================
     # FECHAMENTO
     # ============================================================
     def close(self):
-        """Fecha conexões (principalmente para testes)"""
         Database._instance = None
+        self._initialized = False
         logger.info("[DB] instância fechada")
 
-
-# ============================================================
-# Função de conveniência para uso rápido
-# ============================================================
 def get_db(db_path: str = None) -> Database:
     return Database(db_path)
-
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -345,3 +412,4 @@ if __name__ == "__main__":
     print(f"📊 Altura atual: {db.height()}")
     print(f"👥 Peers ativos: {len(db.listar_peers())}")
     print(f"🔓 Mining Gate: {'ABERTO' if db.get_mining_gate()['gate_open'] else 'FECHADO'}")
+    print(f"🌐 Bootstrap peers: {len(db.listar_bootstrap_peers())}")
