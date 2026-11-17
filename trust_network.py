@@ -1,19 +1,26 @@
-"""trust_network.py — Rede de confiança e reputação do BRN (v3.13)
-================================================================
-v3.13 (2026-11-15) — ROBUSTEZ DE I/O:
-  [FIX] flush() agora usa escrita atômica (os.replace) para evitar
-        corrupção do arquivo JSON se o nó desligar no meio.
-  [FIX] flush() não segura o _lock enquanto escreve no disco. Copia
-        os dados para fora do lock e grava depois.
-  [FIX] sync_local_validator e register_new_validator não forçam
-        mais o flush() a cada chamada. O salvamento é throttled.
-  [FIX] _load() captura JSONDecodeError e avisa, em vez de quebrar.
-  [KEEP] v3.12: Proteção de validadores com score >= 500.
-================================================================
-"""
+# trust_network.py — Rede de confiança e reputação do BRN (v3.14)
+# ================================================================
+# v3.14 (2026-11-17):
+#   [FIX CRÍTICO] NEW_CLIENT_INITIAL_SCORE 500 -> 100. Nó novo nasce
+#         como "new", NÃO como validador protegido. Antes qualquer
+#         Sybil ganhava 500 e ficava imune ao remove_ghosts.
+#   [FIX CRÍTICO] Assinatura do Origin agora usa Ed25519 de verdade
+#         (Ed25519PrivateKey) nos DOIS lados: flush assina com Ed25519,
+#         _load verifica com Ed25519. Antes flush usava Wallet.sign
+#         (Schnorr/secp256k1, retorna str) e _load verificava Ed25519
+#         -> assinatura SEMPRE inválida, cliente descartava o trust.
+#   [FIX] get_active_validators() NÃO faz mais fallback para
+#         get_top_validators(). Se ninguém está ativo, retorna [].
+#         Fantasma não volta mais pro quórum.
+#   [FIX] heartbeat() NÃO dá mais score. Só atualiza last_seen.
+#         Antes dava pra farmar trust mandando heartbeat em loop.
+#   [FIX] AUTO_PROMOTE_MIN_BLOCKS 10 -> 50. 10 blocos é pouco pra
+#         pular pra 1000.
+#   [KEEP] v3.13: flush atômico, throttled, _load com JSONDecodeError.
+# ================================================================
 from __future__ import annotations
 
-__version__ = "3.13"
+__version__ = "3.14"
 
 import json
 import logging
@@ -53,18 +60,18 @@ MAX_VALIDATORS = 21
 VALIDATOR_ROTATION_BLOCKS = 100
 DEFAULT_DATA_FILE = "trust_network.json"
 
-# Aumentado para 15s para evitar I/O storm
 FLUSH_INTERVAL_S = 15.0
 
-NODE_TTL_SECONDS   = int(os.environ.get("BRN_TRUST_NODE_TTL",   "3600"))
+NODE_TTL_SECONDS = int(os.environ.get("BRN_TRUST_NODE_TTL", "3600"))
 ACTIVE_TTL_SECONDS = int(os.environ.get("BRN_TRUST_ACTIVE_TTL", "300"))
-SCORE_PROTECTED    = int(os.environ.get("BRN_TRUST_PROTECT_SCORE", "500"))
-PRUNE_INTERVAL_S   = 60.0
+SCORE_PROTECTED = int(os.environ.get("BRN_TRUST_PROTECT_SCORE", "500"))
+PRUNE_INTERVAL_S = 60.0
 
-NEW_CLIENT_INITIAL_SCORE = float(os.environ.get("BRN_NEW_CLIENT_SCORE", "500"))
-AUTO_PROMOTE_MIN_BLOCKS  = int(os.environ.get("BRN_AUTO_PROMOTE_MIN_BLOCKS", "10"))
-AUTO_PROMOTE_SCORE       = float(os.environ.get("BRN_AUTO_PROMOTE_SCORE", "1000"))
-
+# [FIX v3.14] Nó novo nasce com 100 (new), NÃO com 500 (validador protegido)
+NEW_CLIENT_INITIAL_SCORE = float(os.environ.get("BRN_NEW_CLIENT_SCORE", "100"))
+# [FIX v3.14] 50 blocos assinados pra auto-promover, não 10
+AUTO_PROMOTE_MIN_BLOCKS = int(os.environ.get("BRN_AUTO_PROMOTE_MIN_BLOCKS", "50"))
+AUTO_PROMOTE_SCORE = float(os.environ.get("BRN_AUTO_PROMOTE_SCORE", "1000"))
 
 @dataclass
 class NodeRecord:
@@ -133,14 +140,14 @@ class NodeRecord:
         }
         return cls(**{k: v for k, v in data.items() if k in campos})
 
-
 class TrustNetwork:
     def __init__(self, data_file: str = DEFAULT_DATA_FILE,
                  is_origin: bool = False, node_sk=None):
         self.data_file = Path(data_file)
         self.local_file = self.data_file.with_suffix(".local.json")
         self.is_origin = is_origin
-        self.node_sk = node_sk
+        # node_sk pode ser: Ed25519PrivateKey, Wallet, ou bytes (32B seed Ed25519)
+        self.node_sk = self._normalize_origin_key(node_sk)
 
         self.nodes: Dict[str, NodeRecord] = {}
         self.active_validators: Set[str] = set()
@@ -155,7 +162,6 @@ class TrustNetwork:
         self._dirty_local = False
         self._last_flush = 0.0
 
-        # [FIX v3.13] Timer de flush assíncrono em background
         self._stop_flush = threading.Event()
         self._flush_thread = threading.Thread(
             target=self._flush_loop, daemon=True, name="Trust-Flush"
@@ -169,8 +175,38 @@ class TrustNetwork:
                  "sim" if is_origin else "não",
                  str(self.local_file) if not is_origin else "n/a")
 
+    @staticmethod
+    def _normalize_origin_key(node_sk):
+        """
+        [FIX v3.14] Normaliza a chave do Origin para Ed25519PrivateKey.
+        Antes o flush assumia Wallet (Schnorr) e o load assumia Ed25519.
+        Agora os dois lados usam Ed25519.
+        """
+        if node_sk is None:
+            return None
+        if isinstance(node_sk, Ed25519PrivateKey):
+            return node_sk
+        # Wallet: tem .priv (32 bytes) — usa como seed Ed25519
+        priv = getattr(node_sk, "priv", None)
+        if isinstance(priv, (bytes, bytearray)) and len(priv) == 32:
+            try:
+                return Ed25519PrivateKey.from_private_bytes(bytes(priv))
+            except Exception:
+                pass
+        # bytes / hex direto
+        try:
+            if isinstance(node_sk, str):
+                raw = bytes.fromhex(node_sk)
+            else:
+                raw = bytes(node_sk)
+            if len(raw) == 32:
+                return Ed25519PrivateKey.from_private_bytes(raw)
+        except Exception:
+            pass
+        log.warning("[TrustNetwork] node_sk não é Ed25519/Wallet válido — Origin sem assinatura")
+        return None
+
     def _flush_loop(self) -> None:
-        """[FIX v3.13] Salva no disco a cada 15s APENAS se estiver sujo."""
         while not self._stop_flush.wait(FLUSH_INTERVAL_S):
             self.flush()
 
@@ -187,7 +223,6 @@ class TrustNetwork:
         pk = pubkey.strip().lower()
         if not pk:
             return False
-
         with self._lock:
             self.register_node(pk, address or pk[:16], pk, peer_addr)
             n = self.nodes.get(pk)
@@ -196,9 +231,7 @@ class TrustNetwork:
                 n.connected = True
                 n.last_connect_time = time.time()
                 n.update_trust_level()
-            # [FIX v3.13] Não força flush síncrono aqui. Deixa o _mark_dirty cuidar.
             self._mark_dirty()
-
         log.info("[TrustNetwork] sync_local_validator: %s… (origin=%s)",
                  pk[:16], "sim" if self.is_origin else "não")
         return True
@@ -211,21 +244,21 @@ class TrustNetwork:
             int(pubkey, 16)
         except ValueError:
             return {"ok": False, "msg": "pubkey não é hex"}
-
         pk = pubkey.strip().lower()
+        # [FIX] Default agora é 100 (new), não 500
         score = initial_score if initial_score is not None else NEW_CLIENT_INITIAL_SCORE
-
+        # Trava: ninguém pode se auto-registrar já como validador protegido
+        score = min(score, TRUST_THRESHOLD_VALIDATOR - 1) if initial_score is None else score
         with self._lock:
             existing = self.nodes.get(pk)
             is_new = existing is None
-
             if is_new:
                 self.nodes[pk] = NodeRecord(
                     node_id=pk,
                     address=address or pk[:16],
                     public_key=pk,
                     trust_score=score,
-                    trust_level="active",
+                    trust_level="new",
                     last_seen=time.time(),
                     connected=False,
                 )
@@ -242,11 +275,8 @@ class TrustNetwork:
                     "[TrustNetwork] register_new_validator: %s… já existe, last_seen atualizado",
                     pk[:16],
                 )
-
             n = self.nodes[pk]
             self._mark_dirty()
-            # [FIX v3.13] Não força flush aqui. _mark_dirty já agenda.
-
             return {
                 "ok": True,
                 "is_new": is_new,
@@ -261,16 +291,13 @@ class TrustNetwork:
         if not node_id:
             return
         nid = node_id.strip().lower()
-
         with self._lock:
             n = self.nodes.get(nid)
             if n is None or n.banned:
                 return
-
             n.blocks_signed += 1
             n.last_seen = time.time()
             self._adjust_score(nid, GAIN_BLOCK_SIGNED, f"co-assinou #{block_height}")
-
             if (n.blocks_signed >= AUTO_PROMOTE_MIN_BLOCKS
                     and n.trust_score < AUTO_PROMOTE_SCORE
                     and not n.banned):
@@ -293,7 +320,6 @@ class TrustNetwork:
     def remove_ghosts(self, max_age_s: int = 300) -> int:
         now = time.time()
         to_remove = []
-
         with self._lock:
             for nid, n in list(self.nodes.items()):
                 if self._origin_pubkey and n.public_key.lower() == self._origin_pubkey:
@@ -302,15 +328,12 @@ class TrustNetwork:
                     continue
                 if (now - n.last_seen) > max_age_s:
                     to_remove.append((nid, now - n.last_seen))
-
             for nid, age in to_remove:
                 log.info("[TrustNetwork] Auto-limpeza: removido %s… (inativo %ds)",
                          nid[:12], int(age))
                 del self.nodes[nid]
-
             if to_remove:
                 self._mark_dirty()
-
         return len(to_remove)
 
     def _prune_inactive(self) -> int:
@@ -318,7 +341,6 @@ class TrustNetwork:
         if now - self._last_prune < PRUNE_INTERVAL_S:
             return 0
         self._last_prune = now
-
         to_remove = []
         with self._lock:
             for nid, n in list(self.nodes.items()):
@@ -329,30 +351,22 @@ class TrustNetwork:
                     continue
                 if (now - n.last_seen) > NODE_TTL_SECONDS:
                     to_remove.append(nid)
-
             for nid in to_remove:
                 del self.nodes[nid]
-
             if to_remove:
                 self._mark_dirty()
-
         return len(to_remove)
 
     def _mark_dirty(self) -> None:
-        # [FIX v3.13] Apenas marca. O flush é feito pela thread de background.
         self._dirty = True
         if not self.is_origin:
             self._dirty_local = True
 
     def flush(self) -> None:
-        # [FIX v3.13] Escreve atômicamente e não bloqueia leituras.
         with self._lock:
             if not self._dirty and not self._dirty_local:
                 return
-
             self._prune_inactive()
-
-            # Copia os dados para fora do lock
             data = {
                 "nodes": {nid: n.to_dict() for nid, n in self.nodes.items()},
                 "last_decay_time": self.last_decay_time,
@@ -364,24 +378,18 @@ class TrustNetwork:
             data_file = self.data_file
             local_file = self.local_file
 
-        # Escreve no disco FORA do lock
         if not is_origin:
             try:
                 data["saved_at"] = time.time()
                 data["client_written"] = True
-                
-                # Escrita atômica local
                 tmp_local = local_file.with_suffix(f".tmp.{os.getpid()}")
                 with open(tmp_local, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
                 os.replace(tmp_local, local_file)
-
-                # Escrita atômica principal
                 tmp_main = data_file.with_suffix(f".tmp.{os.getpid()}")
                 with open(tmp_main, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
                 os.replace(tmp_main, data_file)
-                
                 with self._lock:
                     self._dirty_local = False
                     self._last_flush = time.time()
@@ -391,19 +399,17 @@ class TrustNetwork:
 
         try:
             if node_sk is not None:
+                # [FIX v3.14] Ed25519 dos dois lados. node_sk já é Ed25519PrivateKey.
                 payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
-                sig = node_sk.sign(payload)
+                sig = node_sk.sign(payload)  # bytes
                 data["signature"] = sig.hex()
-                data["origin_pubkey"] = node_sk.public_key().public_bytes_raw().hex()
-
+                pub = node_sk.public_key().public_bytes_raw().hex()
+                data["origin_pubkey"] = pub
             data["saved_at"] = time.time()
-
-            # Escrita atômica no Origin
             tmp_main = data_file.with_suffix(f".tmp.{os.getpid()}")
             with open(tmp_main, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
             os.replace(tmp_main, data_file)
-
             tmp_local = local_file.with_suffix(f".tmp.{os.getpid()}")
             try:
                 with open(tmp_local, "w", encoding="utf-8") as f:
@@ -411,7 +417,6 @@ class TrustNetwork:
                 os.replace(tmp_local, local_file)
             except Exception:
                 pass
-
             with self._lock:
                 self._dirty = False
                 self._dirty_local = False
@@ -428,7 +433,6 @@ class TrustNetwork:
             try:
                 with open(self.data_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-
                 sig_hex = data.pop("signature", None)
                 origin_pub_hex = data.pop("origin_pubkey", None)
                 client_written = data.pop("client_written", None)
@@ -498,7 +502,6 @@ class TrustNetwork:
                          merged, len(self.nodes))
             except Exception as e:
                 log.warning("[TrustNetwork] load local falhou: %s", e)
-
         log.info("[TrustNetwork] Carregada — %d nós, %d validadores",
                  len(self.nodes), len(self.active_validators))
 
@@ -517,7 +520,6 @@ class TrustNetwork:
                             self.nodes[node_id] = existing_node
                         self._mark_dirty()
                         return existing_node
-
             if node_id in self.nodes:
                 n = self.nodes[node_id]
                 n.last_seen = time.time()
@@ -527,7 +529,6 @@ class TrustNetwork:
                     n.public_key = public_key
                     self._mark_dirty()
                 return n
-
             n = NodeRecord(
                 node_id=node_id,
                 address=address,
@@ -567,13 +568,13 @@ class TrustNetwork:
             self._mark_dirty()
 
     def heartbeat(self, node_id: str) -> None:
+        # [FIX v3.14] Heartbeat NÃO dá score. Só atualiza last_seen.
+        # Score vem de: assinar bloco, validar bloco, ficar online de verdade.
         with self._lock:
             n = self.nodes.get(node_id)
             if not n:
                 return
             n.last_seen = time.time()
-            if n.connected:
-                self._adjust_score(node_id, GAIN_ONLINE_HOUR / 10, "heartbeat")
             self._apply_decay()
 
     def record_block_validated(self, node_id: str, block_height: int) -> None:
@@ -734,14 +735,12 @@ class TrustNetwork:
             n_target = max(1, int(count))
         except (TypeError, ValueError):
             n_target = 5
-
         with self._lock:
             cands = [
                 n for n in self.nodes.values()
                 if not n.banned and n.public_key
             ]
             cands.sort(key=lambda n: (-n.trust_score, n.public_key))
-
             out: List[str] = []
             seen_pk: Set[str] = set()
             for n in cands:
@@ -755,21 +754,22 @@ class TrustNetwork:
             return out
 
     def get_active_validators(self, count: int = 5) -> List[str]:
+        """
+        [FIX v3.14] Retorna SÓ quem está ativo de verdade.
+        Sem fallback para top. Se ninguém ativo, retorna [].
+        """
         try:
             n_target = max(1, int(count))
         except (TypeError, ValueError):
             n_target = 5
-
         now = time.time()
         with self._lock:
             cands = [
                 n for n in self.nodes.values()
                 if not n.banned and n.public_key
             ]
-
             active = [n for n in cands
                       if (now - n.last_seen) < ACTIVE_TTL_SECONDS]
-
             if self._origin_pubkey:
                 origin = next(
                     (n for n in cands
@@ -777,26 +777,15 @@ class TrustNetwork:
                     None,
                 )
                 if origin is not None and origin not in active:
+                    # Origin é exceção: mesmo sem heartbeat recente, ela é
+                    # a âncora de bootstrap — mas SÓ ela, não o top inteiro.
                     active.append(origin)
-
             if not active:
-                top = self.get_top_validators(count=n_target)
-                if top:
-                    log.warning(
-                        "[TrustNetwork] get_active_validators: nenhum nó "
-                        "ativo e Origin ausente — usando get_top_validators "
-                        "(%d, modo bootstrap)",
-                        len(top),
-                    )
-                    return top
                 log.warning(
-                    "[TrustNetwork] get_active_validators: nenhum nó ativo "
-                    "e Origin ausente — retornando [] (modo bootstrap)"
+                    "[TrustNetwork] get_active_validators: nenhum nó ativo — retornando []"
                 )
                 return []
-
             active.sort(key=lambda n: (-n.trust_score, n.public_key))
-
             out: List[str] = []
             seen_pk: Set[str] = set()
             for n in active:
@@ -807,17 +796,6 @@ class TrustNetwork:
                 out.append(pk)
                 if len(out) >= n_target:
                     break
-
-            if len(out) < n_target:
-                top = self.get_top_validators(count=n_target)
-                if len(top) > len(out):
-                    log.warning(
-                        "[TrustNetwork] get_active_validators incompleto "
-                        "(%d/%d ativos, %d no trust) — usando top (%d)",
-                        len(out), n_target, len(cands), len(top),
-                    )
-                    return top
-
             log.info("[TrustNetwork] get_active_validators: %d/%d (total=%d, origin=%s)",
                      len(out), len(active), len(cands),
                      "sim" if self._origin_pubkey else "não")
