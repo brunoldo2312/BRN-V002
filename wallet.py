@@ -1,20 +1,19 @@
-"""wallet.py — Carteira BRN com Schnorr BIP-340 + fallback ECDSA (v3.0)
-================================================================
-v3.0 (2026-10-28):
-  [NEW] Migração para Schnorr BIP-340 (crypto.py v3.0):
-        - Wallet.sign() usa sign_schnorr (novas assinaturas)
-        - Wallet.verify() tenta Schnorr, cai para ECDSA (compat)
-        - BRN_SIG_SCHEME=auto|schnorr|ecdsa controla o comportamento
-        - Address NÃO muda (mesma chave → mesmo pubkey → mesmo endereço)
-  [KEEP] API pública v2 intacta: create, from_private_key, to_dict,
-         from_dict, priv_hex, pub_hex, address, sign, verify.
-  [KEEP] WalletManager, HDWalletManager, sign_transaction,
-         verify_transaction inalterados na assinatura.
-  [KEEP] Compatível com chain antiga (ECDSA) via fallback.
-================================================================
-"""
+# wallet.py — Carteira BRN com Schnorr BIP-340 + fallback ECDSA (v3.1)
+# ================================================================
+# v3.1 (2026-11-17):
+#   [FIX] Wallet.__init__ agora SEMPRE deriva address/pubkey da priv.
+#         Se from_dict() vier com address/pubkey divergente, loga
+#         warning e usa o derivado (antes confiava no JSON e quebrava
+#         validate_tx com address/pubkey mismatch silencioso).
+#   [FIX] from_private_key / __init__ validam 1 <= priv < N e rejeitam 0.
+#   [FIX] sign() valida len(msg_hash)==32 com ValueError claro.
+#   [FIX] sign_transaction() faz deepcopy (não muta a tx do chamador).
+#   [KEEP] v3.0: Schnorr BIP-340, fallback ECDSA, BRN_SIG_SCHEME,
+#         HDWallet, WalletManager, sign/verify_transaction.
+# ================================================================
 from __future__ import annotations
 
+import copy
 import os
 import json
 import time
@@ -40,24 +39,11 @@ except ImportError:
     Mnemonic = None
     _HAS_MNEMONIC = False
 
-
 log = logging.getLogger("wallet")
 
-
-# ============================================================
-# CONFIG — esquema de assinatura
-# ------------------------------------------------------------
-# BRN_SIG_SCHEME=auto     (default) → assina Schnorr, verifica
-#                                      Schnorr com fallback ECDSA
-# BRN_SIG_SCHEME=schnorr  → assina Schnorr, verifica só Schnorr
-#                                      (quebra a chain antiga; usar após
-#                                      reset completo da rede)
-# BRN_SIG_SCHEME=ecdsa    → assina ECDSA, verifica só ECDSA
-#                                      (modo legado, NÃO recomendado)
-# ============================================================
 WALLETS_DIR = os.environ.get("BRN_WALLETS_DIR", "wallets")
 CURRENT_WALLET_JSON = "current_wallet.json"
-SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+SECP256K1_N = [STRIPPED 66 bytes]
 
 _VALID_SCHEMES = ("auto", "schnorr", "ecdsa")
 _SIG_SCHEME = (os.environ.get("BRN_SIG_SCHEME", "auto").strip().lower() or "auto")
@@ -68,20 +54,23 @@ if _SIG_SCHEME not in _VALID_SCHEMES:
     )
     _SIG_SCHEME = "auto"
 
-
 def get_sig_scheme() -> str:
-    """Retorna o esquema de assinatura configurado."""
     return _SIG_SCHEME
 
-
 def set_sig_scheme(scheme: str) -> None:
-    """Muda o esquema em runtime (útil em testes)."""
     global _SIG_SCHEME
     s = (scheme or "").strip().lower()
     if s not in _VALID_SCHEMES:
         raise ValueError(f"BRN_SIG_SCHEME inválido: {scheme!r}")
     _SIG_SCHEME = s
 
+def _validate_priv_bytes(priv: bytes) -> bytes:
+    if not isinstance(priv, (bytes, bytearray)) or len(priv) != 32:
+        raise ValueError("private_key deve ter 32 bytes (64 hex)")
+    v = int.from_bytes(priv, "big")
+    if not (1 <= v < SECP256K1_N):
+        raise ValueError("private_key fora do range válido (1 <= priv < N)")
+    return bytes(priv)
 
 # ============================================================
 # WALLET — chave única
@@ -93,16 +82,31 @@ class Wallet:
                  created_at: int | None = None,
                  label: str = ""):
         if private_key_hex:
-            self.priv = bytes.fromhex(private_key_hex)
+            try:
+                raw = bytes.fromhex(private_key_hex)
+            except Exception as e:
+                raise ValueError(f"private_key_hex inválido: {e}") from e
+            self.priv = _validate_priv_bytes(raw)
         else:
             self.priv = generate_private_key()
         self.pub = pubkey_from_priv(self.priv, compressed=True)
-        self.address = address or pubkey_to_address(self.pub.hex())
-        self.public_key = public_key or self.pub.hex()
+        # [FIX v3.1] Address/pubkey SEMPRE derivados da priv. Nunca confia no JSON.
+        derived_addr = pubkey_to_address(self.pub.hex())
+        derived_pk = self.pub.hex()
+        if address and address != derived_addr:
+            log.warning(
+                "[wallet] address no JSON (%s...) diverge do derivado (%s...) — usando derivado",
+                address[:16], derived_addr[:16],
+            )
+        if public_key and public_key.lower() != derived_pk.lower():
+            log.warning(
+                "[wallet] public_key no JSON diverge da derivada — usando derivada"
+            )
+        self.address = derived_addr
+        self.public_key = derived_pk
         self.created_at = created_at or int(time.time())
         self.label = label
 
-    # ---- properties ----
     @property
     def priv_hex(self) -> str:
         return self.priv.hex()
@@ -117,7 +121,6 @@ class Wallet:
     def public_key_hex(self) -> str:
         return self.pub_hex
 
-    # ---- criação ----
     @classmethod
     def create(cls) -> "Wallet":
         return cls()
@@ -128,71 +131,55 @@ class Wallet:
 
     @classmethod
     def from_private_key(cls, priv_hex: str) -> "Wallet":
-        priv = bytes.fromhex(priv_hex)
-        if len(priv) != 32:
-            raise ValueError("private_key deve ter 32 bytes (64 hex)")
+        if not isinstance(priv_hex, str):
+            raise ValueError("private_key deve ser string hex")
+        priv_hex = priv_hex.strip()
+        try:
+            raw = bytes.fromhex(priv_hex)
+        except Exception as e:
+            raise ValueError(f"private_key hex inválido: {e}") from e
+        _validate_priv_bytes(raw)  # rejeita 0 e >= N antes de derivar
         return cls(private_key_hex=priv_hex)
 
-    # ---- assinatura (v3.0 — Schnorr BIP-340 com fallback) ----
     def sign(self, msg_hash: bytes) -> str:
-        """
-        Assina o hash (32 bytes). Retorna assinatura em hex (128 chars).
-
-        O esquema depende de BRN_SIG_SCHEME:
-          - auto (default) → Schnorr BIP-340
-          - schnorr        → Schnorr BIP-340
-          - ecdsa          → ECDSA (modo legado)
-        """
+        if not isinstance(msg_hash, (bytes, bytearray)) or len(msg_hash) != 32:
+            raise ValueError("sign: msg_hash deve ter 32 bytes")
         if _SIG_SCHEME == "ecdsa":
-            return sign_ecdsa(self.priv, msg_hash).hex()
-        # auto / schnorr → Schnorr
-        return sign_schnorr(self.priv, msg_hash).hex()
+            return sign_ecdsa(self.priv, bytes(msg_hash)).hex()
+        return sign_schnorr(self.priv, bytes(msg_hash)).hex()
 
     @staticmethod
     def verify(sig_hash: bytes, sig_hex: str, pub_hex: str) -> bool:
-        """
-        Verifica assinatura de bloco/transação.
-
-        Comportamento (v3.0):
-          - auto (default) → tenta Schnorr, cai para ECDSA se falhar
-          - schnorr        → aceita só Schnorr
-          - ecdsa          → aceita só ECDSA
-
-        Ambos os esquemas produzem 64 bytes, então o formato bruto é
-        indistinguível. A verificação criptográfica (Schnorr BIP-340
-        vs ECDSA secp256k1) descarta naturalmente a assinatura do
-        esquema errado — não há falso positivo.
-        """
         try:
             pub = bytes.fromhex(pub_hex)
             sig = bytes.fromhex(sig_hex)
         except Exception:
             return False
-
+        if not isinstance(sig_hash, (bytes, bytearray)) or len(sig_hash) != 32:
+            return False
+        if len(sig) != 64:
+            return False
         if _SIG_SCHEME == "ecdsa":
             try:
-                return verify_ecdsa(pub, sig, sig_hash)
+                return verify_ecdsa(pub, sig, bytes(sig_hash))
             except Exception:
                 return False
-
         if _SIG_SCHEME == "schnorr":
             try:
-                return verify_schnorr(pub, sig, sig_hash)
+                return verify_schnorr(pub, sig, bytes(sig_hash))
             except Exception:
                 return False
-
         # auto: Schnorr primeiro, ECDSA como fallback
         try:
-            if verify_schnorr(pub, sig, sig_hash):
+            if verify_schnorr(pub, sig, bytes(sig_hash)):
                 return True
         except Exception:
             pass
         try:
-            return verify_ecdsa(pub, sig, sig_hash)
+            return verify_ecdsa(pub, sig, bytes(sig_hash))
         except Exception:
             return False
 
-    # ---- serialização ----
     def to_dict(self) -> dict:
         return {
             "address": self.address,
@@ -204,6 +191,8 @@ class Wallet:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Wallet":
+        if not isinstance(d, dict) or "private_key" not in d:
+            raise ValueError("from_dict: dict sem 'private_key'")
         return cls(
             private_key_hex=d["private_key"],
             address=d.get("address", ""),
@@ -215,7 +204,6 @@ class Wallet:
     def __repr__(self):
         return f"<Wallet {self.address[:16]}...>"
 
-
 # ============================================================
 # WALLET MANAGER
 # ============================================================
@@ -223,7 +211,6 @@ class WalletManager:
     WALLETS_DIR = WALLETS_DIR
     _session_priv = None
 
-    # ---------- geração ----------
     @staticmethod
     def generate_keypair() -> dict:
         w = Wallet.create()
@@ -239,7 +226,6 @@ class WalletManager:
         w = Wallet.from_private_key(priv_hex)
         return w.to_dict()
 
-    # ---------- validação ----------
     @staticmethod
     def validate_address(addr) -> bool:
         try:
@@ -252,11 +238,12 @@ class WalletManager:
     @staticmethod
     def validate_private_key(priv_hex: str) -> bool:
         try:
-            return len(bytes.fromhex(priv_hex)) == 32
+            raw = bytes.fromhex(priv_hex)
+            _validate_priv_bytes(raw)
+            return True
         except Exception:
             return False
 
-    # ---------- carteira ativa (current_wallet) ----------
     @staticmethod
     def save_current(address: str, private_key: str, public_key: str,
                      password: str) -> dict:
@@ -280,10 +267,8 @@ class WalletManager:
 
     @staticmethod
     def lock_session() -> None:
-        """Limpa a chave privada em memória. Usado no shutdown."""
         WalletManager._session_priv = None
 
-    # ---------- carteiras exportadas (.wallet) ----------
     @staticmethod
     def _garantir_dir():
         os.makedirs(WalletManager.WALLETS_DIR, exist_ok=True)
@@ -353,10 +338,8 @@ class WalletManager:
             pass
         return False
 
-    # ---------- legado ----------
     @staticmethod
     def load_legacy_json() -> dict:
-        """Lê current_wallet.json (formato antigo em plaintext)."""
         if not os.path.exists(CURRENT_WALLET_JSON):
             return {}
         try:
@@ -365,25 +348,16 @@ class WalletManager:
         except Exception:
             return {}
 
-
 # ============================================================
 # HD WALLET (BIP39 + BIP44 simplificado)
 # ============================================================
 class HDWalletManager:
-    """
-    Deriva chaves no caminho m/44'/0'/0'/0/{index}.
-    Não é BIP32 completo, mas é determinístico e reproduzível
-    a partir do mesmo mnemônico.
-
-    As assinaturas resultantes respeitam BRN_SIG_SCHEME (auto|schnorr|ecdsa).
-    """
     PURPOSE = 44
     COIN_TYPE = 0
     ACCOUNT = 0
     CHANGE = 0
     _N = SECP256K1_N
 
-    # ---------- helpers ----------
     @staticmethod
     def _m():
         if not _HAS_MNEMONIC:
@@ -397,7 +371,6 @@ class HDWalletManager:
         except Exception:
             return False
 
-    # ---------- criação ----------
     @staticmethod
     def create(strength: int = 128) -> dict:
         m = HDWalletManager._m()
@@ -409,23 +382,20 @@ class HDWalletManager:
         m = HDWalletManager._m()
         if not m.check(mn):
             raise ValueError("mnemonico invalido")
-
         seed = m.to_seed(mn, passphrase=passphrase)
         I = hmac_lib.new(b"Bitcoin seed", seed, hashlib.sha512).digest()
         key = int.from_bytes(I[:32], "big")
         chain = I[32:]
-
         path = [
-            HDWalletManager.PURPOSE  + 0x80000000,
+            HDWalletManager.PURPOSE + 0x80000000,
             HDWalletManager.COIN_TYPE + 0x80000000,
-            HDWalletManager.ACCOUNT  + 0x80000000,
+            HDWalletManager.ACCOUNT + 0x80000000,
             HDWalletManager.CHANGE,
             index,
         ]
         for child in path:
             if child >= 0x80000000:
-                data = b"\x00" + key.to_bytes(32, "big") \
-                       + child.to_bytes(4, "big")
+                data = b"\x00" + key.to_bytes(32, "big") + child.to_bytes(4, "big")
             else:
                 pub = pubkey_from_priv(key.to_bytes(32, "big"))
                 data = pub + child.to_bytes(4, "big")
@@ -434,16 +404,15 @@ class HDWalletManager:
             if key == 0:
                 raise ValueError("derivacao BIP32 produziu chave invalida")
             chain = I[32:]
-
         w = Wallet(private_key_hex=key.to_bytes(32, "big").hex())
         return {
-            "mnemonic":     mn,
-            "address":      w.address,
-            "private_key":  w.priv_hex,
-            "public_key":   w.pub_hex,
-            "index":        index,
-            "path":         f"m/44'/{HDWalletManager.COIN_TYPE}'/0'/0/{index}",
-            "sig_scheme":   _SIG_SCHEME,
+            "mnemonic": mn,
+            "address": w.address,
+            "private_key": w.priv_hex,
+            "public_key": w.pub_hex,
+            "index": index,
+            "path": f"m/44'/{HDWalletManager.COIN_TYPE}'/0'/0/{index}",
+            "sig_scheme": _SIG_SCHEME,
         }
 
     @staticmethod
@@ -453,38 +422,24 @@ class HDWalletManager:
         return [HDWalletManager.from_mnemonic(mn, index=i)
                 for i in range(count)]
 
-
 # ============================================================
 # HELPERS DE TX (usados por server.py e testes)
 # ============================================================
 def sign_transaction(wallet: Wallet, tx: dict) -> dict:
-    """Preenche pubkey + signature + txid de uma tx com inputs[].
-
-    v3.0: assina UMA vez e reusa a mesma assinatura em todos os inputs
-    (evita desperdício — o hash é único para a tx inteira).
-    """
+    """Preenche pubkey + signature + txid. NÃO muta a tx original (deepcopy)."""
     from blockchain import signing_hash, txid
 
-    tx = dict(tx)
+    tx = copy.deepcopy(tx)  # [FIX v3.1] antes era dict(tx) shallow — mutava o chamador
     pub_hex = wallet.pub_hex
-
-    # 1) injeta pubkey em todos os inputs
     for inp in tx.get("inputs", []):
         inp["pubkey"] = pub_hex
         inp.setdefault("signature", "")
-
-    # 2) hash único (todos os inputs assinam o mesmo hash)
     h = signing_hash(tx)
-
-    # 3) assinatura única, reusada em todos os inputs
     sig_hex = wallet.sign(h)
     for inp in tx.get("inputs", []):
         inp["signature"] = sig_hex
-
-    # 4) txid
     tx["txid"] = txid(tx)
     return tx
-
 
 def verify_transaction(tx: dict) -> tuple:
     """Retorna (ok, msg). Aceita Schnorr e ECDSA (auto)."""
@@ -502,28 +457,24 @@ def verify_transaction(tx: dict) -> tuple:
     except Exception as e:
         return False, str(e)
 
-
 # ============================================================
 # AUTO-TESTE
 # ============================================================
 if __name__ == "__main__":
     import sys
 
-    # CLI: gen / from / mnemonic / scheme
     if len(sys.argv) > 1 and sys.argv[1] == "gen":
         w = Wallet.create()
         d = w.to_dict()
         d["sig_scheme"] = get_sig_scheme()
         print(json.dumps(d, indent=2))
         sys.exit(0)
-
     if len(sys.argv) > 2 and sys.argv[1] == "from":
         w = Wallet.from_private_key(sys.argv[2])
         d = w.to_dict()
         d["sig_scheme"] = get_sig_scheme()
         print(json.dumps(d, indent=2))
         sys.exit(0)
-
     if len(sys.argv) > 1 and sys.argv[1] == "mnemonic":
         try:
             m = HDWalletManager.create()
@@ -533,15 +484,12 @@ if __name__ == "__main__":
         except Exception as e:
             print("erro:", e)
         sys.exit(0)
-
     if len(sys.argv) > 1 and sys.argv[1] == "scheme":
         print(f"BRN_SIG_SCHEME = {get_sig_scheme()}")
         sys.exit(0)
 
-    # Auto-teste
-    print(f"wallet.py v3.0 — sig_scheme = {get_sig_scheme()}")
+    print(f"wallet.py v3.1 — sig_scheme = {get_sig_scheme()}")
     print("=" * 60)
-
     failures = []
 
     def _check(name, fn):
@@ -555,7 +503,6 @@ if __name__ == "__main__":
             print(f"  [ERR]  {name}: {e}")
             failures.append(name)
 
-    # 1) Address é determinístico e independente do esquema
     def t1():
         priv = generate_private_key().hex()
         w_a = Wallet.from_private_key(priv)
@@ -565,11 +512,9 @@ if __name__ == "__main__":
         set_sig_scheme("ecdsa")
         w_c = Wallet.from_private_key(priv)
         set_sig_scheme("auto")
-        assert addr_auto == w_b.address == w_c.address, \
-            "address deve ser igual em todos os esquemas"
-    _check("address independente do esquema (auto/schnorr/ecdsa)", t1)
+        assert addr_auto == w_b.address == w_c.address
+    _check("address independente do esquema", t1)
 
-    # 2) sign/verify com auto (Schnorr produzida, Schnorr verificada)
     def t2():
         set_sig_scheme("auto")
         w = Wallet.create()
@@ -580,44 +525,34 @@ if __name__ == "__main__":
         assert not w.verify(hashlib.sha256(b"x").digest(), sig, w.pub_hex)
     _check("auto: roundtrip sign/verify", t2)
 
-    # 3) sign com ecdsa, verify com auto → aceita (fallback)
     def t3():
         w = Wallet.create()
         msg = hashlib.sha256(b"hello ecdsa compat").digest()
         set_sig_scheme("ecdsa")
         sig_ecdsa = w.sign(msg)
         set_sig_scheme("auto")
-        # auto deve aceitar assinatura ECDSA (chain antiga)
-        assert w.verify(msg, sig_ecdsa, w.pub_hex), \
-            "auto deve aceitar ECDSA (fallback)"
-    _check("auto: aceita assinatura ECDSA (compat chain antiga)", t3)
+        assert w.verify(msg, sig_ecdsa, w.pub_hex)
+    _check("auto: aceita assinatura ECDSA (compat)", t3)
 
-    # 4) sign com schnorr, verify com ecdsa → REJEITA
     def t4():
         w = Wallet.create()
         msg = hashlib.sha256(b"hello mismatch").digest()
         set_sig_scheme("schnorr")
         sig_schnorr = w.sign(msg)
         set_sig_scheme("ecdsa")
-        # ecdsa NÃO deve aceitar Schnorr (são incompatíveis)
-        assert not w.verify(msg, sig_schnorr, w.pub_hex), \
-            "ecdsa NÃO deve aceitar assinatura Schnorr"
+        assert not w.verify(msg, sig_schnorr, w.pub_hex)
     _check("ecdsa: rejeita assinatura Schnorr", t4)
 
-    # 5) sign com ecdsa, verify com schnorr → REJEITA
     def t5():
         w = Wallet.create()
         msg = hashlib.sha256(b"hello reverse").digest()
         set_sig_scheme("ecdsa")
         sig_ecdsa = w.sign(msg)
         set_sig_scheme("schnorr")
-        assert not w.verify(msg, sig_ecdsa, w.pub_hex), \
-            "schnorr NÃO deve aceitar assinatura ECDSA"
+        assert not w.verify(msg, sig_ecdsa, w.pub_hex)
     _check("schnorr: rejeita assinatura ECDSA", t5)
 
-    # 6) sign_transaction + verify_transaction
     def t6():
-        from blockchain import txid
         set_sig_scheme("auto")
         w = Wallet.create()
         tx = {
@@ -631,14 +566,16 @@ if __name__ == "__main__":
             "locktime": 0,
             "nonce": 0,
         }
+        orig_sig = tx["inputs"][0]["signature"]
         signed = sign_transaction(w, tx)
         ok, msg = verify_transaction(signed)
-        assert ok, f"verify_transaction falhou: {msg}"
-        # mesmo hash, mesma assinatura nos 2 inputs
+        assert ok, msg
         assert signed["inputs"][0]["signature"] == signed["inputs"][1]["signature"]
-    _check("sign_transaction/verify_transaction (auto)", t6)
+        # [FIX v3.1] original NÃO pode ter sido mutada
+        assert tx["inputs"][0]["signature"] == orig_sig == ""
+        assert tx["txid"] == ""
+    _check("sign_transaction não muta original + verify", t6)
 
-    # 7) to_dict/from_dict preserva address
     def t7():
         set_sig_scheme("auto")
         w = Wallet.create()
@@ -648,28 +585,43 @@ if __name__ == "__main__":
         assert w2.priv_hex == w.priv_hex
     _check("to_dict/from_dict", t7)
 
-    # 8) HDWallet determinístico (mesmo mnemônico → mesmo address)
+    def t7b():
+        # [FIX v3.1] JSON com address errado -> usa o derivado, não o JSON
+        w = Wallet.create()
+        d = w.to_dict()
+        d["address"] = "brn1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+        d["public_key"] = "02" + "00" * 32
+        w2 = Wallet.from_dict(d)
+        assert w2.address == w.address
+        assert w2.pub_hex == w.pub_hex
+    _check("from_dict ignora address/pubkey divergentes", t7b)
+
+    def t7c():
+        for bad in ("00" * 32, "ff" * 32):
+            try:
+                Wallet.from_private_key(bad)
+                raise AssertionError(f"deveria rejeitar priv {bad[:8]}...")
+            except ValueError:
+                pass
+    _check("from_private_key rejeita 0 e >= N", t7c)
+
     def t8():
         if not _HAS_MNEMONIC:
-            return  # skip
+            return
         set_sig_scheme("auto")
         m1 = HDWalletManager.create()
         m2 = HDWalletManager.from_mnemonic(m1["mnemonic"], index=0)
         assert m1["address"] == m2["address"]
-        # índice diferente → address diferente
         m3 = HDWalletManager.from_mnemonic(m1["mnemonic"], index=1)
         assert m3["address"] != m1["address"]
-    _check("HDWallet determinístico (auto)", t8)
+    _check("HDWallet determinístico", t8)
 
-    # 9) Restaurar estado
     def t9():
         set_sig_scheme("auto")
         assert get_sig_scheme() == "auto"
     _check("set_sig_scheme / get_sig_scheme", t9)
 
-    # Reset para o default
     set_sig_scheme("auto")
-
     print()
     print("=" * 60)
     if failures:
