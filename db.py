@@ -1,5 +1,15 @@
 # db.py — Banco de Dados SQLite para o Nó BRN
-# Versão: 9.8.0 | Data: 2026-11-18
+# Versão: 9.8.1 | Data: 2026-11-18
+# ============================================================
+# v9.8.1 (2026-11-18) — DESBLOQUEIA O P2P (get_peer_score):
+#   [FIX CRÍTICO] get_peer_score()              → p2p_unified.py / p2p_auth.py
+#   [FIX CRÍTICO] set_peer_score()              → (usado por rate limiting)
+#   [FIX CRÍTICO] bump_peer_score(delta)        → (ajuste incremental)
+#   [NEW]  Coluna 'score REAL DEFAULT 0' na tabela peers.
+#   [NEW]  Migração adiciona 'score' em DBs antigos (ALTER TABLE).
+#   [NEW]  upsert_peer(..., score=None) — se None preserva score atual.
+#   [NEW]  Índice idx_peers_score para ordenação rápida.
+#   [KEEP] Todos os métodos v9.8.0 preservados.
 # ============================================================
 # v9.8.0 (2026-11-18) — COMPLETA OS MÉTODOS QUE O SERVER.PY USA:
 #   [FIX CRÍTICO] count_utxos()                → /api/status
@@ -11,9 +21,7 @@
 #   [FIX CRÍTICO] get_txs_for_address(addr,limit)→ /api/minhas-txs
 #   [FIX CRÍTICO] get_blocks_range(start, end) → /api/blocks, /api/latest
 #   [FIX] listar_peers aceita kwarg 'janela'   → auto.py, auto_trust.py
-#   [FIX] listar_peers(apenas_ativos=True) agora também filtra peers
-#         sem last_seen (age_s < 0), igual main.py/server.py esperam.
-#   [KEEP] Todos os métodos v9.7.0 preservados bit-a-bit.
+#   [FIX] listar_peers(apenas_ativos=True) filtra age_s < 0.
 # ============================================================
 # v9.7.0 — COMPATIBILIDADE TOTAL COM blockchain.py 9.5.9 + l2_manager.py v1.2:
 #   • BLOCKS: add_block(dict) / get_block / get_block_by_hash / tip_hash
@@ -48,7 +56,7 @@ import logging
 
 logger = logging.getLogger("db")
 
-__version__ = "9.8.0"
+__version__ = "9.8.1"
 
 
 # ------------------------------------------------------------
@@ -233,6 +241,7 @@ class Database:
                 used_at INTEGER NOT NULL DEFAULT 0
             )
         """)
+        # [v9.8.1] peers agora tem coluna 'score' (usado pelo P2P)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS peers (
                 node_id TEXT PRIMARY KEY,
@@ -242,6 +251,7 @@ class Database:
                 height INTEGER NOT NULL DEFAULT 0,
                 is_miner INTEGER NOT NULL DEFAULT 0,
                 public_key TEXT NOT NULL DEFAULT '',
+                score REAL NOT NULL DEFAULT 0,
                 last_seen REAL NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL DEFAULT (strftime('%s','now'))
             )
@@ -274,6 +284,7 @@ class Database:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_peers_height ON peers(height);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen DESC);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_peers_score ON peers(score DESC);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_utxos_address ON utxos(address);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_l2_status ON l2_escrows(status);")
@@ -333,6 +344,11 @@ class Database:
             for col in ("genesis_hash", "version", "public_key"):
                 if col not in cols:
                     conn.execute(f"ALTER TABLE peers ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+            # [v9.8.1] score para get_peer_score / rate limiting P2P
+            if "score" not in cols:
+                logger.info("[DB MIGRATION] Adicionando coluna peers.score")
+                conn.execute("ALTER TABLE peers ADD COLUMN score REAL NOT NULL DEFAULT 0")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_peers_score ON peers(score DESC);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_l2_status ON l2_escrows(status);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_l2_buyer ON l2_escrows(buyer);")
 
@@ -425,9 +441,8 @@ class Database:
     def get_blocks_range(self, start: int, end: int) -> List[Dict[str, Any]]:
         """Blocos entre start (inclusive) e end (EXCLUSIVO), em ordem crescente.
 
-        [v9.8.0] Adicionado — server.py::/api/blocks e /api/latest chamam
-        get_blocks_range(start, end). Sem isto, /api/blocks retornava 500 e
-        o Explorer ficava em branco.
+        [v9.8.0] server.py::/api/blocks e /api/latest chamam
+        get_blocks_range(start, end).
         """
         try:
             start = int(start)
@@ -467,9 +482,8 @@ class Database:
     def get_utxos(self, address: str) -> List[Dict[str, Any]]:
         """Lista todos os UTXOs de um endereço, ordenados por amount DESC.
 
-        [v9.8.0] Adicionado — server.py::/api/transfer e /api/saldo chamam
-        get_utxos(address). Sem isto, /api/transfer retornava 500 e a
-        carteira não conseguia montar a tx.
+        [v9.8.0] server.py::/api/transfer e /api/saldo chamam
+        get_utxos(address).
         """
         if not address:
             return []
@@ -484,8 +498,7 @@ class Database:
     def count_utxos(self) -> int:
         """Número total de UTXOs ativos (usado em /api/status).
 
-        [v9.8.0] Adicionado — server.py::/api/status chama
-        chain.db.count_utxos() para exibir "utxos": <int>.
+        [v9.8.0] server.py::/api/status chama chain.db.count_utxos().
         """
         with self._get_connection() as conn:
             row = conn.execute("SELECT COUNT(*) FROM utxos").fetchone()
@@ -504,9 +517,8 @@ class Database:
     def get_tx_by_txid(self, txid_str: str) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
         """Retorna (tx_dict, block_height) ou (None, None) se não encontrado.
 
-        [v9.8.0] Adicionado — server.py::/api/tx-status e
-        /api/verificar-recebimento chamam get_tx_by_txid(txid). Sem isto,
-        essas rotas retornavam 500 (o endpoint de checagem de pagamento).
+        [v9.8.0] server.py::/api/tx-status e /api/verificar-recebimento
+        chamam get_tx_by_txid(txid).
         """
         if not txid_str:
             return None, None
@@ -527,8 +539,8 @@ class Database:
     def get_mempool_tx(self, txid_str: str) -> Optional[Dict[str, Any]]:
         """Retorna o tx dict da mempool, ou None.
 
-        [v9.8.0] Adicionado — server.py::/api/verificar-recebimento e
-        /api/tx-status consultam a mempool antes de checar tx_index.
+        [v9.8.0] server.py::/api/verificar-recebimento e /api/tx-status
+        consultam a mempool antes de tx_index.
         """
         if not txid_str:
             return None
@@ -547,15 +559,9 @@ class Database:
         Retorna lista de dicts {tx, block_height, is_mempool, timestamp},
         ordenada da mais recente para a mais antiga.
 
-        [v9.8.0] Adicionado — server.py::/api/minhas-txs chama
-        get_txs_for_address. A "direção" (received/sent) é calculada
-        DEPOIS pelo server, comparando inputs gastos contra outputs.
-        Aqui só filtramos candidatas.
-
-        Considera "envolvendo" quando:
-          - address aparece em algum output; OU
-          - algum input referencia um output anterior para o address
-            (detecta "sent without change").
+        [v9.8.0] server.py::/api/minhas-txs chama get_txs_for_address.
+        A "direção" (received/sent) é calculada DEPOIS pelo server,
+        comparando inputs gastos contra outputs.
         """
         if not address:
             return []
@@ -593,8 +599,6 @@ class Database:
                     txid = tx.get("txid", "")
                     if not txid:
                         continue
-                    # Cache atualizado ANTES de checar, pra input refs dentro
-                    # do mesmo bloco funcionarem.
                     tx_cache[txid] = tx
                     if self._tx_involves_address(tx, address, tx_cache=tx_cache):
                         out.append({
@@ -616,11 +620,9 @@ class Database:
     def _tx_involves_address(self, tx: dict, address: str,
                               tx_cache: Optional[Dict[str, Dict[str, Any]]]) -> bool:
         """Helper: True se address aparece em outputs OU é dono de input."""
-        # Checa outputs primeiro (caminho rápido)
         for o in (tx.get("outputs") or []):
             if o.get("address") == address:
                 return True
-        # Checa inputs (só faz lookup se tx_cache fornecido)
         if tx_cache is not None:
             for inp in (tx.get("inputs") or []):
                 ref_txid = inp.get("txid", "")
@@ -864,31 +866,52 @@ class Database:
     # ============================================================
     def upsert_peer(self, node_id: str, address: str, genesis_hash: str = "",
                     version: str = "", height: int = 0, is_miner: bool = False,
-                    public_key: str = "") -> None:
+                    public_key: str = "", score: Optional[float] = None) -> None:
+        """Insere ou atualiza um peer.
+
+        [v9.8.1] score=None preserva o score atual (se o peer já existir)
+        ou usa 0.0 (se novo). Assim, o upsert periódico do Peer-Healer não
+        zera scores acumulados por get_peer_score/bump_peer_score.
+        """
         now = time.time()
         with self._write_lock, self._get_connection(write=True) as conn:
-            conn.execute("""
-                INSERT INTO peers (node_id, address, genesis_hash, version, height, is_miner, public_key, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(node_id) DO UPDATE SET
-                    address=excluded.address, genesis_hash=excluded.genesis_hash,
-                    version=excluded.version, height=excluded.height,
-                    is_miner=excluded.is_miner, public_key=excluded.public_key,
-                    last_seen=excluded.last_seen
-            """, (node_id, address, genesis_hash, version, height, int(is_miner), public_key, now))
+            if score is None:
+                # Preserva score existente (COALESCE pega o atual em UPDATE;
+                # no INSERT, peers.score default = 0)
+                conn.execute("""
+                    INSERT INTO peers (node_id, address, genesis_hash, version, height, is_miner, public_key, last_seen)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        address=excluded.address, genesis_hash=excluded.genesis_hash,
+                        version=excluded.version, height=excluded.height,
+                        is_miner=excluded.is_miner, public_key=excluded.public_key,
+                        last_seen=excluded.last_seen
+                """, (node_id, address, genesis_hash, version, height, int(is_miner), public_key, now))
+            else:
+                try:
+                    score_v = float(score)
+                except (ValueError, TypeError):
+                    score_v = 0.0
+                conn.execute("""
+                    INSERT INTO peers (node_id, address, genesis_hash, version, height, is_miner, public_key, score, last_seen)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        address=excluded.address, genesis_hash=excluded.genesis_hash,
+                        version=excluded.version, height=excluded.height,
+                        is_miner=excluded.is_miner, public_key=excluded.public_key,
+                        score=excluded.score, last_seen=excluded.last_seen
+                """, (node_id, address, genesis_hash, version, height, int(is_miner),
+                      public_key, score_v, now))
 
     def listar_peers(self, apenas_ativos: bool = True, max_age_s: int = 300,
                      janela: Optional[int] = None) -> List[Dict[str, Any]]:
         """Lista peers.
 
-        [v9.8.0] Aceita kwarg 'janela' como alias de max_age_s. auto.py,
-        auto_trust.py e auto_trust_daemon.py chamam
-        listar_peers(apenas_ativos=True, janela=1800). Sem o alias,
-        essas chamadas levantavam TypeError e o auto-trust nunca atualizava.
+        [v9.8.0] Aceita kwarg 'janela' como alias de max_age_s (auto.py,
+        auto_trust.py, auto_trust_daemon.py chamam janela=1800).
 
         [v9.8.0] Também filtra corretamente quando apenas_ativos=True e
-        peer.age_s < 0 (nunca visto) — antes ficava de fora do filtro por
-        causa de -1 > 300 == False.
+        peer.age_s < 0 (nunca visto).
         """
         if janela is not None:
             try:
@@ -915,15 +938,81 @@ class Database:
                      max_age_s: int = 300) -> int:
         """Número de peers.
 
-        [v9.8.0] Adicionado — server.py::/api/status e /api/sync-info
-        chamam contar_peers(apenas_ativos=True/False). Sem isto, essas
-        rotas retornavam 500 ao tentar popular "peers": N.
+        [v9.8.0] server.py::/api/status e /api/sync-info chamam
+        contar_peers(apenas_ativos=True/False).
         """
         try:
             return len(self.listar_peers(
                 apenas_ativos=bool(apenas_ativos), max_age_s=int(max_age_s)))
         except Exception:
             return 0
+
+    def get_peer_score(self, identifier: str) -> float:
+        """Score de confiança do peer (usado pelo P2P e rate limiting).
+
+        [v9.8.1] p2p_unified.py e p2p_auth.py chamam
+        db.get_peer_score(addr_or_pubkey) no handshake. Sem isto, TODA
+        conexão P2P de entrada era rejeitada com AttributeError, o nó
+        ficava isolado e o mining gate nunca abria.
+
+        Aceita node_id (hash do pubkey), public_key ou address (com ou
+        sem :porta). Retorna 0.0 se o peer for desconhecido.
+        """
+        if not identifier:
+            return 0.0
+        ident = str(identifier).strip()
+        candidates = [ident]
+        if ":" in ident:
+            candidates.append(ident.rsplit(":", 1)[0])
+        try:
+            with self._get_connection() as conn:
+                for c in candidates:
+                    row = conn.execute(
+                        "SELECT COALESCE(score, 0) FROM peers "
+                        "WHERE node_id = ? OR public_key = ? OR address = ? "
+                        "LIMIT 1",
+                        (c, c, c)).fetchone()
+                    if row:
+                        return float(row[0])
+        except Exception as e:
+            logger.debug("[DB] get_peer_score(%s): %s", ident, e)
+        return 0.0
+
+    def set_peer_score(self, identifier: str, score: float) -> bool:
+        """Seta score absoluto. Aceita node_id/public_key/address."""
+        if not identifier:
+            return False
+        try:
+            score = float(score)
+        except (ValueError, TypeError):
+            return False
+        ident = str(identifier).strip()
+        candidates = [ident]
+        if ":" in ident:
+            candidates.append(ident.rsplit(":", 1)[0])
+        try:
+            with self._write_lock, self._get_connection(write=True) as conn:
+                for c in candidates:
+                    cur = conn.execute(
+                        "UPDATE peers SET score = ? "
+                        "WHERE node_id = ? OR public_key = ? OR address = ?",
+                        (score, c, c, c))
+                    if cur.rowcount > 0:
+                        return True
+        except Exception as e:
+            logger.warning("[DB] set_peer_score(%s): %s", ident, e)
+        return False
+
+    def bump_peer_score(self, identifier: str, delta: float) -> float:
+        """Adiciona delta ao score atual. Retorna o novo valor (ou 0 se ausente)."""
+        try:
+            delta = float(delta)
+        except (ValueError, TypeError):
+            return 0.0
+        current = self.get_peer_score(identifier)
+        new_score = current + delta
+        self.set_peer_score(identifier, new_score)
+        return new_score
 
     def remover_peer(self, node_id: str) -> bool:
         with self._write_lock, self._get_connection(write=True) as conn:
@@ -981,7 +1070,6 @@ class Database:
             return row[0] if row else default
 
     def set_meta(self, key: str, value: Any) -> None:
-        # blockchain.py passa json.dumps() já pronto OU string "1" — guarda como veio
         if isinstance(value, (dict, list)):
             v = json.dumps(value, ensure_ascii=False)
         elif isinstance(value, bool):
@@ -1131,3 +1219,4 @@ if __name__ == "__main__":
     print(f"👥 Peers: {len(db.listar_peers())} | Mempool: {db.mempool_count()} | L2 OPEN: {len(db.get_l2_escrows(status='OPEN'))}")
     print(f"💰 UTXOs: {db.count_utxos()} | Peers ativos: {db.contar_peers(apenas_ativos=True)}")
     print(f"📦 Blocos 0..4: {len(db.get_blocks_range(0, 5))}")
+    print(f"🎯 get_peer_score('test'): {db.get_peer_score('test')}")
