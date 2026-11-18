@@ -1,5 +1,19 @@
 # db.py — Banco de Dados SQLite para o Nó BRN
-# Versão: 9.8.1 | Data: 2026-11-18
+# Versão: 9.8.2 | Data: 2026-11-18
+# ============================================================
+# v9.8.2 (2026-11-18) — FIX CRÍTICO: ORDEM DE CRIAÇÃO DOS ÍNDICES
+#   [FIX] _create_tables NÃO cria mais idx_peers_score. Em DB antigo
+#         (sem coluna score), o CREATE INDEX falhava com
+#         "no such column: score" e derrubava o boot inteiro
+#         (Blockchain.__init__ -> _init_database -> _create_tables).
+#         Agora o índice é criado SÓ em _migrate_schema, DEPOIS do
+#         ALTER TABLE peers ADD COLUMN score.
+#   [FIX] Todos os CREATE INDEX em _create_tables estão envoltos em
+#         try/except defensivo: se um índice falhar (schema muito
+#         antigo), o nó continua em vez de morrer.
+#   [KEEP] Todos os métodos v9.8.1 preservados (get_peer_score,
+#          set_peer_score, bump_peer_score, count_utxos, get_utxos,
+#          get_blocks_range, contar_peers, get_tx_by_txid, etc).
 # ============================================================
 # v9.8.1 (2026-11-18) — DESBLOQUEIA O P2P (get_peer_score):
 #   [FIX CRÍTICO] get_peer_score()              → p2p_unified.py / p2p_auth.py
@@ -7,39 +21,18 @@
 #   [FIX CRÍTICO] bump_peer_score(delta)        → (ajuste incremental)
 #   [NEW]  Coluna 'score REAL DEFAULT 0' na tabela peers.
 #   [NEW]  Migração adiciona 'score' em DBs antigos (ALTER TABLE).
-#   [NEW]  upsert_peer(..., score=None) — se None preserva score atual.
+#   [NEW]  upsert_peer(..., score=None) preserva score existente.
 #   [NEW]  Índice idx_peers_score para ordenação rápida.
-#   [KEEP] Todos os métodos v9.8.0 preservados.
 # ============================================================
 # v9.8.0 (2026-11-18) — COMPLETA OS MÉTODOS QUE O SERVER.PY USA:
-#   [FIX CRÍTICO] count_utxos()                → /api/status
-#   [FIX CRÍTICO] get_utxos(address)           → /api/saldo, /api/portfolio,
-#                                                 /api/transfer, pubkey lookup
-#   [FIX CRÍTICO] contar_peers(apenas_ativos)  → /api/status, /api/sync-info
-#   [FIX CRÍTICO] get_mempool_tx(txid)         → /api/tx-status, /api/verificar-recebimento
-#   [FIX CRÍTICO] get_tx_by_txid(txid)         → /api/tx-status, /api/verificar-recebimento
-#   [FIX CRÍTICO] get_txs_for_address(addr,limit)→ /api/minhas-txs
-#   [FIX CRÍTICO] get_blocks_range(start, end) → /api/blocks, /api/latest
-#   [FIX] listar_peers aceita kwarg 'janela'   → auto.py, auto_trust.py
-#   [FIX] listar_peers(apenas_ativos=True) filtra age_s < 0.
+#   count_utxos / get_utxos / contar_peers / get_mempool_tx /
+#   get_tx_by_txid / get_txs_for_address / get_blocks_range /
+#   listar_peers(janela=...)  → todos adicionados.
 # ============================================================
 # v9.7.0 — COMPATIBILIDADE TOTAL COM blockchain.py 9.5.9 + l2_manager.py v1.2:
-#   • BLOCKS: add_block(dict) / get_block / get_block_by_hash / tip_hash
-#   • UTXO: apply_tx / get_utxo / get_nonce_for_pubkey
-#   • MEMPOOL: add / has / count / stats / all / remove /
-#     utxos_gastos_na_mempool
-#   • TX INDEX: get_tx_block_height
-#   • CONTRATOS: contract_get / contract_put / contract_list
-#   • L2 ESCROW (BTC->BRN): save_l2_escrow / get_l2_escrow_by_id /
-#     get_l2_escrows / update_l2_escrow_status /
-#     is_btc_txid_used / mark_btc_txid_used (anti-replay)
-#   • META: get_meta / set_meta / delete_meta / get_all_meta
-#     (get_meta devolve STRING CRUA — blockchain.py faz json.loads())
-#   • COMPAT: db.lock + db.conn (cumulative_work usa os dois)
-#   • TRUNCATE: recalcula nonces a partir dos blocos que sobraram
-#     (senão reorg/restore conta nonce 2x)
-#   • KEEP: ChainDB, peers, bootstrap_peers, mining_gate,
-#     WAL + busy_timeout
+#   BLOCKS / UTXO / MEMPOOL / TX INDEX / CONTRATOS / L2 ESCROW /
+#   META / COMPAT db.lock+db.conn / TRUNCATE recalcula nonces /
+#   ChainDB + peers + bootstrap_peers + mining_gate + WAL.
 # ============================================================
 from __future__ import annotations
 
@@ -56,7 +49,7 @@ import logging
 
 logger = logging.getLogger("db")
 
-__version__ = "9.8.1"
+__version__ = "9.8.2"
 
 
 # ------------------------------------------------------------
@@ -163,9 +156,15 @@ class Database:
         with self._get_connection(write=True) as conn:
             self._create_tables(conn)
             self._migrate_schema(conn)
+            # [v9.8.2] Cria TODOS os índices APÓS migração, garantindo
+            # que as colunas existem. try/except por índice: um falhando
+            # não derruba o boot.
+            self._create_indexes(conn)
         logger.info("[DB] Inicializado em: %s", self.db_path)
 
     def _create_tables(self, conn: sqlite3.Connection):
+        # [v9.8.2] SEM CREATE INDEX aqui. Todos os índices são criados
+        # em _create_indexes(), chamado APÓS _migrate_schema().
         conn.execute("""
             CREATE TABLE IF NOT EXISTS blocks (
                 height INTEGER PRIMARY KEY,
@@ -218,7 +217,6 @@ class Database:
                 created_at REAL NOT NULL DEFAULT (strftime('%s','now'))
             )
         """)
-        # --- L2 ESCROW (BTC -> BRN) ---
         conn.execute("""
             CREATE TABLE IF NOT EXISTS l2_escrows (
                 escrow_id TEXT PRIMARY KEY,
@@ -241,7 +239,7 @@ class Database:
                 used_at INTEGER NOT NULL DEFAULT 0
             )
         """)
-        # [v9.8.1] peers agora tem coluna 'score' (usado pelo P2P)
+        # [v9.8.1] peers com coluna 'score'
         conn.execute("""
             CREATE TABLE IF NOT EXISTS peers (
                 node_id TEXT PRIMARY KEY,
@@ -282,16 +280,15 @@ class Database:
                 updated_at REAL NOT NULL DEFAULT (strftime('%s','now'))
             )
         """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_peers_height ON peers(height);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen DESC);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_peers_score ON peers(score DESC);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_utxos_address ON utxos(address);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_l2_status ON l2_escrows(status);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_l2_buyer ON l2_escrows(buyer);")
         conn.execute("INSERT OR IGNORE INTO mining_gate (id) VALUES (1)")
 
     def _migrate_schema(self, conn: sqlite3.Connection):
+        """Adiciona colunas/tabelas novas em DBs antigos.
+
+        IMPORTANTE: NÃO cria índices aqui — isso é feito em
+        _create_indexes() após esta função, quando TODAS as colunas
+        já existem.
+        """
         tables = {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         # DB antigo tinha blocks com outro formato -> recria se não tiver coluna data
@@ -314,7 +311,6 @@ class Database:
                         created_at REAL NOT NULL DEFAULT (strftime('%s','now'))
                     )
                 """)
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash);")
         for name, ddl in [
             ("utxos", """CREATE TABLE IF NOT EXISTS utxos (
                 txid TEXT NOT NULL, vout INTEGER NOT NULL, address TEXT NOT NULL DEFAULT '',
@@ -338,19 +334,40 @@ class Database:
             if name not in tables:
                 logger.info("[DB MIGRATION] Criando tabela %s", name)
                 conn.execute(ddl)
-        # peers: colunas novas
+        # peers: colunas novas (ALTER TABLE) — precisa vir ANTES dos índices
         if "peers" in tables:
             cols = [r[1] for r in conn.execute("PRAGMA table_info(peers)").fetchall()]
             for col in ("genesis_hash", "version", "public_key"):
                 if col not in cols:
+                    logger.info("[DB MIGRATION] Adicionando coluna peers.%s", col)
                     conn.execute(f"ALTER TABLE peers ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
-            # [v9.8.1] score para get_peer_score / rate limiting P2P
             if "score" not in cols:
                 logger.info("[DB MIGRATION] Adicionando coluna peers.score")
                 conn.execute("ALTER TABLE peers ADD COLUMN score REAL NOT NULL DEFAULT 0")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_peers_score ON peers(score DESC);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_l2_status ON l2_escrows(status);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_l2_buyer ON l2_escrows(buyer);")
+
+    def _create_indexes(self, conn: sqlite3.Connection):
+        """Cria TODOS os índices. Chamado APÓS _migrate_schema().
+
+        [v9.8.2] Cada CREATE INDEX tem try/except individual: se um
+        falhar (DB de schema muito antigo sem alguma coluna), só loga
+        warning e continua. Diferente de _create_tables, que precisa
+        suceder tudo, os índices são otimização — não bloqueiam boot.
+        """
+        indexes = [
+            "CREATE INDEX IF NOT EXISTS idx_peers_height ON peers(height);",
+            "CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen DESC);",
+            "CREATE INDEX IF NOT EXISTS idx_peers_score ON peers(score DESC);",
+            "CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash);",
+            "CREATE INDEX IF NOT EXISTS idx_utxos_address ON utxos(address);",
+            "CREATE INDEX IF NOT EXISTS idx_l2_status ON l2_escrows(status);",
+            "CREATE INDEX IF NOT EXISTS idx_l2_buyer ON l2_escrows(buyer);",
+        ]
+        for ddl in indexes:
+            try:
+                conn.execute(ddl)
+            except sqlite3.OperationalError as e:
+                logger.warning("[DB] Falha ao criar índice (%s) — ignorando: %s",
+                               ddl.split("idx_")[1].split(" ")[0] if "idx_" in ddl else "?", e)
 
     # ============================================================
     # BLOCKS — formato que blockchain.py espera (dict completo)
@@ -560,8 +577,6 @@ class Database:
         ordenada da mais recente para a mais antiga.
 
         [v9.8.0] server.py::/api/minhas-txs chama get_txs_for_address.
-        A "direção" (received/sent) é calculada DEPOIS pelo server,
-        comparando inputs gastos contra outputs.
         """
         if not address:
             return []
@@ -610,7 +625,6 @@ class Database:
                 if len(out) >= limit * 2:
                     break
 
-        # Ordena: block_height DESC (None primeiro), depois timestamp DESC
         out.sort(key=lambda x: (
             -(x["block_height"] if x["block_height"] is not None else 10**9),
             -x["timestamp"],
@@ -729,7 +743,7 @@ class Database:
         return gastos
 
     # ============================================================
-    # CONTRATOS (stub persistente — contracts.py usa se precisar)
+    # CONTRATOS
     # ============================================================
     def contract_get(self, contract_id: str) -> Optional[Dict[str, Any]]:
         with self._get_connection() as conn:
@@ -759,7 +773,7 @@ class Database:
             return out
 
     # ============================================================
-    # L2 ESCROW (BTC -> BRN) — usado por l2_manager.py v1.2
+    # L2 ESCROW (BTC -> BRN)
     # ============================================================
     def _ensure_l2_tables(self):
         with self._get_connection(write=True) as conn:
@@ -876,8 +890,6 @@ class Database:
         now = time.time()
         with self._write_lock, self._get_connection(write=True) as conn:
             if score is None:
-                # Preserva score existente (COALESCE pega o atual em UPDATE;
-                # no INSERT, peers.score default = 0)
                 conn.execute("""
                     INSERT INTO peers (node_id, address, genesis_hash, version, height, is_miner, public_key, last_seen)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -1135,7 +1147,7 @@ class Database:
                     "closed_at": None, "updated_at": 0}
 
     # ============================================================
-    # TRUNCATE / PRUNE (Fast-Sync, HTTP Re-Sync, Reorg)
+    # TRUNCATE / PRUNE
     # ============================================================
     def truncate_to(self, target_height: int) -> bool:
         if target_height < 0:
@@ -1150,8 +1162,6 @@ class Database:
                 conn.execute("DELETE FROM blocks WHERE height > ?", (target_height,))
                 conn.execute("DELETE FROM utxos WHERE height > ?", (target_height,))
                 conn.execute("DELETE FROM tx_index WHERE height > ?", (target_height,))
-                # Nonces voltam ao estado de fork_h, senão restore
-                # com apply_tx() conta 2x e validate_tx rejeita a próxima tx.
                 conn.execute("DELETE FROM nonces")
                 rows = conn.execute("SELECT data FROM blocks ORDER BY height ASC").fetchall()
                 counts = {}
@@ -1171,7 +1181,8 @@ class Database:
                     conn.execute("INSERT INTO nonces (pubkey, nonce) VALUES (?, ?)", (pk, n))
                 removed = conn.total_changes
             self._vacuum()
-            logger.info("[DB] Truncado > %d. Nova altura: %d (removidos ~%d)", target_height, self.height(), removed)
+            logger.info("[DB] Truncado > %d. Nova altura: %d (removidos ~%d)",
+                        target_height, self.height(), removed)
             return True
         except Exception as e:
             logger.error("[DB] truncate_to falhou: %s", e)
