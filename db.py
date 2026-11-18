@@ -1,5 +1,19 @@
 # db.py — Banco de Dados SQLite para o Nó BRN
-# Versão: 9.7.0 | Data: 2026-11-17
+# Versão: 9.8.0 | Data: 2026-11-18
+# ============================================================
+# v9.8.0 (2026-11-18) — COMPLETA OS MÉTODOS QUE O SERVER.PY USA:
+#   [FIX CRÍTICO] count_utxos()                → /api/status
+#   [FIX CRÍTICO] get_utxos(address)           → /api/saldo, /api/portfolio,
+#                                                 /api/transfer, pubkey lookup
+#   [FIX CRÍTICO] contar_peers(apenas_ativos)  → /api/status, /api/sync-info
+#   [FIX CRÍTICO] get_mempool_tx(txid)         → /api/tx-status, /api/verificar-recebimento
+#   [FIX CRÍTICO] get_tx_by_txid(txid)         → /api/tx-status, /api/verificar-recebimento
+#   [FIX CRÍTICO] get_txs_for_address(addr,limit)→ /api/minhas-txs
+#   [FIX CRÍTICO] get_blocks_range(start, end) → /api/blocks, /api/latest
+#   [FIX] listar_peers aceita kwarg 'janela'   → auto.py, auto_trust.py
+#   [FIX] listar_peers(apenas_ativos=True) agora também filtra peers
+#         sem last_seen (age_s < 0), igual main.py/server.py esperam.
+#   [KEEP] Todos os métodos v9.7.0 preservados bit-a-bit.
 # ============================================================
 # v9.7.0 — COMPATIBILIDADE TOTAL COM blockchain.py 9.5.9 + l2_manager.py v1.2:
 #   • BLOCKS: add_block(dict) / get_block / get_block_by_hash / tip_hash
@@ -28,11 +42,14 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import logging
 
 logger = logging.getLogger("db")
+
+__version__ = "9.8.0"
+
 
 # ------------------------------------------------------------
 # Cursor fake para db.conn.execute() usado em cumulative_work()
@@ -46,6 +63,7 @@ class _FakeCursor:
 
     def fetchone(self):
         return self._rows[0] if self._rows else None
+
 
 class _ConnAdapter:
     """db.conn.execute(...) abre conexão curta, executa e fecha."""
@@ -64,6 +82,7 @@ class _ConnAdapter:
                 except Exception:
                     out.append(r)
             return _FakeCursor(out)
+
 
 class Database:
     _instance: Optional["Database"] = None
@@ -403,6 +422,24 @@ class Database:
                 (int(start), int(limit)))
             return [b for b in (self._row_to_block(r) for r in cur.fetchall()) if b]
 
+    def get_blocks_range(self, start: int, end: int) -> List[Dict[str, Any]]:
+        """Blocos entre start (inclusive) e end (EXCLUSIVO), em ordem crescente.
+
+        [v9.8.0] Adicionado — server.py::/api/blocks e /api/latest chamam
+        get_blocks_range(start, end). Sem isto, /api/blocks retornava 500 e
+        o Explorer ficava em branco.
+        """
+        try:
+            start = int(start)
+            end = int(end)
+        except (ValueError, TypeError):
+            return []
+        if start < 0:
+            start = 0
+        if end <= start:
+            return []
+        return self.list_blocks(start, end - start)
+
     def tip_hash(self) -> str:
         b = self.get_last_block()
         return b.get("hash", "0" * 64) if b else "0" * 64
@@ -427,6 +464,33 @@ class Database:
                 "SELECT * FROM utxos WHERE txid = ? AND vout = ?", (txid, int(vout))).fetchone()
             return dict(row) if row else None
 
+    def get_utxos(self, address: str) -> List[Dict[str, Any]]:
+        """Lista todos os UTXOs de um endereço, ordenados por amount DESC.
+
+        [v9.8.0] Adicionado — server.py::/api/transfer e /api/saldo chamam
+        get_utxos(address). Sem isto, /api/transfer retornava 500 e a
+        carteira não conseguia montar a tx.
+        """
+        if not address:
+            return []
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "SELECT txid, vout, address, amount, pubkey, height "
+                "FROM utxos WHERE address = ? "
+                "ORDER BY amount DESC",
+                (address,))
+            return [dict(r) for r in cur.fetchall()]
+
+    def count_utxos(self) -> int:
+        """Número total de UTXOs ativos (usado em /api/status).
+
+        [v9.8.0] Adicionado — server.py::/api/status chama
+        chain.db.count_utxos() para exibir "utxos": <int>.
+        """
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM utxos").fetchone()
+            return int(row[0]) if row else 0
+
     def get_nonce_for_pubkey(self, pubkey: str) -> int:
         with self._get_connection() as conn:
             row = conn.execute("SELECT nonce FROM nonces WHERE pubkey = ?", (pubkey,)).fetchone()
@@ -436,6 +500,143 @@ class Database:
         with self._get_connection() as conn:
             row = conn.execute("SELECT height FROM tx_index WHERE txid = ?", (txid_str,)).fetchone()
             return int(row[0]) if row else -1
+
+    def get_tx_by_txid(self, txid_str: str) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
+        """Retorna (tx_dict, block_height) ou (None, None) se não encontrado.
+
+        [v9.8.0] Adicionado — server.py::/api/tx-status e
+        /api/verificar-recebimento chamam get_tx_by_txid(txid). Sem isto,
+        essas rotas retornavam 500 (o endpoint de checagem de pagamento).
+        """
+        if not txid_str:
+            return None, None
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT height FROM tx_index WHERE txid = ?", (txid_str,)).fetchone()
+            if not row:
+                return None, None
+            height = int(row[0])
+        blk = self.get_block(height)
+        if not blk:
+            return None, None
+        for tx in blk.get("transactions") or []:
+            if tx.get("txid") == txid_str:
+                return tx, height
+        return None, None
+
+    def get_mempool_tx(self, txid_str: str) -> Optional[Dict[str, Any]]:
+        """Retorna o tx dict da mempool, ou None.
+
+        [v9.8.0] Adicionado — server.py::/api/verificar-recebimento e
+        /api/tx-status consultam a mempool antes de checar tx_index.
+        """
+        if not txid_str:
+            return None
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT tx FROM mempool WHERE txid = ?", (txid_str,)).fetchone()
+            if not row:
+                return None
+            try:
+                return json.loads(row[0])
+            except Exception:
+                return None
+
+    def get_txs_for_address(self, address: str, limit: int = 200) -> List[Dict[str, Any]]:
+        """Lista txs confirmadas + mempool envolvendo `address`.
+
+        Retorna lista de dicts {tx, block_height, is_mempool, timestamp},
+        ordenada da mais recente para a mais antiga.
+
+        [v9.8.0] Adicionado — server.py::/api/minhas-txs chama
+        get_txs_for_address. A "direção" (received/sent) é calculada
+        DEPOIS pelo server, comparando inputs gastos contra outputs.
+        Aqui só filtramos candidatas.
+
+        Considera "envolvendo" quando:
+          - address aparece em algum output; OU
+          - algum input referencia um output anterior para o address
+            (detecta "sent without change").
+        """
+        if not address:
+            return []
+        try:
+            limit = int(limit)
+        except (ValueError, TypeError):
+            limit = 200
+        limit = max(1, min(limit, 5000))
+
+        out: List[Dict[str, Any]] = []
+
+        # 1) mempool primeiro (mais recente por definição)
+        try:
+            for tx in self.all_mempool(limit=5000):
+                if self._tx_involves_address(tx, address, tx_cache=None):
+                    out.append({
+                        "tx": tx,
+                        "block_height": None,
+                        "is_mempool": True,
+                        "timestamp": int(tx.get("timestamp", 0) or 0),
+                    })
+        except Exception as e:
+            logger.warning("[DB] get_txs_for_address(mempool): %s", e)
+
+        # 2) confirmadas — escaneia blocos do mais recente pro mais antigo,
+        #    montando cache de txid → tx conforme avança (pra resolver inputs)
+        h = self.height()
+        if h >= 0:
+            tx_cache: Dict[str, Dict[str, Any]] = {}
+            for height in range(h, max(-1, h - 5000), -1):
+                blk = self.get_block(height)
+                if not blk:
+                    continue
+                for tx in (blk.get("transactions") or []):
+                    txid = tx.get("txid", "")
+                    if not txid:
+                        continue
+                    # Cache atualizado ANTES de checar, pra input refs dentro
+                    # do mesmo bloco funcionarem.
+                    tx_cache[txid] = tx
+                    if self._tx_involves_address(tx, address, tx_cache=tx_cache):
+                        out.append({
+                            "tx": tx,
+                            "block_height": height,
+                            "is_mempool": False,
+                            "timestamp": int(tx.get("timestamp", 0) or 0),
+                        })
+                if len(out) >= limit * 2:
+                    break
+
+        # Ordena: block_height DESC (None primeiro), depois timestamp DESC
+        out.sort(key=lambda x: (
+            -(x["block_height"] if x["block_height"] is not None else 10**9),
+            -x["timestamp"],
+        ))
+        return out[:limit]
+
+    def _tx_involves_address(self, tx: dict, address: str,
+                              tx_cache: Optional[Dict[str, Dict[str, Any]]]) -> bool:
+        """Helper: True se address aparece em outputs OU é dono de input."""
+        # Checa outputs primeiro (caminho rápido)
+        for o in (tx.get("outputs") or []):
+            if o.get("address") == address:
+                return True
+        # Checa inputs (só faz lookup se tx_cache fornecido)
+        if tx_cache is not None:
+            for inp in (tx.get("inputs") or []):
+                ref_txid = inp.get("txid", "")
+                if ref_txid == "0" * 64 or not ref_txid:
+                    continue
+                ref_tx = tx_cache.get(ref_txid)
+                if not ref_tx:
+                    continue
+                try:
+                    vout = int(inp.get("vout", 0))
+                except (ValueError, TypeError):
+                    continue
+                outputs = ref_tx.get("outputs") or []
+                if 0 <= vout < len(outputs) and outputs[vout].get("address") == address:
+                    return True
+        return False
 
     def apply_tx(self, tx: dict, height: int, coinbase: bool = False) -> None:
         """Aplica tx: gasta inputs, cria outputs, registra tx_index, avança nonce."""
@@ -676,7 +877,24 @@ class Database:
                     last_seen=excluded.last_seen
             """, (node_id, address, genesis_hash, version, height, int(is_miner), public_key, now))
 
-    def listar_peers(self, apenas_ativos: bool = True, max_age_s: int = 300) -> List[Dict[str, Any]]:
+    def listar_peers(self, apenas_ativos: bool = True, max_age_s: int = 300,
+                     janela: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Lista peers.
+
+        [v9.8.0] Aceita kwarg 'janela' como alias de max_age_s. auto.py,
+        auto_trust.py e auto_trust_daemon.py chamam
+        listar_peers(apenas_ativos=True, janela=1800). Sem o alias,
+        essas chamadas levantavam TypeError e o auto-trust nunca atualizava.
+
+        [v9.8.0] Também filtra corretamente quando apenas_ativos=True e
+        peer.age_s < 0 (nunca visto) — antes ficava de fora do filtro por
+        causa de -1 > 300 == False.
+        """
+        if janela is not None:
+            try:
+                max_age_s = int(janela)
+            except (ValueError, TypeError):
+                pass
         now = time.time()
         with self._get_connection() as conn:
             cursor = conn.execute("SELECT * FROM peers ORDER BY last_seen DESC")
@@ -685,10 +903,27 @@ class Database:
                 peer = dict(row)
                 peer["is_miner"] = bool(peer["is_miner"])
                 peer["age_s"] = int(now - peer["last_seen"]) if peer["last_seen"] > 0 else -1
-                if apenas_ativos and peer["age_s"] > max_age_s:
-                    continue
+                if apenas_ativos:
+                    if peer["age_s"] < 0:
+                        continue
+                    if peer["age_s"] > max_age_s:
+                        continue
                 peers.append(peer)
             return peers
+
+    def contar_peers(self, apenas_ativos: bool = True,
+                     max_age_s: int = 300) -> int:
+        """Número de peers.
+
+        [v9.8.0] Adicionado — server.py::/api/status e /api/sync-info
+        chamam contar_peers(apenas_ativos=True/False). Sem isto, essas
+        rotas retornavam 500 ao tentar popular "peers": N.
+        """
+        try:
+            return len(self.listar_peers(
+                apenas_ativos=bool(apenas_ativos), max_age_s=int(max_age_s)))
+        except Exception:
+            return 0
 
     def remover_peer(self, node_id: str) -> bool:
         with self._write_lock, self._get_connection(write=True) as conn:
@@ -827,7 +1062,7 @@ class Database:
                 conn.execute("DELETE FROM blocks WHERE height > ?", (target_height,))
                 conn.execute("DELETE FROM utxos WHERE height > ?", (target_height,))
                 conn.execute("DELETE FROM tx_index WHERE height > ?", (target_height,))
-                # [FIX] Nonces voltam ao estado de fork_h, senão restore
+                # Nonces voltam ao estado de fork_h, senão restore
                 # com apply_tx() conta 2x e validate_tx rejeita a próxima tx.
                 conn.execute("DELETE FROM nonces")
                 rows = conn.execute("SELECT data FROM blocks ORDER BY height ASC").fetchall()
@@ -868,20 +1103,25 @@ class Database:
         self._initialized = False
         logger.info("[DB] instância fechada")
 
+
 # ============================================================
 # COMPATIBILIDADE — ChainDB
 # ============================================================
 class ChainDB(Database):
     """ChainDB é o Database. Nome que main.py / blockchain.py esperam."""
 
+
 DB = Database
 ChainDatabase = Database
+
 
 def get_db(db_path: str = None) -> ChainDB:
     return ChainDB(db_path)
 
+
 def get_chain_db(db_path: str = None) -> ChainDB:
     return ChainDB(db_path)
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO,
@@ -889,3 +1129,5 @@ if __name__ == "__main__":
     db = get_db()
     print(f"✅ Banco: {db.db_path} | Altura: {db.height()} | tip: {db.tip_hash()[:16]}...")
     print(f"👥 Peers: {len(db.listar_peers())} | Mempool: {db.mempool_count()} | L2 OPEN: {len(db.get_l2_escrows(status='OPEN'))}")
+    print(f"💰 UTXOs: {db.count_utxos()} | Peers ativos: {db.contar_peers(apenas_ativos=True)}")
+    print(f"📦 Blocos 0..4: {len(db.get_blocks_range(0, 5))}")
