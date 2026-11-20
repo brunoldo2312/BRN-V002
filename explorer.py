@@ -1,5 +1,16 @@
-"""explorer.py — Backend do Explorer + Painéis + Block Explorer (v3.5)
+"""explorer.py — Backend do Explorer + Painéis + Block Explorer (v3.6)
 ===============================================================
+v3.6 (2026-11-20) — ADAPTADO AO db.py v9.8.2 (schema novo):
+  [FIX] blocks agora têm coluna `data` (JSON texto completo);
+        removeu-se o zlib.decompress de `raw` (mantido só como
+        fallback de DB legado).
+  [FIX] Não existe tabela `transactions`; txs confirmadas vêm dos
+        blocos, pendentes da tabela `mempool`.
+  [FIX] utxos não têm coluna `spent`/`block_height`: saldo = SUM
+        das linhas vivas; histórico = utxos + mempool envolvendo
+        o endereço.
+  [FIX] tx_detail: tx_index → bloco; fallback mempool; fallback
+        legado (tabela transactions).
 v3.5 (2026-11-17) — SEGURANÇA XSS/SSTI E LEITURA ZERO-LOCK:
   [FIX] Substituído render_template_string aninhado + Markup() por
         DictLoader nativo do Flask com herança {% extends "base.html" %}
@@ -11,7 +22,7 @@ v3.5 (2026-11-17) — SEGURANÇA XSS/SSTI E LEITURA ZERO-LOCK:
 """
 from __future__ import annotations
 
-__version__ = "3.5"
+__version__ = "3.6"
 
 from flask import Flask, render_template, request, jsonify, send_file, Response
 from jinja2 import DictLoader
@@ -226,22 +237,92 @@ def get_db():
     return conn
 
 
+# ---------- helpers de schema (db.py v9.8.2 + fallback legado) ----------
+def _table_exists(conn, table: str) -> bool:
+    try:
+        r = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,)).fetchone()
+        return r is not None
+    except Exception:
+        return False
+
+
+def _columns(conn, table: str) -> set:
+    try:
+        return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+    except Exception:
+        return set()
+
+
+def _parse_block_row(row) -> dict:
+    """Converte linha de `blocks` no dict do bloco.
+    Novo schema: coluna `data` = JSON texto do bloco completo.
+    Schema legado: coluna `raw` = blob zlib (mantido para leitura antiga).
+    """
+    cols = set(row.keys())
+    b: dict = {}
+    if "data" in cols and row["data"]:
+        try:
+            b = orjson.loads(row["data"])
+        except Exception:
+            b = {}
+    elif "raw" in cols and row["raw"]:
+        try:
+            b = orjson.loads(zlib.decompress(row["raw"]))
+        except Exception:
+            b = {}
+    for c in ("height", "hash", "prev_hash", "timestamp", "nonce",
+              "merkle", "difficulty"):
+        if c in cols and row[c] is not None:
+            b.setdefault(c, row[c])
+    b.setdefault("transactions", [])
+    return b
+
+
+def _is_coinbase(tx: dict) -> bool:
+    ins = tx.get("inputs") or []
+    return bool(ins and ins[0].get("txid") == "0" * 64)
+
+
+def _tx_value_brn(tx: dict) -> float:
+    return sum(int(o.get("amount", 0) or 0) for o in (tx.get("outputs") or [])) / 1e8
+
+
 def get_latest_blocks(n=10):
     conn = get_db()
     out = []
     try:
-        rows = conn.execute("SELECT height, raw FROM blocks ORDER BY height DESC LIMIT ?", (n,)).fetchall()
-        for r in rows:
-            try:
-                b = orjson.loads(zlib.decompress(r["raw"]))
+        if "data" in _columns(conn, "blocks"):
+            rows = conn.execute(
+                "SELECT height, hash, timestamp, data FROM blocks "
+                "ORDER BY height DESC LIMIT ?", (n,)).fetchall()
+            for r in rows:
+                b = _parse_block_row(r)
+                ts = b.get("timestamp") or r["timestamp"] or 0
                 out.append({
-                    "height": b["height"],
-                    "hash": b["hash"],
-                    "txs": len(b["transactions"]),
-                    "time": datetime.fromtimestamp(b["timestamp"]).strftime("%H:%M:%S")
+                    "height": b.get("height", r["height"]),
+                    "hash": b.get("hash") or r["hash"] or "",
+                    "txs": len(b.get("transactions") or []),
+                    "time": datetime.fromtimestamp(ts).strftime("%H:%M:%S"),
                 })
-            except Exception:
-                continue
+        else:
+            # fallback legado: blobs zlib em `raw`
+            rows = conn.execute(
+                "SELECT height, raw FROM blocks ORDER BY height DESC LIMIT ?",
+                (n,)).fetchall()
+            for r in rows:
+                try:
+                    b = orjson.loads(zlib.decompress(r["raw"]))
+                    out.append({
+                        "height": b["height"],
+                        "hash": b["hash"],
+                        "txs": len(b.get("transactions", [])),
+                        "time": datetime.fromtimestamp(
+                            b["timestamp"]).strftime("%H:%M:%S"),
+                    })
+                except Exception:
+                    continue
     except Exception:
         pass
     finally:
@@ -252,26 +333,74 @@ def get_latest_blocks(n=10):
 def get_latest_txs(n=10):
     conn = get_db()
     out = []
+    seen = set()
     try:
-        rows = conn.execute("SELECT raw FROM transactions ORDER BY block_height DESC LIMIT ?", (n,)).fetchall()
-        for r in rows:
-            try:
-                tx = orjson.loads(zlib.decompress(r["raw"]))
-                if tx["inputs"][0]["txid"] == "0" * 64:
+        # 1) Pendentes da mempool (mais recentes primeiro)
+        if _table_exists(conn, "mempool"):
+            mrows = conn.execute(
+                "SELECT tx, added_at FROM mempool "
+                "ORDER BY added_at DESC LIMIT ?", (n,)).fetchall()
+            for r in mrows:
+                try:
+                    tx = orjson.loads(r["tx"])
+                except Exception:
                     continue
-                val = sum(o["amount"] for o in tx["outputs"]) / 1e8
+                tid = tx.get("txid")
+                if not tid or tid in seen or _is_coinbase(tx):
+                    continue
+                seen.add(tid)
+                out.append({
+                    "txid": tid,
+                    "value": f"{_tx_value_brn(tx):.2f}",
+                    "time": datetime.fromtimestamp(
+                        r["added_at"] or tx.get("timestamp", 0)).strftime("%H:%M"),
+                    "pending": True,
+                })
+        # 2) Confirmadas: últimos blocos (não existe tabela `transactions`)
+        if "data" in _columns(conn, "blocks"):
+            rows = conn.execute(
+                "SELECT data FROM blocks ORDER BY height DESC LIMIT 25"
+            ).fetchall()
+            for r in rows:
+                b = _parse_block_row(r)
+                for tx in b.get("transactions") or []:
+                    tid = tx.get("txid")
+                    if not tid or tid in seen or _is_coinbase(tx):
+                        continue
+                    seen.add(tid)
+                    out.append({
+                        "txid": tid,
+                        "value": f"{_tx_value_brn(tx):.2f}",
+                        "time": datetime.fromtimestamp(
+                            tx.get("timestamp", 0)).strftime("%H:%M"),
+                        "pending": False,
+                    })
+                if len(out) >= n:
+                    break
+        elif _table_exists(conn, "transactions"):
+            # fallback legado
+            rows = conn.execute(
+                "SELECT raw FROM transactions ORDER BY block_height DESC LIMIT ?",
+                (n,)).fetchall()
+            for r in rows:
+                try:
+                    tx = orjson.loads(zlib.decompress(r["raw"]))
+                except Exception:
+                    continue
+                if _is_coinbase(tx):
+                    continue
                 out.append({
                     "txid": tx["txid"],
-                    "value": f"{val:.2f}",
-                    "time": datetime.fromtimestamp(tx["timestamp"]).strftime("%H:%M")
+                    "value": f"{_tx_value_brn(tx):.2f}",
+                    "time": datetime.fromtimestamp(
+                        tx.get("timestamp", 0)).strftime("%H:%M"),
+                    "pending": False,
                 })
-            except Exception:
-                continue
     except Exception:
         pass
     finally:
         conn.close()
-    return out
+    return out[:n]
 
 # ============================================================
 # ROTAS DO BLOCK EXPLORER
@@ -286,15 +415,26 @@ def home():
 @app.route("/block/<int:height>")
 def block_detail(height):
     conn = get_db()
+    b = None
     try:
-        row = conn.execute("SELECT raw FROM blocks WHERE height=?", (height,)).fetchone()
-        if not row:
+        if "data" in _columns(conn, "blocks"):
+            row = conn.execute(
+                "SELECT data, height, hash, prev_hash, timestamp, nonce, "
+                "merkle, difficulty FROM blocks WHERE height=?",
+                (height,)).fetchone()
+            if row:
+                b = _parse_block_row(row)
+        else:
+            row = conn.execute(
+                "SELECT raw FROM blocks WHERE height=?", (height,)).fetchone()
+            if row:
+                b = orjson.loads(zlib.decompress(row["raw"]))
+        if not b:
             return "Bloco não encontrado", 404
-        b = orjson.loads(zlib.decompress(row["raw"]))
-        b["time"] = datetime.fromtimestamp(b["timestamp"]).strftime("%d/%m/%Y %H:%M:%S")
-        for tx in b["transactions"]:
-            total = sum(o["amount"] for o in tx["outputs"])
-            tx["value"] = f"{total / 1e8:.8f}"
+        b["time"] = datetime.fromtimestamp(
+            b.get("timestamp", 0) or 0).strftime("%d/%m/%Y %H:%M:%S")
+        for tx in b.get("transactions") or []:
+            tx["value"] = f"{_tx_value_brn(tx):.8f}"
     except Exception as e:
         return f"Erro ao decodificar bloco: {e}", 500
     finally:
@@ -307,28 +447,58 @@ def address_detail(address):
     if not address.startswith("brn1"):
         return "Endereço inválido", 400
     conn = get_db()
+    balance = 0.0
+    total_received = 0.0
+    txs = []
     try:
-        row = conn.execute("SELECT SUM(amount) as s FROM utxos WHERE address=? AND spent=0", (address,)).fetchone()
-        balance = (row["s"] or 0) / 1e8
-        row2 = conn.execute("SELECT SUM(amount) as s FROM utxos WHERE address=?", (address,)).fetchone()
-        total_received = (row2["s"] or 0) / 1e8
-        txs = []
-        seen_txids = set()
-        rows = conn.execute(
-            "SELECT txid, amount, spent, block_height FROM utxos WHERE address=? ORDER BY block_height DESC LIMIT 50",
-            (address,)
-        ).fetchall()
-        for r in rows:
-            if r["txid"] in seen_txids:
-                continue
-            seen_txids.add(r["txid"])
-            txs.append({
-                "txid": r["txid"],
-                "amount": f"{r['amount'] / 1e8:.8f}",
-                "direction": "received",
-                "status": "confirmed",
-                "block_height": r["block_height"]
-            })
+        ucols = _columns(conn, "utxos")
+        if "amount" in ucols:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(amount),0) AS s FROM utxos WHERE address=?",
+                (address,)).fetchone()
+            balance = (row["s"] or 0) / 1e8
+            # Histórico: UTXOs ainda vivos (confirmados)
+            rows = conn.execute(
+                "SELECT txid, amount, height FROM utxos WHERE address=? "
+                "ORDER BY height DESC LIMIT 50", (address,)).fetchall()
+            seen_txids = set()
+            for r in rows:
+                if r["txid"] in seen_txids:
+                    continue
+                seen_txids.add(r["txid"])
+                txs.append({
+                    "txid": r["txid"],
+                    "amount": f"{(r['amount'] or 0) / 1e8:.8f}",
+                    "direction": "received",
+                    "status": "confirmed",
+                    "block_height": r["height"],
+                })
+            # Pendentes: mempool com saída para o endereço
+            if _table_exists(conn, "mempool"):
+                for m in conn.execute(
+                        "SELECT tx FROM mempool ORDER BY added_at "
+                        "DESC LIMIT 200").fetchall():
+                    try:
+                        tx = orjson.loads(m["tx"])
+                    except Exception:
+                        continue
+                    tid = tx.get("txid")
+                    if not tid or tid in seen_txids:
+                        continue
+                    if any(o.get("address") == address
+                           for o in (tx.get("outputs") or [])):
+                        seen_txids.add(tid)
+                        txs.append({
+                            "txid": tid,
+                            "amount": f"{_tx_value_brn(tx):.8f}",
+                            "direction": "received",
+                            "status": "pending",
+                            "block_height": None,
+                        })
+            # Aproximação de recebido: soma dos itens listados
+            # (UTXOs vivos + pendentes; saídas já gastas não aparecem
+            #  na tabela utxos do schema v9.8.2).
+            total_received = sum(float(t["amount"]) for t in txs)
     except Exception as e:
         return f"Erro ao carregar endereço: {e}", 500
     finally:
@@ -345,17 +515,55 @@ def address_detail(address):
 @app.route("/tx/<txid>")
 def tx_detail(txid):
     conn = get_db()
+    tx = None
+    block_height = None
     try:
-        row = conn.execute("SELECT raw, block_height FROM transactions WHERE txid=?", (txid,)).fetchone()
-        if not row:
+        # 1) Confirmada: tx_index → altura → bloco
+        if _table_exists(conn, "tx_index"):
+            row = conn.execute(
+                "SELECT height FROM tx_index WHERE txid=?", (txid,)).fetchone()
+            if row:
+                block_height = row["height"]
+                if "data" in _columns(conn, "blocks"):
+                    brow = conn.execute(
+                        "SELECT data FROM blocks WHERE height=?",
+                        (block_height,)).fetchone()
+                    if brow:
+                        b = _parse_block_row(brow)
+                        tx = next((t for t in (b.get("transactions") or [])
+                                   if t.get("txid") == txid), None)
+                elif _table_exists(conn, "blocks"):
+                    brow = conn.execute(
+                        "SELECT raw FROM blocks WHERE height=?",
+                        (block_height,)).fetchone()
+                    if brow:
+                        b = orjson.loads(zlib.decompress(brow["raw"]))
+                        tx = next((t for t in (b.get("transactions") or [])
+                                   if t.get("txid") == txid), None)
+        # 2) Pendente: mempool
+        if tx is None and _table_exists(conn, "mempool"):
+            mrow = conn.execute(
+                "SELECT tx FROM mempool WHERE txid=?", (txid,)).fetchone()
+            if mrow:
+                tx = orjson.loads(mrow["tx"])
+        # 3) Legado: tabela `transactions` (blobs zlib)
+        if tx is None and _table_exists(conn, "transactions"):
+            row = conn.execute(
+                "SELECT raw, block_height FROM transactions WHERE txid=?",
+                (txid,)).fetchone()
+            if row:
+                tx = orjson.loads(zlib.decompress(row["raw"]))
+                block_height = row["block_height"]
+        if tx is None:
             return "Transação não encontrada", 404
-        tx = orjson.loads(zlib.decompress(row["raw"]))
-        tx_time = datetime.fromtimestamp(tx.get("timestamp", 0)).strftime("%d/%m/%Y %H:%M:%S")
+        tx_time = datetime.fromtimestamp(
+            tx.get("timestamp", 0) or 0).strftime("%d/%m/%Y %H:%M:%S")
     except Exception as e:
         return f"Erro ao decodificar tx: {e}", 500
     finally:
         conn.close()
-    return render_template("tx.html", tx=tx, block_height=row["block_height"], tx_time=tx_time)
+    return render_template(
+        "tx.html", tx=tx, block_height=block_height, tx_time=tx_time)
 
 
 @app.route("/search")
