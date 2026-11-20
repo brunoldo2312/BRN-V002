@@ -1,9 +1,16 @@
 """
-security.py — Camada de segurança HTTP do BRN (v6.2)
+security.py — Camada de segurança HTTP do BRN (v6.3)
 ================================================================
+v6.3 (2026-11-20):
+  [FIX] Arquivo estava truncado em `def _open_audit(): global`
+        (SyntaxError). Completado.
+  [FIX] find_one_and_update(return_document=True) → ReturnDocument.AFTER
+        (pymongo 4.x não aceita bool).
+  [FIX] _rotate_audit_if_needed() implementado (era stub `pass`).
+        audit.log respeita AUDIT_MAX_BYTES e AUDIT_BACKUPS.
+  [NEW] Rate limits backup_* (server.py v9.9.40)
 v6.2 (2026-11-08):
-  [NEW] Adicionado bypass total via BRN_DISABLE_RATE_LIMIT=1.
-        Ideal para redes locais/Tailscale onde o 429 atrapalha o Pool.
+  [NEW] BRN_DISABLE_RATE_LIMIT=1 bypass total
 ================================================================
 """
 from __future__ import annotations
@@ -52,6 +59,11 @@ CLEANUP_INTERVAL_S = 300
 BUCKET_MAX_IDLE_S  = 3600
 ADMIN_TOKEN_MIN_LEN = 16
 
+if os.environ.get("BRN_DISABLE_RATE_LIMIT", "0") == "1":
+    log.warning("[security] BRN_DISABLE_RATE_LIMIT=1 — rate limiting DESATIVADO")
+if not AUDIT_ENABLED:
+    log.warning("[security] BRN_AUDIT_ENABLED=0 — audit log DESATIVADO")
+
 # ============================================================
 # RATE LIMITS
 # ============================================================
@@ -97,6 +109,12 @@ DEFAULT_RATE_LIMITS = {
     "trust_stats":      (300,  60),
     "trust_nodes":      (300,  60),
     "experiment":       (60,   60),
+    # [v6.3] Backup / Restore
+    "backup_files":       (60,  60),
+    "backup_download":    (10,  60),
+    "backup_restore":     (5,   60),
+    "backup_mongo_save":  (10,  60),
+    "backup_config":      (10,  60),
 }
 
 _node_id_hash = "unknown"
@@ -215,7 +233,9 @@ class RateLimiter:
         with self._lock:
             n_buckets = len(self._buckets)
             n_entries = sum(len(b) for b in self._buckets.values())
-        return {"backend": "memory", "buckets": n_buckets, "entries": n_entries, "hits_total": self._hits, "last_cleanup_ago_s": int(time.time() - self._last_cleanup)}
+        return {"backend": "memory", "buckets": n_buckets, "entries": n_entries,
+                "hits_total": self._hits,
+                "last_cleanup_ago_s": int(time.time() - self._last_cleanup)}
 
 class RateLimiterMongo:
     backend = "mongo"
@@ -234,7 +254,8 @@ class RateLimiterMongo:
             coll = db.rate_limits
             if not self._indexes_ok:
                 try:
-                    coll.create_index("expires_at", expireAfterSeconds=0, name="ttl_expires_at", background=True)
+                    coll.create_index("expires_at", expireAfterSeconds=0,
+                                      name="ttl_expires_at", background=True)
                     self._indexes_ok = True
                 except Exception: pass
             return coll, True
@@ -249,7 +270,19 @@ class RateLimiterMongo:
         doc_id = f"{key}:{ip}:{bucket}"
         expires_at = (bucket + 2) * window
         try:
-            result = coll.find_one_and_update({"_id": doc_id}, {"$inc": {"count": 1}, "$setOnInsert": {"expires_at": expires_at, "created_at": now, "key": key, "ip": ip}}, upsert=True, return_document=True)
+            # [v6.3] ReturnDocument.AFTER em vez de True (pymongo 4.x)
+            try:
+                from pymongo import ReturnDocument
+                rd = ReturnDocument.AFTER
+            except Exception:
+                rd = True  # compat com pymongo 3.x
+            result = coll.find_one_and_update(
+                {"_id": doc_id},
+                {"$inc": {"count": 1},
+                 "$setOnInsert": {"expires_at": expires_at,
+                                  "created_at": now, "key": key, "ip": ip}},
+                upsert=True, return_document=rd,
+            )
             count = int((result or {}).get("count", 1))
             if count > limit:
                 retry_after = max(1, int((bucket + 1) * window - now))
@@ -284,7 +317,10 @@ class RateLimiterMongo:
         if ok and coll is not None:
             try: n_docs = coll.estimated_document_count()
             except Exception: pass
-        return {"backend": "mongo" if ok else "memory(fallback)", "docs_in_collection": n_docs, "hits_mongo": h_mongo, "hits_fallback": h_fallback, "fallback_stats": self._fallback.stats()}
+        return {"backend": "mongo" if ok else "memory(fallback)",
+                "docs_in_collection": n_docs,
+                "hits_mongo": h_mongo, "hits_fallback": h_fallback,
+                "fallback_stats": self._fallback.stats()}
 
 _limiter: Optional[Any] = None
 _limiter_lock = threading.Lock()
@@ -336,7 +372,6 @@ def _ensure_cleanup_started() -> None:
 _ensure_cleanup_started()
 
 def require_rate_limit(endpoint_key: str):
-    # [NOVO] Bypass total se a variável de ambiente estiver setada
     if os.environ.get("BRN_DISABLE_RATE_LIMIT", "0") == "1":
         def decorator(fn):
             @wraps(fn)
@@ -354,16 +389,21 @@ def require_rate_limit(endpoint_key: str):
             ok, retry, remaining = _limiter.check(endpoint_key, ip, limit, window)
             backend = getattr(_limiter, "backend", "memory")
             if not ok:
-                audit_log("rate_limit_hit", {"endpoint": endpoint_key, "ip": ip, "limit": limit, "window": window, "backend": backend})
-                resp = jsonify({"ok": False, "msg": f"Muitas requisições. Tente em {retry}s."})
+                audit_log("rate_limit_hit",
+                          {"endpoint": endpoint_key, "ip": ip, "limit": limit,
+                           "window": window, "backend": backend})
+                resp = jsonify({"ok": False,
+                                "msg": f"Muitas requisições. Tente em {retry}s."})
                 resp.status_code = 429
                 resp.headers["Retry-After"] = str(retry)
                 return resp
-            resp = fn(*args, **kwargs)
-            return resp
+            return fn(*args, **kwargs)
         return wrapper
     return decorator
 
+# ============================================================
+# AUDIT LOG
+# ============================================================
 _audit_lock = threading.RLock()
 _audit_fp = None
 
@@ -376,13 +416,50 @@ def _open_audit():
         p.parent.mkdir(parents=True, exist_ok=True)
         _audit_fp = open(LOG_FILE, "a", encoding="utf-8", buffering=1)
         return _audit_fp
-    except Exception: return None
+    except Exception:
+        return None
 
 def _rotate_audit_if_needed() -> None:
-    pass
+    # [v6.3] Implementação real (antes era `pass`)
+    global _audit_fp
+    try:
+        if not os.path.exists(LOG_FILE): return
+        if os.path.getsize(LOG_FILE) < AUDIT_MAX_BYTES: return
+    except Exception:
+        return
+    # fecha antes de rotacionar
+    try:
+        if _audit_fp:
+            _audit_fp.close()
+    except Exception:
+        pass
+    _audit_fp = None
+    # rotaciona log.1 -> log.2 -> ... e log -> log.1
+    if AUDIT_BACKUPS <= 0:
+        try: os.remove(LOG_FILE)
+        except Exception: pass
+        return
+    for i in range(AUDIT_BACKUPS, 0, -1):
+        src = f"{LOG_FILE}.{i-1}" if i > 1 else LOG_FILE
+        dst = f"{LOG_FILE}.{i}"
+        try:
+            if os.path.exists(src):
+                if os.path.exists(dst):
+                    try: os.remove(dst)
+                    except Exception: pass
+                os.replace(src, dst)
+        except Exception:
+            pass
 
-_SENSITIVE_KEYS = frozenset({"private_key", "priv", "sk", "secret", "password", "senha", "mnemonic", "seed", "x-brn-sk", "authorization", "token", "api_key", "brn_admin_token", "x-brn-token", "bearer", "session_key"})
-_SENSITIVE_SUBSTRINGS = ("password", "passwd", "secret", "private", "mnemonic", "api_key", "apikey", "admin_token", "bearer_token")
+_SENSITIVE_KEYS = frozenset({
+    "private_key", "priv", "sk", "secret", "password", "senha", "mnemonic",
+    "seed", "x-brn-sk", "authorization", "token", "api_key", "brn_admin_token",
+    "x-brn-token", "bearer", "session_key",
+})
+_SENSITIVE_SUBSTRINGS = (
+    "password", "passwd", "secret", "private", "mnemonic", "api_key",
+    "apikey", "admin_token", "bearer_token",
+)
 
 def _is_sensitive_key(k: str) -> bool:
     lk = str(k).lower()
@@ -393,14 +470,18 @@ def _is_sensitive_key(k: str) -> bool:
 
 def _sanitize(value: Any, depth: int = 0) -> Any:
     if depth > 6: return "<max_depth>"
-    if isinstance(value, str): return value[:32] + f"...({len(value)} chars)" if len(value) > 80 else value
+    if isinstance(value, str):
+        return value[:32] + f"...({len(value)} chars)" if len(value) > 80 else value
     if isinstance(value, dict):
         out = {}
         for k, v in value.items():
-            if _is_sensitive_key(k) and isinstance(v, str) and v: out[k] = "<redacted>"
-            else: out[k] = _sanitize(v, depth + 1)
+            if _is_sensitive_key(k) and isinstance(v, str) and v:
+                out[k] = "<redacted>"
+            else:
+                out[k] = _sanitize(v, depth + 1)
         return out
-    if isinstance(value, (list, tuple)): return [_sanitize(v, depth + 1) for v in value[:50]]
+    if isinstance(value, (list, tuple)):
+        return [_sanitize(v, depth + 1) for v in value[:50]]
     return value
 
 def hash_short(value: str, length: int = 12) -> str:
@@ -412,17 +493,24 @@ def audit_log(event: str, data: Optional[dict] = None) -> None:
     try:
         ip = get_client_ip()
         ua = (request.headers.get("User-Agent", "")[:120] if request else "")
-    except Exception: ip, ua = "unknown", ""
-    payload = {"ts": datetime.now(timezone.utc).isoformat(), "event": event, "ip": ip, "ua": ua, "pid": os.getpid(), "node_id_hash": _node_id_hash}
+    except Exception:
+        ip, ua = "unknown", ""
+    payload = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": event, "ip": ip, "ua": ua,
+        "pid": os.getpid(), "node_id_hash": _node_id_hash,
+    }
     if data: payload.update(_sanitize(data))
     line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     with _audit_lock:
+        _rotate_audit_if_needed()
         fp = _open_audit()
         if fp:
             try:
                 fp.write(line + "\n")
                 fp.flush()
-            except Exception: pass
+            except Exception:
+                pass
 
 def close_audit() -> None:
     global _audit_fp
@@ -441,6 +529,9 @@ def _register_atexit() -> None:
 
 _register_atexit()
 
+# ============================================================
+# TLS (autoassinado para dev)
+# ============================================================
 ADMIN_TOKEN = os.environ.get("BRN_ADMIN_TOKEN", "").strip()
 if ADMIN_TOKEN and len(ADMIN_TOKEN) < ADMIN_TOKEN_MIN_LEN:
     ADMIN_TOKEN = ""
@@ -448,32 +539,57 @@ if ADMIN_TOKEN and len(ADMIN_TOKEN) < ADMIN_TOKEN_MIN_LEN:
 CERT_FILE = os.environ.get("BRN_TLS_CERT", "brn_cert.pem")
 KEY_FILE  = os.environ.get("BRN_TLS_KEY",  "brn_key.pem")
 
-def ensure_self_signed_cert(cert_file: str = CERT_FILE, key_file: str = KEY_FILE, hostname: str = "127.0.0.1", days: int = 3650) -> tuple[str, str]:
-    if os.path.exists(cert_file) and os.path.exists(key_file): return cert_file, key_file
+def ensure_self_signed_cert(cert_file: str = CERT_FILE,
+                             key_file: str = KEY_FILE,
+                             hostname: str = "127.0.0.1",
+                             days: int = 3650) -> tuple[str, str]:
+    if os.path.exists(cert_file) and os.path.exists(key_file):
+        return cert_file, key_file
     try:
         from cryptography import x509
         from cryptography.x509.oid import NameOID
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import rsa
         import datetime as _dt
-    except ImportError: raise RuntimeError("Instale: pip install cryptography")
+    except ImportError:
+        raise RuntimeError("Instale: pip install cryptography")
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COUNTRY_NAME, "BR"), x509.NameAttribute(NameOID.ORGANIZATION_NAME, "BRN Local Node"), x509.NameAttribute(NameOID.COMMON_NAME, hostname)])
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME, "BR"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "BRN Local Node"),
+        x509.NameAttribute(NameOID.COMMON_NAME, hostname),
+    ])
     try: san = [x509.IPAddress(ipaddress.ip_address(hostname))]
     except ValueError: san = [x509.DNSName(hostname)]
     san.append(x509.DNSName("localhost"))
     san.append(x509.IPAddress(ipaddress.ip_address("127.0.0.1")))
     now = _dt.datetime.now(timezone.utc)
-    cert = (x509.CertificateBuilder().subject_name(subject).issuer_name(issuer).public_key(key.public_key()).serial_number(x509.random_serial_number()).not_valid_before(now).not_valid_after(now + _dt.timedelta(days=days)).add_extension(x509.SubjectAlternativeName(san), critical=False).add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True).sign(key, hashes.SHA256()))
-    with open(key_file, "wb") as f: f.write(key.private_bytes(encoding=serialization.Encoding.PEM, format=serialization.PrivateFormat.TraditionalOpenSSL, encryption_algorithm=serialization.NoEncryption()))
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject).issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + _dt.timedelta(days=days))
+        .add_extension(x509.SubjectAlternativeName(san), critical=False)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    with open(key_file, "wb") as f:
+        f.write(key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption()))
     try: os.chmod(key_file, 0o600)
     except Exception: pass
-    with open(cert_file, "wb") as f: f.write(cert.public_bytes(serialization.Encoding.PEM))
+    with open(cert_file, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
     return cert_file, key_file
 
-def https_enabled() -> bool: return os.environ.get("BRN_HTTPS", "0") == "1"
+def https_enabled() -> bool:
+    return os.environ.get("BRN_HTTPS", "0") == "1"
 
 def get_ssl_context() -> Optional[tuple[str, str]]:
     if not https_enabled(): return None
     try: return ensure_self_signed_cert()
-    except Exception as e: return None
+    except Exception: return None
