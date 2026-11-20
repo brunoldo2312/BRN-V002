@@ -2149,7 +2149,7 @@ def api_backup_restore():
 
 
 @app.route("/api/backup/mongo/save", methods=["POST"])
-@require_rate_limit("backup_download")
+@require_rate_limit("backup_mongo_save")
 @_admin_required
 def api_backup_mongo_save():
     if not _HAS_BACKUP:
