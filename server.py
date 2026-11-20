@@ -1,23 +1,23 @@
 """
-server.py — Backend HTTP do nó BRN (v9.9.39)
+server.py — Backend HTTP do nó BRN (v9.9.40)
 ================================================================
+v9.9.40 (2026-11-20) — BACKUP/RESTORE + SEGURANÇA:
+  [NEW] Rotas /api/backup/* (download, restore, mongo save/list, config)
+  [NEW] Página /backup com UI standalone (HTML puro, sem depender de JS externo)
+  [NEW] backup_manager opcional (try/except — não quebra se ausente)
+  [FIX] Removido print() do ADMIN_TOKEN (não vaza mais em log de produção)
+  [FIX] _mask() em _build_sign_info mostra "(definido, N chars)" em vez de
+        prefixo/sufixo da SK/seed
 v9.9.39 (2026-11-16) — PRODUCTION READY (WAITRESS):
-  [NEW] Substituído o servidor de desenvolvimento do Flask pelo
-        Waitress (WSGI de produção, multi-threaded).
-        Isso acaba com os travamentos da interface durante
-        sincronização P2P ou mineração.
+  [NEW] Servidor de produção Waitress (WSGI, multi-threaded)
 v9.9.38 (2026-11-16) — SINCRONIZAÇÃO MANUAL E HEALER:
-  [NEW] Rota /api/peers/heal para forçar a atualização das alturas
-        dos peers no SQLite.
-  [FIX] Quórum Inteligente: Origin ou nó no topo da rede não é
-        bloqueado por validadores atrasados.
-v9.9.37 (2026-11-15) — SEGURANÇA AUTOMÁTICA DO FAUCET:
-  [NEW] Gera automaticamente um BRN_ADMIN_TOKEN se não existir
-        e salva em .brn_admin_token.
+  [NEW] /api/peers/heal
+  [FIX] Quórum Inteligente: Origin ou nó no topo não é bloqueado
+v9.9.37 (2026-11-15) — SEGURANÇA AUTOMÁTICA DO FAUCET
 ================================================================
 """
 from __future__ import annotations
-import os, time, math, json, atexit, hmac, logging, sys, threading, secrets
+import os, io as _io, time, math, json, atexit, hmac, logging, sys, threading, secrets
 import urllib.request, urllib.error
 from decimal import Decimal, ROUND_DOWN
 from functools import wraps
@@ -46,6 +46,14 @@ except ImportError:
     def hash_short(v, n=12): return str(v)[:n] if v else ""
     def get_client_ip(): return request.remote_addr or "0.0.0.0"
 
+# [v9.9.40] backup_manager é OPCIONAL — não quebra se ausente
+try:
+    import backup_manager as _bkpmgr
+    _HAS_BACKUP = True
+except ImportError:
+    _bkpmgr = None
+    _HAS_BACKUP = False
+
 log = logging.getLogger("server")
 BASE_DIR = Path(__file__).resolve().parent
 WEB_HOST = os.environ.get("BRN_WEB_HOST", "0.0.0.0")
@@ -70,7 +78,7 @@ def _get_admin_token():
     token = os.environ.get("BRN_ADMIN_TOKEN", "").strip()
     if token:
         return token
-        
+
     token_file = BASE_DIR / ".brn_admin_token"
     if token_file.exists():
         try:
@@ -80,7 +88,7 @@ def _get_admin_token():
                 return t
         except Exception:
             pass
-            
+
     novo_token = secrets.token_hex(16)
     try:
         token_file.write_text(novo_token, encoding="utf-8")
@@ -88,16 +96,18 @@ def _get_admin_token():
         except Exception: pass
     except Exception:
         pass
-    
+
     os.environ["BRN_ADMIN_TOKEN"] = novo_token
-    
-    print("\n" + "="*60)
+
+    # [v9.9.40] NÃO imprime o token. Só informa que foi gerado e onde está.
+    print("\n" + "=" * 60)
     print(" 🔐 FAUCET PROTEGIDO AUTOMATICAMENTE")
-    print(f" Senha gerada: {novo_token}")
-    print(f" Salva no arquivo: {token_file.name}")
-    print(" Para liberar tokens, use: Authorization: Bearer " + novo_token)
-    print("="*60 + "\n")
-    
+    print(f" Token salvo em: {token_file.name}")
+    print(" Leia o arquivo para obter o valor. NÃO é logado por segurança.")
+    print("=" * 60 + "\n")
+    log.warning("[security] BRN_ADMIN_TOKEN gerado em %s (conteúdo não é logado)",
+                token_file.name)
+
     return novo_token
 
 ADMIN_TOKEN = _get_admin_token()
@@ -287,10 +297,9 @@ def _check_validators_synced(chain, min_validators: int, tolerance: int,
         len(detail["synced_peers"]) + len(detail["ahead_peers"])
         + len(detail["behind_peers"]) + len(detail["stale_peers"]))
 
-    # [FIX] Se o nó é o Origin OU está no topo da rede, permite minerar
     is_top = (len(detail["ahead_peers"]) == 0)
     is_origin = os.environ.get("BRN_IS_ORIGIN", "0") == "1"
-    
+
     if is_top or is_origin:
         return True, "OK (No topo da rede / Origin)", detail
 
@@ -517,12 +526,11 @@ def _build_sign_info(chain) -> dict:
             pass
 
     def _mask(v: str) -> str:
+        # [v9.9.40] NÃO vaza prefixo/sufixo. Só informa se está definido e o tamanho.
         v = (v or "").strip()
         if not v:
             return ""
-        if len(v) <= 8:
-            return "•" * len(v)
-        return v[:4] + "•" * (len(v) - 8) + v[-4:]
+        return f"(definido, {len(v)} chars)"
 
     sk_hex_set = bool(os.environ.get("BRN_VALIDATOR_SK_HEX", "").strip())
     seed_set = bool(os.environ.get("BRN_VALIDATOR_SEED", "").strip())
@@ -1538,8 +1546,8 @@ def peers_discovered():
 def root():
     try:
         chain = _get_chain()
-        return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.39", "height": chain.db.height(), "peer_id": _BRN_PEER_ID, "health": "/health", "sync_panel": "/sync", "status": "/api/status", "mine_gate": "/api/mine/gate", "dashboard": "/dashboard", "wallet": "/wallet", "monitor": "/monitor", "panel": "/panel"})
-    except Exception as e: return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.39", "peer_id": _BRN_PEER_ID, "error": str(e)})
+        return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.40", "height": chain.db.height(), "peer_id": _BRN_PEER_ID, "health": "/health", "sync_panel": "/sync", "status": "/api/status", "mine_gate": "/api/mine/gate", "dashboard": "/dashboard", "wallet": "/wallet", "monitor": "/monitor", "panel": "/panel", "backup": "/backup"})
+    except Exception as e: return jsonify({"ok": True, "name": "BRN Node", "version": "9.9.40", "peer_id": _BRN_PEER_ID, "error": str(e)})
 
 
 @app.route("/dashboard", methods=["GET"])
@@ -1608,7 +1616,7 @@ def health():
         return jsonify({
             "ok": True,
             "height": chain.db.height(),
-            "version": "9.9.39",
+            "version": "9.9.40",
             "peer_id": _BRN_PEER_ID,
             "chain_injected": _CHAIN is not None,
             "pool_injected": _POOL_MANAGER is not None,
@@ -1620,6 +1628,7 @@ def health():
             "pbft_configured": has_pbft,
             "strict_multisig": STRICT_MULTISIG,
             "trust_download_require_sig": TRUST_DOWNLOAD_REQUIRE_SIG,
+            "backup_available": _HAS_BACKUP,
             "validators": val_summary,
             "mining_gate": gate_summary,
             "sk_validation": dict(_SK_VALIDATION_STATE),
@@ -1954,14 +1963,242 @@ def serve_sync_panel():
     ), 404
 
 
+# ============================================================
+# [v9.9.40] BACKUP / RESTORE
+# ============================================================
+_BACKUP_HTML = """<!doctype html><html lang="pt-BR"><head>
+<meta charset="utf-8"><title>Backup BRN</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{font-family:system-ui,sans-serif;max-width:760px;margin:2em auto;padding:0 1em;color:#222;background:#fafafa}
+h1{color:#06c}section{background:#fff;border:1px solid #ddd;border-radius:8px;padding:1em;margin:1em 0}
+button{padding:.6em 1.2em;border:0;border-radius:6px;background:#06c;color:#fff;cursor:pointer;font-size:1em}
+button.danger{background:#c33}button.ghost{background:#eee;color:#222;border:1px solid #ccc}
+input[type=password],input[type=text]{width:100%;padding:.6em;border:1px solid #ccc;border-radius:6px;margin:.4em 0;box-sizing:border-box}
+pre{background:#f0f0f0;padding:.8em;border-radius:6px;overflow:auto;font-size:.85em;white-space:pre-wrap;word-break:break-all}
+.warn{background:#fff3cd;border-left:4px solid #f0ad4e;padding:.8em;border-radius:4px;margin:.5em 0}
+.ok{background:#d4edda;border-left:4px solid #28a745;padding:.8em;border-radius:4px;margin:.5em 0}
+.err{background:#f8d7da;border-left:4px solid #dc3545;padding:.8em;border-radius:4px;margin:.5em 0}
+code{background:#eef;padding:2px 4px;border-radius:3px}
+</style></head><body>
+<h1>💾 Backup / Restore — Nó BRN</h1>
+<div class="warn">
+<strong>Render free NÃO persiste disco.</strong> Se o nó reiniciar sem backup,
+perde carteira, SK do validador, identidade P2P e histórico.<br>
+<strong>Faça backup antes de cada restart, ou configure o MongoDB (seção 3).</strong>
+</div>
+
+<section>
+<h2>1. Baixar backup</h2>
+<p>Gera um ZIP com carteira, identidade, chain e configs. Cifre com uma senha forte.</p>
+<input type="password" id="dl-pw" placeholder="Senha de cifra (opcional, mas RECOMENDADO)">
+<button onclick="download()">⬇️ Baixar backup</button>
+<div id="dl-result"></div>
+</section>
+
+<section>
+<h2>2. Restaurar de arquivo</h2>
+<input type="file" id="up-file" accept=".zip,.zipz,.brnz">
+<input type="password" id="up-pw" placeholder="Senha (se o backup foi cifrado)">
+<button class="danger" onclick="upload()">⬆️ Restaurar (sobrescreve estado atual)</button>
+<div id="up-result"></div>
+</section>
+
+<section>
+<h2>3. Backup automático (MongoDB)</h2>
+<p>Salva no GridFS a cada 5 min. Restaura sozinho no boot se o DB estiver vazio.
+Requer MongoDB configurado no ambiente.</p>
+<button class="ghost" onclick="mongoSave()">💾 Salvar agora no MongoDB</button>
+<button class="ghost" onclick="mongoList()">📋 Listar backups no MongoDB</button>
+<div id="mongo-result"></div>
+</section>
+
+<section>
+<h2>4. Diretório externo</h2>
+<p>Se você tem NFS/disco persistente, informe o caminho. O boot tenta restaurar
+de lá se o DB estiver vazio.</p>
+<input type="text" id="dir-input" placeholder="/var/data ou /mnt/brn">
+<button class="ghost" onclick="saveDir()">💾 Salvar diretório</button>
+<div id="dir-result"></div>
+</section>
+
+<script>
+const ADMIN = prompt("Admin token (BRN_ADMIN_TOKEN):", "") || "";
+function esc(s){return String(s).replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));}
+function show(el, cls, content){document.getElementById(el).innerHTML='<div class="'+cls+'"><pre>'+esc(typeof content==='string'?content:JSON.stringify(content,null,2))+'</pre></div>';}
+async function api(path, opts){
+  opts = opts || {};
+  opts.headers = Object.assign({}, opts.headers || {}, {Authorization: 'Bearer '+ADMIN});
+  const r = await fetch(path, opts);
+  const ct = r.headers.get('Content-Type') || '';
+  if(ct.indexOf('json') >= 0) return {status: r.status, body: await r.json()};
+  return {status: r.status, body: await r.text()};
+}
+async function download(){
+  const pw = document.getElementById('dl-pw').value;
+  document.getElementById('dl-result').innerHTML = '<div class="ok">Gerando backup…</div>';
+  try {
+    const r = await fetch('/api/backup/download', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json', Authorization: 'Bearer '+ADMIN},
+      body: JSON.stringify({password: pw || null})
+    });
+    if(!r.ok){
+      const j = await r.json().catch(()=>({msg:'erro '+r.status}));
+      show('dl-result', 'err', j);
+      return;
+    }
+    const blob = await r.blob();
+    const cd = r.headers.get('Content-Disposition') || '';
+    const m = cd.match(/filename="([^"]+)"/);
+    const name = m ? m[1] : ('brn_backup_'+Date.now()+'.zip');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    show('dl-result', 'ok', '✅ Baixado: '+name+' ('+(blob.size/1024).toFixed(1)+' KB)');
+  } catch(e){ show('dl-result', 'err', 'Erro: '+e); }
+}
+async function upload(){
+  const f = document.getElementById('up-file').files[0];
+  const pw = document.getElementById('up-pw').value;
+  if(!f){ show('up-result', 'err', 'Escolha um arquivo'); return; }
+  if(!confirm('Isto VAI SOBRESCREVER o estado atual. Continuar?')) return;
+  const fd = new FormData(); fd.append('file', f); if(pw) fd.append('password', pw);
+  try {
+    const r = await fetch('/api/backup/restore', {method: 'POST', headers: {Authorization: 'Bearer '+ADMIN}, body: fd});
+    const j = await r.json();
+    show('up-result', j.ok ? 'ok' : 'err', j);
+  } catch(e){ show('up-result', 'err', 'Erro: '+e); }
+}
+async function mongoSave(){
+  const r = await api('/api/backup/mongo/save', {method: 'POST'});
+  show('mongo-result', r.body.ok ? 'ok' : 'err', r.body);
+}
+async function mongoList(){
+  const r = await api('/api/backup/mongo/list');
+  show('mongo-result', 'ok', r.body);
+}
+async function saveDir(){
+  const d = document.getElementById('dir-input').value;
+  const r = await api('/api/backup/config', {method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({restore_dir: d})});
+  show('dir-result', r.body.ok ? 'ok' : 'err', r.body);
+}
+</script></body></html>"""
+
+
+@app.route("/backup", methods=["GET"])
+def backup_page():
+    return _BACKUP_HTML
+
+
+@app.route("/api/backup/files", methods=["GET"])
+@require_rate_limit("backup_files")
+@_admin_required
+def api_backup_files():
+    if not _HAS_BACKUP:
+        return jsonify({"ok": False, "msg": "backup_manager indisponível"}), 503
+    try:
+        return jsonify({"ok": True, "files": _bkpmgr.list_backup_files()})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/backup/download", methods=["POST"])
+@require_rate_limit("backup_download")
+@_admin_required
+def api_backup_download():
+    if not _HAS_BACKUP:
+        return jsonify({"ok": False, "msg": "backup_manager indisponível"}), 503
+    data = request.get_json(silent=True) or {}
+    pw = (data.get("password") or "").strip() or None
+    if pw and len(pw) < 8:
+        return jsonify({"ok": False, "msg": "senha min 8 chars"}), 400
+    try:
+        blob = _bkpmgr.create_backup(password=pw)
+    except Exception as e:
+        log.exception("backup/download falhou")
+        return jsonify({"ok": False, "msg": str(e)}), 500
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    fname = f"brn_backup_{ts}.zip{'z' if pw else ''}"
+    audit_log("backup_download", {"size": len(blob), "encrypted": bool(pw)})
+    return send_file(_io.BytesIO(blob), mimetype="application/octet-stream",
+                     as_attachment=True, download_name=fname)
+
+
+@app.route("/api/backup/restore", methods=["POST"])
+@require_rate_limit("backup_restore")
+@_admin_required
+def api_backup_restore():
+    if not _HAS_BACKUP:
+        return jsonify({"ok": False, "msg": "backup_manager indisponível"}), 503
+    if "file" not in request.files:
+        return jsonify({"ok": False, "msg": "nenhum arquivo"}), 400
+    f = request.files["file"]
+    blob = f.read(_bkpmgr.MAX_BACKUP_SIZE + 1)
+    if len(blob) > _bkpmgr.MAX_BACKUP_SIZE:
+        return jsonify({"ok": False, "msg": "arquivo grande demais (>500MB)"}), 413
+    pw = (request.form.get("password") or "").strip() or None
+    try:
+        result = _bkpmgr.restore_backup(blob, password=pw)
+    except Exception as e:
+        log.exception("backup/restore falhou")
+        return jsonify({"ok": False, "msg": str(e)}), 500
+    audit_log("backup_restore", {"ok": result.get("ok"), "n": len(result.get("restored", []))})
+    return jsonify(result), (200 if result.get("ok") else 400)
+
+
+@app.route("/api/backup/mongo/save", methods=["POST"])
+@require_rate_limit("backup_download")
+@_admin_required
+def api_backup_mongo_save():
+    if not _HAS_BACKUP:
+        return jsonify({"ok": False, "msg": "backup_manager indisponível"}), 503
+    pw = ((request.get_json(silent=True) or {}).get("password")
+          or os.environ.get("BRN_BACKUP_PASSWORD", "").strip() or None)
+    r = _bkpmgr.save_to_mongo(password=pw)
+    return jsonify(r), (200 if r.get("ok") else 500)
+
+
+@app.route("/api/backup/mongo/list", methods=["GET"])
+@require_rate_limit("backup_files")
+@_admin_required
+def api_backup_mongo_list():
+    if not _HAS_BACKUP:
+        return jsonify({"ok": False, "msg": "backup_manager indisponível"}), 503
+    return jsonify({"ok": True, "backups": _bkpmgr.list_mongo_backups()})
+
+
+@app.route("/api/backup/config", methods=["GET", "POST"])
+@require_rate_limit("backup_config")
+@_admin_required
+def api_backup_config():
+    if request.method == "GET":
+        d = os.environ.get("BRN_RESTORE_DIR", "")
+        return jsonify({"ok": True, "restore_dir": d,
+                        "exists": bool(d) and os.path.exists(d)})
+    d = ((request.get_json(silent=True) or {}).get("restore_dir") or "").strip()
+    if d:
+        try:
+            os.makedirs(d, exist_ok=True)
+            if not os.access(d, os.W_OK):
+                return jsonify({"ok": False, "msg": f"sem permissão de escrita em {d}"}), 400
+        except Exception as e:
+            return jsonify({"ok": False, "msg": str(e)}), 400
+    os.environ["BRN_RESTORE_DIR"] = d
+    audit_log("backup_config", {"restore_dir": d})
+    return jsonify({"ok": True, "restore_dir": d})
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
     try:
         from waitress import serve
         print("="*60)
-        print(f" BRN Server v9.9.39 rodando em PRODUÇÃO (Waitress) na porta {port}")
+        print(f" BRN Server v9.9.40 rodando em PRODUÇÃO (Waitress) na porta {port}")
+        print(f" Backup/restore: /backup   (HTML UI)")
+        print(f" Admin token:    .brn_admin_token (leia o arquivo, não é logado)")
         print("="*60)
-        # threads=32 garante que requisições web não travem o P2P
         serve(app, host=WEB_HOST, port=port, threads=32)
     except ImportError:
         print("Waitress não instalado. Usando Flask dev server (LENTO).")
