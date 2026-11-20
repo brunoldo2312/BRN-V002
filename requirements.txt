@@ -1,23 +1,39 @@
-# Core Blockchain
-cryptography
-argon2-cffi
-orjson
-requests
+# ============================================================
+# BRN-V002 — dependências pinadas (range compatível ~=X.Y)
+# Intervalo `~= X.Y` trava major.minor (atualiza só patch/minor
+# compatível) para builds reproduzíveis sem quebra de major.
+# Python alvo: 3.11 (Dockerfile); compatível com 3.10–3.13.
+# ============================================================
 
-# Servidor HTTP (FastAPI + Uvicorn)
-fastapi
-uvicorn[standard]
-uvloop; sys_platform != "win32"
+# Core Blockchain (Ed25519/secp256k1, hashing, encoding)
+cryptography~=50.0
+argon2-cffi~=25.1
+orjson~=3.13
+requests[socks]~=2.34
 
-# Servidor Web Legado (Fallback)
-flask
-flask-cors
-waitress
+# Servidor HTTP (FastAPI + Uvicorn, server_fastapi.py)
+fastapi~=0.165
+uvicorn[standard]~=0.54
+uvloop~=0.23; sys_platform != "win32"
 
-# Mineração e Carteira
-mnemonic
+# Servidor Web Legado (Flask fallback, server.py / explorer.py)
+flask~=3.1
+flask-cors~=6.0
+waitress~=3.0
+
+# Mineração e Carteira (BIP39 mnemonic; GUI desktop)
+mnemonic==0.21
+# pywebview é usado pela carteira desktop (app_wallet_v3.py);
+# em nó headless (Render/Koyeb/Docker) pode ser removido sem erro.
+pywebview~=6.2
 
 # Banco de dados e Métricas
-pymongo
-pysocks
-requests[socks]
+# pymongo já vem com GridFS (backup_manager.py:
+# save_to_mongo() / restore_from_mongo() / list_mongo_backups()).
+# Não há pacote extra "gridfs".
+pymongo~=4.20
+pysocks==1.7.1
+
+# Ponte BTC (btc_sender.py / offramp_manager.py — construir e
+# assinar transações BTC; opcional quando o offramp estiver desligado)
+bitcoinlib~=0.7
