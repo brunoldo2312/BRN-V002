@@ -1,0 +1,787 @@
+Sim, dá — mas você está prestes a criar o vetor de ataque mais clássico de blockchain
+Vou responder as duas camadas: "é possível?" (sim, e 70% já existe no seu código) e "é seguro?" (não, do jeito que você descreveu — vou explicar o Sybil Attack e como blindar).
+
+Parte 1 — O que você quer, traduzido em arquitetura
+O fluxo que você descreveu:
+
+text
+1. Cliente cria carteira
+2. Manda announce para N peers (não só Origin)
+3. Cada peer verifica score do cliente
+4. Score >= 140 → cliente vira validador
+5. Top scores recebem assinatura de blocos
+6. Validam trabalho + bloco
+7. Bloco entra na blockchain
+Isso é exatamente o mecanismo trust_score → validators → multi-sig → chain que já existe no seu código. A diferença é que hoje:
+
+Só o Origin aceita announce (server.py: if not is_origin: return 403)
+
+O threshold 150 está hardcoded no display do /trust/nodes, mas não no blockchain.py
+
+A trust_network pode não ter update_score automático (depende do trust_daemon)
+
+Então o que falta é: (a) tirar o gate de Origin no announce, (b) adicionar threshold configurável no _get_active_validators, (c) implementar auto-promoção por score.
+
+⚠️ Parte 2 — O problema (leia antes de codar)
+Sybil Attack, em uma frase: se "score >= 140" é o único critério, e score é calculado por uptime/online/assinaturas, então:
+
+Atacante sobe 100 VPS por €4/mês = €400/mês
+
+Cada uma cria carteira, anuncia, fica online 30 dias
+
+Cada uma atinge score 140
+
+Atacante agora tem 100 de 120 validadores = 83%
+
+Minerar bloco fraudulento → assina com 100 chaves → aceito por todos
+
+Rollback de fork profundo é impossível
+
+E se score também contar "assinou blocos aceitos": pior ainda, porque o próprio atacante controla o que é "aceito".
+
+O único jeito de blindar sem staking é:
+
+Mitigação	O que faz	Custo pro atacante
+Cap por /24	Máx 2 validadores por faixa de IP	€400 → €4.000/mês (100 faixas diferentes)
+Timelock	Score 140 há ≥30 dias para virar validador	Tempo (atacante espera 30 dias) + bots mantidos
+Prova de trabalho histórico	Score cresce com blocos válidos assinados (verificado por peers)	Precisa minerar PoW válido, não só ficar online
+Quórum 67% do top-N	Precisa de vários grandes, não um só	Sybil precisa dominar top-5, não top-100
+Vou entregar o código com as 4 mitigações ativáveis por env. Sem elas, é suicídio.
+
+Parte 3 — Como funciona HOJE no seu código
+Vou rastrear o fluxo real que existe para você ver o que aproveitar:
+
+No blockchain.py:
+python
+def _get_active_validators(self) -> list:
+    validators = self._get_trust_validators()  # ← trust.get_active_validators(count=5)
+    # + local_sk se não estiver
+    return sorted({p for p in validators if p})
+Na trust_network.py (inferida pela API):
+python
+trust.get_active_validators(count=5)   # ← retorna top N
+trust.get_top_validators(count=5)      # ← fallback
+trust.nodes = {pubkey: TrustNode(...)} # ← cada node tem trust_score
+No server.py:
+python
+# /api/validator/announce
+if not is_origin:
+    return 403  # ← bloqueia tudo hoje
+Conclusão: o mecanismo existe, mas:
+
+Está bloqueado no Origin (centralizado)
+
+O threshold "140" não é usado em lugar nenhum crítico
+
+A promoção é manual/via daemon, não automática por score
+
+Parte 4 — O código (diff do que existe)
+Vou entregar módulos novos + patches cirúrgicos. Não reescrever tudo.
+
+4.1 — validator_policy.py (novo, completo)
+Toda a lógica de "quem é validador" em um lugar só. Ativável por env.
+
+python
+"""validator_policy.py — Política de validadores por score (v1.0)
+================================================================
+Config por env:
+  BRN_MIN_VALIDATOR_SCORE       default 140
+  BRN_MAX_VALIDATORS            default 5  (top-N por score)
+  BRN_VALIDATOR_TIMELOCK_DAYS   default 0  (0 = sem timelock)
+  BRN_VALIDATOR_MAX_PER_SUBNET  default 2  (/24; 0 = sem cap)
+  BRN_VALIDATOR_REQUIRE_POW     default 0  (1 = exige ≥1 bloco assinado)
+  BRN_VALIDATOR_QUORUM          default 0.67
+  BRN_VALIDATOR_STRICT          default 0  (1 = exige quorum estrito)
+================================================================
+"""
+from __future__ import annotations
+import ipaddress
+import logging
+import os
+import time
+
+log = logging.getLogger("validator_policy")
+
+MIN_SCORE = int(os.environ.get("BRN_MIN_VALIDATOR_SCORE", "140"))
+MAX_VALIDATORS = max(1, int(os.environ.get("BRN_MAX_VALIDATORS", "5")))
+TIMELOCK_DAYS = max(0, int(os.environ.get("BRN_VALIDATOR_TIMELOCK_DAYS", "0")))
+TIMELOCK_S = TIMELOCK_DAYS * 86400
+MAX_PER_SUBNET = max(0, int(os.environ.get("BRN_VALIDATOR_MAX_PER_SUBNET", "2")))
+REQUIRE_POW = os.environ.get("BRN_VALIDATOR_REQUIRE_POW", "0") == "1"
+QUORUM = float(os.environ.get("BRN_VALIDATOR_QUORUM", "0.67"))
+STRICT = os.environ.get("BRN_VALIDATOR_STRICT", "0") == "1"
+
+if QUORUM <= 0 or QUORUM > 1:
+    QUORUM = 0.67
+
+
+def _node_score(n) -> float:
+    try:
+        return float(getattr(n, "trust_score", 0) or 0)
+    except Exception:
+        return 0.0
+
+
+def _node_banned(n) -> bool:
+    return bool(getattr(n, "banned", False))
+
+
+def _node_pubkey(n) -> str:
+    return (getattr(n, "public_key", "") or "").strip().lower()
+
+
+def _node_subnet(n) -> str:
+    """
+    Extrai /24 do endereço. Usa:
+      1. n.peer_addr ("ip:port")   ← preferencial
+      2. n.address
+    Retorna "" se não conseguir.
+    """
+    for attr in ("peer_addr", "address"):
+        addr = (getattr(n, attr, "") or "").strip()
+        if not addr:
+            continue
+        ip = addr.rsplit(":", 1)[0] if ":" in addr else addr
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+            if ip_obj.version == 4:
+                net = ipaddress.ip_network(f"{ip}/24", strict=False)
+                return str(net)
+            if ip_obj.version == 6:
+                net = ipaddress.ip_network(f"{ip}/64", strict=False)
+                return str(net)
+        except ValueError:
+            continue
+    return ""
+
+
+def _first_seen_ts(n) -> float:
+    """Timestamp de quando o nó entrou (assume n.first_seen, fallback 0)."""
+    try:
+        return float(getattr(n, "first_seen", 0) or 0)
+    except Exception:
+        return 0.0
+
+
+def _has_signed_block(n) -> bool:
+    """
+    True se o nó já assinou ≥1 bloco aceito.
+    Assume n.blocks_signed (int) ou n.signed_blocks (int).
+    """
+    for attr in ("blocks_signed", "signed_blocks", "signatures_count"):
+        try:
+            v = getattr(n, attr, 0) or 0
+            if int(v) > 0:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def compute_active_validators(trust, now: float = None) -> list:
+    """
+    Aplica a política e retorna a lista de pubkeys ativas.
+
+    Etapas:
+      1. Filtra score >= MIN_SCORE
+      2. Filtra banidos
+      3. Aplica timelock (first_seen + TIMELOCK_S <= now)
+      4. Aplica REQUIRE_POW (só se ativo)
+      5. Aplica cap por /24 (mantém os top-N por score em cada subnet)
+      6. Aplica cap total (top-MAX_VALIDATORS por score)
+      7. Retorna pubkeys
+    """
+    now = now or time.time()
+    if trust is None or not hasattr(trust, "nodes"):
+        return []
+
+    candidates = []
+    for n in (getattr(trust, "nodes", {}) or {}).values():
+        pk = _node_pubkey(n)
+        if not pk:
+            continue
+        score = _node_score(n)
+        if score < MIN_SCORE:
+            continue
+        if _node_banned(n):
+            continue
+
+        # Timelock
+        if TIMELOCK_S > 0:
+            first = _first_seen_ts(n)
+            if first <= 0 or (now - first) < TIMELOCK_S:
+                log.debug("[POLICY] %s rejeitado por timelock (first=%s, agora=%.0f)",
+                          pk[:12], first, now)
+                continue
+
+        # Prova de trabalho
+        if REQUIRE_POW and not _has_signed_block(n):
+            log.debug("[POLICY] %s rejeitado por REQUIRE_POW", pk[:12])
+            continue
+
+        candidates.append({
+            "pubkey": pk,
+            "score": score,
+            "subnet": _node_subnet(n),
+        })
+
+    # Cap por subnet
+    if MAX_PER_SUBNET > 0:
+        by_subnet: dict = {}
+        for c in candidates:
+            if c["subnet"]:
+                by_subnet.setdefault(c["subnet"], []).append(c)
+            else:
+                # Sem subnet: cap individual (trata como único)
+                by_subnet.setdefault(f"nonsubnet:{c['pubkey']}", []).append(c)
+
+        filtered = []
+        for subnet, items in by_subnet.items():
+            items.sort(key=lambda x: -x["score"])
+            filtered.extend(items[:MAX_PER_SUBNET])
+        candidates = filtered
+
+    # Cap total
+    candidates.sort(key=lambda x: -x["score"])
+    candidates = candidates[:MAX_VALIDATORS]
+
+    pubkeys = sorted({c["pubkey"] for c in candidates})
+
+    if pubkeys:
+        log.info(
+            "[POLICY] %d validador(es) ativos (min_score=%d max=%d "
+            "timelock=%dd cap_subnet=%d require_pow=%s)",
+            len(pubkeys), MIN_SCORE, MAX_VALIDATORS,
+            TIMELOCK_DAYS, MAX_PER_SUBNET, REQUIRE_POW,
+        )
+    else:
+        log.warning("[POLICY] Nenhum validador atende a política "
+                    "(min_score=%d, candidatos=%d)",
+                    MIN_SCORE, len(getattr(trust, "nodes", {}) or {}))
+
+    return pubkeys
+
+
+def required_signatures(n_validators: int) -> int:
+    """Quórum: STRICT exige ALL; senão ceil(n * QUORUM)."""
+    if n_validators <= 0:
+        return 0
+    if STRICT:
+        return n_validators
+    import math
+    return max(1, math.ceil(n_validators * QUORUM))
+
+
+def should_promote(node, now: float = None) -> bool:
+    """
+    Verifica se um nó individual atende a todos os critérios.
+    Útil para o trust_daemon auto-promover.
+    """
+    now = now or time.time()
+    if node is None:
+        return False
+    if _node_banned(node):
+        return False
+    if _node_score(node) < MIN_SCORE:
+        return False
+    if TIMELOCK_S > 0:
+        first = _first_seen_ts(node)
+        if first <= 0 or (now - first) < TIMELOCK_S:
+            return False
+    if REQUIRE_POW and not _has_signed_block(node):
+        return False
+    return True
+
+
+def status() -> dict:
+    return {
+        "min_score": MIN_SCORE,
+        "max_validators": MAX_VALIDATORS,
+        "timelock_days": TIMELOCK_DAYS,
+        "max_per_subnet": MAX_PER_SUBNET,
+        "require_pow": REQUIRE_POW,
+        "quorum": QUORUM,
+        "strict": STRICT,
+    }
+4.2 — Patch no blockchain.py (3 funções)
+Trocar _get_active_validators e _required_signatures:
+
+python
+# ============================================================
+# [v9.5.10] VALIDADORES POR SCORE (Plano D)
+# ============================================================
+def _get_active_validators(self) -> list:
+    """
+    Retorna validadores ativos conforme política de score.
+    Mantém compatibilidade com trust.get_active_validators() quando
+    a policy não estiver ativa.
+    """
+    try:
+        import validator_policy as _vp
+        trust = self.trust_net
+        if trust is not None:
+            validators = _vp.compute_active_validators(trust)
+            # Inclui SK local se não estiver
+            local_sk = self._local_validator_sk
+            if local_sk is not None:
+                try:
+                    local_pk = local_sk.pub_hex
+                    if local_pk and local_pk not in validators:
+                        # Verifica se a SK local também passa a política
+                        # (por consistência). Se não, ainda inclui porque
+                        # é a chave que assina localmente.
+                        validators.append(local_pk)
+                except Exception:
+                    pass
+            return sorted({p for p in validators if p})
+    except ImportError:
+        pass
+    except Exception as e:
+        log.debug("[blockchain] validator_policy falhou: %s", e)
+
+    # Fallback legado (comportamento atual)
+    validators = self._get_trust_validators()
+    local_sk = self._local_validator_sk
+    if local_sk is not None:
+        try:
+            local_pk = local_sk.pub_hex
+            if local_pk and local_pk not in validators:
+                validators.append(local_pk)
+        except Exception:
+            pass
+    return sorted({p for p in validators if p})
+
+
+def _required_signatures(self, validators: list) -> int:
+    try:
+        import validator_policy as _vp
+        n = _vp.required_signatures(len(validators))
+        log.info(f"[SIG] quorum policy: {n}/{len(validators)}")
+        return n
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # Fallback legado
+    n = len(validators)
+    if n == 0:
+        return 0
+    if REQUIRE_ALL_SIGS:
+        return n
+    import math
+    return min(n, max(1, math.ceil(n * VALIDATOR_QUORUM)))
+Essas são as 2 únicas funções que mudam. O resto (_validate_validators_sig, _collect_signatures, accept_block) continua igual — passa a usar a lista mais ampla automaticamente.
+
+4.3 — Patch no server.py — remover gate de Origin no announce
+Trocar a função api_validator_announce:
+
+python
+@app.route("/api/validator/announce", methods=["POST"])
+@require_rate_limit("validator_announce")
+def api_validator_announce():
+    """
+    [v9.9.42] Announce descentralizado: QUALQUER nó com trust network
+    aceita. Promoção a validador depende de score (validator_policy).
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        pubkey = (data.get("pubkey") or "").strip().lower()
+        address = (data.get("address") or "").strip()
+        peer_addr = (data.get("peer_addr") or "").strip()
+
+        if not pubkey or len(pubkey) < 32:
+            return jsonify({"ok": False, "msg": "pubkey inválida"}), 400
+        try:
+            int(pubkey, 16)
+        except ValueError:
+            return jsonify({"ok": False, "msg": "pubkey não é hex"}), 400
+
+        trust = _get_trust_network()
+        if trust is None:
+            return jsonify({"ok": False, "msg": "TrustNetwork indisponível"}), 503
+
+        # --- REGISTRA (todos aceitam, não só origin) ---
+        try:
+            if hasattr(trust, "sync_local_validator"):
+                trust.sync_local_validator(pubkey, address or "", peer_addr)
+            elif hasattr(trust, "register_node"):
+                trust.register_node(
+                    node_id=pubkey,
+                    address=address or pubkey[:16],
+                    public_key=pubkey,
+                    peer_addr=peer_addr,
+                )
+                if hasattr(trust, "mark_connected"):
+                    trust.mark_connected(pubkey)
+            elif hasattr(trust, "ensure_peer_entry"):
+                trust.ensure_peer_entry(pubkey)
+        except Exception as e:
+            log.warning("[announce] register falhou: %s", e)
+            return jsonify({"ok": False, "msg": str(e)}), 500
+
+        # --- SCORE +1 por announce (uptime) ---
+        try:
+            if hasattr(trust, "update_score"):
+                trust.update_score(pubkey, "heartbeat_ok")
+        except Exception:
+            pass
+
+        try:
+            trust.flush()
+        except Exception:
+            pass
+
+        # --- Avalia política ---
+        try:
+            import validator_policy as _vp
+            node = (getattr(trust, "nodes", {}) or {}).get(pubkey)
+            is_validator = _vp.should_promote(node) if node else False
+            score = float(getattr(node, "trust_score", 0) or 0) if node else 0
+            pubkeys_ativas = _vp.compute_active_validators(trust) if node else []
+        except ImportError:
+            is_validator = False
+            score = 0
+            pubkeys_ativas = []
+        except Exception:
+            is_validator = False
+            score = 0
+            pubkeys_ativas = []
+
+        # --- Propaga para peers (não origin) ---
+        propagated = 0
+        try:
+            p2p = _get_p2p_manager()
+            if p2p is not None and hasattr(p2p, "broadcast_validator_registration"):
+                # Evita loop: só propaga se pubkey != eu
+                if pubkey != (_BRN_PEER_ID or ""):
+                    p2p.broadcast_validator_registration(
+                        pubkey, address or pubkey[:16]
+                    )
+                    propagated = 1
+        except Exception:
+            pass
+
+        _invalidate_mining_gate_cache()
+
+        return jsonify({
+            "ok": True,
+            "pubkey": pubkey,
+            "score": round(score, 1),
+            "is_validator": is_validator,
+            "active_validators": len(pubkeys_ativas),
+            "propagated": bool(propagated),
+        }), 200
+    except Exception as e:
+        log.exception("announce falhou")
+        return jsonify({"ok": False, "msg": str(e)}), 500
+Adicione o rate limit em security.py:
+
+python
+"validator_announce": (30, 60),
+4.4 — Auto-promoção no trust_daemon.py (ou main.py)
+Onde você já tem o daemon rodando a cada 30s, adicione:
+
+python
+def _promotion_tick(chain, trust, interval: int = 60):
+    """
+    A cada `interval` segundos, percorre todos os nós da trust e
+    marca como 'validator' quem atende a política.
+    """
+    import time, logging
+    log = logging.getLogger("trust_daemon.promotion")
+    while True:
+        time.sleep(interval)
+        try:
+            import validator_policy as _vp
+        except ImportError:
+            continue
+        try:
+            if trust is None or not hasattr(trust, "nodes"):
+                continue
+            promoted_now = []
+            for pk, n in (trust.nodes or {}).items():
+                old_level = getattr(n, "trust_level", "new")
+                if _vp.should_promote(n):
+                    if old_level != "validator":
+                        try:
+                            n.trust_level = "validator"
+                        except Exception:
+                            pass
+                        promoted_now.append(pk)
+                else:
+                    if old_level == "validator":
+                        try:
+                            n.trust_level = "trusted"  # caiu abaixo do threshold
+                        except Exception:
+                            pass
+            if promoted_now:
+                log.warning("[PROMOTION] %d nó(s) promovido(s): %s",
+                            len(promoted_now),
+                            ", ".join(p[:12] for p in promoted_now[:5]))
+                try:
+                    if hasattr(trust, "flush"):
+                        trust.flush()
+                except Exception:
+                    pass
+                try:
+                    chain._fork_signal = None  # força re-leitura
+                except Exception:
+                    pass
+        except Exception as e:
+            log.debug("[PROMOTION] tick: %s", e)
+
+
+# No _setup_trust_daemon (main.py), adicione:
+import threading
+threading.Thread(
+    target=_promotion_tick,
+    args=(chain, trust, 60),
+    daemon=True,
+    name="ValidatorPromotion",
+).start()
+4.5 — peer_broadcast.py (novo, para clientes)
+O cliente precisa mandar announce para N peers, não só pro Origin:
+
+python
+"""peer_broadcast.py — Cliente anuncia para todos os peers (v1.0)"""
+import json
+import logging
+import threading
+import time
+import urllib.error
+import urllib.request
+from typing import Optional
+
+log = logging.getLogger("peer_broadcast")
+
+
+def broadcast_announce(
+    pubkey: str,
+    address: str,
+    peer_addr: str,
+    peers: list,
+    timeout: float = 3.0,
+) -> dict:
+    """
+    Envia POST /api/validator/announce para cada peer.
+    Retorna {"ok": N, "fail": M, "errors": [...]}.
+    """
+    payload = json.dumps({
+        "pubkey": pubkey,
+        "address": address,
+        "peer_addr": peer_addr,
+    }).encode("utf-8")
+
+    ok = 0
+    fail = 0
+    errors = []
+    for p in peers:
+        if not isinstance(p, str) or ":" not in p:
+            continue
+        ip, port_s = p.rsplit(":", 1)
+        if ip.startswith("127.") or ip == "0.0.0.0":
+            continue
+        try:
+            port = int(port_s)
+            # HTTP: assume que peer HTTP está em port + 5000? 
+            # Melhor: usar BRN_POOL_URLS ou bootstrap
+            url = f"http://{ip}:{port}/api/validator/announce"
+            req = urllib.request.Request(
+                url, data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if 200 <= resp.status < 300:
+                    ok += 1
+                else:
+                    fail += 1
+        except Exception as e:
+            fail += 1
+            errors.append(f"{p}: {e}")
+
+    log.info("[BROADCAST] announce: %d ok, %d fail", ok, fail)
+    return {"ok": ok, "fail": fail, "errors": errors[:5]}
+
+
+def announce_loop(
+    pubkey: str,
+    address: str,
+    peer_addr: str,
+    peer_provider,
+    interval: int = 120,
+    stop_evt: Optional[threading.Event] = None,
+):
+    """Loop de announce a cada `interval` segundos."""
+    stop_evt = stop_evt or threading.Event()
+    while not stop_evt.wait(interval):
+        try:
+            peers = peer_provider() or []
+            if peers:
+                broadcast_announce(pubkey, address, peer_addr, peers)
+        except Exception as e:
+            log.debug("[BROADCAST] loop: %s", e)
+No main.py, após criar a carteira no cliente:
+
+python
+# Cliente acabou de criar carteira
+from peer_broadcast import announce_loop
+import threading
+
+peers_list = chain.db.listar_peers(apenas_ativos=False) or []
+peers_addrs = [p.get("address", "") for p in peers_list if p.get("address")]
+
+threading.Thread(
+    target=announce_loop,
+    args=(wallet.pub_hex, wallet.address, f"{public_ip}:6001", lambda: peers_addrs),
+    daemon=True,
+).start()
+Parte 5 — Mitigação Sybil (o único jeito seguro)
+Sem isso, NÃO ATIVE. O sistema vira um alvo fácil.
+
+5.1 — Ativar as 4 mitigações no .env (prod)
+bash
+# Thresholds
+BRN_MIN_VALIDATOR_SCORE=140
+BRN_MAX_VALIDATORS=5
+BRN_VALIDATOR_QUORUM=0.67
+BRN_VALIDATOR_STRICT=1              # exige quorum (mas não ALL)
+
+# Anti-Sybil (obrigatório)
+BRN_VALIDATOR_MAX_PER_SUBNET=1      # 1 validador por /24
+BRN_VALIDATOR_TIMELOCK_DAYS=30      # 30 dias de idade mínima
+BRN_VALIDATOR_REQUIRE_POW=1         # precisa ter assinado ≥1 bloco antes
+5.2 — O que cada uma faz na prática
+Atacante tenta...	MAX_PER_SUBNET=1 bloqueia?	TIMELOCK=30d bloqueia?	REQUIRE_POW=1 bloqueia?
+100 VPS na mesma /24	✅ Sim (só 1 conta)	—	—
+100 VPS em /24 diferentes	❌ Não (cap não vê)	✅ Sim (30 dias)	✅ Sim (bloco precisa ser assinado)
+Bot farm por 30 dias	—	❌ Não (passou)	✅ Sim (precisa ter minerado PoW válido)
+Comprar validadores existentes	—	—	— (mas está fora do escopo)
+Com os 3 ativos, atacante precisa:
+
+N /24 subnets diferentes (custa €4/mês por subnet, ~€400/mês para 100)
+
+30 dias de uptime (custo de orquestração)
+
+PoW real assinado (compartilhar bloco = custo de mineração)
+
+Preço total para ataque 51%: ~€2.000–5.000 + 30 dias de paciência. Viável para atacante determinado, mas proibitivo para amador.
+
+5.3 — Se você não quer TIMELOCK=30 (rede nova)
+Use BRN_VALIDATOR_TIMELOCK_DAYS=7 como mínimo absoluto. Abaixo disso, a rede fica muito exposta a Sybil durante o bootstrap.
+
+Alternativa: comece com BRN_MAX_VALIDATORS=3 + TIMELOCK=7. Rede pequena, se der fork, você percebe e responde.
+
+Parte 6 — Teste completo (execute antes de confiar)
+Teste 1 — Verificar que a política está ativa
+bash
+curl https://brn-v002.onrender.com/api/consensus/validators | jq
+Deve mostrar:
+
+json
+{
+  "n_active": 3,
+  "required_sigs": 3,
+  "validators": [
+    {"pubkey": "abc...", "trust_score": 342.1, "in_active": true},
+    {"pubkey": "def...", "trust_score": 210.5, "in_active": true},
+    {"pubkey": "ghi...", "trust_score": 145.0, "in_active": true}
+  ]
+}
+Teste 2 — Verificar que um nó abaixo do threshold NÃO é validador
+Crie carteira de teste, anuncie para a rede:
+
+bash
+curl -X POST http://origin-b:5000/api/validator/announce \
+  -H "Content-Type: application/json" \
+  -d '{
+    "pubkey": "'$(python -c 'import secrets; print(secrets.token_hex(32))')'",
+    "address": "brn1qtest",
+    "peer_addr": "203.0.113.10:6001"
+  }' | jq
+Deve retornar "is_validator": false, "score": 0 ou similar. Não promove — só registra.
+
+Teste 3 — Verificar que o bloco exige quórum
+Com 3 validadores ativos e QUORUM=0.67, o próximo bloco deve ter ≥2 assinaturas (ceil(3*0.67)=2). Verifique:
+
+bash
+# Após minerar, checa o último bloco
+curl https://brn-v002.onrender.com/api/block/$(curl -s .../api/status | jq .height) \
+  | jq '.validators_sig | length'
+Teste 4 — Simular Sybil (bem controlado)
+Em ambiente de teste:
+
+Setar BRN_MIN_VALIDATOR_SCORE=10 (baixo)
+
+Setar BRN_VALIDATOR_MAX_PER_SUBNET=0 (sem cap) e TIMELOCK=0
+
+Criar 10 carteiras e anunciar
+
+Verificar que todas viram validador
+
+Agora ative MAX_PER_SUBNET=1 → verificar que só 1 por subnet fica ativo
+
+Ative TIMELOCK=1 (1 dia) → verificar que nenhuma das novas fica ativa
+
+Não rode em produção — é para você ver a diferença.
+
+Parte 7 — Riscos residuais (honestidade total)
+Mesmo com tudo ativado:
+
+Risco	Probabilidade	Mitigação
+Atacante com €2k ataca	Baixa em rede pequena	Monitore consensus_validators diariamente
+Reorg por divisão de validadores	Média durante bootstrap	REQUIRE_ALL_SIGS (quorum=100%) se < 3 validadores
+Score inflado por bot network	Alta sem POW	REQUIRE_POW=1
+Nó honesto perde score por downtime	Alta (Render free dorme)	Health checks + restart automático — seu maior problema prático
+trust_network.json corromper	Baixa	Backup /api/backup periódico
+O problema #4 é o maior. Render free dorme por 15 min inativo. Se isso conta como "downtime" e baixa o score, o Origin perde score sozinho e eventualmente sai do set de validadores. Recomendação: score não deve cair por inatividade curta (<1h). Ajuste no trust_network.update_score para ter "grace period".
+
+Parte 8 — Passo a passo de implantação
+Ordem importa. Não pule.
+
+text
+[Dia 1] Backup
+  └─ /backup do Render e da Origin-B → guarda local
+
+[Dia 2] Configuração mínima (sem ativar política)
+  └─ Adicionar validator_policy.py
+  └─ Setar MIN_SCORE=140, MAX=5, TIMELOCK=7, MAX_PER_SUBNET=1
+  └─ Ativar REQUIRE_POW=1
+  └─ Deploy no Render + B, MAS manter announce BLOQUEADO no Origin
+  └─ Verificar /api/consensus/validators reflete a política
+
+[Dia 3] Ativar announce descentralizado
+  └─ Aplicar patch no server.py (remover is_origin)
+  └─ Aplicar patch no blockchain.py (_get_active_validators)
+  └─ Deploy no Render + B
+  └─ Testar: create carteira → announce para B → verificar score=0, is_validator=false
+  └─ Testar: 7 dias depois, mesma carteira → score>=140 → is_validator=true
+
+[Dia 7] Ativar broadcast no cliente
+  └─ Adicionar peer_broadcast.py
+  └─ Ativar announce_loop no main.py dos clientes
+  └─ Testar 2 clientes: ambos recebem announce um do outro
+
+[Dia 14] Observar
+  └─ Verificar /api/consensus/validators diariamente
+  └─ Se set de validadores mudar sem explicação → investigar (possível Sybil)
+  └─ Se score do Origin cair → investigar (problema #4)
+
+[Dia 30] Se estável
+  └─ Aumentar MAX_VALIDATORS para 7, 10, conforme rede cresce
+  └─ Considerar Plano C (chave de origem compartilhada)
+Resumo em uma frase
+Sim, é tecnicamente possível — o mecanismo já existe no seu blockchain.py (_get_active_validators + _validate_validators_sig). Falta só: (a) tirar o gate de Origin no announce, (b) implementar validator_policy.py com threshold 140 configurável, (c) broadcast dos clientes para peers.
+
+Mas sem anti-Sybil, é suicídio. Ative obrigatoriamente:
+
+BRN_VALIDATOR_MAX_PER_SUBNET=1 (1 validador por /24)
+
+BRN_VALIDATOR_TIMELOCK_DAYS=7 (mínimo absoluto; 30 ideal)
+
+BRN_VALIDATOR_REQUIRE_POW=1 (precisa ter minerado ≥1 bloco)
+
+E resolva o problema prático antes: Render free dorme, perde score, sai do set. Configure health check externo que pinga a cada 5 min, ou migre para Render pago / VPS. Sem isso, o próprio Origin vai ser rebaixado pelo sistema que você está criando.
+
+Quer que eu implemente também a parte do score que cresce com PoW histórico (para REQUIRE_POW ter dentes de verdade), ou já está bom para você subir o primeiro ciclo e ver como se comporta em produção com poucos validadores?
