@@ -2203,3 +2203,49 @@ if __name__ == "__main__":
     except ImportError:
         print("Waitress não instalado. Usando Flask dev server (LENTO).")
         app.run(host=WEB_HOST, port=port, debug=False, threaded=True)
+# ============================================================
+# ORIGIN PROMOTION (drop-in) — /api/node/origin/*
+# ============================================================
+try:
+    import origin_manager as _origin_mgr
+
+    @app.route("/api/node/origin/status", methods=["GET"])
+    @_admin_required
+    def api_origin_status():
+        try:
+            return jsonify(_origin_mgr.origin_status(_get_chain()))
+        except Exception as e:
+            return jsonify({"ok": False, "msg": str(e)}), 500
+
+    @app.route("/api/node/origin/promote", methods=["POST"])
+    @_admin_required
+    def api_origin_promote():
+        try:
+            data = request.get_json(silent=True) or {}
+            reason = (data.get("reason") or "manual_promote").strip()[:200]
+            force = bool(data.get("force", False))
+            r = _origin_mgr.promote_to_origin(
+                _get_chain(), reason=reason, force=force)
+            audit_log("origin_promote",
+                      {"ok": r.get("ok"), "reason": reason, "force": force})
+            return jsonify(r), (200 if r.get("ok") else 400)
+        except Exception as e:
+            log.exception("origin/promote falhou")
+            return jsonify({"ok": False, "msg": str(e)}), 500
+
+    @app.route("/api/node/origin/demote", methods=["POST"])
+    @_admin_required
+    def api_origin_demote():
+        try:
+            data = request.get_json(silent=True) or {}
+            reason = (data.get("reason") or "manual_demote").strip()[:200]
+            r = _origin_mgr.demote_from_origin(_get_chain(), reason=reason)
+            audit_log("origin_demote", {"ok": r.get("ok"), "reason": reason})
+            return jsonify(r), (200 if r.get("ok") else 400)
+        except Exception as e:
+            log.exception("origin/demote falhou")
+            return jsonify({"ok": False, "msg": str(e)}), 500
+
+    log.info("[origin] rotas /api/node/origin/* registradas")
+except Exception as _e:
+    log.warning("[origin] rotas NÃO registradas: %s", _e)
