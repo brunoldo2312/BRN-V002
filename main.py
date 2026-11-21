@@ -1,21 +1,24 @@
-"""main.py — Entrypoint do nó BRN (v13.9.26)
+"""main.py — Entrypoint do nó BRN (v13.9.27)
 ================================================================
+v13.9.27 (2026-11-21) — ORIGIN PROMOTION PERSISTENTE:
+  [NEW] origin_manager.apply_origin_override_at_boot() é chamado ANTES
+        de Blockchain(...). Se brn_origin_override=1 no DB, força
+        BRN_IS_ORIGIN=1, remove BRN_POOL_URL (para o loop "Origin
+        offline") e loga promoted_at/by/reason. Sem isso, a promoção
+        via /api/node/origin/promote só valia em runtime — restart
+        voltava a cliente.
+  [NEW] Banner mostra o is_origin FINAL (após override), não o da env.
+  [NEW] Variável is_origin é reatribuída após override, para que
+        _setup_pool() e _start_web_server() vejam o valor correto.
 v13.9.26 (2026-11-20) — BACKUP + SECRET PERSISTENTE:
-  [NEW] ensure_network_secret() ANTES de blockchain — resolve o bug
-        "secret muda a cada restart no Render". Lê env, cai para
-        arquivo persistente, e só gera se for o primeiro boot.
-  [NEW] auto_restore_on_boot() ANTES de abrir o ChainDB — se o DB
-        estiver vazio e houver backup pendente/Mongo/dir externo,
-        restaura. Essencial no Render free (disco efêmero).
-  [NEW] start_periodic_backup() após Blockchain — se BRN_AUTO_BACKUP=1,
-        salva no MongoDB a cada N segundos.
-  [FIX] _do_force_http_resync() implementado (estava truncado).
-  [FIX] _auto_unlock_gui() completado (estava truncado).
-  [FIX] main() propaga BRN_WEB_PORT e BRN_PEER_ID ANTES de _start_web_server.
+  [NEW] ensure_network_secret() ANTES de blockchain
+  [NEW] auto_restore_on_boot() ANTES de abrir o ChainDB
+  [NEW] start_periodic_backup() após Blockchain
+  [FIX] _do_force_http_resync() e _auto_unlock_gui() completos
 v13.9.25 (2026-11-17):
-  [FIX] _maybe_enable_fast_sync() sempre escreve BRN_FAST_SYNC_UNTIL.
-  [FIX] _start_web_server() chama srv.set_peer_id().
-  [FIX] main() propaga BRN_WEB_PORT antes de importar server.
+  [FIX] _maybe_enable_fast_sync() sempre escreve BRN_FAST_SYNC_UNTIL
+  [FIX] _start_web_server() chama srv.set_peer_id()
+  [FIX] main() propaga BRN_WEB_PORT antes de importar server
 ================================================================
 """
 from __future__ import annotations
@@ -40,8 +43,8 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.26"
-    BUILD_DATE = "2026-11-20"
+    VERSION = "13.9.27"
+    BUILD_DATE = "2026-11-21"
 
 try:
     from isolation_detector import IsolationDetector
@@ -212,7 +215,6 @@ def _resolve_fast_sync_until(args) -> int:
 def _maybe_enable_fast_sync(fast_sync_until: int, args) -> None:
     log = logging.getLogger("main")
 
-    # [FIX v13.9.25] Sempre propagar BRN_FAST_SYNC_UNTIL pro server.py.
     os.environ["BRN_FAST_SYNC_UNTIL"] = str(fast_sync_until)
 
     no_fast_sync = getattr(args, "no_fast_sync", False)
@@ -261,10 +263,6 @@ def _maybe_enable_fast_sync(fast_sync_until: int, args) -> None:
 # RESYNC FORÇADO
 # ============================================================
 def _do_force_http_resync(headless: bool = False) -> None:
-    """
-    Renomeia o DB para .bak.TIMESTAMP (e WAL/SHM se existirem).
-    No próximo boot, o nó começa vazio e re-sincroniza via P2P/HTTP.
-    """
     log = logging.getLogger("main")
     db_env = os.environ.get("BRN_DB", "brn_v2_chain.db")
     p = Path(db_env) if os.path.isabs(db_env) else (BASE_DIR / db_env)
@@ -394,7 +392,6 @@ def _peer_healer_loop(chain, p2p, stop_evt: threading.Event, interval: int = 15)
         log.warning("[Peer-Healer] chain.db não tem upsert_peer() — healer inativo")
         return
 
-    # Import uma única vez (evita reimport a cada iteração)
     try:
         from p2p_unified import P2PClient
     except ImportError:
@@ -708,7 +705,6 @@ def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int,
 
     srv.set_chain(chain)
 
-    # [v13.9.25] Injeta PEER_ID
     if hasattr(srv, "set_peer_id"):
         srv.set_peer_id(os.environ.get("BRN_PEER_ID", ""))
 
@@ -975,7 +971,6 @@ class _WalletAPIAdapter:
             if not sk_hex:
                 return {"ok": False, "msg": "carteira sem chave privada"}
 
-            # Tenta integrar via wallet_integrator se disponível
             sk_installed = False
             if _wi is not None and hasattr(_wi, "integrate"):
                 try:
@@ -1060,7 +1055,6 @@ def main() -> int:
     )
     p2p_port = args.p2p_port or int(os.environ.get("BRN_P2P_PORT", "6001"))
 
-    # [v13.9.25] Propaga BRN_WEB_PORT ANTES de importar server.py
     os.environ["BRN_WEB_PORT"] = str(web_port)
     os.environ["BRN_P2P_PORT"] = str(p2p_port)
 
@@ -1094,20 +1088,9 @@ def main() -> int:
     except Exception as e:
         log.warning("[backup] auto-restore falhou: %s", e)
 
-    # 11. Banner
+    # 11. is_origin inicial (env ou --origem)
     is_origin = args.origem or os.environ.get("BRN_IS_ORIGIN", "0") == "1"
     os.environ["BRN_IS_ORIGIN"] = "1" if is_origin else "0"
-
-    log.warning("=" * 64)
-    log.warning(" BRN Node v%s (%s)", VERSION, BUILD_DATE)
-    log.warning("=" * 64)
-    log.warning(" DB       : %s", os.environ.get("BRN_DB", "brn_v2_chain.db"))
-    log.warning(" Web      : %d", web_port)
-    log.warning(" P2P      : %d", p2p_port)
-    log.warning(" Origin   : %s", is_origin)
-    log.warning(" Headless : %s", args.headless)
-    log.warning(" Fast-sync: %d", fast_sync_until)
-    log.warning("=" * 64)
 
     # 12. Verifica versão blockchain (multi-sig)
     _check_blockchain_version()
@@ -1130,11 +1113,38 @@ def main() -> int:
     os.environ["BRN_PEER_ID"] = peer_id
     log.info("[peer] PEER_ID = %s", peer_id)
 
-    # 15. Cria Blockchain
+    # ============================================================
+    # [v13.9.27] ORIGIN OVERRIDE — aplica ANTES de Blockchain
+    # ============================================================
+    db_path = os.environ.get("BRN_DB", "brn_v2_chain.db")
+    try:
+        from origin_manager import apply_origin_override_at_boot
+        is_origin = apply_origin_override_at_boot(db_path, is_origin)
+        os.environ["BRN_IS_ORIGIN"] = "1" if is_origin else "0"
+        log.info("[origin] is_origin final (após override): %s", is_origin)
+    except ImportError:
+        log.debug("[origin] origin_manager.py ausente — usando env direto")
+    except Exception as e:
+        log.warning("[origin] apply_origin_override falhou: %s", e)
+    # ============================================================
+
+    # 15. Banner (usa o is_origin FINAL)
+    log.warning("=" * 64)
+    log.warning(" BRN Node v%s (%s)", VERSION, BUILD_DATE)
+    log.warning("=" * 64)
+    log.warning(" DB       : %s", db_path)
+    log.warning(" Web      : %d", web_port)
+    log.warning(" P2P      : %d", p2p_port)
+    log.warning(" Origin   : %s", is_origin)
+    log.warning(" Headless : %s", args.headless)
+    log.warning(" Fast-sync: %d", fast_sync_until)
+    log.warning("=" * 64)
+
+    # 16. Cria Blockchain
     try:
         from blockchain import Blockchain
         chain = Blockchain(
-            db_path=os.environ.get("BRN_DB", "brn_v2_chain.db"),
+            db_path=db_path,
             auto_genesis=True,
             network_secret=os.environ.get("BRN_NETWORK_SECRET", ""),
         )
@@ -1147,7 +1157,7 @@ def main() -> int:
              chain.db.height(), chain.db.tip_hash()[:16])
     SK_VALIDATION_STATE["local_height"] = chain.db.height()
 
-    # 16. Backup periódico (v13.9.26) — DEPOIS da chain
+    # 17. Backup periódico (v13.9.26) — DEPOIS da chain
     if os.environ.get("BRN_AUTO_BACKUP", "0") == "1":
         try:
             from backup_manager import start_periodic_backup
@@ -1157,24 +1167,24 @@ def main() -> int:
         except Exception as e:
             log.warning("[AUTO-BACKUP] falhou: %s", e)
 
-    # 17. Trust
+    # 18. Trust
     trust = _setup_trust(chain, node_priv, is_origin)
 
-    # 18. P2P
+    # 19. P2P
     p2p = None
     if not args.no_p2p:
         p2p = _setup_p2p(chain, node_priv, p2p_port)
 
-    # 19. Sync
+    # 20. Sync
     sync_mgr = _setup_sync(chain, p2p)
 
-    # 20. Broadcast
+    # 21. Broadcast
     _setup_broadcast(chain, p2p)
 
-    # 21. Pool
+    # 22. Pool (usa is_origin FINAL após override)
     pool = _setup_pool(chain, is_origin)
 
-    # 22. Shutdown event + signal handlers
+    # 23. Shutdown event + signal handlers
     stop_evt = threading.Event()
 
     def _handle_signal(signum, frame):
@@ -1187,7 +1197,7 @@ def main() -> int:
     except (ValueError, OSError):
         pass
 
-    # 23. Wallet GUI unlock (só se não headless e não no-gui)
+    # 24. Wallet GUI unlock (só se não headless e não no-gui)
     if not args.headless and not args.no_gui:
         try:
             api = _WalletAPIAdapter(chain)
@@ -1200,21 +1210,21 @@ def main() -> int:
         except Exception as e:
             log.warning("[GUI] unlock falhou: %s", e)
 
-    # 24. Web server
+    # 25. Web server
     _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port, stop_evt)
 
-    # 25. Explorer
+    # 26. Explorer
     if not args.no_explorer:
         _start_explorer(chain)
 
-    # 26. Watchdog
+    # 27. Watchdog
     threading.Thread(
         target=_wallet_watchdog_loop,
         args=(chain, p2p, trust, stop_evt, 30),
         daemon=True, name="Watchdog",
     ).start()
 
-    # 27. Peer healer
+    # 28. Peer healer
     if p2p is not None:
         threading.Thread(
             target=_peer_healer_loop,
@@ -1222,7 +1232,7 @@ def main() -> int:
             daemon=True, name="PeerHealer",
         ).start()
 
-    # 28. Trust daemon
+    # 29. Trust daemon
     try:
         _setup_trust_daemon(
             chain, trust, p2p,
@@ -1232,7 +1242,7 @@ def main() -> int:
     except Exception as e:
         log.warning("[trust-daemon] setup falhou: %s", e)
 
-    # 29. Auto-mine (cliente)
+    # 30. Auto-mine (cliente)
     if os.environ.get("BRN_AUTO_MINE", "0") == "1" and not args.no_pool_client:
         def _auto_mine_loop():
             url = f"http://127.0.0.1:{web_port}/api/pool/start_local"
@@ -1265,7 +1275,7 @@ def main() -> int:
                          daemon=True, name="AutoMine").start()
         log.info("[AUTO-MINE] thread iniciada (30s entre tentativas)")
 
-    # 30. Loop principal
+    # 31. Loop principal
     log.warning("=" * 64)
     log.warning(" NÓ INICIADO — aguardando shutdown (Ctrl+C)")
     log.warning("=" * 64)
