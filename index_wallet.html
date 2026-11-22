@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>BRN Wallet v3.22 (Web)</title>
+<title>BRN Wallet v3.23 (Web)</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -55,17 +55,13 @@
   .mode-badge.client { background:#2d2200; color:#e3b341; border:1px solid #9e6a03; }
   .mode-badge.unknown { background:#21262d; color:#8b949e; }
 
-  /* [NEW v3.22] indicador de auth */
-  .auth-badge {
-    display: inline-block; padding: 3px 10px; border-radius: 10px;
-    font-size: .72rem; font-weight: 600; cursor: pointer;
-    font-family: inherit; border: 1px solid #30363d;
-    background: #161b22; color: #8b949e;
-    transition: all .15s;
+  .gate-badge {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: .68rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .05em;
   }
-  .auth-badge:hover { background: #21262d; }
-  .auth-badge.on  { background:#1f2d1f; color:#7ee787; border-color:#238636; }
-  .auth-badge.off { background:#2d2200; color:#e3b341; border-color:#9e6a03; }
+  .gate-badge.ok    { background:#0d2818; color:#7ee787; border:1px solid #238636; }
+  .gate-badge.block { background:#2d1416; color:#ffa198; border:1px solid #8b2424; }
 
   .fork-banner {
     display: none; padding: 12px 16px; margin-bottom: 14px;
@@ -260,13 +256,20 @@
     margin-top: 10px;
   }
 
-  /* [NEW v3.22] miner target state */
   .miner-target {
     font-size:.78rem; transition: color .2s;
   }
   .miner-target.idle  { color: #8b949e; }
   .miner-target.solo  { color: #7ee787; }
   .miner-target.pool  { color: #79c0ff; }
+
+  /* gate info box */
+  .gate-info {
+    background:#0d1117; border:1px solid #21262d; border-radius:6px;
+    padding:10px 12px; margin-top:10px; font-size:.78rem;
+  }
+  .gate-info .gl { color:#8b949e; }
+  .gate-info .gv { color:#e6edf3; font-weight:600; }
 </style>
 </head>
 <body>
@@ -282,7 +285,7 @@
   </div>
 
   <header>
-    <h1>🔷 <span>BRN</span> Wallet <span style="font-size:.7rem;color:#8b949e;">v3.22 web</span></h1>
+    <h1>🔷 <span>BRN</span> Wallet <span style="font-size:.7rem;color:#8b949e;">v3.23 web</span></h1>
     <div class="topbar">
       <div class="topbar-item">
         <span class="dot" id="dot"></span>
@@ -291,8 +294,9 @@
       <div class="topbar-item">
         <span class="mode-badge unknown" id="modeBadge">—</span>
       </div>
-      <div class="topbar-item">
-        <button class="auth-badge off" id="authBadge" title="Configure Basic Auth">🔓 sem auth</button>
+      <div class="topbar-item" title="Gate de mineração do servidor">
+        <span class="topbar-label">Miner:</span>
+        <span class="gate-badge block" id="gateBadge">—</span>
       </div>
       <div class="topbar-item">
         <span class="topbar-label">Sync:</span>
@@ -380,6 +384,11 @@
         <div class="stat"><div class="lbl">Recompensa</div><div class="val" id="eReward">—</div></div>
         <div class="stat"><div class="lbl">Peers</div><div class="val" id="ePeers">—</div></div>
       </div>
+      <div class="gate-info" id="gateInfo" style="display:none;">
+        <div><span class="gl">Mineração liberada:</span> <span class="gv" id="giAllowed">—</span></div>
+        <div><span class="gl">Motivo:</span> <span class="gv" id="giReason">—</span></div>
+        <div><span class="gl">Fila bootstrap:</span> <span class="gv" id="giQueue">—</span></div>
+      </div>
       <div class="row">
         <button class="btn p" id="bRefreshExp">🔄 Atualizar</button>
       </div>
@@ -396,13 +405,12 @@
           <tr>
             <th>Endereço</th>
             <th>Altura</th>
-            <th>Pontuação (Score)</th>
-            <th>Status</th>
+            <th>Δ local</th>
             <th>Última vez</th>
           </tr>
         </thead>
         <tbody id="tbodyPeers">
-          <tr><td colspan="5" style="color:#8b949e;">—</td></tr>
+          <tr><td colspan="4" style="color:#8b949e;">—</td></tr>
         </tbody>
       </table>
     </div>
@@ -622,27 +630,14 @@
     </div>
 
     <div class="card">
-      <h2>Converter BTC → BRN (L2)</h2>
+      <h2>Conversão BTC ↔ BRN</h2>
       <div class="unavailable" style="background:#0d1d2f;border-color:#1f6feb;color:#79c0ff;">
-        ℹ️ A conversão BTC→BRN é feita via <b>ordens L2</b>
-        (<code>/api/l2/create</code>, <code>/api/l2/quote</code>).
-        O cliente web atual mostra <b>somente leitura</b> da cotação.
-        Para criar ordens use a GUI desktop (<code>main.py</code>) ou
-        o endpoint HTTP direto.
+        ℹ️ Este nó <b>não expõe</b> os endpoints <code>/api/l2/quote</code> nem
+        <code>/api/l2/list</code>. A bridge BTC→BRN está disponível somente
+        via <b>GUI desktop</b> (<code>main.py</code>) ou via <code>bridge_manager.py</code>
+        embarcado no Origin. O status acima (onramp/offramp/taxa) é lido de
+        <code>/api/sync-info</code>.
       </div>
-
-      <label>Valor em satoshis (BTC)</label>
-      <input id="l2BtcSats" type="number" min="1000" placeholder="100000" value="100000">
-      <div class="row">
-        <button class="btn" id="bL2Quote">💱 Consultar cotação</button>
-      </div>
-      <div class="msg" id="mL2Quote"></div>
-
-      <label style="margin-top:14px;">Minhas ordens L2</label>
-      <div class="row">
-        <button class="btn" id="bL2List">📋 Listar ordens</button>
-      </div>
-      <div class="msg" id="mL2List"></div>
     </div>
   </div>
 
@@ -694,7 +689,7 @@
     </div>
   </div>
 
-  <div class="footer">BRN Wallet v3.22 (web) · <span id="apiLbl">—</span></div>
+  <div class="footer">BRN Wallet v3.23 (web) · <span id="apiLbl">—</span></div>
 </div>
 
 <script>
@@ -715,14 +710,10 @@ let _blockCursor = null;
 let _allBlocksLoaded = false;
 let _blocksLoading = false;
 
-// [NEW v3.22] Basic Auth
-let AUTH = null;  // {user, pass, header}
-
 const TAB_KEY = "brn_wallet_last_tab";
 const DEFAULT_TAB = "explorer";
 const LS_LIST_KEY = "brn_wallet_list_v1";
 const LS_WALLET_PREFIX = "brn_wallet_v1_";
-const SS_AUTH_KEY = "brn_basic_auth_v1";
 
 // ============================================================
 // HELPERS
@@ -759,103 +750,21 @@ function fmtAgo(ts) {
   if (diff < 86400) return Math.floor(diff / 3600) + "h";
   return Math.floor(diff / 86400) + "d";
 }
-
-// ============================================================
-// [NEW v3.22] BASIC AUTH
-// ============================================================
-function _b64encode(s) {
-  try { return btoa(s); }
-  catch (_) {
-    // unicode-safe
-    return btoa(unescape(encodeURIComponent(s)));
-  }
-}
-
-function _loadAuthFromSession() {
-  try {
-    const raw = sessionStorage.getItem(SS_AUTH_KEY);
-    if (!raw) return false;
-    const o = JSON.parse(raw);
-    if (!o || !o.user || !o.pass) return false;
-    AUTH = {
-      user: o.user,
-      pass: o.pass,
-      header: "Basic " + _b64encode(o.user + ":" + o.pass),
-    };
-    return true;
-  } catch (_) { return false; }
-}
-
-function _saveAuth(user, pass) {
-  AUTH = {
-    user,
-    pass,
-    header: "Basic " + _b64encode(user + ":" + pass),
-  };
-  try {
-    sessionStorage.setItem(SS_AUTH_KEY, JSON.stringify({user, pass}));
-  } catch (_) {}
-}
-
-function _clearAuth() {
-  AUTH = null;
-  try { sessionStorage.removeItem(SS_AUTH_KEY); } catch (_) {}
-}
-
-async function promptForAuth(force = false) {
-  if (AUTH && !force) return true;
-  const user = prompt("Usuário Basic Auth (BRN_WEB_USER):",
-                       AUTH ? AUTH.user : "admin");
-  if (user === null || user === "") return false;
-  const pass = prompt("Senha Basic Auth (BRN_WEB_PASS):", "");
-  if (pass === null || pass === "") return false;
-  _saveAuth(user, pass);
-  _updateAuthIndicator();
-  return true;
-}
-
-function _updateAuthIndicator() {
-  const el = $("authBadge");
-  if (!el) return;
-  if (AUTH) {
-    el.textContent = "🔐 " + AUTH.user;
-    el.className = "auth-badge on";
-    el.title = "Basic Auth ativo. Clique para remover.";
-  } else {
-    el.textContent = "🔓 sem auth";
-    el.className = "auth-badge off";
-    el.title = "Sem Basic Auth. Clique para configurar.";
-  }
+function esc(s) {
+  if (s == null) return "";
+  return String(s).replace(/[&<>"']/g, c => ({
+    "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;"
+  }[c]));
 }
 
 // ============================================================
-// HTTP HELPERS (com auth + retry automático em 401)
+// HTTP HELPERS
 // ============================================================
-function _isAuthError(e) {
-  const m = (e && e.message) || "";
-  return /HTTP\s*401/i.test(m) || /unauthoriz/i.test(m) || /auth required/i.test(m);
-}
-
-async function _withAuthRetry(fn) {
-  try {
-    return await fn();
-  } catch (e) {
-    if (_isAuthError(e)) {
-      const ok = await promptForAuth(true);
-      if (!ok) throw e;
-      return await fn();
-    }
-    throw e;
-  }
-}
-
 async function _getJSONOnce(url, timeoutMs) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const headers = {};
-    if (AUTH) headers["Authorization"] = AUTH.header;
-    const r = await fetch(url, {signal: ctrl.signal, headers});
+    const r = await fetch(url, {signal: ctrl.signal});
     if (!r.ok) {
       let errMsg = `HTTP ${r.status}`;
       try {
@@ -873,11 +782,9 @@ async function _postJSONOnce(url, body, timeoutMs) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const headers = {"Content-Type": "application/json"};
-    if (AUTH) headers["Authorization"] = AUTH.header;
     const r = await fetch(url, {
       method: "POST",
-      headers,
+      headers: {"Content-Type": "application/json"},
       body: JSON.stringify(body || {}),
       signal: ctrl.signal,
     });
@@ -890,21 +797,10 @@ async function _postJSONOnce(url, body, timeoutMs) {
   } finally { clearTimeout(timer); }
 }
 
-async function getJSON(url, opts = {}) {
-  const timeoutMs = opts.timeoutMs ?? 8000;
-  const promptOnAuth = opts.promptOnAuth ?? false;
-  if (promptOnAuth) {
-    return _withAuthRetry(() => _getJSONOnce(url, timeoutMs));
-  }
+async function getJSON(url, timeoutMs = 8000) {
   return _getJSONOnce(url, timeoutMs);
 }
-
-async function postJSON(url, body, opts = {}) {
-  const timeoutMs = opts.timeoutMs ?? 20000;
-  const promptOnAuth = opts.promptOnAuth ?? true;
-  if (promptOnAuth) {
-    return _withAuthRetry(() => _postJSONOnce(url, body, timeoutMs));
-  }
+async function postJSON(url, body, timeoutMs = 20000) {
   return _postJSONOnce(url, body, timeoutMs);
 }
 
@@ -1008,7 +904,7 @@ async function loadWalletLocal(name, password) {
 }
 
 // ============================================================
-// SHIM — mapeia métodos pywebview para endpoints HTTP
+// SHIM — mapeia métodos para endpoints REAIS (testados 2026-11-22)
 // ============================================================
 async function api(method, ...args) {
   try {
@@ -1018,19 +914,27 @@ async function api(method, ...args) {
 
       case "node_status": {
         const r = await getJSON("/api/status");
-        return {...r, ok: r.success !== false && !r.error, pool_enabled: false};
+        // server.py retorna {difficulty, fast_sync_active, ..., mining_allowed}
+        // NÃO retorna `success`, então ok baseado em campos presentes
+        const ok = typeof r.height === "number";
+        return {...r, ok};
       }
+
+      case "health":
+        return await getJSON("/health");
 
       case "sync_info":
         return await getJSON("/api/sync-info");
 
-      case "get_trust_nodes":
-        return await getJSON("/api/trust/nodes");
+      case "sync_status":
+        return await getJSON("/api/sync/status");
 
-      case "peers_score": {
-        const r = await getJSON("/api/peers");
-        return {peers: r.peers || []};
-      }
+      case "mine_gate":
+        return await getJSON("/api/mine/gate");
+
+      // [FIX v3.23] /api/peers retorna {ok, count, active, peers:[...]}
+      case "peers_list":
+        return await getJSON("/api/peers");
 
       case "generate_wallet": {
         const r = await postJSON("/api/nova-carteira", {});
@@ -1051,7 +955,6 @@ async function api(method, ...args) {
         return await getJSON("/api/minhas-txs/" + encodeURIComponent(args[0]) + "?limit=" + limit);
       }
 
-      // [FIX v3.22] inclui asset_id e public_key
       case "transfer": {
         return await postJSON("/api/transfer", {
           from: args[0],
@@ -1066,11 +969,10 @@ async function api(method, ...args) {
       case "mining_status":
         return await getJSON("/api/miner/status");
 
-      // [FIX v3.22] manda address E validator_address (compat)
       case "start_mining": {
         return await postJSON("/api/miner/start", {
-          address: args[0],
           validator_address: args[0],
+          address: args[0],
           miner_pubkey: args[1],
         });
       }
@@ -1078,32 +980,20 @@ async function api(method, ...args) {
       case "stop_mining":
         return await postJSON("/api/miner/stop", {});
 
-      // [FIX v3.22] tenta /api/pool/status, cai para /api/pool/local_status
+      // Pool local (cliente embutido)
       case "pool_status": {
-        try {
-          return await getJSON("/api/pool/status");
-        } catch (_) {
-          return await getJSON("/api/pool/local_status");
-        }
+        return await getJSON("/api/pool/local_status");
       }
 
-      // [FIX v3.22] tenta /api/pool/start, cai para /api/pool/start_local
       case "pool_start_mining": {
-        const body = {address: args[0], pubkey: args[1]};
-        try {
-          return await postJSON("/api/pool/start", body);
-        } catch (_) {
-          return await postJSON("/api/pool/start_local", body);
-        }
+        return await postJSON("/api/pool/start_local", {
+          address: args[0],
+          pubkey: args[1],
+        });
       }
 
-      // [FIX v3.22] tenta /api/pool/stop, cai para /api/pool/stop_local
       case "pool_stop_mining": {
-        try {
-          return await postJSON("/api/pool/stop", {});
-        } catch (_) {
-          return await postJSON("/api/pool/stop_local", {});
-        }
+        return await postJSON("/api/pool/stop_local", {});
       }
 
       case "verificar_recebimento": {
@@ -1114,20 +1004,6 @@ async function api(method, ...args) {
 
       case "tx_status":
         return await getJSON("/api/tx-status/" + encodeURIComponent(args[0]));
-
-      // [FIX v3.22] usa L2 em vez do inexistente /api/bridge/claim
-      case "bridge_claim":
-        return {ok: false, msg: "Converter BTC→BRN no web não está implementado. Use L2 (API /api/l2/create) ou a GUI desktop."};
-
-      case "l2_quote": {
-        const sats = Number(args[0]) || 100000;
-        return await getJSON("/api/l2/quote?btc_sats=" + sats);
-      }
-
-      case "l2_list": {
-        const buyer = args[0] || "";
-        return await getJSON("/api/l2/list?buyer=" + encodeURIComponent(buyer));
-      }
 
       case "save_wallet":
         return await saveWalletLocal(args[0], args[1], {
@@ -1140,16 +1016,19 @@ async function api(method, ...args) {
       case "list_wallets":
         return listWalletsLocal();
 
-      case "get_active_wallet":
-        return {ok: false};
-
+      // [CONFIRMADO 200] /api/blocks?start=&limit=
       case "list_blocks":
         return await getJSON("/api/blocks?start=" + args[0] + "&limit=" + args[1]);
 
+      // [CONFIRMADO 200] /api/block/<h>
       case "get_block": {
         const r = await getJSON("/api/block/" + args[0]);
         return {ok: true, block: r};
       }
+
+      // [CONFIRMADO 200] /api/latest (array de blocos)
+      case "latest_blocks":
+        return await getJSON("/api/latest");
 
       default:
         return {ok: false, msg: "Método não mapeado: " + method};
@@ -1164,18 +1043,33 @@ async function api(method, ...args) {
 // ============================================================
 function setDotState(cls) { $("dot").className = "dot " + cls; }
 
+function _setGateBadge(allowed, reason) {
+  const el = $("gateBadge");
+  if (!el) return;
+  if (allowed) {
+    el.className = "gate-badge ok";
+    el.textContent = "OK";
+    el.title = "Mineração liberada";
+  } else {
+    el.className = "gate-badge block";
+    el.textContent = "BLOCK";
+    el.title = reason || "Mineração bloqueada";
+  }
+}
+
 async function refreshStatus() {
   try {
     const s = await api("node_status");
-    if (!s.ok) throw new Error(s.msg || "offline");
+    if (!s.ok) throw new Error("offline");
 
+    // Mode badge
     const badge = $("modeBadge");
     if (s.rede_descentralizada === true) {
       badge.className = "mode-badge origin";
       badge.textContent = "DESCENTRALIZADA";
-    } else if (s.pool_enabled) {
+    } else if (s.fila_tamanho > 0) {
       badge.className = "mode-badge origin";
-      badge.textContent = "ORIGEM";
+      badge.textContent = "BOOTSTRAP (" + s.fila_tamanho + "/20)";
     } else {
       badge.className = "mode-badge client";
       badge.textContent = "CLIENTE";
@@ -1187,6 +1081,18 @@ async function refreshStatus() {
     $("eUtxos").textContent   = s.utxos != null ? s.utxos : "—";
     $("ePeers").textContent   = s.peers != null ? s.peers : "—";
     $("eReward").textContent  = s.reward ? fmtBRN(s.reward / 1e8) : "—";
+
+    // Gate info
+    _setGateBadge(!!s.mining_allowed, s.mining_gate_reason);
+    const gi = $("gateInfo");
+    if (gi) {
+      gi.style.display = "block";
+      $("giAllowed").textContent = s.mining_allowed ? "✅ SIM" : "❌ NÃO";
+      $("giAllowed").style.color = s.mining_allowed ? "#7ee787" : "#ffa198";
+      $("giReason").textContent = s.mining_gate_reason || "—";
+      $("giQueue").textContent = (s.fila_tamanho || 0) + "/20" +
+        (s.rede_descentralizada ? " (descentralizada)" : " (bootstrap)");
+    }
 
     setDotState("on");
     $("statusTxt").textContent = "Nó online";
@@ -1223,13 +1129,6 @@ async function refreshSyncInfo() {
     $("brOnramp").textContent  = onramp  ? "🟢" : "🔴";
     $("brOfframp").textContent = offramp ? "🟢" : "🔴";
 
-    if (d.miner_target) {
-      const el = $("minerTarget");
-      if (el && el.classList.contains("idle")) {
-        el.textContent = d.miner_target;
-      }
-    }
-
     if ($("brOnState")) {
       $("brOnState").textContent  = onramp  ? "🟢 Ativo"  : "🔴 Inativo";
       $("brOffState").textContent = offramp ? "🟢 Ativo"  : "🔴 Falta WIF";
@@ -1243,32 +1142,17 @@ async function refreshSyncInfo() {
 }
 
 // ============================================================
-// PEERS
+// PEERS  [FIX v3.23] usa /api/peers diretamente
 // ============================================================
 async function refreshPeers() {
   try {
-    const s = await api("get_trust_nodes");
-    let peers = (s && s.nodes) ? s.nodes : [];
-    if (!peers.length) {
-      const old = await api("peers_score");
-      peers = old.peers || [];
-    }
+    const s = await api("peers_list");
+    const peers = (s && Array.isArray(s.peers)) ? s.peers : [];
+    const active = s && s.active != null ? s.active : peers.length;
 
     const summary = $("peerScoreSummary");
-    if (peers.length === 0) {
-      summary.innerHTML = "";
-    } else {
-      let trusted = 0, banned = 0, maxScore = 0;
-      for (const p of peers) {
-        if (p.status === "trusted") trusted++;
-        else if (p.status === "banned") banned++;
-        const sc = p.trust_score != null ? p.trust_score : (p.score || 0);
-        if (sc > maxScore) maxScore = sc;
-      }
-      let html = `<span class="pill" style="background:#1f2d1f;color:#7ee787;">Top: ${maxScore.toFixed(1)} pts</span>`;
-      if (trusted > 0) html += `<span class="pill" style="background:#0d2818;color:#7ee787;">${trusted} ✓</span>`;
-      if (banned > 0) html += `<span class="pill err">${banned} ✗</span>`;
-      summary.innerHTML = html;
+    if (summary) {
+      summary.innerHTML = `<span class="pill">${active}/${peers.length}</span>`;
     }
 
     const card = $("peersCard");
@@ -1277,21 +1161,20 @@ async function refreshPeers() {
 
     if (peers.length === 0) { card.style.display = "none"; return; }
 
+    const localH = parseInt($("eHeight").textContent, 10) || 0;
     tbody.innerHTML = "";
     for (const p of peers.slice(0, 100)) {
       const tr = document.createElement("tr");
-      const addr = p.address || "?";
-      const h = p.height || 0;
-      const status = p.status || "new";
-      const score = p.trust_score != null ? p.trust_score : (p.score || 0);
-      let statusHtml = `<span class="badge">${status.toUpperCase()}</span>`;
-      if (status === "trusted") statusHtml = `<span class="badge trusted">✓ CONFIÁVEL</span>`;
-      else if (status === "banned") statusHtml = `<span class="badge banned">✗ BANIDO</span>`;
+      const addr = p.address || p.ip || "?";
+      const ph = p.height != null ? p.height : 0;
+      const delta = ph - localH;
+      let deltaTxt = "0", deltaColor = "#8b949e";
+      if (delta > 0) { deltaTxt = "+" + delta; deltaColor = "#79c0ff"; }
+      else if (delta < 0) { deltaTxt = String(delta); deltaColor = "#e3b341"; }
       tr.innerHTML = `
-        <td><code>${addr}</code></td>
-        <td>${h}</td>
-        <td><b style="color:#e3b341;">${Number(score).toFixed(1)} pts</b></td>
-        <td>${statusHtml}</td>
+        <td><code>${esc(addr)}</code></td>
+        <td>${ph}</td>
+        <td style="color:${deltaColor}"><b>${deltaTxt}</b></td>
         <td>${fmtAgo(p.last_seen)}</td>
       `;
       tbody.appendChild(tr);
@@ -1310,7 +1193,7 @@ async function syncCheckConnection() {
   msg("mSync", "🔍 Verificando conexão com o nó...", "info");
   try {
     const s = await api("node_status");
-    if (!s.ok) throw new Error(s.msg || "nó offline");
+    if (!s.ok) throw new Error("nó offline");
     const peers = s.peers || 0;
     const height = s.height || 0;
     if (peers === 0) {
@@ -1348,13 +1231,12 @@ async function syncStart() {
 
 async function syncUpdateProgress() {
   try {
-    const d = await api("sync_info");
-    if (d.erro) throw new Error(d.erro);
-    const sync = d.sync || {};
-    const height = sync.height || 0;
-    const target = sync.target || 0;
-    const peers  = sync.peers  || 0;
-    const percent = sync.percent || 0;
+    const d = await api("sync_status");
+    if (!d.ok) throw new Error(d.msg || "sync_status falhou");
+    const height = d.local_height || 0;
+    const target = d.target_height || 0;
+    const percent = d.progress || 0;
+    const peers = d.peers_known || 0;
 
     $("syncHeight").textContent = height;
     $("syncTarget").textContent = target;
@@ -1365,20 +1247,14 @@ async function syncUpdateProgress() {
     const statusEl = $("syncStatusText");
     let statusText = "", barColor = "#58a6ff";
 
-    if (peers === 0) {
-      statusText = "🔌 Sem peers conectados";
+    if (d.forking) {
+      statusText = "⚠️ Fork detectado — reorg em andamento";
       barColor = "#f85149";
-      bar.style.width = "0%"; pctEl.textContent = "0%";
-      msg("mSync", "❌ Nenhum peer conectado.", "err", 6000);
-      syncMode = "error";
-    } else if (target === 0) {
-      statusText = "⏳ Aguardando dados do peer...";
-      barColor = "#d29922";
-      bar.style.width = "0%"; pctEl.textContent = "0%";
-    } else if (height >= target) {
+    } else if (d.synced || height >= target) {
       statusText = "✅ Sincronizado";
       barColor = "#3fb950";
-      bar.style.width = "100%"; pctEl.textContent = "100%";
+      bar.style.width = "100%";
+      pctEl.textContent = "100%";
       if (syncMode !== "synced") {
         syncMode = "synced";
         $("syncBadgeOk").classList.add("show");
@@ -1388,7 +1264,7 @@ async function syncUpdateProgress() {
       }
     } else {
       const falta = target - height;
-      statusText = "📥 Baixando... faltam " + falta + " blocos";
+      statusText = "📥 Sincronizando... faltam " + falta + " blocos";
       barColor = "#58a6ff";
       bar.style.width = percent + "%";
       pctEl.textContent = percent.toFixed(2) + "%";
@@ -1402,7 +1278,6 @@ async function syncUpdateProgress() {
     $("syncBar").style.background = barColor;
     $("syncPct").textContent = percent.toFixed(2) + "%";
     $("syncPct").style.color = barColor;
-    $("peerCount").textContent = peers;
   } catch (e) {
     msg("mSync", "❌ " + e.message, "err");
     syncMode = "error";
@@ -1430,7 +1305,7 @@ async function carregarBlocos(reset) {
   }
   try {
     const _st = await api("node_status");
-    if (!_st.ok) throw new Error(_st.msg || "node offline");
+    if (!_st.ok) throw new Error("node offline");
     const _currentHeight = _st.height;
     let _start, _end;
     if (reset || _blockCursor === null) {
@@ -1474,7 +1349,7 @@ async function carregarBlocos(reset) {
     clearMsg("mExp");
   } catch (e) {
     if (reset) {
-      tb.innerHTML = '<tr><td colspan="5" style="color:#ffa198;">' + e.message + '</td></tr>';
+      tb.innerHTML = '<tr><td colspan="5" style="color:#ffa198;">' + esc(e.message) + '</td></tr>';
     }
   } finally {
     _blocksLoading = false;
@@ -1587,7 +1462,6 @@ async function gerarCarteira() {
   }
 }
 
-// [FIX v3.22] NÃO seta minerTarget = wallet.address (bug D)
 function renderCarteira() {
   if (!wallet.address) return;
   $("walletBox").style.display = "block";
@@ -1596,7 +1470,6 @@ function renderCarteira() {
   $("wPriv").style.filter = "blur(4px)";
   $("wPub").textContent  = wallet.public_key;
   $("txFrom").value = wallet.address;
-  $("brToBrn") && ($("brToBrn").value = wallet.address);
 }
 
 async function atualizarSaldo() {
@@ -1656,7 +1529,7 @@ async function carregarMinhasTxs(limit) {
     const valor = ((t.amount || 0) / 1e8).toFixed(8);
 
     tr.innerHTML = '<td>' + dirBadge + '</td>' +
-      '<td><code title="' + t.txid + '">' + shortHash(t.txid, 18) + '</code></td>' +
+      '<td><code title="' + esc(t.txid) + '">' + shortHash(t.txid, 18) + '</code></td>' +
       '<td>' + valor + '</td>' +
       '<td>' + statusBadge + '</td>' +
       '<td>' + bloco + '</td>';
@@ -1728,23 +1601,21 @@ async function minerar() {
   try {
     const st = await api("node_status");
     const height = st.height || 0;
-
     if (height <= 0) {
-      msg("mMine", "⚠️ Nó sem blockchain local. Redirecionando para o Pool...", "warn", 5000);
-
-      setTimeout(async () => {
-        await minerarPool();
-      }, 1500);
+      msg("mMine", "⚠️ Nó sem blockchain local. Tentando pool...", "warn", 5000);
+      setTimeout(() => minerarPool(), 1000);
+      return;
+    }
+    if (!st.mining_allowed) {
+      msg("mMine", "⚠️ Gate de mineração: " + (st.mining_gate_reason || "?"), "warn", 6000);
       return;
     }
   } catch (e) {
-    msg("mMine", "⚠️ Falha ao checar rede. Tentando Pool por segurança...", "warn", 5000);
-    setTimeout(async () => {
-      await minerarPool();
-    }, 1500);
+    msg("mMine", "⚠️ Falha ao checar rede.", "warn", 4000);
     return;
   }
 
+  // Para pool se estiver ativo
   try {
     const poolSt = await api("pool_status");
     if (poolSt && poolSt.running) {
@@ -1791,7 +1662,7 @@ async function minerar() {
 }
 
 // ============================================================
-// MINERAÇÃO EM POOL
+// MINERAÇÃO EM POOL (cliente local)
 // ============================================================
 async function minerarPool() {
   clearMsg("mPool");
@@ -1833,7 +1704,7 @@ async function minerarPool() {
     try {
       const r = await api("pool_start_mining", wallet.address, wallet.public_key);
       if (r && r.ok) {
-        msg("mPool", "🌐 Ligado ao pool! Minerando com a pool da rede.", "ok", 6000);
+        msg("mPool", "🌐 Ligado ao pool! " + (r.msg || ""), "ok", 6000);
       } else {
         msg("mPool", "❌ " + ((r && r.msg) || "falha ao ligar ao pool"), "err");
       }
@@ -1938,7 +1809,6 @@ async function updateMiningUI() {
     }
   } catch (e) { /* silencioso */ }
 
-  // [FIX v3.22] Estado do minerTarget derivado de onde está minerando
   if (soloRunning) {
     _setMinerTarget("solo", soloAddr || wallet.address);
   } else if (poolRunning) {
@@ -2015,42 +1885,12 @@ async function consultarTxStatus() {
 }
 
 // ============================================================
-// BRIDGE / L2
+// BRIDGE — [FIX v3.23] endpoints L2 NÃO existem neste server
 // ============================================================
 async function bridgeRefresh() {
   clearMsg("mBridge");
   await refreshSyncInfo();
-}
-
-async function l2Quote() {
-  clearMsg("mL2Quote");
-  const sats = Number($("l2BtcSats").value) || 100000;
-  try {
-    const r = await api("l2_quote", sats);
-    if (r.error) throw new Error(r.error);
-    let txt = "";
-    if (r.rate) txt += "Taxa: " + r.rate + " · ";
-    if (r.brn_net) txt += "Você recebe: " + r.brn_net + " BRN";
-    else txt = JSON.stringify(r);
-    msg("mL2Quote", txt, "ok", 10000);
-  } catch (e) {
-    msg("mL2Quote", "❌ " + e.message, "err");
-  }
-}
-
-async function l2List() {
-  clearMsg("mL2List");
-  try {
-    const r = await api("l2_list", wallet.address || "");
-    if (r.error) throw new Error(r.error);
-    const list = r.orders || r.list || [];
-    if (!list.length) { msg("mL2List", "Nenhuma ordem encontrada.", "info", 5000); return; }
-    msg("mL2List", list.length + " ordem(ns): " +
-      list.slice(0,5).map(o => (o.escrow_id || "?").slice(0,10) + " [" + (o.status || "?") + "]").join(", "),
-      "info", 15000);
-  } catch (e) {
-    msg("mL2List", "❌ " + e.message, "err");
-  }
+  msg("mBridge", "ℹ️ Status atualizado (dados de /api/sync-info).", "info", 3000);
 }
 
 // ============================================================
@@ -2124,7 +1964,6 @@ async function downloadWallet() {
   const pass = $("svPass").value || prompt("Senha para criptografar o backup (mín. 8):");
   if (!pass || pass.length < 8) { msg("mBackup", "❌ Senha inválida.", "err"); return; }
 
-  // [FIX v3.22] confirmação obrigatória — sem ela perde tudo
   const ack = confirm(
     "⚠️ BACKUP CRIPTOGRAFADO\n\n" +
     "O arquivo .json que será baixado SÓ pode ser aberto com a senha que você acabou de digitar.\n\n" +
@@ -2206,24 +2045,11 @@ function configTabs() {
 }
 
 function configEventos() {
-  // [NEW v3.22] auth badge
-  $("authBadge").onclick = async () => {
-    if (AUTH) {
-      if (!confirm("Remover Basic Auth da sessão?")) return;
-      _clearAuth();
-      _updateAuthIndicator();
-      return;
-    }
-    if (await promptForAuth(true)) {
-      msg("mCart", "✅ Auth salva para esta sessão.", "ok", 3000);
-    }
-  };
-
   $("bSyncCheck").onclick = syncCheckConnection;
   $("bSyncStart").onclick = syncStart;
   $("bSyncStop").onclick  = syncStop;
 
-  $("bRefreshExp").onclick = () => carregarBlocos(true);
+  $("bRefreshExp").onclick = () => { refreshStatus(); carregarBlocos(true); };
   $("bRefreshPeers").onclick = refreshPeers;
 
   $("bVerMaisBlocos").onclick = () => carregarBlocos(false);
@@ -2257,8 +2083,6 @@ function configEventos() {
   };
   $("bTxStatus").onclick   = consultarTxStatus;
   $("bBridgeRefresh").onclick = bridgeRefresh;
-  $("bL2Quote").onclick    = l2Quote;
-  $("bL2List").onclick     = l2List;
   $("bSalvar").onclick     = salvar;
   $("bListar").onclick     = listarWallets;
   $("bCarregar").onclick   = carregar;
@@ -2279,9 +2103,6 @@ function configEventos() {
 // BOOTSTRAP
 // ============================================================
 async function boot() {
-  _loadAuthFromSession();
-  _updateAuthIndicator();
-
   configTabs();
   configEventos();
   $("apiLbl").textContent = window.location.host;
@@ -2303,8 +2124,8 @@ async function boot() {
 
   setInterval(async () => {
     try {
-      const d = await api("sync_info");
-      const forking = !!(d && d.sync && d.sync.syncing === false && d.sync.forking);
+      const d = await api("sync_status");
+      const forking = !!(d && d.forking);
       $("forkBanner").classList.toggle("show", forking);
       if (forking) {
         $("dot").className = "dot fork";
