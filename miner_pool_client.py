@@ -1,9 +1,30 @@
-"""miner_pool_client.py — Pool client BRN (v7.4)
+"""miner_pool_client.py — Pool client BRN (v7.5)
 ================================================================
-v7.4 (2026-11-16) — RENDER DEFAULT E HASHRATE FLUIDO:
-  [NEW] URL padrão do Pool alterada para https://brn-v002.onrender.com
-  [FIX] Lote de mineração reduzido para 5k hashes para o hashrate
-        fluir na interface instantaneamente.
+v7.5 (2026-11-22) — DEFAULTS SEGUROS E RACE-FREE:
+
+  [BREAKING] pool_url SEM default. Requer BRN_POOL_URL ou argumento
+             explícito. O default antigo apontava para o Render
+             (brn-v002.onrender.com) e quebrava silenciosamente
+             instalações self-hosted.
+  [BREAKING] BRN_POOL_FAST_SYNC_UNTIL default agora 0 (desligado).
+             Antes era 4084 hardcoded — após a rede passar de 4084,
+             todos os mineradores travavam em "fast_sync_below_4084"
+             para sempre sem explicação.
+  [FIX] hashrate agora é amostrado a cada 250 hashes dentro do batch.
+        Antes, só a cada 5000 → UI ficava em 0 kH/s por ~50s em
+        máquinas lentas.
+  [FIX] hashes_total conta por iteração, não += batch no fim. Antes,
+        um stop no meio do batch inflava 5k hashes fantasmas.
+  [FIX] _loop_gate_wait ganhou guard (_gate_thread) — stop/start
+        rápido não duplica mais a thread de gate.
+  [FIX] _spawn_mining_threads usa flags por tipo de thread; no fall
+        de gate, limpa apenas o que morreu (HB, Work, PoW).
+  [FIX] _fetch_work reage a "job expirado" e "desconhecido" →
+        dispara _reregister() automaticamente.
+  [FIX] run() faz self._running = False ao sair → is_alive() correto.
+  [FIX] _gate_reason inicial = "starting" em vez de "not_checked".
+  [KEEP] API pública (get_pool_client, set_pool_client,
+         stop_pool_client, PoolClient) idêntica.
 ================================================================
 """
 from __future__ import annotations
@@ -19,7 +40,10 @@ import urllib.error
 from blockchain import block_hash, target_from_difficulty
 
 log = logging.getLogger("pool.client")
-__version__ = "7.4"
+__version__ = "7.5"
+
+HASHRATE_SAMPLE_EVERY = int(os.environ.get("BRN_POOL_HASHRATE_SAMPLE", "250"))
+POW_BATCH_SIZE = int(os.environ.get("BRN_POOL_BATCH", "5000"))
 
 _INSTANCE = None
 _INSTANCE_LOCK = threading.RLock()
@@ -121,9 +145,8 @@ class PoolClient(threading.Thread):
 
         self.address = address
         self.pubkey = pubkey
-        # [FIX] URL padrão apontando para o Render
-        default_url = "https://brn-v002.onrender.com"
-        self.pool_url = (pool_url or os.environ.get("BRN_POOL_URL", default_url)).rstrip("/")
+        # [FIX v7.5] sem default Render. Exige configuração explícita.
+        self.pool_url = (pool_url or os.environ.get("BRN_POOL_URL", "")).rstrip("/")
         self.miner_id = miner_id or uuid.uuid4().hex[:12]
 
         self._stop = threading.Event()
@@ -131,9 +154,14 @@ class PoolClient(threading.Thread):
         self._lock = threading.RLock()
 
         self._mining_active = threading.Event()
-        self._gate_reason = "not_checked"
+        self._gate_reason = "starting"
         self._gate_detail = {}
-        self._mining_threads_spawned = False
+        self._gate_thread: threading.Thread | None = None
+
+        # [FIX v7.5] flags por tipo de thread
+        self._hb_thread: threading.Thread | None = None
+        self._work_thread: threading.Thread | None = None
+        self._pow_thread: threading.Thread | None = None
 
         self.hashrate_meter = HashrateMeter(window=5.0)
         self.hashes_total = 0
@@ -149,11 +177,22 @@ class PoolClient(threading.Thread):
         self._job = None
         self._job_lock = threading.RLock()
 
+    # ------------------------------------------------------------------
+    # Gates
+    # ------------------------------------------------------------------
     def _check_gates(self) -> tuple:
+        if not self.pool_url:
+            return False, "pool_url_not_configured", {
+                "pool_url": "",
+                "hint": "defina BRN_POOL_URL (ex: http://127.0.0.1:8080)",
+            }
+
         try:
-            fast_sync_until = int(os.environ.get("BRN_POOL_FAST_SYNC_UNTIL", "4084"))
+            # [FIX v7.5] default 0 → desligado. Só ativa se o operador
+            # quiser forçar. Evita deadlock eterno após altura 4084.
+            fast_sync_until = int(os.environ.get("BRN_POOL_FAST_SYNC_UNTIL", "0"))
         except (ValueError, TypeError):
-            fast_sync_until = 4084
+            fast_sync_until = 0
 
         detail = {
             "pool_url": self.pool_url,
@@ -217,22 +256,40 @@ class PoolClient(threading.Thread):
 
         return True, "gates_ok", detail
 
+    # ------------------------------------------------------------------
+    # Start / Stop
+    # ------------------------------------------------------------------
     def start_mining(self) -> tuple:
         if self._running:
             return False, "ja rodando"
+
+        if not self.pool_url:
+            msg = ("BRN_POOL_URL nao configurada — defina a URL do pool "
+                   "(ex: http://127.0.0.1:8080 ou https://seu-pool.example)")
+            self.last_error = msg
+            log.error("pool client: %s", msg)
+            return False, msg
 
         self._stop.clear()
         self._mining_active.clear()
         self._running = True
         self.started_at = time.time()
-        self._mining_threads_spawned = False
-        self._gate_reason = "checking"
+        self._gate_reason = "starting"
+        self._gate_detail = {}
+        self._hb_thread = None
+        self._work_thread = None
+        self._pow_thread = None
 
-        threading.Thread(target=self._loop_gate_wait, daemon=True,
-                         name="Pool-Gate").start()
+        # [FIX v7.5] guard contra gate thread duplicada
+        with self._lock:
+            if self._gate_thread is None or not self._gate_thread.is_alive():
+                self._gate_thread = threading.Thread(
+                    target=self._loop_gate_wait, daemon=True,
+                    name="Pool-Gate")
+                self._gate_thread.start()
 
-        log.info("pool client: iniciado (miner_id=%s) — aguardando gates",
-                 self.miner_id)
+        log.info("pool client: iniciado (miner_id=%s, pool=%s) — aguardando gates",
+                 self.miner_id, self.pool_url)
         return True, "iniciado (aguardando gates)"
 
     def stop_mining(self) -> tuple:
@@ -243,7 +300,7 @@ class PoolClient(threading.Thread):
         self._running = False
         try:
             _http_post(f"{self.pool_url}/api/pool/disconnect",
-                       {"miner_id": self.miner_id})
+                       {"miner_id": self.miner_id}, timeout=3.0)
         except Exception:
             pass
         log.info("pool client: parado")
@@ -255,6 +312,9 @@ class PoolClient(threading.Thread):
     def is_mining(self) -> bool:
         return self._running and self._mining_active.is_set()
 
+    # ------------------------------------------------------------------
+    # Gate loop
+    # ------------------------------------------------------------------
     def _loop_gate_wait(self):
         try:
             poll_gate_s = float(os.environ.get("BRN_POOL_GATE_POLL_INTERVAL", "30"))
@@ -271,21 +331,19 @@ class PoolClient(threading.Thread):
                 self._gate_detail = detail
 
                 if ok and not gate_ok_prev:
-                    log.info("pool client: ✅ gates OK (%s) — iniciando mineração",
+                    log.info("pool client: gates OK (%s) — iniciando mineracao",
                              reason)
                     self._mining_active.set()
-                    if not self._mining_threads_spawned:
-                        self._spawn_mining_threads()
-                        self._mining_threads_spawned = True
+                    self._spawn_mining_threads()
                     gate_ok_prev = True
                 elif ok and gate_ok_prev:
                     self._mining_active.set()
                 elif not ok:
                     if gate_ok_prev:
-                        log.warning("pool client: ⚠️ gates caíram (%s) — "
-                                    "parando mineração", reason)
+                        log.warning("pool client: gates cairam (%s) — "
+                                    "parando mineracao", reason)
                         self._mining_active.clear()
-                        self._mining_threads_spawned = False
+                        self._reset_dead_threads()
                     gate_ok_prev = False
             except Exception as e:
                 log.warning("pool client: gate check falhou: %s", e)
@@ -293,18 +351,53 @@ class PoolClient(threading.Thread):
             if self._stop.wait(poll_gate_s):
                 break
 
-    def _spawn_mining_threads(self):
-        threading.Thread(target=self._loop_heartbeat, daemon=True,
-                         name="Pool-HB").start()
-        threading.Thread(target=self._loop_work, daemon=True,
-                         name="Pool-Work").start()
-        if not self.is_alive():
-            try:
-                self.start()
-            except RuntimeError:
-                threading.Thread(target=self.run, daemon=True,
-                                 name="Pool-PoW").start()
+    # ------------------------------------------------------------------
+    # Worker threads
+    # ------------------------------------------------------------------
+    def _reset_dead_threads(self):
+        """[FIX v7.5] limpa flags apenas para threads que já morreram."""
+        with self._lock:
+            for attr in ("_hb_thread", "_work_thread", "_pow_thread"):
+                t = getattr(self, attr)
+                if t is not None and not t.is_alive():
+                    setattr(self, attr, None)
 
+    def _spawn_mining_threads(self):
+        with self._lock:
+            # heartbeat
+            if self._hb_thread is None or not self._hb_thread.is_alive():
+                self._hb_thread = threading.Thread(
+                    target=self._loop_heartbeat, daemon=True,
+                    name="Pool-HB")
+                self._hb_thread.start()
+
+            # fetch de work
+            if self._work_thread is None or not self._work_thread.is_alive():
+                self._work_thread = threading.Thread(
+                    target=self._loop_work, daemon=True,
+                    name="Pool-Work")
+                self._work_thread.start()
+
+            # PoW
+            if self._pow_thread is None or not self._pow_thread.is_alive():
+                # self (PoolClient) é Thread; se já foi iniciado e morreu,
+                # não pode ser re-startado — usa Thread alvo.
+                if not self.is_alive() and self.ident is None:
+                    self._pow_thread = self
+                    try:
+                        self.start()
+                    except RuntimeError:
+                        self._pow_thread = threading.Thread(
+                            target=self.run, daemon=True, name="Pool-PoW")
+                        self._pow_thread.start()
+                else:
+                    self._pow_thread = threading.Thread(
+                        target=self.run, daemon=True, name="Pool-PoW")
+                    self._pow_thread.start()
+
+    # ------------------------------------------------------------------
+    # Heartbeat / Work
+    # ------------------------------------------------------------------
     def _loop_heartbeat(self):
         if not self._mining_active.is_set():
             return
@@ -341,7 +434,8 @@ class PoolClient(threading.Thread):
                        {"miner_id": self.miner_id})
         if not r.get("ok"):
             self.last_error = r.get("msg", "work falhou")
-            if "desconhecido" in self.last_error.lower():
+            low = self.last_error.lower()
+            if "desconhecido" in low or "expirado" in low:
                 self._reregister()
             return
         job = r.get("job") or {}
@@ -359,14 +453,23 @@ class PoolClient(threading.Thread):
                 "pubkey":   self.pubkey,
             })
             if r.get("ok"):
-                self.miner_id = r.get("miner_id", self.miner_id)
+                new_id = r.get("miner_id", self.miner_id)
+                if new_id != self.miner_id:
+                    log.info("pool client: miner_id atualizado %s -> %s",
+                             self.miner_id, new_id)
+                    self.miner_id = new_id
                 self._fetch_work()
         except Exception:
             pass
 
+    # ------------------------------------------------------------------
+    # PoW loop
+    # ------------------------------------------------------------------
     def run(self):
+        # Espera o primeiro work chegar
         for _ in range(10):
             if self._stop.is_set() or not self._mining_active.is_set():
+                self._running = False
                 return
             try:
                 self._fetch_work()
@@ -379,10 +482,13 @@ class PoolClient(threading.Thread):
 
         nonce = 0
         last_job_id = None
+        sampled_at = self.hashes_total
 
         while not self._stop.is_set():
             if not self._mining_active.is_set():
                 log.info("pool client: PoW pausado (gates caíram)")
+                # [FIX v7.5] não zera _running aqui: _loop_gate_wait
+                # gerencia. run() só sai.
                 return
 
             with self._job_lock:
@@ -395,6 +501,7 @@ class PoolClient(threading.Thread):
             if job.get("job_id") != last_job_id:
                 last_job_id = job.get("job_id")
                 nonce = 0
+                sampled_at = self.hashes_total
 
             share_diff = int(job.get("share_difficulty", 4))
             diff = int(job.get("difficulty", 5))
@@ -404,12 +511,18 @@ class PoolClient(threading.Thread):
             merkle = job["merkle"]
             ts = int(job["timestamp"])
 
-            # Lote de 5k para atualizar o medidor rápido
-            batch = 5000
-            for i in range(batch):
+            for _i in range(POW_BATCH_SIZE):
                 if self._stop.is_set() or not self._mining_active.is_set():
                     break
+
                 h = block_hash(prev, merkle, ts, nonce, diff)
+                self.hashes_total += 1
+
+                # [FIX v7.5] amostra a cada HASHRATE_SAMPLE_EVERY hashes
+                # para o hashrate fluir em sub-segundo.
+                if self.hashes_total - sampled_at >= HASHRATE_SAMPLE_EVERY:
+                    self.hashrate_meter.add(self.hashes_total)
+                    sampled_at = self.hashes_total
 
                 if int(h, 16) <= target_int:
                     self.shares_submitted += 1
@@ -432,20 +545,29 @@ class PoolClient(threading.Thread):
                     else:
                         self.shares_rejected += 1
                         self.last_error = r.get("msg", "rejeitado")
-                        if ("job expirado" in self.last_error.lower()
-                                or "desconhecido" in self.last_error.lower()):
+                        low = self.last_error.lower()
+                        if "job expirado" in low or "desconhecido" in low:
                             self._fetch_work()
                             break
                 nonce += 1
 
-            self.hashes_total += batch
+            # flush final do batch
             self.hashrate_meter.add(self.hashes_total)
+            sampled_at = self.hashes_total
 
+        # saída limpa
+        self._running = False
+        log.info("pool client: run() encerrado")
+
+    # ------------------------------------------------------------------
+    # Status
+    # ------------------------------------------------------------------
     def status(self) -> dict:
         with self._lock:
             job = self._job or {}
             sdiff = job.get("share_difficulty", 4)
             mining_active = self._mining_active.is_set()
+            rate = self.hashrate_meter.rate()
             return {
                 "ok": True,
                 "running": self._running,
@@ -455,8 +577,8 @@ class PoolClient(threading.Thread):
                 "gate_detail": self._gate_detail,
                 "miner_id": self.miner_id,
                 "address": self.address,
-                "hashrate": round(self.hashrate_meter.rate(), 2),
-                "hashrate_khs": round(self.hashrate_meter.rate() / 1000, 3),
+                "hashrate": round(rate, 2),
+                "hashrate_khs": round(rate / 1000, 3),
                 "hashes_total": self.hashes_total,
                 "shares_submitted": self.shares_submitted,
                 "shares_accepted": self.shares_accepted,
