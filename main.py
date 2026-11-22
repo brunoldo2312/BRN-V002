@@ -1,20 +1,26 @@
-"""main.py — Entrypoint do nó BRN (v13.9.28)
+"""main.py — Entrypoint do nó BRN (v13.9.29)
 ================================================================
-v13.9.28 (2026-11-22) — WIRING VISÍVEL E RE-WIRE PÓS-UNLOCK:
-  [NEW] _ensure_wiring(chain, stage) — wrapper que chama auto_wire.wire_all(),
-        loga trust/sk/p2p/collector e avisa o que está faltando em cada etapa.
-        Chamado em 5 pontos: post-blockchain, post-trust, post-p2p,
-        post-gui-unlock, post-start.
-  [FIX] Após _auto_unlock_gui() setar a SK, o _sign_collector é recriado.
-        Antes ficava None para sempre porque set_p2p rodava antes do unlock
-        (SK ainda não existia), e ninguém refazia o collector depois.
-  [NEW] Banner mostra blockchain.__version__ e status do BRN_AUTO_WIRE
-        para diagnóstico imediato (se o v9.6.0 não estiver no disco, aparece).
-  [KEEP] Tudo de v13.9.27 preservado (origin override, backup, fast-sync,
-         identity, wallet GUI, peer-healer, trust-daemon, explorer, etc).
+v13.9.29 (2026-11-22) — BOOTSTRAP DE GENESIS E DIAGNÓSTICO:
+  [NEW] _try_fetch_genesis_from_peers() — antes de criar Blockchain,
+        se o DB local está vazio (height < 0), busca o bloco genesis
+        via HTTP /api/block/0 de cada BRN_BOOTSTRAP_PEERS. Se algum
+        responder, inicializa o DB com ESSE genesis em vez do hardcoded.
+        Evita fork imediato quando DB local foi wipado e os peers têm
+        genesis diferente (que era o bug do v13.9.28).
+  [NEW] _diagnose_genesis_health() — depois do Blockchain criado,
+        compara local genesis vs peers (timeout 2s, só 3 primeiros).
+        Se há divergência, loga bloco "FORK DE GENESIS" com hashes
+        lado a lado (não destrutivo, só aviso).
+  [NEW] CLI --no-genesis-bootstrap — desliga o passo acima, volta
+        ao comportamento antigo (usa GENESIS_BLOCK hardcoded).
+  [NEW] Banner mostra GENESIS: peer <ip> | hardcoded | existing
+  [KEEP] v13.9.28: wiring visível (5x), re-wire pós-GUI, banner com
+         blockchain version + auto-wire status
+  [KEEP] v13.9.27: origin promotion persistente
+  [KEEP] v13.9.26: backup + secret persistente
+v13.9.28 (2026-11-22) — WIRING VISÍVEL E RE-WIRE PÓS-UNLOCK
 v13.9.27 (2026-11-21) — ORIGIN PROMOTION PERSISTENTE
 v13.9.26 (2026-11-20) — BACKUP + SECRET PERSISTENTE
-v13.9.25 (2026-11-17) — _maybe_enable_fast_sync + set_peer_id
 ================================================================
 """
 from __future__ import annotations
@@ -39,7 +45,7 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.28"
+    VERSION = "13.9.29"
     BUILD_DATE = "2026-11-22"
 
 try:
@@ -104,17 +110,16 @@ def parse_args():
     p.add_argument("--no-interactive", action="store_true")
     p.add_argument("--no-p2p", action="store_true")
     p.add_argument("--no-explorer", action="store_true")
+    p.add_argument("--no-genesis-bootstrap", action="store_true",
+                   help="[v13.9.29] desliga bootstrap de genesis via peers")
     p.add_argument("--db", metavar="PATH", default=None)
     p.add_argument("--web-port", type=int, default=None)
     p.add_argument("--p2p-port", type=int, default=None)
     p.add_argument("--version", action="store_true")
     p.add_argument("--skip-verify", action="store_true")
-    p.add_argument("--force-http-resync", action="store_true",
-                   help="renomeia o DB para .bak.TIMESTAMP e sai")
-    p.add_argument("--fast-sync-until", type=int, default=None,
-                   help="Altura até a qual pular validação completa")
-    p.add_argument("--no-fast-sync", action="store_true",
-                   help="Desativa fast-sync (validação completa desde o boot)")
+    p.add_argument("--force-http-resync", action="store_true")
+    p.add_argument("--fast-sync-until", type=int, default=None)
+    p.add_argument("--no-fast-sync", action="store_true")
     return p.parse_args()
 
 
@@ -175,15 +180,11 @@ def _setup_logging(level: str = "INFO") -> logging.Logger:
 
 
 # ============================================================
-# [NEW v13.9.28] WIRING VISÍVEL
+# [v13.9.28] WIRING VISÍVEL
 # ============================================================
 def _ensure_wiring(chain, stage: str = "?") -> dict:
     """Verifica e (se possível) injeta trust_net, local_validator_sk e
-    sign_collector via auto_wire.wire_all(). Loga o estado real em cada
-    etapa do boot.
-
-    Nunca levanta exceção — é seguro chamar quantas vezes quiser.
-    Retorna dict com estado atual (útil para chamar de testes)."""
+    sign_collector via auto_wire.wire_all(). Loga o estado real."""
     log = logging.getLogger("main")
 
     def _snapshot():
@@ -212,7 +213,6 @@ def _ensure_wiring(chain, stage: str = "?") -> dict:
         except Exception as e:
             log.warning("[wiring:%s] wire_all falhou: %s", stage, e)
 
-    # Log único e conciso (você vai ver 5 dessas no boot)
     log.info(
         "[wiring:%s] trust=%s sk=%s p2p=%s collector=%s",
         stage,
@@ -222,7 +222,6 @@ def _ensure_wiring(chain, stage: str = "?") -> dict:
         state["collector"] or "None",
     )
 
-    # Avisos concretos (não spam — só quando falta)
     if state["trust"] is None:
         log.warning(
             "[wiring:%s] ⚠ trust_net=None → multi-sig desligado "
@@ -242,6 +241,107 @@ def _ensure_wiring(chain, stage: str = "?") -> dict:
         )
 
     return state
+
+
+# ============================================================
+# [v13.9.29] BOOTSTRAP DE GENESIS VIA PEERS
+# ============================================================
+def _fetch_peer_genesis(peer_ip: str, timeout: float = 3.0):
+    """Tenta obter bloco genesis de um peer via HTTP."""
+    try:
+        url = f"http://{peer_ip}:5000/api/block/0"
+        req = urllib.request.Request(url, headers={"User-Agent": "brn-bootstrap/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            b0 = json.loads(resp.read().decode("utf-8"))
+        if not isinstance(b0, dict):
+            return None
+        if b0.get("height") != 0:
+            return None
+        if not b0.get("hash") or not b0.get("transactions"):
+            return None
+        return b0
+    except Exception as e:
+        logging.getLogger("main").debug("[genesis] peer %s falhou: %s", peer_ip, e)
+        return None
+
+
+def _try_fetch_genesis_from_peers():
+    """Percorre BRN_BOOTSTRAP_PEERS, retorna o primeiro genesis válido."""
+    log = logging.getLogger("main")
+    peers = [p.strip() for p in os.environ.get("BRN_BOOTSTRAP_PEERS", "").split(",") if p.strip()]
+    if not peers:
+        log.warning("[genesis] BRN_BOOTSTRAP_PEERS vazio — não é possível buscar genesis")
+        return None
+
+    for peer in peers:
+        ip = peer.rsplit(":", 1)[0] if ":" in peer else peer
+        log.info("[genesis] tentando %s…", ip)
+        b0 = _fetch_peer_genesis(ip)
+        if b0:
+            return b0, ip
+    return None, None
+
+
+def _diagnose_genesis_health(chain, db_path):
+    """Compara genesis local com peers. NÃO destrutivo — só loga."""
+    log = logging.getLogger("main")
+    
+    try:
+        local_b0 = chain.db.get_block(0)
+        if not local_b0:
+            return
+        local_hash = local_b0.get("hash", "")
+    except Exception as e:
+        log.debug("[genesis-health] local falhou: %s", e)
+        return
+    
+    peers = [p.strip() for p in os.environ.get("BRN_BOOTSTRAP_PEERS", "").split(",") if p.strip()]
+    if not peers:
+        return
+    
+    local_h = chain.db.height()
+    matches = []
+    mismatches = []
+    offline = []
+    peer_hashes = {}
+    
+    for peer in peers[:3]:
+        ip = peer.rsplit(":", 1)[0] if ":" in peer else peer
+        b0 = _fetch_peer_genesis(ip, timeout=2.0)
+        if not b0:
+            offline.append(ip)
+            continue
+        ph = b0.get("hash", "")
+        peer_hashes[ip] = ph
+        if ph == local_hash:
+            matches.append(ip)
+        else:
+            mismatches.append(ip)
+    
+    if matches and not mismatches:
+        log.info("[genesis-health] OK: genesis local == %d peer(s)", len(matches))
+    elif mismatches and not matches:
+        log.warning("=" * 64)
+        log.warning(" [genesis-health] ⚠ FORK DE GENESIS DETECTADO")
+        log.warning("=" * 64)
+        log.warning("  local genesis : %s…", local_hash[:32])
+        for ip, ph in peer_hashes.items():
+            log.warning("  peer %-15s: %s…", ip, ph[:32])
+        log.warning("  chain local (%d blocos) NÃO vai sincronizar com esses peers", local_h)
+        log.warning("  Para corrigir:")
+        log.warning("    a) Restaure backup: brn_v2_chain.db.bak.* ou backups/chain_*.db")
+        log.warning("    b) Copie DB do peer via scp")
+        log.warning("    c) Apague DB e rode de novo (bootstrap busca genesis do peer)")
+        log.warning("=" * 64)
+    elif mismatches and matches:
+        log.warning(
+            "[genesis-health] PEERS DIVERGEM: %d OK, %d FORK. "
+            "Verifique se algum peer está desatualizado.",
+            len(matches), len(mismatches),
+        )
+    
+    if offline and not matches and not mismatches:
+        log.debug("[genesis-health] nenhum peer respondeu (offline)")
 
 
 # ============================================================
@@ -279,7 +379,6 @@ def _resolve_fast_sync_until(args) -> int:
 
 def _maybe_enable_fast_sync(fast_sync_until: int, args) -> None:
     log = logging.getLogger("main")
-
     os.environ["BRN_FAST_SYNC_UNTIL"] = str(fast_sync_until)
 
     no_fast_sync = getattr(args, "no_fast_sync", False)
@@ -641,8 +740,6 @@ def _setup_p2p(chain, node_id_priv, p2p_port: int):
     try:
         from p2p_unified import P2PManager
         p2p = P2PManager(chain, node_id_priv=node_id_priv, tcp_port=p2p_port)
-        # [v13.9.28] set_p2p no blockchain v9.6.0 cria o sign_collector.
-        # Logamos o estado logo depois para você ver se funcionou.
         chain.set_p2p(p2p)
         collector_ok = getattr(chain, "_sign_collector", None) is not None
         log.info("[p2p] set_p2p OK — collector=%s",
@@ -997,10 +1094,6 @@ def _auto_unlock_gui(api, allow_interactive: bool = True) -> tuple:
 
 
 class _WalletAPIAdapter:
-    """
-    Adapta _wi (wallet_integrator) ou _Wallet (Wallet) para a interface
-    consumida por _auto_unlock_gui: has_wallet/get_active_wallet/unlock_wallet.
-    """
     def __init__(self, chain):
         self.chain = chain
 
@@ -1082,10 +1175,7 @@ def main() -> int:
         print(f"BRN v{VERSION} ({BUILD_DATE})")
         return 0
 
-    # 1. Carrega .env
     n_loaded = _load_env_file()
-
-    # 2. Logging
     log = _setup_logging(os.environ.get("BRN_LOG_LEVEL", "INFO"))
     if n_loaded:
         log.info("[env] %d variável(is) carregada(s) de brn_network.env", n_loaded)
@@ -1093,16 +1183,13 @@ def main() -> int:
     if args.headless:
         os.environ["BRN_HEADLESS"] = "1"
 
-    # 3. DB path
     if args.db:
         os.environ["BRN_DB"] = args.db
 
-    # 4. Force resync?
     if args.force_http_resync:
         _do_force_http_resync(headless=args.headless)
         return 0
 
-    # 5. auto_discovery (Tailscale) — DEPOIS do logging
     if not args.no_auto_config and not args.no_p2p:
         try:
             import auto_discovery
@@ -1112,14 +1199,12 @@ def main() -> int:
         except Exception as e:
             log.debug("[auto-discovery] falhou: %s", e)
 
-    # 6. Bootstrap peers via JSON (fallback)
     if not os.environ.get("BRN_BOOTSTRAP_PEERS"):
         bpj = _read_bootstrap_json()
         if bpj:
             os.environ["BRN_BOOTSTRAP_PEERS"] = bpj
             log.info("[bootstrap] %d peer(s) de bootstrap_peers.json", len(bpj.split(",")))
 
-    # 7. Resolve portas
     web_port = args.web_port or int(
         os.environ.get("BRN_WEB_PORT", os.environ.get("PORT", "5000"))
     )
@@ -1128,12 +1213,10 @@ def main() -> int:
     os.environ["BRN_WEB_PORT"] = str(web_port)
     os.environ["BRN_P2P_PORT"] = str(p2p_port)
 
-    # 8. Fast-sync
     fast_sync_until = _resolve_fast_sync_until(args)
     _maybe_enable_fast_sync(fast_sync_until, args)
     SK_VALIDATION_STATE["fast_sync_until"] = fast_sync_until
 
-    # 9. Network secret (v13.9.26) — ANTES de importar blockchain
     try:
         from network_secret import ensure_network_secret
         ensure_network_secret()
@@ -1142,7 +1225,6 @@ def main() -> int:
     except Exception as e:
         log.warning("[secret] falhou: %s", e)
 
-    # 10. Auto-restore de backup (v13.9.26) — ANTES de abrir o DB
     try:
         from backup_manager import auto_restore_on_boot
         _r = auto_restore_on_boot()
@@ -1158,21 +1240,17 @@ def main() -> int:
     except Exception as e:
         log.warning("[backup] auto-restore falhou: %s", e)
 
-    # 11. is_origin inicial (env ou --origem)
     is_origin = args.origem or os.environ.get("BRN_IS_ORIGIN", "0") == "1"
     os.environ["BRN_IS_ORIGIN"] = "1" if is_origin else "0"
 
-    # 12. Verifica versão blockchain (multi-sig)
     _check_blockchain_version()
 
-    # 13. Identidade
     try:
         node_priv, node_pub = _load_or_create_node_identity()
     except Exception as e:
         log.error("[identity] falhou: %s", e)
         return 1
 
-    # 14. Deriva PEER_ID
     try:
         if len(node_pub) >= 64:
             peer_id = hashlib.sha256(bytes.fromhex(node_pub)).hexdigest()[:16]
@@ -1183,9 +1261,6 @@ def main() -> int:
     os.environ["BRN_PEER_ID"] = peer_id
     log.info("[peer] PEER_ID = %s", peer_id)
 
-    # ============================================================
-    # [v13.9.27] ORIGIN OVERRIDE — aplica ANTES de Blockchain
-    # ============================================================
     db_path = os.environ.get("BRN_DB", "brn_v2_chain.db")
     try:
         from origin_manager import apply_origin_override_at_boot
@@ -1196,15 +1271,14 @@ def main() -> int:
         log.debug("[origin] origin_manager.py ausente — usando env direto")
     except Exception as e:
         log.warning("[origin] apply_origin_override falhou: %s", e)
-    # ============================================================
 
-    # 15. Banner (usa o is_origin FINAL) — [v13.9.28] mostra versão blockchain
     try:
         import blockchain as _bc_mod
         _bc_ver = getattr(_bc_mod, "__version__", "?")
     except Exception:
         _bc_ver = "?"
 
+    # Banner (antes de bootstrap de genesis para você ver a config)
     log.warning("=" * 64)
     log.warning(" BRN Node v%s (%s)", VERSION, BUILD_DATE)
     log.warning("=" * 64)
@@ -1216,30 +1290,115 @@ def main() -> int:
     log.warning(" Fast-sync: %d", fast_sync_until)
     log.warning(" BRN Core : blockchain.py v%s", _bc_ver)
     log.warning(" Auto-wire: %s", os.environ.get("BRN_AUTO_WIRE", "1"))
+
+    # ============================================================
+    # [v13.9.29] Detecta genesis e bootstrap via peers se DB vazio
+    # ============================================================
+    db_current_h = _get_current_db_height(db_path)
+    db_empty = db_current_h < 0
+    genesis_source = "existing"
+    
+    if db_empty:
+        log.warning(" Genesis  : (DB vazio, será inicializado)")
+    else:
+        # DB já tem dados — mostra o genesis real
+        try:
+            from db import ChainDB
+            _tmp_db = ChainDB(db_path)
+            _gb = _tmp_db.get_block(0)
+            _tmp_db.close()
+            if _gb:
+                log.warning(" Genesis  : %s…", _gb["hash"][:32])
+        except Exception:
+            log.warning(" Genesis  : (não foi possível ler)")
+
     log.warning("=" * 64)
 
-    # 16. Cria Blockchain
+    # 16. Cria Blockchain — [v13.9.29] com bootstrap de genesis via peers
     try:
         from blockchain import Blockchain
-        chain = Blockchain(
-            db_path=db_path,
-            auto_genesis=True,
-            network_secret=os.environ.get("BRN_NETWORK_SECRET", ""),
-        )
+
+        if db_empty and not args.no_genesis_bootstrap:
+            log.warning("[genesis] DB vazio — buscando genesis dos peers")
+            peer_genesis, peer_ip = _try_fetch_genesis_from_peers()
+
+            if peer_genesis:
+                log.warning("[genesis] genesis obtido de %s: %s…",
+                            peer_ip, peer_genesis["hash"][:32])
+                chain = Blockchain(
+                    db_path=db_path,
+                    auto_genesis=False,
+                    network_secret=os.environ.get("BRN_NETWORK_SECRET", ""),
+                )
+                try:
+                    chain.db.add_block(peer_genesis)
+                    chain.db.apply_tx(peer_genesis["transactions"][0], 0, coinbase=True)
+                    chain.db.set_meta("genesis_hash", peer_genesis["hash"])
+                    chain.genesis_expected_hash = peer_genesis["hash"]
+                    genesis_source = f"peer:{peer_ip}"
+                    log.warning("[genesis] DB inicializado com genesis do peer")
+                    log.warning("[genesis]   address : %s",
+                                peer_genesis["transactions"][0]["outputs"][0]["address"])
+                    log.warning("[genesis]   height  : 0 (pronto para sync)")
+                except Exception as e:
+                    log.error("[genesis] falha ao gravar genesis do peer: %s", e)
+                    log.warning("[genesis] caindo para GENESIS_BLOCK hardcoded")
+                    chain = Blockchain(
+                        db_path=db_path,
+                        auto_genesis=True,
+                        network_secret=os.environ.get("BRN_NETWORK_SECRET", ""),
+                    )
+                    genesis_source = "hardcoded(fallback)"
+            else:
+                log.warning("=" * 64)
+                log.warning(" [genesis] ⚠ NENHUM peer respondeu com /api/block/0")
+                log.warning(" [genesis] usando GENESIS_BLOCK hardcoded")
+                log.warning(" [genesis] ⚠ Se peers têm genesis diferente, sync vai")
+                log.warning(" [genesis]    falhar com 'prev_hash diverge em #1'")
+                log.warning(" [genesis]    Corrija depois com: --force-http-resync")
+                log.warning("=" * 64)
+                chain = Blockchain(
+                    db_path=db_path,
+                    auto_genesis=True,
+                    network_secret=os.environ.get("BRN_NETWORK_SECRET", ""),
+                )
+                genesis_source = "hardcoded(no-peers)"
+        elif db_empty and args.no_genesis_bootstrap:
+            log.warning("[genesis] --no-genesis-bootstrap setado — usando hardcoded")
+            chain = Blockchain(
+                db_path=db_path,
+                auto_genesis=True,
+                network_secret=os.environ.get("BRN_NETWORK_SECRET", ""),
+            )
+            genesis_source = "hardcoded(forced)"
+        else:
+            # DB tem dados — abre normal
+            chain = Blockchain(
+                db_path=db_path,
+                auto_genesis=True,
+                network_secret=os.environ.get("BRN_NETWORK_SECRET", ""),
+            )
+            genesis_source = "existing"
+
         chain.is_origin = is_origin
+
+        # [v13.9.29] Diagnóstico pós-boot (não destrutivo)
+        if not db_empty:
+            try:
+                _diagnose_genesis_health(chain, db_path)
+            except Exception as e:
+                log.debug("[genesis] diagnose falhou: %s", e)
     except Exception as e:
         log.exception("[chain] init falhou")
         return 1
 
     log.info("[chain] height=%d tip=%s…",
              chain.db.height(), chain.db.tip_hash()[:16])
+    log.info("[chain] genesis_source=%s", genesis_source)
     SK_VALIDATION_STATE["local_height"] = chain.db.height()
 
-    # [v13.9.28] Wiring stage 1: depois do Blockchain.__init__
-    # (o auto_wire já rodou dentro do __init__, isso só confirma/loga)
     _ensure_wiring(chain, "post-blockchain")
 
-    # 17. Backup periódico (v13.9.26) — DEPOIS da chain
     if os.environ.get("BRN_AUTO_BACKUP", "0") == "1":
         try:
             from backup_manager import start_periodic_backup
@@ -1249,26 +1408,18 @@ def main() -> int:
         except Exception as e:
             log.warning("[AUTO-BACKUP] falhou: %s", e)
 
-    # 18. Trust
     trust = _setup_trust(chain, node_priv, is_origin)
     _ensure_wiring(chain, "post-trust")
 
-    # 19. P2P (cria sign_collector via set_p2p)
     p2p = None
     if not args.no_p2p:
         p2p = _setup_p2p(chain, node_priv, p2p_port)
     _ensure_wiring(chain, "post-p2p")
 
-    # 20. Sync
     sync_mgr = _setup_sync(chain, p2p)
-
-    # 21. Broadcast
     _setup_broadcast(chain, p2p)
-
-    # 22. Pool (usa is_origin FINAL após override)
     pool = _setup_pool(chain, is_origin)
 
-    # 23. Shutdown event + signal handlers
     stop_evt = threading.Event()
 
     def _handle_signal(signum, frame):
@@ -1281,7 +1432,6 @@ def main() -> int:
     except (ValueError, OSError):
         pass
 
-    # 24. Wallet GUI unlock (só se não headless e não no-gui)
     gui_unlocked = False
     if not args.headless and not args.no_gui:
         try:
@@ -1294,29 +1444,22 @@ def main() -> int:
             ok_unlock, src, addr, err = _auto_unlock_gui(
                 api, allow_interactive=allow_interactive)
             gui_unlocked = bool(ok_unlock and not err)
-            # [v13.9.28] Re-wire após GUI unlock — SK pode ter sido setada
-            # por _WalletAPIAdapter.unlock_wallet() e o collector precisa
-            # ser recriado (foi criado em set_p2p antes da SK existir).
             if gui_unlocked:
                 _ensure_wiring(chain, "post-gui-unlock")
         except Exception as e:
             log.warning("[GUI] unlock falhou: %s", e)
 
-    # 25. Web server
     _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port, stop_evt)
 
-    # 26. Explorer
     if not args.no_explorer:
         _start_explorer(chain)
 
-    # 27. Watchdog
     threading.Thread(
         target=_wallet_watchdog_loop,
         args=(chain, p2p, trust, stop_evt, 30),
         daemon=True, name="Watchdog",
     ).start()
 
-    # 28. Peer healer
     if p2p is not None:
         threading.Thread(
             target=_peer_healer_loop,
@@ -1324,7 +1467,6 @@ def main() -> int:
             daemon=True, name="PeerHealer",
         ).start()
 
-    # 29. Trust daemon
     try:
         _setup_trust_daemon(
             chain, trust, p2p,
@@ -1334,7 +1476,6 @@ def main() -> int:
     except Exception as e:
         log.warning("[trust-daemon] setup falhou: %s", e)
 
-    # 30. Auto-mine (cliente)
     if os.environ.get("BRN_AUTO_MINE", "0") == "1" and not args.no_pool_client:
         def _auto_mine_loop():
             url = f"http://127.0.0.1:{web_port}/api/pool/start_local"
@@ -1367,12 +1508,11 @@ def main() -> int:
                          daemon=True, name="AutoMine").start()
         log.info("[AUTO-MINE] thread iniciada (30s entre tentativas)")
 
-    # 31. Loop principal
-    # [v13.9.28] Wiring stage final — confirma estado logo antes do loop
     _ensure_wiring(chain, "post-start")
 
     log.warning("=" * 64)
     log.warning(" NÓ INICIADO — aguardando shutdown (Ctrl+C)")
+    log.warning(" Genesis: %s", genesis_source)
     log.warning("=" * 64)
 
     try:
@@ -1382,7 +1522,6 @@ def main() -> int:
         log.warning("[shutdown] Ctrl+C")
         stop_evt.set()
 
-    # Cleanup ordenado
     log.warning("[shutdown] parando componentes…")
     try:
         if p2p is not None and hasattr(p2p, "stop"):
