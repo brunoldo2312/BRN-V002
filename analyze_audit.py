@@ -31,13 +31,13 @@ def analyze(log_file: str):
     node_to_variant = {}         # node_id_hash -> "A" ou "B"
     exposures = {"A": 0, "B": 0}
     unique_nodes = {"A": set(), "B": set()}
-    
+
     # Eventos de resultado por variante
     events = {
         "A": defaultdict(int),
         "B": defaultdict(int)
     }
-    
+
     # Controle diário para calcular o 'r' (novas carteiras/dia)
     daily_nodes = defaultdict(set)
     unattributed_events = 0
@@ -126,7 +126,7 @@ def analyze(log_file: str):
     print(f"  Exposições Totais : {total_exp}")
     print(f"  Controle (A)      : {exp_a} ({pct_a:.1f}%)")
     print(f"  Tratamento (B)    : {exp_b} ({pct_b:.1f}%)")
-    
+
     # SRM check: se um lado for < 45% ou > 55%, há alerta.
     srm_ok = True
     if abs(pct_a - 50) > 5:
@@ -134,7 +134,7 @@ def analyze(log_file: str):
         srm_ok = False
     else:
         print("  ✅ [OK] Distribuição balanceada.")
-        
+
     if unattributed_events > 0:
         print(f"  ⚠️  [ALERTA] {unattributed_events} eventos importantes (miner_start_ok, etc) ocorreram sem exposição registrada.")
 
@@ -142,11 +142,11 @@ def analyze(log_file: str):
     print("\n[Gate 2] Evidência Estatística (Métrica Primária: Ativação)")
     act_a = events["A"]["miner_start_ok"]
     act_b = events["B"]["miner_start_ok"]
-    
+
     rate_a = safe_div(act_a, exp_a)
     rate_b = safe_div(act_b, exp_b)
     lift = rate_b - rate_a
-    
+
     print(f"  Ativação A (Controle)   : {act_a}/{exp_a} = {rate_a*100:.2f}%")
     print(f"  Ativação B (Tratamento) : {act_b}/{exp_b} = {rate_b*100:.2f}%")
     print(f"  Lift Absoluto           : {lift*100:+.2f} pontos percentuais")
@@ -157,7 +157,7 @@ def analyze(log_file: str):
         # Proporção agrupada (pooled proportion)
         p_pool = (act_a + act_b) / (exp_a + exp_b)
         se = math.sqrt(p_pool * (1 - p_pool) * ((1/exp_a) + (1/exp_b)))
-        
+
         if se > 0:
             z_score = lift / se
             print(f"  Z-score                 : {z_score:+.3f}")
@@ -170,27 +170,27 @@ def analyze(log_file: str):
 
     # ---- Gate 3: Guarda-Rails ----
     print("\n[Gate 3] Guarda-Rails (Segurança)")
-    
+
     # Calcula taxas de falha por variante
     def print_guardrail(name, ev_key):
         a_count = events["A"][ev_key]
         b_count = events["B"][ev_key]
         a_rate = safe_div(a_count, exp_a)
         b_rate = safe_div(b_count, exp_b)
-        
+
         diff = b_rate - a_rate
         symbol = "🔴" if diff > 0.05 else "🟢" # Vermelho se B for 5pp pior
-        
+
         print(f"  {symbol} {name:<22} | A: {a_count:>3} ({a_rate*100:>5.1f}%) | B: {b_count:>3} ({b_rate*100:>5.1f}%)")
 
     print_guardrail("Falha ao Minerar", "miner_start_failed")
     print_guardrail("Transferência Rejeitada", "transfer_rejected")
     print_guardrail("Rate Limit Atingido", "rate_limit_hit")
-    
+
     # ---- Métricas Secundárias e Aceleração ----
     print("\n[Métricas Secundárias]")
     print_guardrail("Transferência com Sucesso", "transfer_ok")
-    
+
     print("\n[Taxa de Novas Carteiras (r)]")
     dias = len(daily_nodes)
     total_unicos = len(set.union(*daily_nodes.values())) if daily_nodes else 0
@@ -206,9 +206,10 @@ def analyze(log_file: str):
     print("\n" + "="*70)
     print(" 📝 VEREDITO (Sugestão baseada nos 4 Gates)")
     print("="*70)
-    
+
     z = locals().get('z_score', 0)
-    
+    r_val = locals().get('r', float('inf'))   # [FIX] evita NameError se dias == 0
+
     if total_exp < 50:
         print(f"  ⏳ HOLD: Amostra muito pequena ({total_exp} exposições).")
         print("     Continue coletando dados até ter pelo menos 50 usuários por variante.")
@@ -218,16 +219,27 @@ def analyze(log_file: str):
         print("  ✅ SHIP: A Variante B (Banner) aumentou a ativação de forma significativa.")
         print("     Recomendação: Desligar o A/B test e deixar o Banner ligado para 100% dos usuários.")
     elif abs(z) >= 1.96 and lift < 0:
-        print("  ❌ KILL: A Variante B DIMINUIU a ativação. Reverta para a tela original.")
+        print("  ❌ KILL: A Variante B (Banner) DIMINUIU a ativação de forma significativa.")
+        print("     Recomendação: Desligar a Variante B e manter o Controle (A) para 100%.")
+    elif r_val < 30:
+        print(f"  ⚠️  INCONCLUSIVO + VOLUME BAIXO: |Z| = {abs(z):.2f} < 1.96 e r = {r_val:.1f}/dia.")
+        print("     O A/B clássico levará semanas para atingir significância.")
+        print("     Recomendação: adotar o CTA para 100% se o Lift pontual for positivo")
+        print("     e monitorar guard-rails manualmente (r < 30 já justifica rollout).")
     else:
-        print("  ⏳ HOLD: Nenhuma diferença estatisticamente significativa observada até agora.")
-        print("     Recomendação: Manter o teste rodando.")
-    
+        print("  ⏳ HOLD: Continue coletando dados (|Z| < 1.96).")
+        print(f"     Amostra atual: {total_exp} exposições ({exp_a} A / {exp_b} B).")
     print("="*70)
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Analisa o audit.log do Teste A/B")
-    parser.add_argument("--log", default=DEFAULT_LOG, help="Caminho do arquivo de log")
-    args = parser.parse_args()
-    
+    ap = argparse.ArgumentParser(
+        prog="analyze_audit.py",
+        description="Calculadora de Resultados do Teste A/B (BRN)",
+    )
+    ap.add_argument(
+        "--log", default=DEFAULT_LOG,
+        help=f"caminho do log a analisar (default: {DEFAULT_LOG})",
+    )
+    args = ap.parse_args()
     analyze(args.log)
