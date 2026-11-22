@@ -7,12 +7,11 @@ REM ============================================================
 REM  [0/9] VARIAVEIS DE AMBIENTE
 REM ============================================================
 echo ============================================================
-echo   INICIANDO BRN NODE - CLIENTE (v4 - SK auto)
+echo   INICIANDO BRN NODE - CLIENTE (v4.1 - SK auto)
 echo ============================================================
 echo.
 echo [0/9] Carregando configuracoes de rede e senhas...
 
-REM --- Rede (blockchain) ---
 set "BRN_NETWORK_SECRET=088641fd110a36bcb3a1bd3d497d8cd68287bf10e49eedfc52d1fc0329ef8d12"
 set "BRN_MAX_VALIDATORS=3"
 set "BRN_VALIDATOR_QUORUM=0.51"
@@ -33,37 +32,25 @@ set "BRN_CHECKPOINT_INTERVAL=100"
 set "BRN_ORIGIN_PUBKEY=03c0f4604d5264b5eda409eac8212267bd76ff46973bb14e01a16c290f437e0e6e"
 set "BRN_TCP_TIMEOUT=30.0"
 
-REM --- Bootstrap: SO o Ubuntu (o 100.64.151.67 morreu com 283 falhas) ---
 set "BRN_BOOTSTRAP_PEERS=100.111.253.8:6001"
 set "BRN_POOL_URL=http://100.111.253.8:5000"
 
-REM --- Este no e CLIENTE (nao Origin) ---
 set "BRN_IS_ORIGIN=0"
 set "BRN_POOL_ENABLED=0"
 
-REM --- Senhas (usadas para decifrar current_wallet.enc) ---
 set "BRN_NODE_PASSWORD=senha-forte-windows-2026"
 set "BRN_WALLET_SESSION_PASS=carteira-windows-2026"
 set "BRN_WEB_PASS=web-windows-2026"
 
-REM --- Logging (DEBUG mostra [wiring], [auto_wire], [collector]) ---
 set "BRN_LOG_LEVEL=DEBUG"
-
-REM --- Auto-wire: forca deteccao automatica de trust/sk/collector ---
 set "BRN_AUTO_WIRE=1"
-
-REM --- Multi-sig: mantem bypass de bootstrap (rede pequena) ---
 set "BRN_STRICT_MULTISIG=0"
-
-REM --- Fast-sync: NAO forca assume_valid (main.py decide pelo DB) ---
 set "BRN_ASSUME_VALID_UNTIL=0"
 set "BRN_BOOTSTRAP_SKIP_SIGS_UNTIL=4085"
 
-REM --- Python unbuffered (logs em tempo real) ---
 set "PYTHONUNBUFFERED=1"
 set "PYTHONIOENCODING=utf-8"
 
-REM --- PBFT: main.py v13.9.29 nao integra set_pbft ---
 set "BRN_PBFT_ENABLED=0"
 set "BRN_PBFT_ENFORCE=0"
 
@@ -141,7 +128,7 @@ echo OK.
 echo.
 
 REM ============================================================
-REM  [4/9] PRE-FLIGHT: arquivos, carteira, SK
+REM  [4/9] PRE-FLIGHT
 REM ============================================================
 echo [4/9] PRE-FLIGHT: arquivos, carteira, SK...
 echo.
@@ -154,7 +141,7 @@ for %%F in (blockchain.py main.py server.py db.py wallet.py crypto.py auto_wire.
         echo   [X]  %%F AUSENTE - critico
     )
 )
-if exist "brn_miner.dll" (echo   [ok] brn_miner.dll) else (echo   [WARN] brn_miner.dll ausente - PoW lento)
+if exist "brn_miner.dll" (echo   [ok] brn_miner.dll) else (echo   [WARN] brn_miner.dll ausente)
 echo.
 
 echo   --- Versao do blockchain.py ---
@@ -172,16 +159,16 @@ echo.
 
 REM --- Cria carteira se nao existir ---
 if not exist "current_wallet.enc" (
-    echo   --- Criando carteira nova (current_wallet.enc) ---
+    echo   --- Criando carteira nova ---
     python -c "import os; pw = os.environ.get('BRN_WALLET_SESSION_PASS', 'carteira-windows-2026'); from wallet import Wallet; from secure_store import save_current_wallet; w = Wallet(); r = save_current_wallet(pw, {'address': w.address, 'private_key': w.priv_hex, 'public_key': w.pub_hex}); print('  Carteira criada:', w.address) if r.get('ok') else print('  FALHA:', r.get('msg'))"
 ) else (
     echo   --- current_wallet.enc ja existe ---
 )
 
-REM --- [v4] CRIA .validator_sk SE NAO EXISTIR ---
+REM --- Cria .validator_sk se nao existir ---
 if not exist ".validator_sk" (
     echo.
-    echo   --- Gerando .validator_sk (SK do validador) ---
+    echo   --- Gerando .validator_sk ---
     python -c "import os; pw = os.environ.get('BRN_WALLET_SESSION_PASS', 'carteira-windows-2026'); from wallet import Wallet; w = Wallet(); open('.validator_sk','w').write(w.priv_hex); print('  Endereco:', w.address); print('  Pubkey  :', w.pub_hex[:16] + '...'); print('  SK salva em .validator_sk (64 hex chars)')"
     if errorlevel 1 (
         echo   [X] Falha ao gerar .validator_sk
@@ -194,18 +181,18 @@ if not exist ".validator_sk" (
 )
 echo.
 
-REM --- [v4] VERIFICA DETECCAO PELO AUTO_WIRE ---
+REM --- Verifica deteccao pelo auto_wire ---
 echo   --- Verificando deteccao de SK pelo auto_wire ---
-python -c "import os; os.environ['BRN_AUTO_WIRE']='1'; from auto_wire import _detect_sk; w, src = _detect_sk(); print('  auto_wire detecta:', src or 'NENHUMA SK') if w else print('  [X] NENHUMA SK ENCONTRADA pelas 5 fontes')"
+python -c "import os; os.environ['BRN_AUTO_WIRE']='1'; from auto_wire import _detect_sk; w, src = _detect_sk(); print('  auto_wire detecta:', src or 'NENHUMA SK') if w else print('  [X] NENHUMA SK ENCONTRADA')"
 if errorlevel 1 (
     echo   [X] Falha ao importar auto_wire
 )
 echo.
 
-REM --- Forca rede descentralizada (libera da fila) ---
+REM --- Forca rede descentralizada ---
 echo   --- Verificando fila de mineradores ---
 python -c "from db import ChainDB; d=ChainDB('brn_v2_chain.db'); m=d.get_meta('rede_descentralizada'); d.close(); print('  rede_descentralizada =', m or 'nao setado')"
-python -c "from db import ChainDB; d=ChainDB('brn_v2_chain.db'); d.set_meta('rede_descentralizada','1'); d.close(); print('  [ok] rede_descentralizada=1 (minera sem esperar 20 mineradores)')"
+python -c "from db import ChainDB; d=ChainDB('brn_v2_chain.db'); d.set_meta('rede_descentralizada','1'); d.close(); print('  [ok] rede_descentralizada=1')"
 echo.
 
 REM --- Conectividade dos peers ---
@@ -258,29 +245,21 @@ echo [ok] GUI opener iniciado
 echo.
 
 REM ============================================================
-REM  [8/9] O QUE PROCURAR NO LOG
+REM  [8/9] LOG
 REM ============================================================
 echo [8/9] O que procurar no log:
 echo.
-echo   ============================================================
-echo   SUCESSO (SK + auto-wire OK):
-echo   ============================================================
-echo   [auto_wire] trust=TrustNetwork sk=.validator_sk collector=OK validators=N
-echo   [wiring:post-p2p] trust=TrustNetwork sk=OK p2p=P2PManager collector=OK
+echo   SUCESSO:
+echo   [auto_wire] trust=TrustNetwork sk=.validator_sk collector=OK
 echo   [watchdog] SK detectada pk=...
-echo   [chain] height=4084
-echo   ============================================================
 echo.
-echo   FALHA (SK nao detectada):
-echo   ============================================================
+echo   FALHA:
 echo   [auto_wire] nenhuma SK encontrada
-echo   [wiring:post-p2p] _local_validator_sk=None
 echo   [watchdog] SK=None
-echo   ============================================================
 echo.
 
 REM ============================================================
-REM  [9/9] INICIA NO COM TEE (CONSOLE + ARQUIVO)
+REM  [9/9] INICIA NO
 REM ============================================================
 echo [9/9] Iniciando no (Ctrl+C para parar)...
 echo ============================================================
@@ -306,7 +285,7 @@ echo ============================================================
 echo.
 echo Log salvo em: %LOG_FILE%
 echo.
-echo Para ver o log completo:
+echo Para ver o log:
 echo   type "%LOG_FILE%"
 echo.
 pause
