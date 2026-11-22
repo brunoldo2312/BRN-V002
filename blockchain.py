@@ -1,17 +1,27 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.5.9 | Data: 15/11/2026
+Versão: 9.6.0 | Data: 22/11/2026
 ================================================================
+v9.6.0 (2026-11-22) — AUTO-WIRE DE CONSENSO:
+  [NEW] __init__ chama _auto_wire() quando BRN_AUTO_WIRE=1 (default).
+        Detecta e injeta automaticamente:
+          - trust_net        (trust_network.json ou BRN_TRUST_NETWORK)
+          - _local_validator_sk (BRN_VALIDATOR_SK_HEX / SEED / .validator_sk /
+                                 current_wallet.enc / current_wallet.json)
+        Torna /api/trust/nodes funcional sem tocar em main.py.
+  [NEW] set_p2p() cria sign_collector automaticamente ao receber o P2P
+        (pede sigs aos peers via p2p.request_block_signature).
+  [NEW] _auto_wire() é idempotente; pode ser chamado quantas vezes quiser.
+  [KEEP] Toda a lógica de v9.5.9 preservada (multi-sig, PBFT hooks,
+         checkpoints, auth_tag, reorg/chain_validator plugados, WAL).
 v9.5.9 (2026-11-15) — ROBUSTEZ DE BANCO DE DADOS:
   [NEW] Ativação automática do SQLite em WAL mode e busy_timeout=30000
-        no momento da inicialização. Isso evita que o banco trave
-        quando a API HTTP e o P2P tentarem acessá-lo ao mesmo tempo.
+        no momento da inicialização.
 v9.5.8 (2026-11-12) — FIX BOOTSTRAP MULTI-SIG COM SK LOCAL
-  [KEEP] ... (restante do changelog original mantido)
 ================================================================
 """
 from __future__ import annotations
 
-__version__ = "9.5.9"
+__version__ = "9.6.0"
 
 import os
 import time
@@ -81,6 +91,9 @@ BRN_PBFT_START_HEIGHT = int(os.environ.get("BRN_PBFT_START_HEIGHT", "0"))
 BRN_STRICT_MULTISIG = os.environ.get("BRN_STRICT_MULTISIG", "0") == "1"
 
 BRN_TRUST_FALLBACK_TO_TOP = os.environ.get("BRN_TRUST_FALLBACK_TO_TOP", "0") == "1"
+
+# [v9.6.0] Feature flag do auto-wire (default ON)
+BRN_AUTO_WIRE = os.environ.get("BRN_AUTO_WIRE", "1") == "1"
 
 if BRN_STRICT_MULTISIG:
     BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = 0
@@ -495,7 +508,7 @@ class Blockchain:
                  genesis_pubkey=None, auto_genesis=True, network_secret=None,
                  require_auth_tag=None):
         self.db = ChainDB(db_path)
-        
+
         # ============================================================
         # [ROBUSTNESS FIX v9.5.9] Ativa WAL e busy_timeout no SQLite
         # para evitar travamentos (database is locked) sob alta carga.
@@ -527,6 +540,26 @@ class Blockchain:
         self._local_validator_sk = None
         self._pbft = None
 
+        # ============================================================
+        # [AUTO-WIRE v9.6.0]
+        # Detecta e injeta automaticamente:
+        #   - trust_net (trust_network.json ou BRN_TRUST_NETWORK)
+        #   - _local_validator_sk (SK_HEX / SEED / .validator_sk /
+        #                          current_wallet.enc / current_wallet.json)
+        # Chamado ANTES do bloco de auto_genesis para rodar nos dois
+        # caminhos (auto_genesis=True e False).
+        # Nenhuma exceção escapa — se auto_wire.py não existir, é no-op.
+        # ============================================================
+        if BRN_AUTO_WIRE:
+            try:
+                from auto_wire import wire_all as _wire
+                _wire(self, verbose=False)
+            except ImportError:
+                log.debug("[auto-wire] auto_wire.py não encontrado — pulando")
+            except Exception as _e:
+                log.debug(f"[auto-wire] falhou: {_e}")
+        # ============================================================
+
         fila_salva = self.db.get_meta("fila_mineracao")
         self.fila_mineracao = json.loads(fila_salva) if fila_salva else {}
         rede_desc = self.db.get_meta("rede_descentralizada")
@@ -552,7 +585,22 @@ class Blockchain:
                  f"({len(getattr(trust, 'nodes', {}))} nós)")
 
     def set_p2p(self, p2p):
+        # ============================================================
+        # [AUTO-WIRE v9.6.0] Cria sign_collector quando P2P é injetado.
+        # O collector pede sigs aos peers via p2p.request_block_signature.
+        # ============================================================
         self.p2p = p2p
+        if BRN_AUTO_WIRE and self._sign_collector is None and p2p is not None:
+            try:
+                from auto_wire import make_default_collector, wire_all
+                self._sign_collector = make_default_collector(self)
+                log.info("[auto-wire] sign_collector criado após set_p2p")
+                # re-tenta injetar trust/sk se ainda faltar
+                wire_all(self, verbose=True)
+            except ImportError:
+                log.debug("[auto-wire] auto_wire.py não encontrado")
+            except Exception as _e:
+                log.debug(f"[auto-wire] collector falhou: {_e}")
 
     def set_local_validator_sk(self, sk) -> None:
         if sk is None:
@@ -1621,6 +1669,7 @@ class Blockchain:
             "strict_multisig": BRN_STRICT_MULTISIG,
             "trust_fallback_to_top": BRN_TRUST_FALLBACK_TO_TOP,
             "require_auth_tag": self.require_auth_tag,
+            "auto_wire": BRN_AUTO_WIRE,
         }
         if self._pbft is not None:
             try:
