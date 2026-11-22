@@ -1,24 +1,20 @@
-"""main.py — Entrypoint do nó BRN (v13.9.27)
+"""main.py — Entrypoint do nó BRN (v13.9.28)
 ================================================================
-v13.9.27 (2026-11-21) — ORIGIN PROMOTION PERSISTENTE:
-  [NEW] origin_manager.apply_origin_override_at_boot() é chamado ANTES
-        de Blockchain(...). Se brn_origin_override=1 no DB, força
-        BRN_IS_ORIGIN=1, remove BRN_POOL_URL (para o loop "Origin
-        offline") e loga promoted_at/by/reason. Sem isso, a promoção
-        via /api/node/origin/promote só valia em runtime — restart
-        voltava a cliente.
-  [NEW] Banner mostra o is_origin FINAL (após override), não o da env.
-  [NEW] Variável is_origin é reatribuída após override, para que
-        _setup_pool() e _start_web_server() vejam o valor correto.
-v13.9.26 (2026-11-20) — BACKUP + SECRET PERSISTENTE:
-  [NEW] ensure_network_secret() ANTES de blockchain
-  [NEW] auto_restore_on_boot() ANTES de abrir o ChainDB
-  [NEW] start_periodic_backup() após Blockchain
-  [FIX] _do_force_http_resync() e _auto_unlock_gui() completos
-v13.9.25 (2026-11-17):
-  [FIX] _maybe_enable_fast_sync() sempre escreve BRN_FAST_SYNC_UNTIL
-  [FIX] _start_web_server() chama srv.set_peer_id()
-  [FIX] main() propaga BRN_WEB_PORT antes de importar server
+v13.9.28 (2026-11-22) — WIRING VISÍVEL E RE-WIRE PÓS-UNLOCK:
+  [NEW] _ensure_wiring(chain, stage) — wrapper que chama auto_wire.wire_all(),
+        loga trust/sk/p2p/collector e avisa o que está faltando em cada etapa.
+        Chamado em 5 pontos: post-blockchain, post-trust, post-p2p,
+        post-gui-unlock, post-start.
+  [FIX] Após _auto_unlock_gui() setar a SK, o _sign_collector é recriado.
+        Antes ficava None para sempre porque set_p2p rodava antes do unlock
+        (SK ainda não existia), e ninguém refazia o collector depois.
+  [NEW] Banner mostra blockchain.__version__ e status do BRN_AUTO_WIRE
+        para diagnóstico imediato (se o v9.6.0 não estiver no disco, aparece).
+  [KEEP] Tudo de v13.9.27 preservado (origin override, backup, fast-sync,
+         identity, wallet GUI, peer-healer, trust-daemon, explorer, etc).
+v13.9.27 (2026-11-21) — ORIGIN PROMOTION PERSISTENTE
+v13.9.26 (2026-11-20) — BACKUP + SECRET PERSISTENTE
+v13.9.25 (2026-11-17) — _maybe_enable_fast_sync + set_peer_id
 ================================================================
 """
 from __future__ import annotations
@@ -43,8 +39,8 @@ os.chdir(BASE_DIR)
 try:
     from version import VERSION, BUILD_DATE
 except ImportError:
-    VERSION = "13.9.27"
-    BUILD_DATE = "2026-11-21"
+    VERSION = "13.9.28"
+    BUILD_DATE = "2026-11-22"
 
 try:
     from isolation_detector import IsolationDetector
@@ -160,7 +156,6 @@ def _read_bootstrap_json() -> str:
 
 
 def _setup_logging(level: str = "INFO") -> logging.Logger:
-    """Configura logging global. SEMPRE retorna um Logger válido."""
     try:
         from brn_logger import setup_logger, get_logger
         setup_logger(level=level, quiet=False)
@@ -177,6 +172,76 @@ def _setup_logging(level: str = "INFO") -> logging.Logger:
     except Exception:
         pass
     return logging.getLogger("main")
+
+
+# ============================================================
+# [NEW v13.9.28] WIRING VISÍVEL
+# ============================================================
+def _ensure_wiring(chain, stage: str = "?") -> dict:
+    """Verifica e (se possível) injeta trust_net, local_validator_sk e
+    sign_collector via auto_wire.wire_all(). Loga o estado real em cada
+    etapa do boot.
+
+    Nunca levanta exceção — é seguro chamar quantas vezes quiser.
+    Retorna dict com estado atual (útil para chamar de testes)."""
+    log = logging.getLogger("main")
+
+    def _snapshot():
+        return {
+            "trust": type(chain.trust_net).__name__ if getattr(chain, "trust_net", None) else None,
+            "sk": "OK" if getattr(chain, "_local_validator_sk", None) else None,
+            "p2p": type(chain.p2p).__name__ if getattr(chain, "p2p", None) else None,
+            "collector": "OK" if getattr(chain, "_sign_collector", None) else None,
+        }
+
+    state = _snapshot()
+
+    needs_wire = (
+        state["trust"] is None
+        or state["sk"] is None
+        or (state["p2p"] is not None and state["collector"] is None)
+    )
+
+    if needs_wire and os.environ.get("BRN_AUTO_WIRE", "1") == "1":
+        try:
+            from auto_wire import wire_all
+            wire_all(chain, verbose=False)
+            state = _snapshot()
+        except ImportError:
+            log.debug("[wiring:%s] auto_wire.py ausente", stage)
+        except Exception as e:
+            log.warning("[wiring:%s] wire_all falhou: %s", stage, e)
+
+    # Log único e conciso (você vai ver 5 dessas no boot)
+    log.info(
+        "[wiring:%s] trust=%s sk=%s p2p=%s collector=%s",
+        stage,
+        state["trust"] or "None",
+        state["sk"] or "None",
+        state["p2p"] or "None",
+        state["collector"] or "None",
+    )
+
+    # Avisos concretos (não spam — só quando falta)
+    if state["trust"] is None:
+        log.warning(
+            "[wiring:%s] ⚠ trust_net=None → multi-sig desligado "
+            "(bootstrap bypass ativo)", stage,
+        )
+    if state["sk"] is None:
+        log.warning(
+            "[wiring:%s] ⚠ _local_validator_sk=None → nó NÃO assina blocos. "
+            "Configure BRN_VALIDATOR_SK_HEX, .validator_sk ou "
+            "BRN_NODE_PASSWORD + current_wallet.enc", stage,
+        )
+    if state["p2p"] is not None and state["collector"] is None:
+        log.warning(
+            "[wiring:%s] ⚠ _sign_collector=None → só assina localmente "
+            "(ou nada, se SK=None). Verifique se blockchain.py é ≥ v9.6.0",
+            stage,
+        )
+
+    return state
 
 
 # ============================================================
@@ -547,7 +612,7 @@ def _check_blockchain_version() -> bool:
         log.error("[version] não importei blockchain: %s", e)
         return os.environ.get("BRN_STRICT_MULTISIG") != "1"
 
-    ok = ver.startswith("9.4") or (ver >= "9.4.10") or ver.startswith("9.5")
+    ok = ver.startswith("9.4") or (ver >= "9.4.10") or ver.startswith("9.5") or ver.startswith("9.6")
     if ok:
         log.info("[version] blockchain.py v%s (multi-sig OK)", ver)
         return True
@@ -572,14 +637,20 @@ def _setup_trust(chain, node_id_priv, is_origin: bool):
 
 
 def _setup_p2p(chain, node_id_priv, p2p_port: int):
+    log = logging.getLogger("main")
     try:
         from p2p_unified import P2PManager
         p2p = P2PManager(chain, node_id_priv=node_id_priv, tcp_port=p2p_port)
+        # [v13.9.28] set_p2p no blockchain v9.6.0 cria o sign_collector.
+        # Logamos o estado logo depois para você ver se funcionou.
         chain.set_p2p(p2p)
+        collector_ok = getattr(chain, "_sign_collector", None) is not None
+        log.info("[p2p] set_p2p OK — collector=%s",
+                 "OK" if collector_ok else "None (⚠ verifique blockchain.py ≥ v9.6.0)")
         p2p.start()
         return p2p
     except Exception as e:
-        logging.getLogger("main").error("[p2p] init falhou: %s", e)
+        log.error("[p2p] init falhou: %s", e)
         return None
 
 
@@ -877,7 +948,6 @@ def _prompt_password_interactive(api, max_attempts: int = 3) -> tuple:
 
 
 def _auto_unlock_gui(api, allow_interactive: bool = True) -> tuple:
-    """Tenta desbloquear a carteira automaticamente via env/file; se não, interativo."""
     log = logging.getLogger("main")
     try:
         has = api.has_wallet()
@@ -1128,7 +1198,13 @@ def main() -> int:
         log.warning("[origin] apply_origin_override falhou: %s", e)
     # ============================================================
 
-    # 15. Banner (usa o is_origin FINAL)
+    # 15. Banner (usa o is_origin FINAL) — [v13.9.28] mostra versão blockchain
+    try:
+        import blockchain as _bc_mod
+        _bc_ver = getattr(_bc_mod, "__version__", "?")
+    except Exception:
+        _bc_ver = "?"
+
     log.warning("=" * 64)
     log.warning(" BRN Node v%s (%s)", VERSION, BUILD_DATE)
     log.warning("=" * 64)
@@ -1138,6 +1214,8 @@ def main() -> int:
     log.warning(" Origin   : %s", is_origin)
     log.warning(" Headless : %s", args.headless)
     log.warning(" Fast-sync: %d", fast_sync_until)
+    log.warning(" BRN Core : blockchain.py v%s", _bc_ver)
+    log.warning(" Auto-wire: %s", os.environ.get("BRN_AUTO_WIRE", "1"))
     log.warning("=" * 64)
 
     # 16. Cria Blockchain
@@ -1157,6 +1235,10 @@ def main() -> int:
              chain.db.height(), chain.db.tip_hash()[:16])
     SK_VALIDATION_STATE["local_height"] = chain.db.height()
 
+    # [v13.9.28] Wiring stage 1: depois do Blockchain.__init__
+    # (o auto_wire já rodou dentro do __init__, isso só confirma/loga)
+    _ensure_wiring(chain, "post-blockchain")
+
     # 17. Backup periódico (v13.9.26) — DEPOIS da chain
     if os.environ.get("BRN_AUTO_BACKUP", "0") == "1":
         try:
@@ -1169,11 +1251,13 @@ def main() -> int:
 
     # 18. Trust
     trust = _setup_trust(chain, node_priv, is_origin)
+    _ensure_wiring(chain, "post-trust")
 
-    # 19. P2P
+    # 19. P2P (cria sign_collector via set_p2p)
     p2p = None
     if not args.no_p2p:
         p2p = _setup_p2p(chain, node_priv, p2p_port)
+    _ensure_wiring(chain, "post-p2p")
 
     # 20. Sync
     sync_mgr = _setup_sync(chain, p2p)
@@ -1198,6 +1282,7 @@ def main() -> int:
         pass
 
     # 24. Wallet GUI unlock (só se não headless e não no-gui)
+    gui_unlocked = False
     if not args.headless and not args.no_gui:
         try:
             api = _WalletAPIAdapter(chain)
@@ -1206,7 +1291,14 @@ def main() -> int:
                 and not args.headless
                 and sys.stdin.isatty()
             )
-            _auto_unlock_gui(api, allow_interactive=allow_interactive)
+            ok_unlock, src, addr, err = _auto_unlock_gui(
+                api, allow_interactive=allow_interactive)
+            gui_unlocked = bool(ok_unlock and not err)
+            # [v13.9.28] Re-wire após GUI unlock — SK pode ter sido setada
+            # por _WalletAPIAdapter.unlock_wallet() e o collector precisa
+            # ser recriado (foi criado em set_p2p antes da SK existir).
+            if gui_unlocked:
+                _ensure_wiring(chain, "post-gui-unlock")
         except Exception as e:
             log.warning("[GUI] unlock falhou: %s", e)
 
@@ -1276,6 +1368,9 @@ def main() -> int:
         log.info("[AUTO-MINE] thread iniciada (30s entre tentativas)")
 
     # 31. Loop principal
+    # [v13.9.28] Wiring stage final — confirma estado logo antes do loop
+    _ensure_wiring(chain, "post-start")
+
     log.warning("=" * 64)
     log.warning(" NÓ INICIADO — aguardando shutdown (Ctrl+C)")
     log.warning("=" * 64)
