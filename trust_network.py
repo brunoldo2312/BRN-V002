@@ -1,26 +1,31 @@
-# trust_network.py — Rede de confiança e reputação do BRN (v3.14)
+# trust_network.py — Rede de confiança e reputação do BRN (v3.14.1)
 # ================================================================
-# v3.14 (2026-11-17):
-#   [FIX CRÍTICO] NEW_CLIENT_INITIAL_SCORE 500 -> 100. Nó novo nasce
-#         como "new", NÃO como validador protegido. Antes qualquer
-#         Sybil ganhava 500 e ficava imune ao remove_ghosts.
-#   [FIX CRÍTICO] Assinatura do Origin agora usa Ed25519 de verdade
-#         (Ed25519PrivateKey) nos DOIS lados: flush assina com Ed25519,
-#         _load verifica com Ed25519. Antes flush usava Wallet.sign
-#         (Schnorr/secp256k1, retorna str) e _load verificava Ed25519
-#         -> assinatura SEMPRE inválida, cliente descartava o trust.
-#   [FIX] get_active_validators() NÃO faz mais fallback para
-#         get_top_validators(). Se ninguém está ativo, retorna [].
-#         Fantasma não volta mais pro quórum.
-#   [FIX] heartbeat() NÃO dá mais score. Só atualiza last_seen.
-#         Antes dava pra farmar trust mandando heartbeat em loop.
-#   [FIX] AUTO_PROMOTE_MIN_BLOCKS 10 -> 50. 10 blocos é pouco pra
-#         pular pra 1000.
+# v3.14.1 (2026-11-22) — PINAGEM DE ORIGIN PUBKEY:
+#   [FIX CRÍTICO] _load() agora valida a assinatura do Origin contra
+#         BRN_ORIGIN_PUBKEY (env), não contra a origin_pubkey embutida
+#         no próprio arquivo. Antes, atacante com write no
+#         trust_network.json (ou MITM do /api/trust/download) podia
+#         assinar com chave própria e mandar origin_pubkey
+#         correspondente — o cliente aceitava. Agora, com o env
+#         setado, qualquer assinatura que não bata com a pinned é
+#         rejeitada e o cliente descarta o payload.
+#   [NEW] Se BRN_ORIGIN_PUBKEY não está setado, o cliente mantém o
+#         comportamento antigo (TOFU) MAS loga warning explícito
+#         recomendando pinar.
+#   [KEEP] v3.14: Ed25519 dos dois lados, NEW_CLIENT_INITIAL_SCORE=100,
+#         get_active_validators sem fallback, heartbeat sem score,
+#         AUTO_PROMOTE_MIN_BLOCKS=50, flush atômico.
+# v3.14 (2026-11-17): (changelog original mantido)
+#   [FIX CRÍTICO] NEW_CLIENT_INITIAL_SCORE 500 -> 100.
+#   [FIX CRÍTICO] Assinatura do Origin usa Ed25519 nos dois lados.
+#   [FIX] get_active_validators() sem fallback para top.
+#   [FIX] heartbeat() não dá score.
+#   [FIX] AUTO_PROMOTE_MIN_BLOCKS 10 -> 50.
 #   [KEEP] v3.13: flush atômico, throttled, _load com JSONDecodeError.
 # ================================================================
 from __future__ import annotations
 
-__version__ = "3.14"
+__version__ = "3.14.1"
 
 import json
 import logging
@@ -72,6 +77,7 @@ NEW_CLIENT_INITIAL_SCORE = float(os.environ.get("BRN_NEW_CLIENT_SCORE", "100"))
 # [FIX v3.14] 50 blocos assinados pra auto-promover, não 10
 AUTO_PROMOTE_MIN_BLOCKS = int(os.environ.get("BRN_AUTO_PROMOTE_MIN_BLOCKS", "50"))
 AUTO_PROMOTE_SCORE = float(os.environ.get("BRN_AUTO_PROMOTE_SCORE", "1000"))
+
 
 @dataclass
 class NodeRecord:
@@ -139,6 +145,7 @@ class NodeRecord:
             "votes_received", "uptime_score", "success_rate",
         }
         return cls(**{k: v for k, v in data.items() if k in campos})
+
 
 class TrustNetwork:
     def __init__(self, data_file: str = DEFAULT_DATA_FILE,
@@ -441,12 +448,37 @@ class TrustNetwork:
                 if sig_hex and origin_pub_hex:
                     payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
                     try:
-                        pub_bytes = bytes.fromhex(origin_pub_hex)
-                        pk = Ed25519PublicKey.from_public_bytes(pub_bytes)
+                        # [FIX v3.14.1] Verifica contra a pubkey PINADA (env),
+                        # não contra a pubkey que veio dentro do arquivo.
+                        # Se BRN_ORIGIN_PUBKEY está setado, qualquer arquivo
+                        # assinado por outra chave é rejeitado.
+                        pinned = (os.environ.get("BRN_ORIGIN_PUBKEY") or "").strip().lower()
+                        if pinned:
+                            if origin_pub_hex.lower() != pinned:
+                                log.warning(
+                                    "[TrustNetwork] origin_pubkey do arquivo (%s…) "
+                                    "diverge de BRN_ORIGIN_PUBKEY (%s…) — "
+                                    "verificando com a pinada",
+                                    origin_pub_hex[:16], pinned[:16],
+                                )
+                            pk_bytes = bytes.fromhex(pinned)
+                        else:
+                            log.warning(
+                                "[TrustNetwork] BRN_ORIGIN_PUBKEY não setado — "
+                                "verificando assinatura com a pubkey do próprio "
+                                "arquivo (TOFU inseguro). Defina BRN_ORIGIN_PUBKEY "
+                                "no brn_network.env para pinagem forte."
+                            )
+                            pk_bytes = bytes.fromhex(origin_pub_hex)
+                        pk = Ed25519PublicKey.from_public_bytes(pk_bytes)
                         pk.verify(bytes.fromhex(sig_hex), payload)
-                        log.info("[TrustNetwork] Assinatura do Origem VALIDADA.")
+                        log.info("[TrustNetwork] Assinatura do Origem VALIDADA%s.",
+                                 " (pinada)" if pinned else " (TOFU)")
                     except Exception as e:
-                        log.error("[TrustNetwork] ASSINATURA INVÁLIDA! O arquivo foi alterado.")
+                        log.error(
+                            "[TrustNetwork] ASSINATURA INVÁLIDA! O arquivo foi alterado. "
+                            "(%s)", e,
+                        )
                         if not self.is_origin:
                             data = {"nodes": {}}
                         else:
