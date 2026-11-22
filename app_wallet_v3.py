@@ -1,25 +1,23 @@
-"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.22)
+"""app_wallet_v3.py — Ponte entre a GUI pywebview e o nó BRN (v3.23)
 ================================================================
-v3.22 (2026-11-13) — GUARD CONTRA API_BASE REMOTO ACIDENTAL:
-  [FIX CRÍTICO] API_BASE agora passa por _resolve_api_base(). Se o
-        ambiente NÃO tem RENDER/RENDER_SERVICE_ID (ou seja, rodando
-        localmente), e BRN_API_BASE aponta pra um host remoto (ex:
-        onrender.com), o módulo FORÇA de volta pra 127.0.0.1:{porta}.
-        Antes, o app_wallet_v3.py herdava BRN_API_BASE do .env e
-        fazia UNLOCK/TRANSFER/POOL_START no servidor do Render,
-        mesmo com a GUI aberta em 127.0.0.1. Resultado: a carteira
-        do PC e a do Render ficavam misturadas e o operador não
-        entendia o que estava acontecendo.
-  [NEW] _resolve_api_base() — resolução com detecção de ambiente.
-  [NEW] Override explícito via BRN_API_BASE_ALLOW_REMOTE=1 quando
-        você REALMENTE quer que a GUI local fale com servidor remoto
-        (ex: para debug). Sem isso, remote é rejeitado com WARNING.
-  [NEW] Log de boot mostra claramente "API_BASE=..." e a fonte
-        ("env", "local-forced", "local-default").
-  [NEW] get_version() retorna {version, api_base, api_base_source,
-        has_requests, on_render}.
-  [KEEP] v3.21: unlock_wallet honesto sobre SK, retry_sk_sync(),
-        _verify_sk_on_node(), --verify-sk.
+v3.23 (2026-11-22) — VERIFICAÇÃO REAL DE SK (COMPATÍVEL v9.9.40):
+  [FIX] _verify_sk_on_node() usava /api/consensus/validators como fonte
+        primária — endpoint que NÃO EXISTE no server.py v9.9.40. Caía
+        em "unavailable" sem nunca confirmar a SK.
+  [NEW] _verify_sk_on_node() agora cascateia:
+          /api/mine/gate  -> /api/status -> /health
+        (todos existem no server v9.9.40; o primeiro é a fonte de verdade
+        do gate de mineração).
+  [NEW] Retorna sign_collector_ready, mining_allowed, gate_reason,
+        fast_sync_active na resposta de unlock/load_wallet/create.
+        Se sign_collector_ready=False, o usuário sabe que o nó não
+        assinará blocos MESMO com sk_installed=True.
+  [NEW] _verify_sk_on_node() é chamado SEMPRE após _sync_sk_to_chain,
+        não só quando o sync falha. Confirma contra 3 fontes.
+  [NEW] get_debug_info() inclui mining_gate completo (mining_allowed,
+        reason, detail) — para colar em issue/chat quando travar.
+  [KEEP] v3.22: guard API_BASE remoto, unlock_wallet honesto, retry_sk_sync,
+        _verify_sk_on_node, --verify-sk, --self-test.
 ================================================================
 """
 from __future__ import annotations
@@ -33,7 +31,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "3.22"
+__version__ = "3.23"
 
 try:
     import requests
@@ -78,14 +76,6 @@ def _resolve_api_base() -> tuple:
         url     — URL final (sempre termina com rstrip)
         source  — "env" (usado como está), "env-forced-local" (override),
                   "local-default" (sem BRN_API_BASE, assume local)
-
-    Regras:
-      1. Se não tem BRN_API_BASE → usa http://127.0.0.1:{BRN_WEB_PORT|PORT|5000}
-      2. Se tem BRN_API_BASE remoto:
-         a. Rodando no Render → aceita (é o caso esperado)
-         b. BRN_API_BASE_ALLOW_REMOTE=1 → aceita (debug explícito)
-         c. Caso contrário → FORÇA local e loga WARNING
-      3. Se tem BRN_API_BASE local → aceita
     """
     raw = (os.environ.get("BRN_API_BASE", "") or "").strip()
     allow_remote = os.environ.get("BRN_API_BASE_ALLOW_REMOTE", "0") == "1"
@@ -194,49 +184,135 @@ def _sync_sk_to_chain(sk_hex: str, address: str = "",
                 "sk_installed": False}
 
 
+# ============================================================
+# [v3.23] VERIFICAÇÃO REAL DE SK NO NÓ — cascata de fallbacks
+# ============================================================
 def _verify_sk_on_node(pubkey_hex: str) -> dict:
     """
-    Confirma via /api/consensus/validators que o NÓ realmente tem a SK
-    instalada com essa pubkey. Fonte de verdade final.
+    Confirma via HTTP que o NÓ realmente tem a SK instalada com essa pubkey
+    E que o sign_collector foi criado (para o nó efetivamente assinar).
+
+    Cascata de fontes (todas existem no server v9.9.40):
+      1. /api/mine/gate  — fonte de verdade (retorna detail.validators_ready,
+                           detail.local_pk, detail.sk_installed, checks)
+      2. /api/status     — fallback (retorna validators_ready,
+                           validators_reason, mining_allowed, gate_reason)
+      3. /health         — último recurso (wallet_sk_installed + validators)
+
+    Nunca levanta exceção. Retorna dict com:
+        installed, source, local_pk_full, n_trust, n_active, required_sigs,
+        sign_collector_ready, mining_allowed, gate_reason, fast_sync_active,
+        bootstrap_would_fire, raw
     """
-    out = {"installed": False, "local_pk_full": "", "source": "unavailable",
-           "n_trust": 0, "n_active": 0, "required_sigs": 0,
-           "bootstrap_would_fire": None, "raw": {}}
+    out = {
+        "installed": False,
+        "source": "unavailable",
+        "local_pk_full": "",
+        "n_trust": 0,
+        "n_active": 0,
+        "required_sigs": 0,
+        "sign_collector_ready": None,   # None = não soubemos
+        "mining_allowed": None,
+        "gate_reason": "",
+        "fast_sync_active": None,
+        "bootstrap_would_fire": None,
+        "raw": {},
+    }
     if not pubkey_hex:
         out["source"] = "no_pubkey"
         return out
 
     pubkey_hex = pubkey_hex.strip().lower()
 
+    # ---------- Fonte 1: /api/mine/gate (existe no v9.9.40) ----------
     try:
-        r = _get("/api/consensus/validators", timeout=5.0)
-        if isinstance(r, dict) and r.get("ok"):
-            out["raw"] = r
-            local_full = (r.get("local_pk_full") or "").strip().lower()
-            out["local_pk_full"] = local_full
-            out["n_trust"] = int(r.get("n_trust", 0) or 0)
-            out["n_active"] = int(r.get("n_active", 0) or 0)
-            out["required_sigs"] = int(r.get("required_sigs", 0) or 0)
-            out["bootstrap_would_fire"] = bool(
-                r.get("bootstrap_would_fire", False))
-            if local_full and local_full == pubkey_hex:
-                out["installed"] = True
-                out["source"] = "consensus/validators:full_match"
+        g = _get("/api/mine/gate?force=1", timeout=5.0, retries=0)
+        if isinstance(g, dict) and g.get("ok"):
+            detail = g.get("detail") or {}
+            out["raw"] = g
+            out["mining_allowed"] = bool(g.get("mining_allowed", False))
+            out["gate_reason"] = g.get("reason", "") or ""
+            out["fast_sync_active"] = bool(detail.get("fast_sync_active", False))
+
+            sk_inst = detail.get("sk_installed")
+            local_pk = (detail.get("local_pk") or "").rstrip(".").strip().lower()
+            # local_pk vem truncado no gate ("abcd…"); valida por prefixo
+            if sk_inst is True and local_pk:
+                if pubkey_hex.startswith(local_pk):
+                    out["installed"] = True
+                    out["source"] = "mine/gate:prefix_match"
+                else:
+                    out["source"] = f"mine/gate:prefix_mismatch({local_pk})"
+                    return out
+            elif sk_inst is False:
+                out["source"] = "mine/gate:sk_installed=false"
                 return out
-            if r.get("local_pk_installed") and not local_full:
-                out["source"] = "consensus/validators:truncated_only"
-            elif local_full and local_full != pubkey_hex:
-                out["source"] = f"consensus/validators:mismatch({local_full[:16]})"
+            elif sk_inst is True and not local_pk:
+                # instalado mas sem pk exposta — assume OK se source diz OK
+                out["installed"] = True
+                out["source"] = "mine/gate:flag_only"
+
+            # sign_collector_ready — o gate não expõe diretamente,
+            # mas se mining_allowed=False com reason=no_sk, é sinal claro
+            reason = (g.get("reason") or "").lower()
+            if reason in ("no_sk", "validators_not_synced"):
+                # não conseguimos confirmar collector, mas sk existe e o gate
+                # ainda reclama de OUTRA coisa — não é problema nosso
+                pass
+
+            # validação de pk OK — retorna
+            if out["installed"]:
+                # tenta obter sign_collector_ready via /api/status (campo opcional)
+                try:
+                    st = _get("/api/status", timeout=3.0, retries=0)
+                    if isinstance(st, dict):
+                        if "sign_collector_ready" in st:
+                            out["sign_collector_ready"] = bool(
+                                st["sign_collector_ready"])
+                except Exception:
+                    pass
                 return out
     except Exception as e:
-        log.debug("_verify_sk_on_node: /api/consensus/validators falhou: %s", e)
+        log.debug("_verify_sk_on_node: /api/mine/gate falhou: %s", e)
 
+    # ---------- Fonte 2: /api/status (existe no v9.9.40) ----------
     try:
-        r = _get("/health", timeout=5.0)
-        if isinstance(r, dict) and r.get("ok"):
-            out["raw"] = r
-            installed_flag = bool(r.get("wallet_sk_installed"))
-            val = r.get("validators") or {}
+        st = _get("/api/status", timeout=5.0, retries=0)
+        if isinstance(st, dict) and "height" in st:
+            out["raw"] = st
+            out["validators_ready"] = bool(st.get("validators_ready", False))
+            out["mining_allowed"] = bool(st.get("mining_allowed", False))
+            out["gate_reason"] = st.get("mining_gate_reason", "") or ""
+            out["fast_sync_active"] = bool(st.get("fast_sync_active", False))
+            if "sign_collector_ready" in st:
+                out["sign_collector_ready"] = bool(
+                    st["sign_collector_ready"])
+
+            # Não temos a pubkey local exposta aqui, mas
+            # validators_ready=True + mining_allowed=True implica que SK
+            # existe (server v9.9.40 marca validators_ready só com SK).
+            if out["validators_ready"] and out["mining_allowed"]:
+                out["installed"] = True
+                out["source"] = "status:validators_ready+mining_allowed"
+                return out
+            if out["gate_reason"] == "no_sk":
+                out["source"] = "status:mining_gate_reason=no_sk"
+                return out
+            if out["gate_reason"] == "validators_not_synced":
+                # SK existe; rede é que não está pronta
+                out["installed"] = True
+                out["source"] = "status:validators_not_synced(but_sk_exists)"
+                return out
+    except Exception as e:
+        log.debug("_verify_sk_on_node: /api/status falhou: %s", e)
+
+    # ---------- Fonte 3: /health (último recurso) ----------
+    try:
+        h = _get("/health", timeout=5.0, retries=0)
+        if isinstance(h, dict):
+            out["raw"] = h
+            installed_flag = bool(h.get("wallet_sk_installed"))
+            val = h.get("validators") or {}
             local_trunc = (val.get("local_pk") or "").rstrip(".").strip().lower()
             if not installed_flag:
                 out["source"] = "health:wallet_sk_installed=false"
@@ -385,10 +461,7 @@ def _list_wallet_names() -> list[str]:
             except Exception as e:
                 log.debug("WalletManager.%s falhou: %s", meth, e)
 
-    if lst is None:
-        return names
-
-    if not isinstance(lst, list):
+    if lst is None or not isinstance(lst, list):
         return names
 
     for w in lst:
@@ -464,7 +537,7 @@ def _build_unlock_response(source: str, sync_r: dict,
                             verification: dict | None = None) -> dict:
     """
     Monta a resposta de unlock_wallet/load_wallet/create consolidando
-    sync_r + verificação cruzada do nó.
+    sync_r + verificação cruzada do nó (v3.23: sempre com 3 fontes).
     """
     sk_installed = bool(sync_r.get("sk_installed", False))
     in_trust = bool(sync_r.get("in_trust", False))
@@ -473,30 +546,39 @@ def _build_unlock_response(source: str, sync_r: dict,
     peers_notified = int(sync_r.get("peers_notified", 0) or 0)
     warnings = list(sync_r.get("warnings", []) or [])
     errors = list(sync_r.get("errors", []) or [])
-    verification_source = "sync"
 
     error_code = sync_r.get("error_code", "")
     msg = sync_r.get("msg", "")
 
-    if not sk_installed:
-        verify_pubkey = (_WALLET_SESSION.get("public_key") or "").strip()
-        if verify_pubkey:
-            try:
-                v = _verify_sk_on_node(verify_pubkey)
-            except Exception as e:
-                v = {"installed": False, "source": f"verify_exception:{e}"}
-        else:
-            v = {"installed": False, "source": "no_pubkey"}
-        verification = v
-        if v.get("installed"):
-            sk_installed = True
-            verification_source = f"cross_check:{v.get('source','?')}"
+    # [v3.23] SEMPRE verifica no nó (não só quando o sync falha).
+    # sync_r pode dizer ok=True mas sk_installed=False (SK aceita mas
+    # sem collector). A verificação em cascata pega esse caso.
+    verify_pubkey = (_WALLET_SESSION.get("public_key") or "").strip()
+    v = {"installed": False, "source": "no_pubkey"}
+    if verify_pubkey:
+        try:
+            v = _verify_sk_on_node(verify_pubkey)
+        except Exception as e:
+            v = {"installed": False, "source": f"verify_exception:{e}"}
+
+    if v.get("installed"):
+        if not sk_installed:
             warnings.append(
-                f"SK verificada no nó via {v.get('source')} "
-                f"(sync HTTP havia falhado com {error_code or 'erro'})"
+                f"SK confirmada no nó via {v.get('source')} "
+                f"(sync HTTP dizia sk_installed=False com {error_code or '?'})"
             )
-        else:
-            verification_source = f"cross_check_failed:{v.get('source','?')}"
+        sk_installed = True
+        verification_source = f"cross_check:{v.get('source', '?')}"
+    else:
+        verification_source = f"cross_check_failed:{v.get('source', '?')}"
+        if sk_installed:
+            # sync_r diz OK, mas verificação não confirma. Confia no mais
+            # conservador: nó pode NÃO assinar.
+            warnings.append(
+                f"sync HTTP diz sk_installed=True, mas verificação "
+                f"({v.get('source')}) NÃO confirmou. Assumindo não instalada."
+            )
+            sk_installed = False
 
     if not sk_installed:
         if error_code in ("connection", "timeout", "server_offline", "no_requests"):
@@ -517,6 +599,16 @@ def _build_unlock_response(source: str, sync_r: dict,
 
     node_will_sign = bool(sk_installed)
 
+    # [v3.23] Avisa se collector não foi criado (mesmo com SK OK)
+    collector_ready = v.get("sign_collector_ready")
+    if sk_installed and collector_ready is False:
+        warnings.append(
+            "SK instalada, mas sign_collector_ready=False no nó. "
+            "O nó NÃO vai coletar assinaturas dos peers. "
+            "Verifique se blockchain.py ≥ v9.6.0 e reinicie o main.py."
+        )
+        node_will_sign = False
+
     return {
         "ok": True,
         "address": _WALLET_SESSION.get("address", ""),
@@ -524,6 +616,10 @@ def _build_unlock_response(source: str, sync_r: dict,
         "sk_installed": sk_installed,
         "node_will_sign": node_will_sign,
         "verification_source": verification_source,
+        "sign_collector_ready": collector_ready,
+        "mining_allowed": v.get("mining_allowed"),
+        "gate_reason": v.get("gate_reason", ""),
+        "fast_sync_active": v.get("fast_sync_active"),
         "in_trust": in_trust,
         "multisig_ready": multisig_ready,
         "propagated": propagated,
@@ -531,7 +627,7 @@ def _build_unlock_response(source: str, sync_r: dict,
         "warnings": warnings,
         "errors": errors,
         "sync_error_code": error_code,
-        "verification": verification or {},
+        "verification": v,
         "api_base": API_BASE,
         "api_base_source": _API_BASE_SOURCE,
     }
@@ -1020,8 +1116,22 @@ class WalletApi:
                 "fila_tamanho": s.get("fila_tamanho", 0),
                 "rede_descentralizada": s.get("rede_descentralizada", False),
                 "peer_id": s.get("peer_id", ""),
+                "mining_allowed": s.get("mining_allowed", None),
+                "mining_gate_reason": s.get("mining_gate_reason", ""),
+                "validators_ready": s.get("validators_ready", None),
+                "validators_reason": s.get("validators_reason", ""),
+                "fast_sync_active": s.get("fast_sync_active", None),
                 "api_base": API_BASE,
             }
+        except Exception as e:
+            return {"ok": False, "msg": str(e)}
+
+    def mine_gate(self) -> dict:
+        """[v3.23] Endpoint que já existe no server v9.9.40.
+        Retorna o gate completo de mineração."""
+        try:
+            r = _get("/api/mine/gate?force=1", timeout=10.0)
+            return r
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
@@ -1049,19 +1159,45 @@ class WalletApi:
             return {"erro": str(e)}
 
     def consensus_validators(self) -> dict:
+        """[v3.23] Cai para /api/mine/gate se /api/consensus/validators
+        não existir (server v9.9.40 não tem)."""
         try:
-            r = _get("/api/consensus/validators", timeout=10.0)
-            return r if "error" not in r else {
-                "ok": False, "msg": r["error"],
-                "required_sigs": 0, "all_required": True, "validators": [],
-            }
+            r = _get("/api/consensus/validators", timeout=10.0, retries=0)
+            if "error" not in r:
+                return r
+            log.debug("consensus/validators indisponível: %s", r.get("error"))
         except Exception as e:
-            return {"ok": False, "msg": str(e), "required_sigs": 0,
-                    "all_required": True, "validators": []}
+            log.debug("consensus/validators exceção: %s", e)
+
+        # Fallback: /api/mine/gate (existe no v9.9.40)
+        try:
+            g = _get("/api/mine/gate?force=1", timeout=10.0)
+            if isinstance(g, dict) and "error" not in g:
+                detail = g.get("detail") or {}
+                return {
+                    "ok": True,
+                    "validators": detail.get("validators_detail", {}),
+                    "required_sigs": 0,
+                    "all_required": False,
+                    "bootstrap_would_fire": bool(
+                        g.get("mining_allowed", False) is False
+                        and "quorum" in (g.get("reason", "") or "").lower()
+                    ),
+                    "mining_allowed": bool(g.get("mining_allowed", False)),
+                    "gate_reason": g.get("reason", ""),
+                    "source": "mine_gate_fallback",
+                    "detail": detail,
+                }
+        except Exception as e:
+            log.debug("mine_gate fallback falhou: %s", e)
+
+        return {"ok": False, "msg": "consensus e mine/gate indisponíveis",
+                "required_sigs": 0, "all_required": True, "validators": []}
 
     def block_signatures(self, height: int) -> dict:
         try:
-            return _get(f"/api/block/{int(height)}/signatures", timeout=10.0)
+            return _get(f"/api/block/{int(height)}/signatures", timeout=10.0,
+                        retries=0)
         except Exception as e:
             return {"ok": False, "msg": str(e), "signatures": []}
 
@@ -1085,6 +1221,9 @@ class WalletApi:
                 "is_multisig_active": required >= 1,
                 "last_block_ready": last_sigs >= required if required > 0 else True,
                 "bootstrap_would_fire": bool(validators_resp.get("bootstrap_would_fire", False)),
+                "mining_allowed": validators_resp.get("mining_allowed"),
+                "gate_reason": validators_resp.get("gate_reason", ""),
+                "source": validators_resp.get("source", "consensus/validators"),
             }
         except Exception as e:
             return {"ok": False, "msg": str(e), "validators_active": 0, "required_sigs": 0}
@@ -1281,17 +1420,28 @@ class WalletApi:
         node_verification = {}
         if _WALLET_SESSION.get("public_key"):
             try:
-                node_verification = _verify_sk_on_node(_WALLET_SESSION["public_key"])
+                v = _verify_sk_on_node(_WALLET_SESSION["public_key"])
                 node_verification = {
-                    "installed": bool(node_verification.get("installed")),
-                    "source": node_verification.get("source"),
-                    "n_trust": node_verification.get("n_trust"),
-                    "n_active": node_verification.get("n_active"),
-                    "required_sigs": node_verification.get("required_sigs"),
-                    "bootstrap_would_fire": node_verification.get("bootstrap_would_fire"),
+                    "installed": bool(v.get("installed")),
+                    "source": v.get("source"),
+                    "n_trust": v.get("n_trust"),
+                    "n_active": v.get("n_active"),
+                    "required_sigs": v.get("required_sigs"),
+                    "bootstrap_would_fire": v.get("bootstrap_would_fire"),
+                    "sign_collector_ready": v.get("sign_collector_ready"),
+                    "mining_allowed": v.get("mining_allowed"),
+                    "gate_reason": v.get("gate_reason"),
+                    "fast_sync_active": v.get("fast_sync_active"),
                 }
             except Exception as e:
                 node_verification = {"error": str(e)}
+
+        # [v3.23] Inclui o gate completo (para colar em issue/chat)
+        mining_gate = {}
+        try:
+            mining_gate = self.mine_gate()
+        except Exception as e:
+            mining_gate = {"error": str(e)}
 
         return {
             "version": __version__,
@@ -1304,6 +1454,7 @@ class WalletApi:
             "wallet_address": _WALLET_SESSION.get("address", ""),
             "wallet_public_key": _WALLET_SESSION.get("public_key", ""),
             "node_verification": node_verification,
+            "mining_gate": mining_gate,
             "pool_client_running": pool_running,
             "pool_url_resolved": self._resolve_pool_url(),
             "consensus": consensus_info,
@@ -1353,24 +1504,42 @@ def _self_test() -> int:
     else:
         print(f"[1] [X] ping: {r} (main.py offline?)")
 
+    print("\n[2] /api/mine/gate (fonte de verdade do gate):")
+    g = api.mine_gate()
+    if isinstance(g, dict) and g.get("ok"):
+        print(f"    mining_allowed={g.get('mining_allowed')}")
+        print(f"    reason={g.get('reason')}")
+        detail = g.get("detail") or {}
+        print(f"    sk_installed={detail.get('sk_installed')}")
+        print(f"    local_pk={detail.get('local_pk')}")
+        print(f"    validators_ready={detail.get('validators_ready')}")
+        print(f"    validators_reason={detail.get('validators_reason')}")
+        print(f"    fast_sync_active={detail.get('fast_sync_active')}")
+    else:
+        print(f"    [X] {g}")
+
     h = api.has_wallet()
-    print(f"[2] has_wallet: exists={h.get('exists')} "
+    print(f"\n[3] has_wallet: exists={h.get('exists')} "
           f"root_enc={h.get('root_enc')} named={h.get('named_wallets')}")
 
     lw = api.list_wallets()
-    print(f"[3] list_wallets: {len(lw)} carteira(s)")
+    print(f"[4] list_wallets: {len(lw)} carteira(s)")
     for w in lw:
         print(f"      - {w}")
 
     pw = _get_default_password()
     if pw and lw:
         first = lw[0]["name"]
-        print(f"\n[4] Teste load_wallet('{first}.wallet'):")
+        print(f"\n[5] Teste load_wallet('{first}.wallet'):")
         r = api.load_wallet(f"{first}.wallet", pw)
         print(f"    ok={r.get('ok')} address={(r.get('address') or '')[:16]}…")
         print(f"    sk_installed={r.get('sk_installed')} "
               f"node_will_sign={r.get('node_will_sign')} "
+              f"sign_collector_ready={r.get('sign_collector_ready')} "
               f"verification_source={r.get('verification_source')}")
+        print(f"    mining_allowed={r.get('mining_allowed')} "
+              f"gate_reason={r.get('gate_reason')} "
+              f"fast_sync_active={r.get('fast_sync_active')}")
         for w in (r.get("warnings") or []):
             print(f"    [WARN] {w}")
         for e in (r.get("errors") or []):
@@ -1402,19 +1571,23 @@ def _cmd_verify_sk() -> int:
     print("[1] unlock_wallet(pwd do env)…")
     r = api.unlock_wallet(pw)
 
-    print(f"\n    ok               = {r.get('ok')}")
-    print(f"    address          = {r.get('address')}")
-    print(f"    source           = {r.get('source')}")
-    print(f"    api_base         = {r.get('api_base')}")
-    print(f"    api_base_source  = {r.get('api_base_source')}")
-    print(f"    sk_installed     = {r.get('sk_installed')}  <-- O QUE IMPORTA")
-    print(f"    node_will_sign   = {r.get('node_will_sign')}  <-- DERIVADO")
-    print(f"    verification     = {r.get('verification_source')}")
-    print(f"    in_trust         = {r.get('in_trust')}")
-    print(f"    multisig_ready   = {r.get('multisig_ready')}")
-    print(f"    propagated       = {r.get('propagated')}")
-    print(f"    peers_notified   = {r.get('peers_notified')}")
-    print(f"    sync_error_code  = {r.get('sync_error_code') or '(nenhum)'}")
+    print(f"\n    ok                    = {r.get('ok')}")
+    print(f"    address               = {r.get('address')}")
+    print(f"    source                = {r.get('source')}")
+    print(f"    api_base              = {r.get('api_base')}")
+    print(f"    api_base_source       = {r.get('api_base_source')}")
+    print(f"    sk_installed          = {r.get('sk_installed')}  <-- O QUE IMPORTA")
+    print(f"    node_will_sign        = {r.get('node_will_sign')}  <-- DERIVADO")
+    print(f"    sign_collector_ready  = {r.get('sign_collector_ready')}")
+    print(f"    verification_source   = {r.get('verification_source')}")
+    print(f"    mining_allowed        = {r.get('mining_allowed')}")
+    print(f"    gate_reason           = {r.get('gate_reason')}")
+    print(f"    fast_sync_active      = {r.get('fast_sync_active')}")
+    print(f"    in_trust              = {r.get('in_trust')}")
+    print(f"    multisig_ready        = {r.get('multisig_ready')}")
+    print(f"    propagated            = {r.get('propagated')}")
+    print(f"    peers_notified        = {r.get('peers_notified')}")
+    print(f"    sync_error_code       = {r.get('sync_error_code') or '(nenhum)'}")
 
     for w in (r.get("warnings") or []):
         print(f"\n    [WARN] {w}")
@@ -1438,7 +1611,22 @@ def _cmd_verify_sk() -> int:
             print(f"  - _sync_sk_to_chain foi REJEITADA pelo servidor ({ec})")
         else:
             print("  - sync_r veio vazio: carteira sem private_key?")
+
+        print("\n  Verificação cruzada (3 fontes):")
+        print(f"    source = {r.get('verification_source')}")
+        v = r.get("verification") or {}
+        print(f"    installed = {v.get('installed')}  source={v.get('source')}")
+        print(f"    raw = {json.dumps({k: v.get(k) for k in ('n_trust', 'n_active', 'required_sigs') if v.get(k) is not None}, default=str)}")
         return 2
+
+    if r.get("sign_collector_ready") is False:
+        print("\n" + "=" * 60)
+        print(" [!] SK OK MAS sign_collector_ready=False")
+        print("=" * 60)
+        print(" O nó tem a SK mas não vai COLETAR assinaturas dos peers.")
+        print("  - Verifique se blockchain.py é ≥ v9.6.0 (auto-wire)")
+        print("  - Reinicie o main.py e observe o log [wiring:post-p2p]")
+        return 3
 
     print("\n" + "=" * 60)
     print(" [ok] SK INSTALADA — NÓ DEVE ASSINAR NORMALMENTE")
