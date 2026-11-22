@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>BRN Wallet v3.21 (Web)</title>
+<title>BRN Wallet v3.22 (Web)</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -54,6 +54,18 @@
   .mode-badge.origin { background:#1f2d1f; color:#7ee787; border:1px solid #238636; }
   .mode-badge.client { background:#2d2200; color:#e3b341; border:1px solid #9e6a03; }
   .mode-badge.unknown { background:#21262d; color:#8b949e; }
+
+  /* [NEW v3.22] indicador de auth */
+  .auth-badge {
+    display: inline-block; padding: 3px 10px; border-radius: 10px;
+    font-size: .72rem; font-weight: 600; cursor: pointer;
+    font-family: inherit; border: 1px solid #30363d;
+    background: #161b22; color: #8b949e;
+    transition: all .15s;
+  }
+  .auth-badge:hover { background: #21262d; }
+  .auth-badge.on  { background:#1f2d1f; color:#7ee787; border-color:#238636; }
+  .auth-badge.off { background:#2d2200; color:#e3b341; border-color:#9e6a03; }
 
   .fork-banner {
     display: none; padding: 12px 16px; margin-bottom: 14px;
@@ -247,6 +259,14 @@
     padding: 10px 14px; border-radius: 6px; font-size: .85rem;
     margin-top: 10px;
   }
+
+  /* [NEW v3.22] miner target state */
+  .miner-target {
+    font-size:.78rem; transition: color .2s;
+  }
+  .miner-target.idle  { color: #8b949e; }
+  .miner-target.solo  { color: #7ee787; }
+  .miner-target.pool  { color: #79c0ff; }
 </style>
 </head>
 <body>
@@ -254,7 +274,7 @@
 
   <div class="web-banner">
     🌐 <b>Versão Web</b> · A carteira fica apenas no seu navegador (criptografada).
-    A SK nunca é armazenada no servidor Render. Faça backup em <b>💾 Arquivo</b>.
+    A SK nunca é armazenada no servidor. Faça backup em <b>💾 Arquivo</b>.
   </div>
 
   <div id="forkBanner" class="fork-banner">
@@ -262,7 +282,7 @@
   </div>
 
   <header>
-    <h1>🔷 <span>BRN</span> Wallet <span style="font-size:.7rem;color:#8b949e;">v3.21 web</span></h1>
+    <h1>🔷 <span>BRN</span> Wallet <span style="font-size:.7rem;color:#8b949e;">v3.22 web</span></h1>
     <div class="topbar">
       <div class="topbar-item">
         <span class="dot" id="dot"></span>
@@ -270,6 +290,9 @@
       </div>
       <div class="topbar-item">
         <span class="mode-badge unknown" id="modeBadge">—</span>
+      </div>
+      <div class="topbar-item">
+        <button class="auth-badge off" id="authBadge" title="Configure Basic Auth">🔓 sem auth</button>
       </div>
       <div class="topbar-item">
         <span class="topbar-label">Sync:</span>
@@ -444,7 +467,7 @@
 
         <div class="stat" style="margin-top:12px;border-color:#238636;">
           <div class="lbl">⛏️ Minerando para</div>
-          <div class="val" id="minerTarget" style="font-size:.78rem;color:#7ee787;">—</div>
+          <div class="val miner-target idle" id="minerTarget">— (parado)</div>
         </div>
       </div>
 
@@ -599,21 +622,27 @@
     </div>
 
     <div class="card">
-      <h2>Converter BTC → BRN</h2>
-      <div class="unavailable">
-        ⚠️ <b>Indisponível no servidor web.</b> O endpoint <code>/api/bridge/claim</code>
-        não está implementado no <code>server.py</code>. Use a GUI desktop
-        (<code>main.py</code>) para converter BTC→BRN.
+      <h2>Converter BTC → BRN (L2)</h2>
+      <div class="unavailable" style="background:#0d1d2f;border-color:#1f6feb;color:#79c0ff;">
+        ℹ️ A conversão BTC→BRN é feita via <b>ordens L2</b>
+        (<code>/api/l2/create</code>, <code>/api/l2/quote</code>).
+        O cliente web atual mostra <b>somente leitura</b> da cotação.
+        Para criar ordens use a GUI desktop (<code>main.py</code>) ou
+        o endpoint HTTP direto.
       </div>
-      <label>TXID BTC recebido</label>
-      <input id="brTxid" placeholder="ex: 3f4a…" disabled>
-      <label>Meu endereço BRN (destino)</label>
-      <input id="brToBrn" readonly placeholder="brn1...">
+
+      <label>Valor em satoshis (BTC)</label>
+      <input id="l2BtcSats" type="number" min="1000" placeholder="100000" value="100000">
       <div class="row">
-        <button class="btn" id="bBridgeClaim" disabled style="opacity:.5;cursor:not-allowed;">
-          💱 Converter para BRN (indisponível)
-        </button>
+        <button class="btn" id="bL2Quote">💱 Consultar cotação</button>
       </div>
+      <div class="msg" id="mL2Quote"></div>
+
+      <label style="margin-top:14px;">Minhas ordens L2</label>
+      <div class="row">
+        <button class="btn" id="bL2List">📋 Listar ordens</button>
+      </div>
+      <div class="msg" id="mL2List"></div>
     </div>
   </div>
 
@@ -665,7 +694,7 @@
     </div>
   </div>
 
-  <div class="footer">BRN Wallet v3.21 (web) · <span id="apiLbl">—</span></div>
+  <div class="footer">BRN Wallet v3.22 (web) · <span id="apiLbl">—</span></div>
 </div>
 
 <script>
@@ -686,10 +715,14 @@ let _blockCursor = null;
 let _allBlocksLoaded = false;
 let _blocksLoading = false;
 
+// [NEW v3.22] Basic Auth
+let AUTH = null;  // {user, pass, header}
+
 const TAB_KEY = "brn_wallet_last_tab";
 const DEFAULT_TAB = "explorer";
 const LS_LIST_KEY = "brn_wallet_list_v1";
 const LS_WALLET_PREFIX = "brn_wallet_v1_";
+const SS_AUTH_KEY = "brn_basic_auth_v1";
 
 // ============================================================
 // HELPERS
@@ -728,29 +761,123 @@ function fmtAgo(ts) {
 }
 
 // ============================================================
-// HTTP HELPERS
+// [NEW v3.22] BASIC AUTH
 // ============================================================
-async function getJSON(url, timeoutMs = 8000) {
+function _b64encode(s) {
+  try { return btoa(s); }
+  catch (_) {
+    // unicode-safe
+    return btoa(unescape(encodeURIComponent(s)));
+  }
+}
+
+function _loadAuthFromSession() {
+  try {
+    const raw = sessionStorage.getItem(SS_AUTH_KEY);
+    if (!raw) return false;
+    const o = JSON.parse(raw);
+    if (!o || !o.user || !o.pass) return false;
+    AUTH = {
+      user: o.user,
+      pass: o.pass,
+      header: "Basic " + _b64encode(o.user + ":" + o.pass),
+    };
+    return true;
+  } catch (_) { return false; }
+}
+
+function _saveAuth(user, pass) {
+  AUTH = {
+    user,
+    pass,
+    header: "Basic " + _b64encode(user + ":" + pass),
+  };
+  try {
+    sessionStorage.setItem(SS_AUTH_KEY, JSON.stringify({user, pass}));
+  } catch (_) {}
+}
+
+function _clearAuth() {
+  AUTH = null;
+  try { sessionStorage.removeItem(SS_AUTH_KEY); } catch (_) {}
+}
+
+async function promptForAuth(force = false) {
+  if (AUTH && !force) return true;
+  const user = prompt("Usuário Basic Auth (BRN_WEB_USER):",
+                       AUTH ? AUTH.user : "admin");
+  if (user === null || user === "") return false;
+  const pass = prompt("Senha Basic Auth (BRN_WEB_PASS):", "");
+  if (pass === null || pass === "") return false;
+  _saveAuth(user, pass);
+  _updateAuthIndicator();
+  return true;
+}
+
+function _updateAuthIndicator() {
+  const el = $("authBadge");
+  if (!el) return;
+  if (AUTH) {
+    el.textContent = "🔐 " + AUTH.user;
+    el.className = "auth-badge on";
+    el.title = "Basic Auth ativo. Clique para remover.";
+  } else {
+    el.textContent = "🔓 sem auth";
+    el.className = "auth-badge off";
+    el.title = "Sem Basic Auth. Clique para configurar.";
+  }
+}
+
+// ============================================================
+// HTTP HELPERS (com auth + retry automático em 401)
+// ============================================================
+function _isAuthError(e) {
+  const m = (e && e.message) || "";
+  return /HTTP\s*401/i.test(m) || /unauthoriz/i.test(m) || /auth required/i.test(m);
+}
+
+async function _withAuthRetry(fn) {
+  try {
+    return await fn();
+  } catch (e) {
+    if (_isAuthError(e)) {
+      const ok = await promptForAuth(true);
+      if (!ok) throw e;
+      return await fn();
+    }
+    throw e;
+  }
+}
+
+async function _getJSONOnce(url, timeoutMs) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const r = await fetch(url, {signal: ctrl.signal});
+    const headers = {};
+    if (AUTH) headers["Authorization"] = AUTH.header;
+    const r = await fetch(url, {signal: ctrl.signal, headers});
     if (!r.ok) {
       let errMsg = `HTTP ${r.status}`;
-      try { const e = await r.json(); if (e.msg) errMsg = e.msg; } catch(_) {}
+      try {
+        const e = await r.json();
+        if (e.msg) errMsg = e.msg;
+        else if (e.error) errMsg = e.error;
+      } catch (_) {}
       throw new Error(errMsg);
     }
     return await r.json();
   } finally { clearTimeout(timer); }
 }
 
-async function postJSON(url, body, timeoutMs = 20000) {
+async function _postJSONOnce(url, body, timeoutMs) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
+    const headers = {"Content-Type": "application/json"};
+    if (AUTH) headers["Authorization"] = AUTH.header;
     const r = await fetch(url, {
       method: "POST",
-      headers: {"Content-Type": "application/json"},
+      headers,
       body: JSON.stringify(body || {}),
       signal: ctrl.signal,
     });
@@ -761,6 +888,24 @@ async function postJSON(url, body, timeoutMs = 20000) {
     }
     return data;
   } finally { clearTimeout(timer); }
+}
+
+async function getJSON(url, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? 8000;
+  const promptOnAuth = opts.promptOnAuth ?? false;
+  if (promptOnAuth) {
+    return _withAuthRetry(() => _getJSONOnce(url, timeoutMs));
+  }
+  return _getJSONOnce(url, timeoutMs);
+}
+
+async function postJSON(url, body, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? 20000;
+  const promptOnAuth = opts.promptOnAuth ?? true;
+  if (promptOnAuth) {
+    return _withAuthRetry(() => _postJSONOnce(url, body, timeoutMs));
+  }
+  return _postJSONOnce(url, body, timeoutMs);
 }
 
 // ============================================================
@@ -906,34 +1051,60 @@ async function api(method, ...args) {
         return await getJSON("/api/minhas-txs/" + encodeURIComponent(args[0]) + "?limit=" + limit);
       }
 
+      // [FIX v3.22] inclui asset_id e public_key
       case "transfer": {
-        // args: [from, to, "BRN", amount, private_key, public_key]
         return await postJSON("/api/transfer", {
-          from: args[0], to: args[1], amount: args[3], private_key: args[4],
+          from: args[0],
+          to: args[1],
+          asset_id: args[2] || "BRN",
+          amount: args[3],
+          private_key: args[4],
+          public_key: args[5] || "",
         });
       }
 
       case "mining_status":
         return await getJSON("/api/miner/status");
 
-      case "start_mining":
+      // [FIX v3.22] manda address E validator_address (compat)
+      case "start_mining": {
         return await postJSON("/api/miner/start", {
-          address: args[0], miner_pubkey: args[1],
+          address: args[0],
+          validator_address: args[0],
+          miner_pubkey: args[1],
         });
+      }
 
       case "stop_mining":
         return await postJSON("/api/miner/stop", {});
 
-      case "pool_status":
-        return await getJSON("/api/pool/local_status");
+      // [FIX v3.22] tenta /api/pool/status, cai para /api/pool/local_status
+      case "pool_status": {
+        try {
+          return await getJSON("/api/pool/status");
+        } catch (_) {
+          return await getJSON("/api/pool/local_status");
+        }
+      }
 
-      case "pool_start_mining":
-        return await postJSON("/api/pool/start_local", {
-          address: args[0], pubkey: args[1],
-        });
+      // [FIX v3.22] tenta /api/pool/start, cai para /api/pool/start_local
+      case "pool_start_mining": {
+        const body = {address: args[0], pubkey: args[1]};
+        try {
+          return await postJSON("/api/pool/start", body);
+        } catch (_) {
+          return await postJSON("/api/pool/start_local", body);
+        }
+      }
 
-      case "pool_stop_mining":
-        return await postJSON("/api/pool/stop_local", {});
+      // [FIX v3.22] tenta /api/pool/stop, cai para /api/pool/stop_local
+      case "pool_stop_mining": {
+        try {
+          return await postJSON("/api/pool/stop", {});
+        } catch (_) {
+          return await postJSON("/api/pool/stop_local", {});
+        }
+      }
 
       case "verificar_recebimento": {
         const [addr, txid] = args;
@@ -944,8 +1115,19 @@ async function api(method, ...args) {
       case "tx_status":
         return await getJSON("/api/tx-status/" + encodeURIComponent(args[0]));
 
+      // [FIX v3.22] usa L2 em vez do inexistente /api/bridge/claim
       case "bridge_claim":
-        return {ok: false, msg: "Bridge claim não disponível no servidor web. Use a GUI desktop."};
+        return {ok: false, msg: "Converter BTC→BRN no web não está implementado. Use L2 (API /api/l2/create) ou a GUI desktop."};
+
+      case "l2_quote": {
+        const sats = Number(args[0]) || 100000;
+        return await getJSON("/api/l2/quote?btc_sats=" + sats);
+      }
+
+      case "l2_list": {
+        const buyer = args[0] || "";
+        return await getJSON("/api/l2/list?buyer=" + encodeURIComponent(buyer));
+      }
 
       case "save_wallet":
         return await saveWalletLocal(args[0], args[1], {
@@ -1043,7 +1225,9 @@ async function refreshSyncInfo() {
 
     if (d.miner_target) {
       const el = $("minerTarget");
-      if (el) el.textContent = d.miner_target;
+      if (el && el.classList.contains("idle")) {
+        el.textContent = d.miner_target;
+      }
     }
 
     if ($("brOnState")) {
@@ -1403,7 +1587,7 @@ async function gerarCarteira() {
   }
 }
 
-// [FIX v3.21] Atualiza o endereço na caixa verde assim que a carteira é carregada/gerada
+// [FIX v3.22] NÃO seta minerTarget = wallet.address (bug D)
 function renderCarteira() {
   if (!wallet.address) return;
   $("walletBox").style.display = "block";
@@ -1412,11 +1596,7 @@ function renderCarteira() {
   $("wPriv").style.filter = "blur(4px)";
   $("wPub").textContent  = wallet.public_key;
   $("txFrom").value = wallet.address;
-  $("brToBrn").value = wallet.address;
-  
-  // NOVO: Mostra o endereço no alvo de mineração imediatamente
-  const mt = $("minerTarget");
-  if (mt) mt.textContent = wallet.address;
+  $("brToBrn") && ($("brToBrn").value = wallet.address);
 }
 
 async function atualizarSaldo() {
@@ -1545,14 +1725,13 @@ async function minerar() {
   if (!wallet.address) { msg("mMine", "❌ Gere/carregue uma carteira.", "err"); return; }
   if (miningBusy) return;
 
-  // Verifica se o nó tem blockchain antes de minerar solo
   try {
     const st = await api("node_status");
     const height = st.height || 0;
-    
+
     if (height <= 0) {
       msg("mMine", "⚠️ Nó sem blockchain local. Redirecionando para o Pool...", "warn", 5000);
-      
+
       setTimeout(async () => {
         await minerarPool();
       }, 1500);
@@ -1599,9 +1778,6 @@ async function minerar() {
       if (r && r.ok) {
         msg("mMine", "⛏️ Mineração LOCAL (Solo) iniciada.", "ok", 6000);
         miningRunning = true;
-        // [FIX v3.21] Garante que a caixa verde mostra o endereço
-        const mt = $("minerTarget");
-        if (mt) mt.textContent = wallet.address;
       } else {
         msg("mMine", "❌ " + ((r && r.msg) || "falha ao iniciar"), "err");
       }
@@ -1658,9 +1834,6 @@ async function minerarPool() {
       const r = await api("pool_start_mining", wallet.address, wallet.public_key);
       if (r && r.ok) {
         msg("mPool", "🌐 Ligado ao pool! Minerando com a pool da rede.", "ok", 6000);
-        // [FIX v3.21] Garante que a caixa verde mostra o endereço
-        const mt = $("minerTarget");
-        if (mt) mt.textContent = wallet.address;
       } else {
         msg("mPool", "❌ " + ((r && r.msg) || "falha ao ligar ao pool"), "err");
       }
@@ -1676,12 +1849,32 @@ async function minerarPool() {
 // ============================================================
 // ATUALIZAR UI DE MINERAÇÃO
 // ============================================================
+function _setMinerTarget(state, addr) {
+  const el = $("minerTarget");
+  if (!el) return;
+  if (state === "solo" && addr) {
+    el.textContent = addr;
+    el.className = "val miner-target solo";
+  } else if (state === "pool" && addr) {
+    el.textContent = addr + " (via pool)";
+    el.className = "val miner-target pool";
+  } else {
+    el.textContent = "— (parado)";
+    el.className = "val miner-target idle";
+  }
+}
+
 async function updateMiningUI() {
+  let soloRunning = false, soloAddr = "";
+  let poolRunning = false, poolAddr = "";
+
   try {
     const st = await api("mining_status");
     const btn = $("bMinerar");
     const box = $("miningInfo");
     miningRunning = !!(st && st.running);
+    soloRunning = miningRunning;
+    soloAddr = st && st.address ? st.address : "";
 
     if (!miningBusy) {
       btn.disabled = false;
@@ -1702,15 +1895,8 @@ async function updateMiningUI() {
       $("miningUptime").textContent = fmtUptime(st.uptime || 0);
       const hr = (st.hashrate_khs != null) ? st.hashrate_khs : ((st.hashrate || 0) / 1000);
       $("miningHashrate").textContent = Number(hr).toFixed(2);
-      
-      // [FIX v3.21] Se está minerando, mostra o endereço ativo
-      const mt = $("minerTarget");
-      if (mt) mt.textContent = st.address || wallet.address || "—";
     } else {
       box.classList.remove("show");
-      // [FIX v3.21] Se parou, mostra o endereço da carteira (se tiver)
-      const mt = $("minerTarget");
-      if (mt) mt.textContent = wallet.address || "—";
     }
   } catch (e) { /* silencioso */ }
 
@@ -1718,7 +1904,8 @@ async function updateMiningUI() {
     const pst = await api("pool_status");
     const btn = $("bMinerarPool");
     const box = $("poolInfo");
-    const poolRunning = !!(pst && pst.running);
+    poolRunning = !!(pst && pst.running);
+    poolAddr = pst && pst.address ? pst.address : "";
 
     if (!miningBusy) {
       btn.disabled = false;
@@ -1750,6 +1937,15 @@ async function updateMiningUI() {
       box.classList.remove("show");
     }
   } catch (e) { /* silencioso */ }
+
+  // [FIX v3.22] Estado do minerTarget derivado de onde está minerando
+  if (soloRunning) {
+    _setMinerTarget("solo", soloAddr || wallet.address);
+  } else if (poolRunning) {
+    _setMinerTarget("pool", poolAddr || wallet.address);
+  } else {
+    _setMinerTarget("idle", "");
+  }
 }
 
 // ============================================================
@@ -1819,11 +2015,42 @@ async function consultarTxStatus() {
 }
 
 // ============================================================
-// BRIDGE
+// BRIDGE / L2
 // ============================================================
 async function bridgeRefresh() {
   clearMsg("mBridge");
   await refreshSyncInfo();
+}
+
+async function l2Quote() {
+  clearMsg("mL2Quote");
+  const sats = Number($("l2BtcSats").value) || 100000;
+  try {
+    const r = await api("l2_quote", sats);
+    if (r.error) throw new Error(r.error);
+    let txt = "";
+    if (r.rate) txt += "Taxa: " + r.rate + " · ";
+    if (r.brn_net) txt += "Você recebe: " + r.brn_net + " BRN";
+    else txt = JSON.stringify(r);
+    msg("mL2Quote", txt, "ok", 10000);
+  } catch (e) {
+    msg("mL2Quote", "❌ " + e.message, "err");
+  }
+}
+
+async function l2List() {
+  clearMsg("mL2List");
+  try {
+    const r = await api("l2_list", wallet.address || "");
+    if (r.error) throw new Error(r.error);
+    const list = r.orders || r.list || [];
+    if (!list.length) { msg("mL2List", "Nenhuma ordem encontrada.", "info", 5000); return; }
+    msg("mL2List", list.length + " ordem(ns): " +
+      list.slice(0,5).map(o => (o.escrow_id || "?").slice(0,10) + " [" + (o.status || "?") + "]").join(", "),
+      "info", 15000);
+  } catch (e) {
+    msg("mL2List", "❌ " + e.message, "err");
+  }
 }
 
 // ============================================================
@@ -1896,6 +2123,16 @@ async function downloadWallet() {
   if (!wallet.address) { msg("mBackup", "❌ Sem carteira.", "err"); return; }
   const pass = $("svPass").value || prompt("Senha para criptografar o backup (mín. 8):");
   if (!pass || pass.length < 8) { msg("mBackup", "❌ Senha inválida.", "err"); return; }
+
+  // [FIX v3.22] confirmação obrigatória — sem ela perde tudo
+  const ack = confirm(
+    "⚠️ BACKUP CRIPTOGRAFADO\n\n" +
+    "O arquivo .json que será baixado SÓ pode ser aberto com a senha que você acabou de digitar.\n\n" +
+    "Se você perder essa senha, PERDE a carteira para sempre. Ninguém — nem o servidor — consegue recuperar.\n\n" +
+    "Você guardou a senha em local seguro?"
+  );
+  if (!ack) { msg("mBackup", "⏹️ Backup cancelado.", "info", 3000); return; }
+
   try {
     const enc = await encryptWallet({
       address: wallet.address,
@@ -1953,7 +2190,6 @@ function switchTab(tabName) {
   try { localStorage.setItem(TAB_KEY, tabName); } catch (_) {}
   if (tabName === "bridge") {
     refreshSyncInfo();
-    $("brToBrn").value = wallet.address || "";
   }
 }
 
@@ -1970,6 +2206,19 @@ function configTabs() {
 }
 
 function configEventos() {
+  // [NEW v3.22] auth badge
+  $("authBadge").onclick = async () => {
+    if (AUTH) {
+      if (!confirm("Remover Basic Auth da sessão?")) return;
+      _clearAuth();
+      _updateAuthIndicator();
+      return;
+    }
+    if (await promptForAuth(true)) {
+      msg("mCart", "✅ Auth salva para esta sessão.", "ok", 3000);
+    }
+  };
+
   $("bSyncCheck").onclick = syncCheckConnection;
   $("bSyncStart").onclick = syncStart;
   $("bSyncStop").onclick  = syncStop;
@@ -2008,6 +2257,8 @@ function configEventos() {
   };
   $("bTxStatus").onclick   = consultarTxStatus;
   $("bBridgeRefresh").onclick = bridgeRefresh;
+  $("bL2Quote").onclick    = l2Quote;
+  $("bL2List").onclick     = l2List;
   $("bSalvar").onclick     = salvar;
   $("bListar").onclick     = listarWallets;
   $("bCarregar").onclick   = carregar;
@@ -2028,6 +2279,9 @@ function configEventos() {
 // BOOTSTRAP
 // ============================================================
 async function boot() {
+  _loadAuthFromSession();
+  _updateAuthIndicator();
+
   configTabs();
   configEventos();
   $("apiLbl").textContent = window.location.host;
