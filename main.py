@@ -1,1912 +1,2242 @@
-"""blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.7.0 | Data: 23/11/2026
+"""main.py — Entrypoint do nó BRN (v13.9.25)
 ================================================================
-v9.7.0 (2026-11-23) — CONSENSO ESTRITO A PARTIR DO BLOCO 6000:
-  [NEW] CONSENSUS_STRICT_FROM_HEIGHT (default 6000, env
-        BRN_CONSENSUS_STRICT_FROM). A partir dessa altura:
-          - _validate_validators_sig NÃO usa mais NENHUM bypass
-            (bootstrap local, estrangeira, trust_score, skip_until,
-            assume_valid). Só aceita se tiver N assinaturas de
-            pubkeys DISTINTAS no set local.
-          - validate_block não aceita assume_valid em blocos ≥ limite.
-          - mine_block_interruptible retorna None se
-            _count_synced_peers() < _min_peers_for_mining().
-  [NEW] _count_synced_peers(): conta peers com height dentro de
-        ±PEER_SYNC_TOLERANCE da altura local (default ±2).
-  [NEW] _min_peers_for_mining() = MIN_PEERS_FOR_MINING (default 3,
-        env BRN_MIN_PEERS_FOR_MINING).
-  [NEW] _count_external_sigs(): conta assinaturas válidas que NÃO
-        são da _local_validator_sk. Usado para garantir que a rede
-        realmente assinou, não só o nó local.
-  [NEW] Em blocos ≥ CONSENSUS_STRICT_FROM_HEIGHT, _validate_validators_sig
-        exige `external_sigs >= required - 1` (ou seja, se required=3,
-        precisa de ≥2 assinaturas de peers externos — a sua conta como 1).
-  [NEW] Logs claros: "[CONSENSUS] altura X < 6000: usando bypass
-        bootstrap" / "[CONSENSUS] altura X ≥ 6000: consenso ESTRITO".
-  [KEEP] v9.6.0: auto-wire (trust_net, local_validator_sk,
-         sign_collector), set_p2p cria collector automaticamente.
-v9.6.0 (2026-11-22) — AUTO-WIRE DE CONSENSO
-v9.5.9 (2026-11-15) — ROBUSTEZ DE BANCO DE DADOS
+v13.9.25 (2026-11-17) — PROPAGAÇÃO DE ENV PRO SERVER.PY:
+  [FIX CRÍTICO] _maybe_enable_fast_sync() agora SEMPRE escreve
+        os.environ["BRN_FAST_SYNC_UNTIL"], inclusive quando desativado
+        (--no-fast-sync ou --fast-sync-until 0). Antes só setava
+        BRN_ASSUME_VALID_UNTIL / BRN_BOOTSTRAP_SKIP_SIGS_UNTIL.
+        server.py lê BRN_FAST_SYNC_UNTIL no IMPORT (constante módulo-global
+        _MIN_FAST_SYNC_UNTIL), então com --no-fast-sync o main.py liberava
+        o auto-mine mas /api/pool/start_local retornava 409
+        "fast_sync_below_4084" em loop eterno. Sintoma: "PoolClient
+        falhou (1)" a cada 30s no log do auto-mine.
+  [FIX CRÍTICO] _start_web_server() agora chama srv.set_peer_id() com
+        BRN_PEER_ID (derivado logo após node_identity). Sem isto,
+        server._BRN_PEER_ID ficava vazio e, quando FastAPI falhava e o
+        main.py caía no fallback Flask (srv.app.run()), a rota /wallet
+        do Flask não redirecionava → operador perdia a GUI no browser.
+        Também /api/peer_id retornava peer_id="" nos health checks.
+  [FIX] main() agora propaga a porta HTTP resolvida (BRN_WEB_PORT ou
+        PORT ou 5000) para os.environ["BRN_WEB_PORT"]. server.py lê
+        BRN_WEB_PORT pra BOOTSTRAP_HTTP_PORT — no Render (PORT=10000,
+        sem BRN_WEB_PORT) os notify de bootstrap iam pra porta 5000.
+  [KEEP] v13.9.24: auto_discovery DEPOIS de _setup_logging;
+        _do_force_http_resync(headless=...) explícito;
+        _setup_logging() sempre retorna Logger.
+v13.9.24 (2026-11-17) — LIMPEZA:
+  [FIX] auto_discovery.auto_configure_bootstrap() movido para
+        DEPOIS de _setup_logging() — antes seus logs eram
+        descartados no logger raiz.
+  [FIX] _do_force_http_resync() recebe 'headless' como parâmetro
+        em vez de fazer '"--headless" in sys.argv'.
+  [FIX] _setup_logging() garante retorno de um Logger válido.
+v13.9.23 — AUTO-HEALER DE PEERS (CONSENSO):
+  [NEW] Thread _peer_healer_loop rodando a cada 15s.
+        Ela pinga os peers via P2P, descobre a altura real e
+        atualiza o SQLite, destravando o Mining Gate sem
+        precisar de scripts externos.
+v13.9.22 (2026-11-14) — DESCOBERTA AUTOMÁTICA DE PEERS (TAILSCALE):
+  [NEW] Ao iniciar, o nó chama auto_discovery.auto_configure_bootstrap()
+        para listar todos os IPs online na rede Tailscale e adicioná-los
+        automaticamente ao BRN_BOOTSTRAP_PEERS.
+v13.9.21 — CONSENSO DE ALTURA (SYNC REAL):
+  [FIX] O sistema não depende mais cegamente do bloco 6000 para
+        considerar o nó "sincronizado".
+v13.9.20 — SOLUÇÃO 2: caminho único de carteira por peer:
+  [NEW] PEER_ID = sha256(pubkey)[:16] derivado logo após carregar
+        node_identity. Injetado em os.environ["BRN_PEER_ID"].
 ================================================================
 """
 from __future__ import annotations
-
-__version__ = "9.7.0"
-
-import os
-import time
-import math
-import hmac
-import json
+import argparse
 import hashlib
+import os
+import signal
+import sys
+import threading
+import time
+import json
 import logging
-from typing import Optional
+import secrets
+import sqlite3
+from pathlib import Path
 
-import orjson
-
-from crypto import double_sha256, sha256
-from db import ChainDB
-
-
-log = logging.getLogger("blockchain")
-
-COIN_NAME       = "BrunoCoin"
-TICKER          = "BRN"
-DECIMALS        = 8
-UNIT            = 10 ** DECIMALS
-MAX_SUPPLY      = 21_000_000 * UNIT
-INITIAL_REWARD  = 50 * UNIT
-HALVING_INTERVAL = 210_000
-
-BLOCK_TIME          = int(os.environ.get("BRN_BLOCK_TIME",       "30"))
-DIFFICULTY_INTERVAL = int(os.environ.get("BRN_DIFF_INTERVAL",    "50"))
-MAX_DIFFICULTY      = int(os.environ.get("BRN_MAX_DIFFICULTY",   "7"))
-INITIAL_DIFFICULTY  = int(os.environ.get("BRN_MIN_DIFFICULTY",   "5"))
-FORCE_DIFFICULTY    = os.environ.get("BRN_FORCE_DIFFICULTY", "").strip()
-
-MAX_TX_PER_BLOCK   = 500
-MIN_RELAY_FEE      = 1000
-MAX_REORG_DEPTH    = 2000
-HASH_BATCH_SIZE    = 5000
-AUTH_TAG_START_HEIGHT = 6000
-CHECKPOINT_INTERVAL   = 1000
-MTP_WINDOW            = 50
-FILA_MAX_MINERADORES  = 20
-
-MAX_VALIDATORS       = int(os.environ.get("BRN_MAX_VALIDATORS", "5"))
-REQUIRE_ALL_SIGS     = os.environ.get("BRN_REQUIRE_ALL_SIGS", "1") == "1"
-VALIDATOR_QUORUM     = float(os.environ.get("BRN_VALIDATOR_QUORUM", "0.67"))
-SIG_COLLECT_TIMEOUT  = float(os.environ.get("BRN_SIG_COLLECT_TIMEOUT", "10"))
-MAX_MEMPOOL_SIZE     = int(os.environ.get("BRN_MAX_MEMPOOL_SIZE", "5000"))
-
-BOOTSTRAP_TRUST_THRESHOLD = float(
-    os.environ.get("BRN_BOOTSTRAP_TRUST_THRESHOLD", "500")
-)
-
-BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = int(
-    os.environ.get("BRN_BOOTSTRAP_SKIP_SIGS_UNTIL", "0") or "0"
-)
-
-BRN_ASSUME_VALID_UNTIL = int(
-    os.environ.get("BRN_ASSUME_VALID_UNTIL", "0") or "0"
-)
-
-BRN_CHECKPOINT_AUTO_HEIGHT = int(
-    os.environ.get("BRN_CHECKPOINT_AUTO_HEIGHT", "0") or "0"
-)
-
-BRN_PBFT_ENFORCE = os.environ.get("BRN_PBFT_ENFORCE", "0") == "1"
-BRN_PBFT_START_HEIGHT = int(os.environ.get("BRN_PBFT_START_HEIGHT", "0"))
-
-BRN_STRICT_MULTISIG = os.environ.get("BRN_STRICT_MULTISIG", "0") == "1"
-
-BRN_TRUST_FALLBACK_TO_TOP = os.environ.get("BRN_TRUST_FALLBACK_TO_TOP", "0") == "1"
-
-BRN_AUTO_WIRE = os.environ.get("BRN_AUTO_WIRE", "1") == "1"
-
-# ============================================================
-# [v9.7.0] CONSENSO ESTRITO A PARTIR DO BLOCO 6000
-# ============================================================
-CONSENSUS_STRICT_FROM_HEIGHT = int(
-    os.environ.get("BRN_CONSENSUS_STRICT_FROM", "6000") or "6000"
-)
-MIN_PEERS_FOR_MINING = int(
-    os.environ.get("BRN_MIN_PEERS_FOR_MINING", "3") or "3"
-)
-PEER_SYNC_TOLERANCE = int(
-    os.environ.get("BRN_PEER_SYNC_TOLERANCE", "2") or "2"
-)
-
-if CONSENSUS_STRICT_FROM_HEIGHT > 0:
-    log.warning(
-        "[CONSENSUS] A partir do bloco #%d: "
-        "consenso ESTRITO (sem bypass de multi-sig, "
-        "exige ≥%d peers sincronizados para minerar).",
-        CONSENSUS_STRICT_FROM_HEIGHT, MIN_PEERS_FOR_MINING,
-    )
-
-if BRN_STRICT_MULTISIG:
-    BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = 0
-    BRN_ASSUME_VALID_UNTIL = 0
-    log.warning(
-        "[STRICT] BRN_STRICT_MULTISIG=1 — TODOS os bypasses de "
-        "multi-sig foram desativados. A rede vai travar se os "
-        "validadores não assinarem."
-    )
-
-if not (0.0 < VALIDATOR_QUORUM <= 1.0):
-    VALIDATOR_QUORUM = 0.67
-if SIG_COLLECT_TIMEOUT <= 0:
-    SIG_COLLECT_TIMEOUT = 10.0
-if BOOTSTRAP_TRUST_THRESHOLD < 0:
-    BOOTSTRAP_TRUST_THRESHOLD = 500.0
-if BRN_BOOTSTRAP_SKIP_SIGS_UNTIL < 0:
-    BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = 0
-if BRN_ASSUME_VALID_UNTIL < 0:
-    BRN_ASSUME_VALID_UNTIL = 0
-if BRN_CHECKPOINT_AUTO_HEIGHT < 0:
-    BRN_CHECKPOINT_AUTO_HEIGHT = 0
-if BRN_PBFT_START_HEIGHT < 0:
-    BRN_PBFT_START_HEIGHT = 0
-
-if BRN_ASSUME_VALID_UNTIL > 0:
-    log.warning(
-        "[ASSUME-VALID] Ativo até altura %d — blocos nessa faixa pulam "
-        "validação completa.",
-        BRN_ASSUME_VALID_UNTIL,
-    )
-if BRN_CHECKPOINT_AUTO_HEIGHT > 0:
-    log.warning(
-        "[AUTO-CHECKPOINT] Checkpoint automático na altura %d.",
-        BRN_CHECKPOINT_AUTO_HEIGHT,
-    )
-if BRN_PBFT_ENFORCE:
-    log.warning(
-        "[PBFT] ENFORCE=1 — blocos a partir da altura %d sem "
-        "pbft_commits válidos serão rejeitados.",
-        BRN_PBFT_START_HEIGHT,
-    )
-if BRN_TRUST_FALLBACK_TO_TOP:
-    log.warning(
-        "[TRUST] BRN_TRUST_FALLBACK_TO_TOP=1 — _get_active_validators "
-        "vai usar get_top_validators() quando active estiver vazio. "
-        "ISSO PODE INTRODUZIR FANTASMAS NO QUÓRUM."
-    )
-
-GENESIS_PREV      = "0" * 64
-GENESIS_TIMESTAMP = 1700000000
-GENESIS_REWARD    = INITIAL_REWARD
-GENESIS_ADDRESS   = "brn1qxyzk7y0v2j4g0a8d9n5t2k7h4s6w8c9p2e"
-GENESIS_PUBKEY    = ""
-
-SIGNING_DOMAIN   = b"BRN-TX-v1|"
-AUTH_TAG_DOMAIN  = b"BRN-BLOCK-AUTH-v1|"
-BLOCK_SIG_DOMAIN = b"BRN-BLOCK-SIG-v1|"
-_CORE_V          = 1
-NETWORK_SECRET = os.environ.get("BRN_NETWORK_SECRET", "").strip()
+BASE_DIR = Path(__file__).resolve().parent
+os.chdir(BASE_DIR)
 
 try:
-    import brn_miner as _brn_miner_c
-    _HAS_C_MINER = _brn_miner_c.is_available()
-    if _HAS_C_MINER:
-        log.info("PoW C acceleration ATIVA (%s)", _brn_miner_c.library_path())
-    else:
-        log.info("PoW C acceleration indisponível — usando Python puro")
-except Exception as _e:
-    _brn_miner_c = None
-    _HAS_C_MINER = False
-    log.debug("brn_miner.py nao disponivel: %s", _e)
+    from version import VERSION, BUILD_DATE
+except ImportError:
+    VERSION = "13.9.25"
+    BUILD_DATE = "2026-11-17"
+
+try:
+    from isolation_detector import IsolationDetector
+    _HAS_ISOLATION = True
+except ImportError:
+    IsolationDetector = None
+    _HAS_ISOLATION = False
+
+try:
+    import wallet_integrator as _wi
+    _HAS_WI = True
+except ImportError:
+    _wi = None
+    _HAS_WI = False
+
+try:
+    import requests as _requests
+    _HAS_REQUESTS = True
+except ImportError:
+    _requests = None
+    _HAS_REQUESTS = False
+
+try:
+    from wallet import Wallet as _Wallet
+    _HAS_WALLET = True
+except ImportError:
+    _Wallet = None
+    _HAS_WALLET = False
 
 
-def miner_info() -> dict:
-    if _HAS_C_MINER and _brn_miner_c is not None:
-        return {"c_available": True, "path": str(_brn_miner_c.library_path()),
-                "python_fallback": True}
-    return {"c_available": False, "path": None, "python_fallback": True}
+SK_VALIDATION_STATE = {
+    "checked": False, "ok": False, "error": "", "source": "",
+    "address_configured": "", "address_derived": "",
+    "pubkey_configured": "", "pubkey_derived": "",
+    "origin_online": None, "auto_mine_status": "idle", "gui_wallet_source": "",
+    "local_height": -1,
+    "fast_sync_active": False,
+    "fast_sync_until": 0,
+    "validators_ready": False,
+    "validators_reason": "",
+    "validators_detail": {},
+}
+
+HTTP_SYNC_PROGRESS = {
+    "syncing": False,
+    "local_height": -1,
+    "target_height": 0,
+    "percent": 0.0,
+    "best_peer": "",
+}
 
 
-_checkpoints: dict = {}
-_checkpoint_priv = None
+def parse_args():
+    p = argparse.ArgumentParser(prog="main.py")
+    p.add_argument("--headless", action="store_true")
+    p.add_argument("--no-gui", action="store_true")
+    p.add_argument("--client-mode", action="store_true")
+    p.add_argument("--origem", action="store_true")
+    p.add_argument("--no-pool-client", action="store_true")
+    p.add_argument("--no-auto-config", action="store_true")
+    p.add_argument("--no-interactive", action="store_true")
+    p.add_argument("--no-p2p", action="store_true")
+    p.add_argument("--no-explorer", action="store_true")
+    p.add_argument("--db", metavar="PATH", default=None)
+    p.add_argument("--web-port", type=int, default=None)
+    p.add_argument("--p2p-port", type=int, default=None)
+    p.add_argument("--version", action="store_true")
+    p.add_argument("--skip-verify", action="store_true")
+    p.add_argument("--force-http-resync", action="store_true",
+                   help="renomeia o DB para .bak.TIMESTAMP e sai")
+    p.add_argument("--fast-sync-until", type=int, default=None,
+                   help="Altura até a qual pular validação completa")
+    p.add_argument("--no-fast-sync", action="store_true",
+                   help="Desativa fast-sync (validação completa desde o boot)")
+    return p.parse_args()
 
 
-def set_checkpoints(d: dict) -> None:
-    global _checkpoints
-    _checkpoints = {str(k): v for k, v in (d or {}).items()}
-
-
-def set_checkpoint_priv(priv) -> None:
-    global _checkpoint_priv
-    _checkpoint_priv = priv
-
-
-def get_checkpoints() -> dict:
-    return dict(_checkpoints)
-
-
-def _create_auto_checkpoint(block: dict) -> None:
-    if _checkpoint_priv is None:
-        log.warning(
-            "[CHECKPOINT] #%d NÃO criado: _checkpoint_priv não configurada",
-            block["height"],
-        )
-        return
+def _load_env_file():
+    env_file = BASE_DIR / "brn_network.env"
+    if not env_file.exists():
+        return 0
+    loaded = 0
     try:
-        from checkpoints import sign_checkpoint, save_checkpoints, load_checkpoints
-        h = int(block["height"])
-        cp = sign_checkpoint(h, block["hash"], _checkpoint_priv)
-        if not cp:
-            log.warning("[CHECKPOINT] #%d sign_checkpoint retornou vazio", h)
-            return
-        cps = load_checkpoints()
-        cps[str(h)] = cp
-        save_checkpoints(cps)
-        _checkpoints[str(h)] = cp
-        log.warning(
-            "[CHECKPOINT] #%d criado automaticamente: %s...",
-            h, block["hash"][:32],
-        )
-    except Exception as e:
-        log.error("[CHECKPOINT] #%d falhou: %s", block["height"], e)
-
-
-def _verify_checkpoint_for_block(block) -> tuple:
-    cp = _checkpoints.get(str(block["height"]))
-    if not cp:
-        return True, ""
-    if cp.get("hash") != block["hash"]:
-        return False, f"checkpoint mismatch em #{block['height']}"
-    try:
-        from checkpoints import verify_checkpoint
-        if not verify_checkpoint(cp):
-            return False, f"checkpoint invalido em #{block['height']}"
-    except ImportError:
-        pass
-    except Exception as e:
-        return False, f"checkpoint verify erro: {e}"
-    return True, ""
-
-
-def _maybe_sign_checkpoint(block) -> None:
-    if _checkpoint_priv is None:
-        return
-    try:
-        h = int(block["height"])
-        if h == 0 or h % CHECKPOINT_INTERVAL != 0:
-            return
-        from checkpoints import sign_checkpoint, save_checkpoints
-        from wallet import Wallet
-        priv = _checkpoint_priv
-        if isinstance(priv, str):
-            priv = Wallet(private_key_hex=priv.strip())
-        cp = sign_checkpoint(h, block["hash"], priv)
-        if not cp:
-            return
-        _checkpoints[str(h)] = cp
-        save_checkpoints(_checkpoints)
-        print(f"[CHECKPOINT] #{h} assinado e salvo")
+        text = env_file.read_text(encoding="utf-8", errors="ignore")
     except Exception:
-        pass
+        return 0
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        k, _, v = s.partition("=")
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        if k and k not in os.environ:
+            os.environ[k] = v
+            loaded += 1
+    return loaded
 
 
-def signing_hash_block(block: dict) -> bytes:
-    raw_msg = BLOCK_SIG_DOMAIN + block["hash"].encode()
-    return sha256(raw_msg)
-
-
-def sign_block_as_validator(block: dict, priv) -> dict:
-    if priv is None:
-        return {}
-    try:
-        from wallet import Wallet
-        if not isinstance(priv, Wallet):
-            if isinstance(priv, str):
-                priv = Wallet(private_key_hex=priv.strip())
-            else:
-                return {}
-        h = signing_hash_block(block)
-        sig = priv.sign(h)
-        return {
-            "pubkey": priv.pub_hex,
-            "signature": sig,
-        }
-    except Exception as e:
-        log.debug(f"sign_block falhou: {e}")
-        return {}
-
-
-def verify_block_signature(pubkey_hex: str, block: dict, sig_hex: str) -> bool:
-    try:
-        from wallet import Wallet
-        h = signing_hash_block(block)
-        return Wallet.verify(h, sig_hex, pubkey_hex)
-    except Exception:
-        return False
-
-
-def compute_auth_tag(height: int, block_hash_hex: str, secret: str = None) -> str:
-    sec = secret if secret is not None else NETWORK_SECRET
-    if not sec:
+def _read_bootstrap_json() -> str:
+    p = BASE_DIR / "bootstrap_peers.json"
+    if not p.exists():
         return ""
-    msg = AUTH_TAG_DOMAIN + f"{int(height)}:{block_hash_hex}".encode()
-    return hmac.new(sec.encode(), msg, hashlib.sha256).hexdigest()
-
-
-def verify_auth_tag(height: int, block_hash_hex: str, tag: str,
-                    secret: str = None) -> bool:
-    expected = compute_auth_tag(height, block_hash_hex, secret)
-    if not expected or not tag:
-        return False
-    return hmac.compare_digest(expected, tag)
-
-
-def block_hash(prev_hash, merkle, timestamp, nonce, difficulty) -> str:
-    header = f"{prev_hash}{merkle}{timestamp}{nonce}{difficulty}"
-    return double_sha256(header.encode()).hex()
-
-
-def target_from_difficulty(difficulty: int) -> int:
-    return int("0" * int(difficulty) + "f" * (64 - int(difficulty)), 16)
-
-
-def meets_difficulty(h_hex: str, difficulty: int) -> bool:
     try:
-        return int(h_hex, 16) <= target_from_difficulty(difficulty)
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return ",".join(str(x).strip() for x in data if str(x).strip())
+        if isinstance(data, dict) and "peers" in data:
+            return ",".join(str(x).strip() for x in data["peers"] if str(x).strip())
     except Exception:
-        return False
+        pass
+    return ""
 
 
-def work_from_difficulty(difficulty) -> int:
-    return 16 ** int(difficulty)
+# ============================================================
+# LOGGING À PROVA DE FALHAS (v13.9.26)
+# ============================================================
+def _setup_logging(level: str = "INFO") -> logging.Logger:
+    """Configura logging global. SEMPRE retorna um Logger válido.
 
+    Contrato (v13.9.26):
+      - SEMPRE instala handlers no ROOT logger (stderr + arquivo em logs/).
+        Sem isto, qualquer `logging.getLogger("blockchain").warning(...)`
+        emitido ANTES do `brn_logger` ser importado cai no lastResort e
+        perde timestamp — e qualquer `.info()`/`.error()` é dropado.
+      - Se o brn_logger existir, ele é aplicado por cima. Se falhar,
+        ignoramos e seguimos com o root configurado.
+      - Idempotente: chamadas repetidas não duplicam handlers.
+      - Instala `sys.excepthook` para capturar tracebacks de saída
+        silenciosa (SystemExit/exception não tratada no `main`).
+    """
+    _level = getattr(logging, str(level).upper(), logging.INFO)
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
-def compute_merkle_root(txids: list) -> str:
-    if not txids:
-        return "0" * 64
-    layer = [bytes.fromhex(t) for t in txids]
-    while len(layer) > 1:
-        if len(layer) % 2:
-            layer.append(layer[-1])
-        layer = [sha256(layer[i] + layer[i + 1]) for i in range(0, len(layer), 2)]
-    return layer[0].hex()
+    root = logging.getLogger()
+    try:
+        root.setLevel(_level)
+    except Exception:
+        pass
 
-
-def _tx_core(tx: dict) -> dict:
-    inputs = [{"txid": i["txid"], "vout": i["vout"], "pubkey": i.get("pubkey", "")}
-              for i in tx["inputs"]]
-    outputs = [{"address": o["address"], "amount": o["amount"],
-                "pubkey": o.get("pubkey", "")} for o in tx["outputs"]]
-    core = {"v": _CORE_V, "inputs": inputs, "outputs": outputs,
-            "timestamp": tx["timestamp"], "locktime": tx.get("locktime", 0),
-            "nonce": tx.get("nonce", 0)}
-    if "data" in tx and tx["data"] is not None:
-        core["data"] = tx["data"]
-    if "height" in tx:
-        core["height"] = tx["height"]
-    return core
-
-
-def _serialize_core(tx: dict) -> bytes:
-    return orjson.dumps(_tx_core(tx), option=orjson.OPT_SORT_KEYS)
-
-
-def txid(tx: dict) -> str:
-    return double_sha256(_serialize_core(tx)).hex()
-
-
-def signing_hash(tx: dict) -> bytes:
-    return double_sha256(SIGNING_DOMAIN + _serialize_core(tx))
-
-
-def _pow_search_py(prev_hash, merkle, ts, diff, nonce_start=0,
-                   should_continue=None, progress_cb=None):
-    prefix = f"{prev_hash}{merkle}{ts}".encode()
-    diff_bytes = str(diff).encode()
-    target_int = int("0" * int(diff) + "f" * (64 - int(diff)), 16)
-    sha = hashlib.sha256
-    nonce = nonce_start
-    hashes_done = 0
-    while True:
-        for _ in range(HASH_BATCH_SIZE):
-            data = prefix + str(nonce).encode() + diff_bytes
-            h = sha(sha(data).digest()).digest()
-            if int.from_bytes(h, "big") <= target_int:
-                return nonce, h.hex(), hashes_done + 1
-            nonce += 1
-        hashes_done += HASH_BATCH_SIZE
-        time.sleep(0)
-        if should_continue is not None and not should_continue():
-            return None, None, hashes_done
-        if progress_cb is not None:
-            try:
-                progress_cb(nonce, hashes_done)
-            except Exception:
-                pass
-
-
-def _pow_search_c(prev_hash, merkle, ts, diff, nonce_start,
-                  should_continue, progress_cb):
-    prefix = f"{prev_hash}{merkle}{ts}"
-    diff_str = str(int(diff))
-    nonce = nonce_start
-    hashes_done = 0
-    while True:
-        try:
-            result = _brn_miner_c.pow_search(
-                prefix, diff_str, int(diff),
-                nonce_start=nonce, max_iters=HASH_BATCH_SIZE,
-            )
-        except Exception:
-            return _pow_search_py(prev_hash, merkle, ts, diff, nonce,
-                                  should_continue, progress_cb)
-        if result is None:
-            return _pow_search_py(prev_hash, merkle, ts, diff, nonce,
-                                  should_continue, progress_cb)
-        found_nonce, found_hash, batch_hashes = result
-        hashes_done += batch_hashes
-        if found_nonce is not None:
-            return found_nonce, found_hash, hashes_done
-        nonce += batch_hashes
-        if should_continue is not None and not should_continue():
-            return None, None, hashes_done
-        if progress_cb is not None:
-            try:
-                progress_cb(nonce, hashes_done)
-            except Exception:
-                pass
-
-
-def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0,
-                should_continue=None, progress_cb=None):
-    if _HAS_C_MINER and _brn_miner_c is not None:
-        return _pow_search_c(prev_hash, merkle, ts, diff, nonce_start,
-                             should_continue, progress_cb)
-    return _pow_search_py(prev_hash, merkle, ts, diff, nonce_start,
-                          should_continue, progress_cb)
-
-
-def make_coinbase(address: str, pubkey_hex: str, height: int, reward: int,
-                  fila_mineracao: dict = None) -> dict:
-    if not pubkey_hex:
-        raise ValueError("make_coinbase: pubkey_hex é obrigatória")
-    outputs = []
-    if fila_mineracao and len(fila_mineracao) > 0:
-        valor_validador = int(reward * 0.5)
-        valor_restante = reward - valor_validador
-        valor_por_cliente = valor_restante // len(fila_mineracao)
-        outputs.append({"address": address, "amount": valor_validador,
-                        "pubkey": pubkey_hex})
-        for cliente_addr, cliente_pub in fila_mineracao.items():
-            outputs.append({"address": cliente_addr, "amount": valor_por_cliente,
-                            "pubkey": cliente_pub})
-        total_pago = sum(o["amount"] for o in outputs)
-        if total_pago < reward:
-            outputs[0]["amount"] += (reward - total_pago)
-    else:
-        outputs.append({"address": address, "amount": int(reward),
-                        "pubkey": pubkey_hex})
-    cb = {
-        "txid": "",
-        "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF,
-                    "pubkey": "", "signature": ""}],
-        "outputs": outputs,
-        "timestamp": int(time.time()),
-        "locktime": 0,
-        "height": int(height),
-        "nonce": 0,
-    }
-    cb["txid"] = txid(cb)
-    return cb
-
-
-def build_genesis() -> dict:
-    cb = {
-        "txid": "",
-        "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF,
-                    "pubkey": "", "signature": ""}],
-        "outputs": [{"address": GENESIS_ADDRESS, "amount": GENESIS_REWARD,
-                     "pubkey": GENESIS_PUBKEY}],
-        "timestamp": GENESIS_TIMESTAMP,
-        "locktime": 0,
-        "height": 0,
-        "nonce": 0,
-    }
-    cb["txid"] = txid(cb)
-    merkle = compute_merkle_root([cb["txid"]])
-    nonce = 0
-    while True:
-        h = block_hash(GENESIS_PREV, merkle, GENESIS_TIMESTAMP, nonce, 1)
-        if h.startswith("0"):
-            break
-        nonce += 1
-    g = {
-        "height": 0, "hash": h, "prev_hash": GENESIS_PREV,
-        "timestamp": GENESIS_TIMESTAMP, "nonce": nonce, "merkle": merkle,
-        "difficulty": 1, "transactions": [cb],
-        "cumulative_work": work_from_difficulty(1), "validators_sig": [],
-    }
-    tag = compute_auth_tag(0, h)
-    if tag:
-        g["auth_tag"] = tag
-    return g
-
-
-GENESIS_BLOCK = build_genesis()
-
-
-class Blockchain:
-    def __init__(self, db_path="brn_v2_chain.db", genesis_address=None,
-                 genesis_pubkey=None, auto_genesis=True, network_secret=None,
-                 require_auth_tag=None):
-        self.db = ChainDB(db_path)
-
-        try:
-            if hasattr(self.db, 'conn') and self.db.conn is not None:
-                self.db.conn.execute("PRAGMA journal_mode=WAL;")
-                self.db.conn.execute("PRAGMA synchronous=NORMAL;")
-                self.db.conn.execute("PRAGMA busy_timeout=30000;")
-                log.info("[DB] SQLite otimizado com WAL mode e 30s de timeout.")
-        except Exception as e:
-            log.warning(f"[DB] Não foi possível aplicar WAL/timeout no SQLite: {e}")
-
-        self.genesis_expected_hash = None
-        self.network_secret = network_secret if network_secret is not None else NETWORK_SECRET
-
-        if require_auth_tag is None:
-            require_auth_tag = os.environ.get("BRN_REQUIRE_AUTH_TAG", "1") == "1"
-        self._auth_tag_requested = bool(require_auth_tag)
-        self.require_auth_tag = self._auth_tag_requested and bool(self.network_secret)
-
-        self.on_block_mined = None
-        self._fork_signal = None
-
-        self.trust_net = None
-        self.p2p = None
-        self._sign_collector = None
-        self._local_validator_sk = None
-        self._pbft = None
-
-        if BRN_AUTO_WIRE:
-            try:
-                from auto_wire import wire_all as _wire
-                _wire(self, verbose=False)
-            except ImportError:
-                log.debug("[auto-wire] auto_wire.py não encontrado — pulando")
-            except Exception as _e:
-                log.debug(f"[auto-wire] falhou: {_e}")
-
-        fila_salva = self.db.get_meta("fila_mineracao")
-        self.fila_mineracao = json.loads(fila_salva) if fila_salva else {}
-        rede_desc = self.db.get_meta("rede_descentralizada")
-        self.rede_descentralizada = (rede_desc == "1")
-
-        if not auto_genesis:
-            self.genesis_expected_hash = GENESIS_BLOCK["hash"]
-            return
-        if self.db.height() < 0:
-            g = GENESIS_BLOCK
-            if genesis_address:
-                g = self._genesis_with_address(
-                    genesis_address,
-                    genesis_pubkey if genesis_pubkey is not None else GENESIS_PUBKEY,
-                )
-            self.db.add_block(g)
-            self.db.apply_tx(g["transactions"][0], 0, coinbase=True)
-            self.db.set_meta("genesis_hash", g["hash"])
-
-    def set_trust_net(self, trust):
-        self.trust_net = trust
-        log.info(f"[Blockchain] trust_net injetado "
-                 f"({len(getattr(trust, 'nodes', {}))} nós)")
-
-    def set_p2p(self, p2p):
-        self.p2p = p2p
-        if BRN_AUTO_WIRE and self._sign_collector is None and p2p is not None:
-            try:
-                from auto_wire import make_default_collector, wire_all
-                self._sign_collector = make_default_collector(self)
-                log.info("[auto-wire] sign_collector criado após set_p2p")
-                wire_all(self, verbose=True)
-            except ImportError:
-                log.debug("[auto-wire] auto_wire.py não encontrado")
-            except Exception as _e:
-                log.debug(f"[auto-wire] collector falhou: {_e}")
-
-    def set_local_validator_sk(self, sk) -> None:
-        if sk is None:
-            self._local_validator_sk = None
-            return
-        try:
-            from wallet import Wallet
-            if isinstance(sk, Wallet):
-                self._local_validator_sk = sk
-                log.info("[SIG] chave local de validador configurada (Wallet)")
-                return
-            if isinstance(sk, str):
-                h = sk.strip()
-                if len(h) != 64 or any(c not in "0123456789abcdefABCDEF" for c in h):
-                    log.warning("[SIG] set_local_validator_sk: hex inválido")
-                    self._local_validator_sk = None
-                    return
-                self._local_validator_sk = Wallet(private_key_hex=h)
-                log.info("[SIG] chave local de validador configurada (hex)")
-                return
-            log.warning(f"[SIG] set_local_validator_sk: tipo não suportado "
-                        f"({type(sk).__name__}); ignorando")
-            self._local_validator_sk = None
-        except Exception as e:
-            log.warning(f"[SIG] set_local_validator_sk falhou: {e}")
-            self._local_validator_sk = None
-
-    def set_sign_collector(self, cb):
-        self._sign_collector = cb
-
-    def set_pbft(self, pbft) -> None:
-        self._pbft = pbft
-        if pbft is not None:
-            enabled = getattr(pbft, "PBFT_ENABLED", "?")
-            enforce = getattr(pbft, "PBFT_ENFORCE", "?")
-            log.info("[PBFT] motor injetado (enabled=%s enforce=%s)",
-                     enabled, enforce)
-        else:
-            log.info("[PBFT] motor removido da Blockchain")
-
-    def adicionar_na_fila(self, address: str, pubkey: str) -> None:
-        if self.rede_descentralizada:
-            return
-        if not address or not pubkey:
-            return
-        if address in self.fila_mineracao:
-            return
-        self.fila_mineracao[address] = pubkey
-        print(f"[BOOTSTRAP] Novo minerador na fila: {address[:12]}... "
-              f"({len(self.fila_mineracao)}/{FILA_MAX_MINERADORES})")
-        self.db.set_meta("fila_mineracao", json.dumps(self.fila_mineracao))
-        if len(self.fila_mineracao) >= FILA_MAX_MINERADORES:
-            self.rede_descentralizada = True
-            self.db.set_meta("rede_descentralizada", "1")
-            print("\n[BOOTSTRAP] 20 MINERADORES ATINGIDOS! REDE DESCENTRALIZADA.\n")
-
-    @staticmethod
-    def _genesis_with_address(address: str, pubkey_hex: str = "") -> dict:
-        cb = {
-            "txid": "",
-            "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF,
-                        "pubkey": "", "signature": ""}],
-            "outputs": [{"address": address, "amount": GENESIS_REWARD,
-                         "pubkey": pubkey_hex}],
-            "timestamp": GENESIS_TIMESTAMP,
-            "locktime": 0,
-            "height": 0,
-            "nonce": 0,
-        }
-        cb["txid"] = txid(cb)
-        merkle = compute_merkle_root([cb["txid"]])
-        nonce = 0
-        while True:
-            h = block_hash(GENESIS_PREV, merkle, GENESIS_TIMESTAMP, nonce, 1)
-            if h.startswith("0"):
+    # Idempotência: detecta handlers nossos já instalados
+    _already = False
+    try:
+        for h in root.handlers:
+            if getattr(h, "_brn_main_handler", False):
+                _already = True
                 break
-            nonce += 1
-        g = {
-            "height": 0, "hash": h, "prev_hash": GENESIS_PREV,
-            "timestamp": GENESIS_TIMESTAMP, "nonce": nonce, "merkle": merkle,
-            "difficulty": 1, "transactions": [cb],
-            "cumulative_work": work_from_difficulty(1), "validators_sig": [],
-        }
-        tag = compute_auth_tag(0, h)
-        if tag:
-            g["auth_tag"] = tag
-        return g
+    except Exception:
+        _already = False
 
-    def set_network_secret(self, secret: str) -> None:
-        self.network_secret = (secret or "").strip()
-        self.require_auth_tag = self._auth_tag_requested and bool(self.network_secret)
-        if self._auth_tag_requested and not self.network_secret:
-            log.warning(
-                "[auth_tag] BRN_REQUIRE_AUTH_TAG=1 mas secret vazio — "
-                "require_auth_tag ficou False até o secret ser definido."
-            )
-
-    def current_reward(self, height: int) -> int:
-        halvings = height // HALVING_INTERVAL
-        if halvings >= 64:
-            return 0
-        return INITIAL_REWARD >> halvings
-
-    def current_difficulty(self) -> int:
-        if FORCE_DIFFICULTY:
-            try:
-                return max(1, min(20, int(FORCE_DIFFICULTY)))
-            except ValueError:
-                pass
-        h = self.db.height()
-        if h < DIFFICULTY_INTERVAL:
-            return INITIAL_DIFFICULTY
-        start = self.db.get_block(h - DIFFICULTY_INTERVAL + 1)
-        end = self.db.get_block(h)
-        if not start or not end:
-            return INITIAL_DIFFICULTY
-        if end["difficulty"] > MAX_DIFFICULTY:
-            return MAX_DIFFICULTY
-        actual = max(1, end["timestamp"] - start["timestamp"])
-        expected = BLOCK_TIME * DIFFICULTY_INTERVAL
-        prev = end["difficulty"]
-        new = int(prev * expected / actual)
-        new = max(prev // 4, min(prev * 4, new))
-        return max(1, min(MAX_DIFFICULTY, new))
-
-    def cumulative_work(self) -> int:
-        total = 0
-        with self.db.lock:
-            rows = self.db.conn.execute("SELECT difficulty FROM blocks").fetchall()
-            for r in rows:
-                try:
-                    total += work_from_difficulty(r["difficulty"])
-                except Exception:
-                    continue
-        return total
-
-    def get_latest_height(self) -> int:
-        return self.db.height()
-
-    def get_transaction_block_height(self, txid_str: str) -> int:
-        return self.db.get_tx_block_height(txid_str)
-
-    def count_confirmations(self, txid_str: str) -> int:
-        tx_height = self.get_transaction_block_height(txid_str)
-        if tx_height == -1:
-            return 0
-        return self.get_latest_height() - tx_height
-
-    def estimate_fee(self, priority: str = "medium") -> int:
+    if not _already:
+        # 1) stderr — visível no .bat / PowerShell mesmo sem Tee-Object
         try:
-            stats = self.db.mempool_stats()
-        except Exception:
-            return MIN_RELAY_FEE
-        count = stats.get("count", 0)
-        fees = stats.get("fees", [])
-        if count == 0 or not fees:
-            return MIN_RELAY_FEE
-        fees_sorted = sorted(fees, reverse=True)
-        n = len(fees_sorted)
-        if priority == "high":
-            idx = max(0, n // 10)
-            return max(MIN_RELAY_FEE, fees_sorted[idx] * 2)
-        elif priority == "low":
-            idx = min(n - 1, (n * 9) // 10)
-            return max(MIN_RELAY_FEE, fees_sorted[idx])
-        else:
-            idx = n // 2
-            return max(MIN_RELAY_FEE, fees_sorted[idx])
-
-    def tx_fee(self, tx: dict) -> int:
-        if tx.get("data", {}).get("type") == "l2_mint":
-            return 0
-        in_sum = 0
-        for inp in tx["inputs"]:
-            u = self.db.get_utxo(inp["txid"], inp["vout"])
-            if u:
-                in_sum += u["amount"]
-        return in_sum - sum(o["amount"] for o in tx["outputs"])
-
-    def _validate_contract_tx(self, tx: dict) -> tuple:
-        tx_data = tx.get("data") or {}
-        t = tx_data.get("type")
-        if t == "deploy":
-            code = tx_data.get("code")
-            if not isinstance(code, dict):
-                return False, "deploy sem 'code' (dict)"
-            try:
-                from contracts import ContractVM
-                return ContractVM.validate(code)
-            except ImportError:
-                return False, "modulo contracts.py nao encontrado"
-            except Exception as e:
-                return False, f"erro validando contrato: {e}"
-        if t == "call":
-            cid = tx_data.get("contract_id")
-            if not cid or not isinstance(cid, str):
-                return False, "call sem 'contract_id'"
-            if not cid.startswith("ctr1"):
-                return False, "contract_id deve começar com 'ctr1'"
-            if not self.db.contract_get(cid):
-                return False, f"contrato {cid[:16]}... nao existe"
-            return True, "ok"
-        return False, f"tipo de contrato desconhecido: {t}"
-
-    def _contract_sender_address(self, tx: dict) -> str:
-        inputs = tx.get("inputs") or []
-        if not inputs or not isinstance(inputs[0], dict):
-            raise ValueError("transacao de contrato sem input valido")
-        pubkey_hex = inputs[0].get("pubkey", "")
-        if not isinstance(pubkey_hex, str) or not pubkey_hex:
-            raise ValueError("transacao de contrato sem pubkey do remetente")
-        try:
-            from bech32 import address_from_pubkey
-            pubkey = bytes.fromhex(pubkey_hex)
-            address = address_from_pubkey(pubkey)
-        except Exception as exc:
-            raise ValueError("pubkey do remetente invalida") from exc
-        if not address:
-            raise ValueError("nao foi possivel derivar endereco do remetente")
-        return address
-
-    def _apply_contract_tx(self, tx: dict) -> dict:
-        tx_data = tx.get("data") or {}
-        t = tx_data.get("type")
-        from contracts import deploy as _deploy, call as _call
-        sender = self._contract_sender_address(tx)
-        if t == "deploy":
-            r = _deploy(self, sender, tx_data.get("code") or {},
-                        metadata=tx_data.get("metadata"))
-            if not r.get("ok"):
-                raise ValueError(f"deploy falhou: {r.get('msg')}")
-            return r
-        if t == "call":
-            r = _call(self, tx_data.get("contract_id", ""), sender,
-                      tx_data.get("args"))
-            if not r.get("ok"):
-                raise ValueError(f"call falhou: {r.get('msg')}")
-            return r
-        raise ValueError(f"tipo de contrato desconhecido: {t}")
-
-    def validate_tx(self, tx: dict, from_mempool: bool = False) -> tuple:
-        from wallet import Wallet
-
-        if tx.get("data", {}).get("type") == "l2_mint":
-            if not from_mempool:
-                return False, "L2 mint nao pode ser validado fora da mempool"
-            return True, "ok"
-
-        if not tx.get("inputs") or not tx.get("outputs"):
-            return False, "tx sem inputs/outputs"
-        if tx["inputs"][0]["txid"] == "0" * 64:
-            return False, "coinbase invalida"
-        if tx.get("txid") != txid(tx):
-            return False, "txid invalido"
-        tx_data = tx.get("data") or {}
-        if isinstance(tx_data, dict) and tx_data.get("type") in ("deploy", "call"):
-            ok_ctr, msg_ctr = self._validate_contract_tx(tx)
-            if not ok_ctr:
-                return False, f"contrato: {msg_ctr}"
-        if not from_mempool:
-            try:
-                gastos_mem = self.db.utxos_gastos_na_mempool()
-            except AttributeError:
-                gastos_mem = set()
-            except Exception:
-                gastos_mem = set()
-            for inp in tx["inputs"]:
-                key = (inp["txid"], int(inp["vout"]))
-                if key in gastos_mem:
-                    return False, (f"UTXO {inp['txid'][:16]}...:{inp['vout']} "
-                                   f"ja esta sendo gasta por outra tx na mempool")
-        for inp in tx["inputs"]:
-            if not inp.get("pubkey"):
-                return False, "input sem pubkey"
-        tx_nonce = tx.get("nonce", 0)
-        for inp in tx["inputs"]:
-            pk = inp["pubkey"]
-            expected = self.db.get_nonce_for_pubkey(pk)
-            if tx_nonce != expected:
-                return False, (f"nonce invalido para {pk[:16]}... "
-                               f"(esperado {expected}, recebido {tx_nonce})")
-        in_sum = 0
-        seen = set()
-        for inp in tx["inputs"]:
-            key = (inp["txid"], inp["vout"])
-            if key in seen:
-                return False, "input duplicado"
-            seen.add(key)
-            u = self.db.get_utxo(inp["txid"], inp["vout"])
-            if not u:
-                return False, "UTXO inexistente"
-            stored_pk = (u["pubkey"] or "").strip()
-            if stored_pk and set(stored_pk) != {"0"}:
-                if inp["pubkey"] != stored_pk:
-                    return False, (f"pubkey mismatch: input={inp['pubkey'][:16]}... "
-                                   f"utxo={stored_pk[:16]}")
-            else:
-                try:
-                    from bech32 import address_from_pubkey
-                    derived = address_from_pubkey(bytes.fromhex(inp["pubkey"]))
-                except Exception:
-                    return False, "input pubkey invalida"
-                if derived != u["address"]:
-                    return False, (f"address mismatch: deriva {derived[:16]}... "
-                                   f"utxo {u['address'][:16]}...")
-            in_sum += u["amount"]
-        out_sum = sum(o["amount"] for o in tx["outputs"])
-        if out_sum > in_sum:
-            return False, "outputs > inputs"
-        if in_sum - out_sum < MIN_RELAY_FEE:
-            return False, "fee abaixo do minimo"
-        sig_hash = signing_hash(tx)
-        for inp in tx["inputs"]:
-            if not Wallet.verify(sig_hash, inp.get("signature", ""), inp["pubkey"]):
-                return False, "assinatura invalida"
-        return True, "ok"
-
-    def submit_tx(self, tx: dict) -> tuple:
-        if self.db.mempool_count() >= MAX_MEMPOOL_SIZE:
-            return False, "Mempool cheia. Tente novamente mais tarde."
-        if self.db.has_mempool(tx["txid"]):
-            return False, "ja na mempool"
-        ok, msg = self.validate_tx(tx)
-        if not ok:
-            return False, msg
-        fee = self.tx_fee(tx)
-        if fee < 0:
-            return False, "fee negativa"
-        if not self.db.add_mempool(tx, fee):
-            return False, "falha na mempool"
-        return True, tx["txid"]
-
-    def add_l2_transaction(self, l2_tx: dict) -> str:
-        buyer = l2_tx.get("buyer")
-        amount = int(l2_tx.get("brn_amount", 0))
-        if not buyer or amount <= 0:
-            raise ValueError("L2 tx invalida: buyer ou amount ausente")
-
-        tx = {
-            "txid": "",
-            "inputs": [{
-                "txid": "0" * 64, "vout": 0xFFFFFFFF,
-                "pubkey": "", "signature": ""
-            }],
-            "outputs": [{
-                "address": buyer, "amount": amount, "pubkey": ""
-            }],
-            "timestamp": int(time.time()),
-            "locktime": 0,
-            "nonce": 0,
-            "data": {
-                "type": "l2_mint",
-                "btc_txid": l2_tx.get("btc_txid"),
-                "escrow_id": l2_tx.get("escrow_id"),
-            },
-        }
-        tx["txid"] = txid(tx)
-        self.db.add_mempool(tx, 0)
-        log.info(f"[L2] Transação L2 adicionada à mempool: "
-                 f"{tx['txid'][:16]}... (+{amount/1e8} BRN para {buyer[:12]}...)")
-        return tx["txid"]
-
-    def median_time_past(self, height: int) -> int:
-        timestamps = []
-        for i in range(max(0, height - MTP_WINDOW), height):
-            try:
-                b = self.db.get_block(i)
-                if b:
-                    timestamps.append(b["timestamp"])
-            except Exception:
-                continue
-        if not timestamps:
-            return 0
-        timestamps.sort()
-        return timestamps[len(timestamps) // 2]
-
-    def _get_trust_validators(self) -> list:
-        validators: list = []
-        trust = self.trust_net
-        if trust is None:
-            return []
-
-        try:
-            if hasattr(trust, "get_active_validators"):
-                validators = list(trust.get_active_validators(
-                    count=MAX_VALIDATORS) or [])
-            else:
-                validators = list(trust.get_top_validators(
-                    count=MAX_VALIDATORS) or [])
+            sh = logging.StreamHandler(sys.stderr)
+            sh.setFormatter(fmt)
+            sh.setLevel(_level)
+            sh._brn_main_handler = True
+            root.addHandler(sh)
         except Exception as e:
-            log.warning(f"[VALIDATORS] falhou: {e}")
-            validators = []
-
-        if not validators and hasattr(trust, "get_top_validators"):
-            if BRN_TRUST_FALLBACK_TO_TOP:
-                try:
-                    validators = list(trust.get_top_validators(
-                        count=MAX_VALIDATORS) or [])
-                    if validators:
-                        log.warning(
-                            "[VALIDATORS] active_validators vazio; usando "
-                            "get_top_validators() como fallback "
-                            "(BRN_TRUST_FALLBACK_TO_TOP=1) — %d validador(es)",
-                            len(validators),
-                        )
-                except Exception as e:
-                    log.warning(
-                        f"[VALIDATORS] fallback get_top_validators falhou: {e}")
-                    validators = []
-            else:
-                log.warning(
-                    "[VALIDATORS] active_validators vazio e "
-                    "BRN_TRUST_FALLBACK_TO_TOP=0 — quórum fica vazio "
-                    "(bootstrap, multi-sig desligado)."
-                )
-
-        return sorted({p for p in validators if p})
-
-    def _get_active_validators(self) -> list:
-        validators = self._get_trust_validators()
-
-        local_sk = self._local_validator_sk
-        if local_sk is not None:
             try:
-                local_pk = local_sk.pub_hex
-            except Exception:
-                local_pk = ""
-            if local_pk and local_pk not in validators:
-                validators.append(local_pk)
-                log.info(
-                    f"[VALIDATORS] bootstrap: incluindo local "
-                    f"{local_pk[:16]}… no set"
-                )
-
-        return sorted({p for p in validators if p})
-
-    def _required_signatures(self, validators: list) -> int:
-        n = len(validators)
-        if n == 0:
-            return 0
-        if REQUIRE_ALL_SIGS:
-            log.info(f"[SIG] quorum=ALL ({n}/{n})")
-            return n
-        need = max(1, math.ceil(n * VALIDATOR_QUORUM))
-        need = min(need, n)
-        log.info(f"[SIG] quorum={VALIDATOR_QUORUM} → {need}/{n} assinaturas")
-        return need
-
-    # ============================================================
-    # [v9.7.0] HELPERS DO CONSENSO ESTRITO
-    # ============================================================
-    def _count_synced_peers(self) -> int:
-        """Conta peers com altura local ±PEER_SYNC_TOLERANCE
-        (excluindo loopback e este nó).
-        Usado para gate de mineração a partir do bloco 6000."""
-        try:
-            local_h = int(self.db.height())
-        except Exception:
-            return 0
-        if local_h < 0:
-            return 0
-        try:
-            peers = self.db.listar_peers(apenas_ativos=True) or []
-        except Exception:
-            return 0
-        now = time.time()
-        n = 0
-        for p in peers:
-            if not isinstance(p, dict):
-                continue
-            addr = (p.get("address") or "").strip()
-            if not addr or addr.startswith("127.") or addr == "0.0.0.0":
-                continue
-            try:
-                ph = int(p.get("height", 0) or 0)
-            except (ValueError, TypeError):
-                ph = 0
-            try:
-                ls = float(p.get("last_seen", 0) or 0)
-            except (ValueError, TypeError):
-                ls = 0.0
-            # Ignora peers "stale" (> 5 min sem ping)
-            if ls <= 0 or (now - ls) > 300:
-                continue
-            if abs(ph - local_h) <= PEER_SYNC_TOLERANCE:
-                n += 1
-        return n
-
-    def _min_peers_for_mining(self) -> int:
-        return max(1, int(MIN_PEERS_FOR_MINING))
-
-    def _is_strict_consensus_height(self, height: int) -> bool:
-        try:
-            h = int(height)
-        except Exception:
-            return False
-        return CONSENSUS_STRICT_FROM_HEIGHT > 0 and h >= CONSENSUS_STRICT_FROM_HEIGHT
-
-    def _count_external_sigs(self, block: dict) -> int:
-        """Conta assinaturas válidas de pubkeys DIFERENTES da SK local.
-        Usado para garantir que a rede realmente assinou (não só o nó local)."""
-        try:
-            local_pk = ""
-            if self._local_validator_sk is not None:
-                local_pk = (self._local_validator_sk.pub_hex or "").strip().lower()
-            sigs = block.get("validators_sig") or []
-            if not isinstance(sigs, list):
-                return 0
-            seen = set()
-            n = 0
-            for entry in sigs:
-                if not isinstance(entry, dict):
-                    continue
-                pk = (entry.get("pubkey") or "").strip().lower()
-                sg = (entry.get("signature") or "").strip()
-                if not pk or not sg:
-                    continue
-                if pk == local_pk:
-                    continue
-                if pk in seen:
-                    continue
-                if not verify_block_signature(pk, block, sg):
-                    continue
-                seen.add(pk)
-                n += 1
-            return n
-        except Exception:
-            return 0
-
-    # ============================================================
-    # [_validate_validators_sig] — agora com CONSENSO ESTRITO ≥6000
-    # ============================================================
-    def _validate_validators_sig(self, block: dict,
-                                  validators: Optional[list] = None) -> tuple:
-        try:
-            bh = int(block.get("height", -1))
-        except Exception:
-            bh = -1
-
-        strict = self._is_strict_consensus_height(bh)
-        if strict:
-            # [v9.7.0] A partir de 6000: sem bypass de bootstrap
-            if BRN_BOOTSTRAP_SKIP_SIGS_UNTIL > 0 and 0 < bh <= BRN_BOOTSTRAP_SKIP_SIGS_UNTIL:
-                log.warning(
-                    "[CONSENSUS] altura %d ≥ %d: IGNORANDO "
-                    "BRN_BOOTSTRAP_SKIP_SIGS_UNTIL=%d (consenso estrito)",
-                    bh, CONSENSUS_STRICT_FROM_HEIGHT, BRN_BOOTSTRAP_SKIP_SIGS_UNTIL,
-                )
-        else:
-            # [v9.7.0] Antes de 6000: bypass permitido
-            if not BRN_STRICT_MULTISIG and BRN_BOOTSTRAP_SKIP_SIGS_UNTIL > 0:
-                if 0 < bh <= BRN_BOOTSTRAP_SKIP_SIGS_UNTIL:
-                    log.warning(
-                        "[SIG] EMERGENCIA: bloco #%d aceito SEM multi-sig "
-                        "(BRN_BOOTSTRAP_SKIP_SIGS_UNTIL=%d). "
-                        "A partir de #%d bypass NÃO vale mais.",
-                        bh, BRN_BOOTSTRAP_SKIP_SIGS_UNTIL,
-                        CONSENSUS_STRICT_FROM_HEIGHT,
-                    )
-                    return True, ""
-
-        if validators is None:
-            validators = self._get_active_validators()
-        if not validators:
-            if strict:
-                # [v9.7.0] Sem validadores no trust em altura estrita
-                # é bloqueio TOTAL, não bypass.
-                return False, (
-                    f"Bloco #{bh} ≥ {CONSENSUS_STRICT_FROM_HEIGHT}: "
-                    f"lista de validadores vazia — impossível validar "
-                    f"assinaturas. Configure trust_network.json."
-                )
-            return True, ""
-
-        required = self._required_signatures(validators)
-
-        trust_validators = self._get_trust_validators()
-        n_trust = len(trust_validators)
-        n_bootstrap_local = len(validators) - n_trust
-
-        sigs = block.get("validators_sig", [])
-        if sigs is None:
-            sigs = []
-        if not isinstance(sigs, list):
-            return False, "validators_sig inválido"
-
-        valid_set = set(validators)
-        verified_pubkeys: set = set()
-        foreign_pubkeys: set = set()
-
-        for entry in sigs:
-            if not isinstance(entry, dict):
-                continue
-            pubkey = (entry.get("pubkey") or "").strip()
-            signature = (entry.get("signature") or "").strip()
-            if not pubkey or not signature:
-                continue
-            if pubkey in verified_pubkeys or pubkey in foreign_pubkeys:
-                continue
-            if not verify_block_signature(pubkey, block, signature):
-                log.warning(f"[SIG] assinatura inválida de {pubkey[:16]}")
-                continue
-            if pubkey in valid_set:
-                verified_pubkeys.add(pubkey)
-            else:
-                foreign_pubkeys.add(pubkey)
-
-        got = len(verified_pubkeys)
-        got_foreign = len(foreign_pubkeys)
-
-        if got >= required:
-            if strict:
-                # [v9.7.0] Em altura estrita, também exige que pelo menos
-                # `required - 1` assinaturas sejam de OUTROS nós (não só
-                # a SK local). Se você é o único validador no trust, não
-                # passa — a rede precisa de 3 nós reais.
-                n_ext = self._count_external_sigs(block)
-                if n_ext < max(1, required - 1):
-                    return False, (
-                        f"Bloco #{bh} ≥ {CONSENSUS_STRICT_FROM_HEIGHT}: "
-                        f"{required - 1} assinatura(s) externa(s) exigidas, "
-                        f"tem {n_ext}. Único assinante é a SK local — "
-                        f"a rede (≥{MIN_PEERS_FOR_MINING} peers) precisa "
-                        f"assinar também."
-                    )
-                log.info(
-                    "[CONSENSUS] Bloco #%d ≥ %d: %d/%d sigs (%d externa(s)) — OK",
-                    bh, CONSENSUS_STRICT_FROM_HEIGHT,
-                    got, required, n_ext,
-                )
-            return True, ""
-
-        if strict:
-            # [v9.7.0] Em altura estrita: SEM bypass estrangeiro,
-            # SEM bootstrap local, SEM trust_score.
-            missing = [p[:12] + "…" for p in validators if p not in verified_pubkeys]
-            return False, (
-                f"[CONSENSO ESTRITO ≥{CONSENSUS_STRICT_FROM_HEIGHT}] "
-                f"Bloco #{bh} precisa de {required}/{len(validators)} "
-                f"assinaturas do set local, tem {got}. "
-                f"Faltam: {', '.join(missing[:5])}. "
-                f"({got_foreign} assinatura(s) estrangeira(s) ignorada(s); "
-                f"trust_validators={n_trust}, bootstrap_local={n_bootstrap_local})."
-            )
-
-        if (not BRN_STRICT_MULTISIG and n_trust < 2
-                and got == 0 and got_foreign >= 1):
-            try:
-                block_h = int(block.get("height", -1))
-                my_height = self.db.height()
-            except Exception:
-                block_h = -1
-                my_height = -1
-            if block_h > my_height + 1:
-                return False, (
-                    f"Bloco #{block_h}: salto de altura "
-                    f"(tip local #{my_height}); rejeitado para evitar fork"
-                )
-            log.warning(
-                f"[SIG] Bloco #{block_h}: aceito em MODO BOOTSTRAP "
-                f"(trust real tem {n_trust} validador(es), "
-                f"{got_foreign} assinatura(s) estrangeira(s) válida(s)). "
-                f"A partir de #{CONSENSUS_STRICT_FROM_HEIGHT} bypass NÃO vale."
-            )
-            return True, ""
-
-        if (not BRN_STRICT_MULTISIG
-                and n_trust < 2
-                and got >= 1
-                and got_foreign == 0):
-            local_pk = ""
-            if self._local_validator_sk is not None:
-                try:
-                    local_pk = self._local_validator_sk.pub_hex
-                except Exception:
-                    pass
-            if local_pk and local_pk in verified_pubkeys:
-                try:
-                    block_h = int(block.get("height", -1))
-                    my_height = self.db.height()
-                except Exception:
-                    block_h = -1
-                    my_height = -1
-                if block_h <= my_height + 1:
-                    log.warning(
-                        f"[SIG] Bloco #{block_h}: aceito em MODO "
-                        f"BOOTSTRAP LOCAL ({got}/{required} sigs; "
-                        f"único assinante é a própria SK local "
-                        f"{local_pk[:16]}…). A partir de "
-                        f"#{CONSENSUS_STRICT_FROM_HEIGHT} bypass NÃO vale."
-                    )
-                    return True, ""
-
-        if (not BRN_STRICT_MULTISIG
-                and n_trust < 2
-                and got >= 1
-                and got_foreign == 0):
-            trusted = False
-            trusted_pubkey = ""
-            if self.trust_net is not None:
-                try:
-                    for pk in verified_pubkeys:
-                        for node in self.trust_net.nodes.values():
-                            node_pk = (node.public_key or "").lower()
-                            if node_pk and node_pk == pk.lower():
-                                score = float(getattr(node, "trust_score", 0) or 0)
-                                if score >= BOOTSTRAP_TRUST_THRESHOLD:
-                                    trusted = True
-                                    trusted_pubkey = pk
-                                    break
-                        if trusted:
-                            break
-                except Exception as e:
-                    log.debug(f"[SIG] trust_score lookup falhou: {e}")
-
-            if trusted:
-                try:
-                    block_h = int(block.get("height", -1))
-                    my_height = self.db.height()
-                except Exception:
-                    block_h = -1
-                    my_height = -1
-                if block_h <= my_height + 1:
-                    log.warning(
-                        f"[SIG] Bloco #{block_h}: aceito em MODO BOOTSTRAP "
-                        f"ESTENDIDO ({got}/{required} sigs; assinante "
-                        f"{trusted_pubkey[:16]}… com trust_score>="
-                        f"{BOOTSTRAP_TRUST_THRESHOLD:.0f}). A partir de "
-                        f"#{CONSENSUS_STRICT_FROM_HEIGHT} bypass NÃO vale."
-                    )
-                    return True, ""
-
-        if got == 0 and got_foreign == 0:
-            return False, f"Bloco #{block.get('height')}: sem assinaturas válidas"
-
-        missing = [p[:12] + "…" for p in validators if p not in verified_pubkeys]
-        prefix = "[STRICT] " if BRN_STRICT_MULTISIG else ""
-        return False, (
-            f"{prefix}Bloco #{block['height']} precisa de "
-            f"{required}/{len(validators)} assinaturas do set local, "
-            f"tem {got}. Faltam: {', '.join(missing[:5])}. "
-            f"({got_foreign} assinatura(s) estrangeira(s) ignorada(s); "
-            f"trust_validators={n_trust}, bootstrap_local={n_bootstrap_local})."
-        )
-
-    def diagnose_validators(self) -> dict:
-        trust_v = self._get_trust_validators()
-        active_v = self._get_active_validators()
-        local_pk = ""
-        if self._local_validator_sk is not None:
-            try:
-                local_pk = self._local_validator_sk.pub_hex
+                print(f"[log] stderr handler falhou: {e}", file=sys.stderr)
             except Exception:
                 pass
-        return {
-            "trust_validators": trust_v,
-            "active_validators": active_v,
-            "local_pk": local_pk,
-            "local_in_trust": (local_pk in trust_v) if local_pk else False,
-            "local_in_active": (local_pk in active_v) if local_pk else False,
-            "n_trust": len(trust_v),
-            "n_active": len(active_v),
-            "n_bootstrap_local": max(0, len(active_v) - len(trust_v)),
-            "n_synced_peers": self._count_synced_peers(),
-            "required_sigs": self._required_signatures(active_v),
-            "require_all_sigs": REQUIRE_ALL_SIGS,
-            "validator_quorum": VALIDATOR_QUORUM,
-            "consensus_strict_from": CONSENSUS_STRICT_FROM_HEIGHT,
-            "min_peers_for_mining": MIN_PEERS_FOR_MINING,
-            "peer_sync_tolerance": PEER_SYNC_TOLERANCE,
-            "bootstrap_would_fire": (len(trust_v) < 2),
-            "bootstrap_trust_threshold": BOOTSTRAP_TRUST_THRESHOLD,
-            "bootstrap_skip_until": BRN_BOOTSTRAP_SKIP_SIGS_UNTIL,
-            "assume_valid_until": BRN_ASSUME_VALID_UNTIL,
-            "strict_multisig": BRN_STRICT_MULTISIG,
-            "trust_fallback_to_top": BRN_TRUST_FALLBACK_TO_TOP,
-        }
 
-    def validate_block(self, block: dict, prev_block=None,
-                        validators: Optional[list] = None) -> tuple:
-        if block["height"] == 0 and prev_block is None:
-            if (self.genesis_expected_hash
-                    and block["hash"] != self.genesis_expected_hash):
-                if self.db.height() == -1:
-                    log.warning("[Blockchain] DB vazio — aceitando o Genesis do peer")
-                    self.genesis_expected_hash = block["hash"]
-                else:
-                    return False, f"genesis nao corresponde ao esperado"
-
-        expected_prev = (prev_block["hash"] if prev_block else self.db.tip_hash())
-        if block["prev_hash"] != expected_prev:
-            return False, "prev_hash incorreto"
-        expected_height = ((prev_block["height"] + 1) if prev_block
-                           else self.db.height() + 1)
-        if block["height"] != expected_height:
-            return False, "altura invalida"
-
-        h_int = int(block["height"])
-
-        # [v9.7.0] assume_valid SÓ vale antes do CONSENSUS_STRICT_FROM_HEIGHT
-        if (not BRN_STRICT_MULTISIG
-                and BRN_ASSUME_VALID_UNTIL > 0
-                and 0 < h_int <= BRN_ASSUME_VALID_UNTIL
-                and not self._is_strict_consensus_height(h_int)):
-            try:
-                h_calc = block_hash(
-                    block["prev_hash"], block["merkle"], block["timestamp"],
-                    block["nonce"], block["difficulty"],
-                )
-            except KeyError as e:
-                return False, f"campo ausente em #{h_int}: {e}"
-            if h_calc != block["hash"]:
-                return False, f"hash incorreto (assume_valid) em #{h_int}"
-            if h_int % 100 == 0 or h_int == 1:
-                log.info(
-                    "[ASSUME-VALID] #%d aceito (hash+prev_hash apenas; "
-                    "%d/%d)", h_int, h_int, BRN_ASSUME_VALID_UNTIL,
-                )
-            return True, "ok (assume_valid)"
-
-        if block["height"] > MTP_WINDOW:
-            try:
-                mtp = self.median_time_past(block["height"])
-                if block["timestamp"] < mtp:
-                    return False, (f"timestamp ({block['timestamp']}) < "
-                                   f"MTP ({mtp})")
-            except Exception as e:
-                log.warning(f"[validate_block] Falha no MTP (tolerado): {e}")
-
-        if not meets_difficulty(block["hash"], block["difficulty"]):
-            return False, "PoW invalido"
-        h = block_hash(block["prev_hash"], block["merkle"], block["timestamp"],
-                       block["nonce"], block["difficulty"])
-        if h != block["hash"]:
-            return False, "hash incorreto"
-        calc_merkle = compute_merkle_root([t["txid"] for t in block["transactions"]])
-        if calc_merkle != block["merkle"]:
-            return False, "merkle incorreto"
-
-        ok_cp, msg_cp = _verify_checkpoint_for_block(block)
-        if not ok_cp:
-            return False, msg_cp
-
-        if block["height"] > 0:
-            ok_sig, msg_sig = self._validate_validators_sig(
-                block, validators=validators)
-            if not ok_sig:
-                return False, msg_sig
-
-        if block["height"] > 0 and self.require_auth_tag:
-            if not self.network_secret:
-                return False, "no exige auth_tag mas sem BRN_NETWORK_SECRET"
-            if block["height"] > AUTH_TAG_START_HEIGHT:
-                tag = block.get("auth_tag")
-                if not tag:
-                    return False, "bloco sem auth_tag"
-                if not verify_auth_tag(block["height"], block["hash"], tag,
-                                        self.network_secret):
-                    return False, "auth_tag invalido (segredo errado?)"
-            else:
-                tag = block.get("auth_tag")
-                if tag:
-                    if not verify_auth_tag(block["height"], block["hash"], tag,
-                                            self.network_secret):
-                        return False, "auth_tag invalido em bloco legado"
-
-        cb = block["transactions"][0]
-        if cb["inputs"][0]["txid"] != "0" * 64:
-            return False, "primeira tx nao e coinbase"
-        if cb.get("txid") != txid(cb):
-            return False, "coinbase txid invalido"
-        if block["height"] > 0:
-            for out in cb["outputs"]:
-                if not out.get("pubkey"):
-                    return False, "coinbase output sem pubkey"
-        for inp in cb["inputs"]:
-            if inp.get("signature"):
-                return False, "coinbase input com assinatura"
-        reward = self.current_reward(block["height"])
-        fees = 0
-        for i, t in enumerate(block["transactions"][1:], 1):
-            if t["txid"] != txid(t):
-                return False, "txid invalido"
-            ok_tx, msg_tx = self.validate_tx(t, from_mempool=True)
-            if not ok_tx:
-                return False, f"tx #{i}: {msg_tx}"
-            fees += self.tx_fee(t)
-        total_cb = sum(o["amount"] for o in cb["outputs"])
-        if total_cb > reward + fees:
-            return False, "coinbase acima do permitido"
-
-        if self._pbft is not None:
-            enforce_this_block = (BRN_PBFT_ENFORCE
-                                   and h_int >= BRN_PBFT_START_HEIGHT)
-            if "pbft_commits" in block:
-                try:
-                    ok_pbft, why_pbft = self._pbft.validate_proof(block)
-                    if not ok_pbft:
-                        return False, f"pbft: {why_pbft}"
-                except Exception as e:
-                    log.warning("[PBFT] validate_proof exceção: %s", e)
-                    if enforce_this_block:
-                        return False, f"pbft: exceção {e}"
-            elif enforce_this_block:
-                return False, f"bloco #{h_int} sem prova PBFT (pbft_commits)"
-
-        return True, "ok"
-
-    def accept_block(self, block: dict,
-                     validators: Optional[list] = None) -> tuple:
-        prev = self.db.get_block_by_hash(block["prev_hash"])
-        ok, msg = self.validate_block(block, prev, validators=validators)
-        if not ok:
-            return False, msg
-
+        # 2) arquivo em logs/brn_node_YYYYmmdd_HHMMSS.log
+        _log_file_path = None
         try:
-            existing = self.db.get_block(block["height"])
-            if existing:
-                return False, f"Bloco #{block['height']} já existe na blockchain"
+            logdir = BASE_DIR / "logs"
+            logdir.mkdir(parents=True, exist_ok=True)
+            fname = logdir / f"brn_node_{time.strftime('%Y%m%d_%H%M%S')}.log"
+            fh = logging.FileHandler(str(fname), encoding="utf-8")
+            fh.setFormatter(fmt)
+            fh.setLevel(_level)
+            fh._brn_main_handler = True
+            root.addHandler(fh)
+            _log_file_path = fname
+        except Exception as e:
+            try:
+                print(f"[log] file handler falhou: {e}", file=sys.stderr)
+            except Exception:
+                pass
+
+        if _log_file_path is not None:
+            try:
+                print(f"[log] arquivo: {_log_file_path}", file=sys.stderr)
+            except Exception:
+                pass
+
+    # 3) brn_logger por cima (opcional, não crítico)
+    lg = None
+    try:
+        from brn_logger import setup_logger, get_logger
+        setup_logger(level=level, quiet=False)
+        lg = get_logger("main")
+    except Exception:
+        lg = None
+
+    if lg is None:
+        lg = logging.getLogger("main")
+    try:
+        # Garante que os logs do "main" cheguem ao root (que tem os handlers)
+        lg.propagate = True
+    except Exception:
+        pass
+
+    # 4) excepthook global — captura SystemExit e exceções não tratadas
+    #    Sem isto, um `return 2/3/6/7` do main() some sem deixar rastro.
+    try:
+        _install_excepthook(lg)
+    except Exception:
+        pass
+
+    return lg
+
+
+def _install_excepthook(logger: logging.Logger) -> None:
+    """Instala sys.excepthook que loga qualquer exceção não tratada
+    (com traceback completo) e também SystemExit != 0."""
+    if getattr(sys, "_brn_excepthook_installed", False):
+        return
+
+    _orig_hook = sys.excepthook
+
+    def _hook(exc_type, exc_value, exc_tb):
+        try:
+            if issubclass(exc_type, KeyboardInterrupt):
+                _orig_hook(exc_type, exc_value, exc_tb)
+                return
+            if issubclass(exc_type, SystemExit):
+                code = getattr(exc_value, "code", 0)
+                if isinstance(code, int) and code not in (0, None):
+                    logger.error(
+                        "[main] SystemExit(%d) — processo encerrou. "
+                        "Cheque as linhas acima no log.",
+                        code,
+                    )
+                else:
+                    logger.info("[main] SystemExit(%r) — encerrando normal",
+                                code)
+                return
+            logger.critical(
+                "[main] UNCAUGHT EXCEPTION — %s: %s",
+                exc_type.__name__, exc_value,
+                exc_info=(exc_type, exc_value, exc_tb),
+            )
         except Exception:
             pass
-
-        try:
-            self.db.add_block(block)
-        except Exception as e:
-            return False, f"Erro ao gravar bloco #{block['height']}: {e}"
-
-        if self.trust_net is not None and block["height"] > 0:
+        finally:
             try:
-                sigs = block.get("validators_sig", []) or []
-                seen = set()
-                for entry in sigs:
-                    if not isinstance(entry, dict):
-                        continue
-                    pk = (entry.get("pubkey") or "").strip().lower()
-                    if not pk or pk in seen:
-                        continue
-                    seen.add(pk)
-                    if hasattr(self.trust_net, "record_block_signed"):
-                        self.trust_net.record_block_signed(
-                            pk, block["height"],
-                        )
-            except Exception as e:
-                log.debug(f"[accept_block] record_block_signed falhou: {e}")
-
-        if (BRN_CHECKPOINT_AUTO_HEIGHT > 0
-                and int(block["height"]) == BRN_CHECKPOINT_AUTO_HEIGHT):
-            _create_auto_checkpoint(block)
-
-        _maybe_sign_checkpoint(block)
-        for i, t in enumerate(block["transactions"]):
-            coinbase = (i == 0)
-            self.db.apply_tx(t, block["height"], coinbase=coinbase)
-            if i > 0:
-                self.db.remove_mempool(t["txid"])
-            if not coinbase:
-                tx_data = t.get("data") or {}
-                if (isinstance(tx_data, dict)
-                        and tx_data.get("type") in ("deploy", "call")):
-                    try:
-                        self._apply_contract_tx(t)
-                    except Exception as e:
-                        print(f"[CONTRACT] tx {t['txid'][:16]}... falhou: {e}")
-        return True, block["hash"]
-
-    def _attach_auth_tag(self, block: dict) -> dict:
-        tag = compute_auth_tag(block["height"], block["hash"], self.network_secret)
-        if tag:
-            block["auth_tag"] = tag
-        return block
-
-    def _fire_block_mined(self, block: dict) -> None:
-        cb = self.on_block_mined
-        if cb is None:
-            return
-        try:
-            cb(block)
-        except Exception as e:
-            print(f"[on_block_mined] callback falhou: {e}")
-
-    def _collect_signatures(self, block: dict,
-                             validators: Optional[list] = None) -> list:
-        if validators is None:
-            validators = self._get_active_validators()
-        if not validators:
-            return []
-
-        valid_set = set(validators)
-        sigs: list = []
-        seen: set = set()
-
-        local_sk = self._local_validator_sk
-        if local_sk is not None:
-            entry = sign_block_as_validator(block, local_sk)
-            if not entry:
-                log.warning("[SIG] assinatura local falhou (chave inválida?)")
-            else:
-                pk = entry.get("pubkey", "")
-                if pk in valid_set:
-                    if verify_block_signature(pk, block, entry.get("signature", "")):
-                        sigs.append(entry)
-                        seen.add(pk)
-                    else:
-                        log.warning(f"[SIG] assinatura local inválida ({pk[:16]})")
-                elif pk:
-                    log.info(f"[SIG] pubkey local {pk[:16]} não é validador "
-                             f"ativo — assinatura descartada")
-
-        if self._sign_collector is not None:
-            extra: list = []
-            try:
-                from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
-                _pool = ThreadPoolExecutor(
-                    max_workers=1, thread_name_prefix="sig-collect")
-                try:
-                    _fut = _pool.submit(self._sign_collector, block)
-                    try:
-                        extra = _fut.result(timeout=SIG_COLLECT_TIMEOUT) or []
-                    except FutTimeout:
-                        log.warning(
-                            f"[SIG] _sign_collector timeout após "
-                            f"{SIG_COLLECT_TIMEOUT:.1f}s "
-                            f"(thread abandonada em background)"
-                        )
-                        extra = []
-                finally:
-                    _pool.shutdown(wait=False)
-            except Exception as e:
-                log.warning(f"[SIG] _sign_collector falhou: {e}")
-
-            for entry in extra:
-                if not isinstance(entry, dict):
-                    continue
-                pk = (entry.get("pubkey") or "").strip()
-                sg = (entry.get("signature") or "").strip()
-                if not pk or not sg:
-                    continue
-                if pk not in valid_set:
-                    log.warning(f"[SIG] coletor devolveu pubkey desconhecida: "
-                                f"{pk[:16]}")
-                    continue
-                if pk in seen:
-                    continue
-                if verify_block_signature(pk, block, sg):
-                    sigs.append(entry)
-                    seen.add(pk)
-                else:
-                    log.warning(f"[SIG] coletor devolveu assinatura inválida: "
-                                f"{pk[:16]}")
-
-        return sigs
-
-    def mine_block(self, miner_address: str, miner_pubkey: str) -> dict:
-        if not miner_pubkey:
-            raise ValueError("mine_block: miner_pubkey é obrigatória")
-        return self.mine_block_interruptible(miner_address, miner_pubkey, None)
-
-    def mine_block_interruptible(self, miner_address: str, miner_pubkey: str,
-                                  should_continue=None, progress_cb=None) -> dict:
-        if not miner_pubkey:
-            raise ValueError("mine_block_interruptible: miner_pubkey é obrigatória")
-
-        height = self.db.height() + 1
-
-        # ============================================================
-        # [v9.7.0] GATE DE MINERAÇÃO ≥ CONSENSUS_STRICT_FROM_HEIGHT
-        # Exige MIN_PEERS_FOR_MINING peers sincronizados ANTES de
-        # gastar CPU no PoW.
-        # ============================================================
-        if self._is_strict_consensus_height(height):
-            n_synced = self._count_synced_peers()
-            need = self._min_peers_for_mining()
-            if n_synced < need:
-                log.warning(
-                    "[CONSENSUS] Bloco #%d ≥ %d: mineração BLOQUEADA — "
-                    "%d/%d peers sincronizados (tolerância ±%d). "
-                    "Aguarde mais peers ou use BRN_MIN_PEERS_FOR_MINING.",
-                    height, CONSENSUS_STRICT_FROM_HEIGHT,
-                    n_synced, need, PEER_SYNC_TOLERANCE,
-                )
-                return None
-            log.info(
-                "[CONSENSUS] Bloco #%d ≥ %d: %d/%d peers sincronizados — "
-                "mineração liberada (consenso estrito).",
-                height, CONSENSUS_STRICT_FROM_HEIGHT, n_synced, need,
-            )
-
-        validators = self._get_active_validators()
-        if BRN_STRICT_MULTISIG:
-            log.info(
-                "[STRICT] minerando com %d validador(es), quórum=%s",
-                len(validators),
-                "ALL" if REQUIRE_ALL_SIGS else VALIDATOR_QUORUM,
-            )
-
-        reward = self.current_reward(height)
-        diff = self.current_difficulty()
-
-        fila_para_pagar = None
-        if (not self.rede_descentralizada and len(self.fila_mineracao) > 0):
-            fila_para_pagar = self.fila_mineracao
-        cb = make_coinbase(miner_address, miner_pubkey, height, reward,
-                           fila_mineracao=fila_para_pagar)
-
-        candidatas = self.db.all_mempool(limit=MAX_TX_PER_BLOCK - 1)
-        selected = []
-        gastos_neste_bloco = set()
-        for t in candidatas:
-            try:
-                ok_tx, msg_tx = self.validate_tx(t, from_mempool=True)
-                if not ok_tx:
-                    continue
-                conflito = False
-                for inp in t.get("inputs", []):
-                    key = (inp["txid"], int(inp["vout"]))
-                    if key in gastos_neste_bloco:
-                        conflito = True
-                        break
-                if conflito:
-                    continue
-                for inp in t.get("inputs", []):
-                    gastos_neste_bloco.add((inp["txid"], int(inp["vout"])))
-                selected.append(t)
+                _orig_hook(exc_type, exc_value, exc_tb)
             except Exception:
-                continue
-        txs = [cb] + selected
-        merkle = compute_merkle_root([t["txid"] for t in txs])
-        prev_hash = self.db.tip_hash()
-        ts = int(time.time())
-        nonce, h_hex, _ = _pow_search(
-            prev_hash, merkle, ts, diff,
-            should_continue=should_continue, progress_cb=progress_cb,
-        )
-        if nonce is None:
-            return None
+                pass
 
-        block = {
-            "height": height, "hash": h_hex, "prev_hash": prev_hash,
-            "timestamp": ts, "nonce": nonce, "merkle": merkle,
-            "difficulty": diff, "transactions": txs,
-            "validators_sig": [],
-        }
-        self._attach_auth_tag(block)
+    sys.excepthook = _hook
+    sys._brn_excepthook_installed = True
 
-        sigs = self._collect_signatures(block, validators=validators)
-        block["validators_sig"] = sigs
 
-        ok_sig, msg_sig = self._validate_validators_sig(
-            block, validators=validators)
-        if not ok_sig:
-            log.warning(f"[MINER] bloco #{height} REJEITADO (multi-sig): {msg_sig}")
-            return None
-
-        if self._pbft is not None:
-            try:
-                decided = self._pbft.propose(block)
-                if decided:
-                    if not self._pbft.attach_proof(block):
-                        _matched = False
-                        try:
-                            _lock = getattr(self._pbft, "lock", None)
-                            _states = getattr(self._pbft, "states", None)
-                            if _lock is not None and _states is not None:
-                                with _lock:
-                                    for (_v, _s), _st in _states.items():
-                                        if (getattr(_st, "decided", False)
-                                                and getattr(_st, "block_hash", None)
-                                                == block.get("hash")):
-                                            block["pbft_view"] = _st.view
-                                            block["pbft_seq"] = _st.seq
-                                            block["pbft_commits"] = [
-                                                {"pubkey": _pk, "signature": _sg}
-                                                for _pk, _sg in _st.commits.items()
-                                            ]
-                                            _matched = True
-                                            break
-                        except Exception as _e:
-                            log.debug("[PBFT] fallback attach_proof falhou: %s", _e)
-
-                        if not _matched:
-                            log.warning(
-                                f"[PBFT] bloco #{height} decidiu mas "
-                                f"attach_proof falhou")
-                            if (BRN_PBFT_ENFORCE
-                                    and height >= BRN_PBFT_START_HEIGHT):
-                                return None
-                        else:
-                            log.info(
-                                f"[PBFT] bloco #{height} attach via fallback "
-                                f"(seq avançou)")
-                    else:
-                        log.info("[PBFT] bloco #%d decidido com %d commit(s)",
-                                 height, len(block.get("pbft_commits", [])))
-                else:
-                    if (BRN_PBFT_ENFORCE
-                            and height >= BRN_PBFT_START_HEIGHT):
-                        log.warning(f"[PBFT] bloco #{height} NÃO decidido — "
-                                    f"descartando (ENFORCE=1)")
-                        return None
-                    else:
-                        log.warning(f"[PBFT] bloco #{height} sem quórum PBFT — "
-                                    f"continuando via multi-sig (ENFORCE=0)")
-            except Exception as e:
-                log.error("[PBFT] propose falhou para #%d: %s", height, e)
-                if (BRN_PBFT_ENFORCE
-                        and height >= BRN_PBFT_START_HEIGHT):
-                    return None
-
-        ok, msg = self.accept_block(block, validators=validators)
-        if ok:
-            self._fire_block_mined(block)
-            return block
-        log.warning(f"[MINER] bloco #{height} minerado mas REJEITADO: {msg}")
-        return None
-
-    def state_snapshot(self) -> dict:
+# ============================================================
+# FAST-SYNC
+# ============================================================
+def _get_current_db_height(db_path: str) -> int:
+    if not os.path.isabs(db_path):
+        db_path = str(BASE_DIR / db_path)
+    if not os.path.exists(db_path):
+        return -1
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
         try:
-            n_validators = len(self._get_active_validators())
-        except Exception:
-            n_validators = -1
-        snap = {
-            "height": self.get_latest_height(),
-            "tip_hash": self.db.tip_hash(),
-            "difficulty": self.current_difficulty(),
-            "cumulative_work": self.cumulative_work(),
-            "mempool": self.db.mempool_count(),
-            "checkpoints": len(_checkpoints),
-            "rede_descentralizada": self.rede_descentralizada,
-            "fila_tamanho": len(self.fila_mineracao),
-            "validators_active": n_validators,
-            "n_synced_peers": self._count_synced_peers(),
-            "required_sigs": self._required_signatures(
-                self._get_active_validators()),
-            "require_all_sigs": REQUIRE_ALL_SIGS,
-            "validator_quorum": VALIDATOR_QUORUM,
-            "consensus_strict_from": CONSENSUS_STRICT_FROM_HEIGHT,
-            "min_peers_for_mining": MIN_PEERS_FOR_MINING,
-            "peer_sync_tolerance": PEER_SYNC_TOLERANCE,
-            "bootstrap_trust_threshold": BOOTSTRAP_TRUST_THRESHOLD,
-            "bootstrap_skip_sigs_until": BRN_BOOTSTRAP_SKIP_SIGS_UNTIL,
-            "assume_valid_until": BRN_ASSUME_VALID_UNTIL,
-            "checkpoint_auto_height": BRN_CHECKPOINT_AUTO_HEIGHT,
-            "strict_multisig": BRN_STRICT_MULTISIG,
-            "trust_fallback_to_top": BRN_TRUST_FALLBACK_TO_TOP,
-            "require_auth_tag": self.require_auth_tag,
-            "auto_wire": BRN_AUTO_WIRE,
-        }
-        if self._pbft is not None:
-            try:
-                snap["pbft"] = self._pbft.status()
-            except Exception:
-                snap["pbft"] = {"error": "status falhou"}
-        else:
-            snap["pbft"] = {"enabled": False}
-        return snap
-
-
-def _reorg_to_method(self, new_blocks, max_depth=MAX_REORG_DEPTH,
-                     allow_genesis_reorg=False):
-    try:
-        from reorg import reorg_to as _reorg_to
-        res = _reorg_to(self, new_blocks, max_depth, allow_genesis_reorg)
-        return res.to_tuple()
-    except ImportError as e:
-        return False, f"reorg indisponivel: {e}"
-
-
-def _find_fork_method(self, remote_blocks, max_depth=1000):
-    try:
-        from reorg import find_fork_point as _find_fork
-        return _find_fork(self, remote_blocks, max_depth)
-    except ImportError:
+            row = conn.execute("SELECT MAX(height) FROM blocks").fetchone()
+            return int(row[0]) if row and row[0] is not None else -1
+        finally:
+            conn.close()
+    except Exception:
         return -1
 
 
-def _verify_chain_method(self, full=True):
+def _resolve_fast_sync_until(args) -> int:
+    if getattr(args, "no_fast_sync", False):
+        return 0
+    if getattr(args, "fast_sync_until", None) is not None:
+        try:
+            return max(0, int(args.fast_sync_until))
+        except (ValueError, TypeError):
+            pass
     try:
-        from chain_validator import verify_chain as _verify_ext
-        return _verify_ext(self)
-    except ImportError as e:
-        class _FakeResult:
-            valid = False
-            errors = [f"chain_validator indisponivel: {e}"]
-            def to_dict(self): return {"valid": False, "errors": self.errors}
-        return _FakeResult()
+        return max(0, int(os.environ.get("BRN_FAST_SYNC_UNTIL", "4084")))
+    except (ValueError, TypeError):
+        return 4084
 
 
-def _verify_chain_dict_method(self):
+def _maybe_enable_fast_sync(fast_sync_until: int, args) -> None:
+    log = logging.getLogger("main")
+
+    # [FIX v13.9.25] Sempre propagar BRN_FAST_SYNC_UNTIL pro server.py.
+    # server.py lê no IMPORT em _MIN_FAST_SYNC_UNTIL; sem isto,
+    # --no-fast-sync / --fast-sync-until 0 deixava main.py liberado
+    # mas /api/mine/gate retornava 409 "fast_sync_below_4084" para sempre.
+    os.environ["BRN_FAST_SYNC_UNTIL"] = str(fast_sync_until)
+
+    no_fast_sync = getattr(args, "no_fast_sync", False)
+    cli_explicit = getattr(args, "fast_sync_until", None) is not None
+
+    if no_fast_sync:
+        log.info("[FAST-SYNC] --no-fast-sync ativo — validação completa desde o boot")
+        return
+
+    if fast_sync_until <= 0:
+        log.info("[FAST-SYNC] desativado (fast_sync_until=%d)", fast_sync_until)
+        return
+
+    db_path = os.environ.get("BRN_DB", "brn_v2_chain.db")
+    current_h = _get_current_db_height(db_path)
+
+    if current_h >= fast_sync_until:
+        log.info(
+            "[FAST-SYNC] DB em %d (>= %d) — fast-sync NÃO ativado.",
+            current_h, fast_sync_until,
+        )
+        return
+
+    def _should_set(key: str) -> bool:
+        if cli_explicit:
+            return True
+        return not os.environ.get(key)
+
+    if _should_set("BRN_ASSUME_VALID_UNTIL"):
+        os.environ["BRN_ASSUME_VALID_UNTIL"] = str(fast_sync_until)
+    if _should_set("BRN_BOOTSTRAP_SKIP_SIGS_UNTIL"):
+        os.environ["BRN_BOOTSTRAP_SKIP_SIGS_UNTIL"] = str(fast_sync_until)
+
+    log.warning("=" * 64)
+    log.warning(" [FAST-SYNC] ATIVADO")
+    log.warning("=" * 64)
+    log.warning("  altura atual    : %d", current_h)
+    log.warning("  sync rápido até : %d", fast_sync_until)
+    log.warning("  Blocos 1..%d aceitos SEM validação completa", fast_sync_until)
+    log.warning("  A partir de %d, validação FULL é obrigatória.", fast_sync_until + 1)
+    log.warning("  Mineração só libera APÓS %d E validadores sincronizados.", fast_sync_until)
+    log.warning("=" * 64)
+
+
+def _verify_validators_synced(chain, min_validators: int = 1,
+                              tolerance: int = 1,
+                              max_age_s: int = 300) -> tuple:
+    our_h = int(chain.db.height())
+    now = time.time()
+
+    details = {
+        "our_height": our_h,
+        "min_validators": min_validators,
+        "tolerance": tolerance,
+        "max_age_s": max_age_s,
+        "synced_peers": [],
+        "ahead_peers": [],
+        "behind_peers": [],
+        "stale_peers": [],
+        "total_peers": 0,
+    }
+
+    if our_h < 0:
+        return False, f"nosso DB está vazio (height={our_h})", details
+
     try:
-        from chain_validator import verify_chain as _verify_ext
-        return _verify_ext(self).to_dict()
-    except ImportError as e:
-        return {"valid": False, "errors": [f"chain_validator indisponivel: {e}"]}
+        peers = chain.db.listar_peers(apenas_ativos=False)
+    except Exception as e:
+        return False, f"falha ao listar peers do DB: {e}", details
+
+    peers = peers or []
+    details["total_peers"] = len(peers)
+
+    for p in peers:
+        if not isinstance(p, dict):
+            continue
+        addr = (p.get("address") or "").strip()
+        if not addr:
+            continue
+        ip = addr.rsplit(":", 1)[0] if ":" in addr else addr
+        if not ip or ip.startswith("127.") or ip == "0.0.0.0":
+            continue
+
+        try:
+            peer_h = int(p.get("height", 0) or 0)
+        except (ValueError, TypeError):
+            peer_h = 0
+        try:
+            last_seen = float(p.get("last_seen", 0) or 0)
+        except (ValueError, TypeError):
+            last_seen = 0.0
+        age_s = int(now - last_seen) if last_seen > 0 else -1
+
+        entry = {"ip": ip, "height": peer_h, "age_s": age_s}
+
+        if age_s < 0 or age_s > max_age_s:
+            details["stale_peers"].append(entry)
+            continue
+
+        delta = peer_h - our_h
+        if abs(delta) <= tolerance:
+            details["synced_peers"].append({**entry, "delta": delta})
+        elif delta > 0:
+            details["ahead_peers"].append({**entry, "delta": delta})
+        else:
+            details["behind_peers"].append({**entry, "delta": delta})
+
+    if len(details["synced_peers"]) >= min_validators:
+        return True, (
+            f"{len(details['synced_peers'])} validador(es) em altura "
+            f"~{our_h} (tolerância ±{tolerance})"
+        ), details
+
+    return False, (
+        f"apenas {len(details['synced_peers'])}/{min_validators} "
+        f"validador(es) em altura ~{our_h} "
+        f"(à frente={len(details['ahead_peers'])}, "
+        f"atrás={len(details['behind_peers'])}, "
+        f"stale={len(details['stale_peers'])}, "
+        f"total={details['total_peers']})"
+    ), details
 
 
-Blockchain.reorg_to = _reorg_to_method
-Blockchain.find_fork_point = _find_fork_method
-Blockchain.verify_chain = _verify_chain_method
-Blockchain.verify_chain_dict = _verify_chain_dict_method
-print("reorg.py e chain_validator.py plugados em Blockchain (modo lazy)")
+# ============================================================
+# PEER HEALER
+# ============================================================
+def _peer_healer_loop(chain, p2p, stop_evt: threading.Event, interval: int = 15):
+    """
+    Thread que pinga os peers via P2P e atualiza a altura real no SQLite.
+    Destrava o Mining Gate sem precisar de scripts externos.
+    """
+    log = logging.getLogger("main")
+    log.info("[Peer-Healer] iniciado (interval=%ds)", interval)
+
+    if not p2p:
+        log.warning("[Peer-Healer] P2P não inicializado — healer inativo.")
+        return
+
+    if not hasattr(chain.db, "upsert_peer"):
+        log.warning("[Peer-Healer] chain.db não tem upsert_peer() — "
+                    "healer inativo (atualize db.py para v13.9.23+)")
+        return
+
+    while not stop_evt.wait(interval):
+        try:
+            local_h = int(chain.db.height())
+            if local_h < 0:
+                continue
+
+            peers = chain.db.listar_peers(apenas_ativos=False)
+            for p in peers:
+                addr = (p.get("address") or "").strip()
+                if not addr or ":" not in addr:
+                    continue
+                ip, port_s = addr.rsplit(":", 1)
+                if ip.startswith("127.") or ip == "0.0.0.0":
+                    continue
+
+                try:
+                    port = int(port_s)
+                    from p2p_unified import P2PClient
+
+                    resp, _ = P2PClient.send_message(
+                        ip, port, {"type": "get_chain_height"}, timeout=3.0)
+                    if resp:
+                        h = int(resp.get("height", 0) or 0)
+                        if h >= 0:
+                            node_id = p.get("node_id") or addr
+                            genesis = p.get("genesis_hash") or ""
+                            version = p.get("version") or "?"
+                            is_miner = bool(p.get("is_miner", False))
+                            public_key = p.get("public_key") or ""
+
+                            chain.db.upsert_peer(
+                                node_id=node_id, address=addr, genesis_hash=genesis,
+                                version=version, height=h, is_miner=is_miner,
+                                public_key=public_key
+                            )
+
+                            if abs(h - local_h) <= 1:
+                                log.info("[Peer-Healer] Peer %s sincronizado em %d (local=%d)",
+                                         addr, h, local_h)
+                            else:
+                                log.debug("[Peer-Healer] Peer %s altura %d (local=%d)",
+                                          addr, h, local_h)
+                except Exception as e:
+                    log.debug("[Peer-Healer] Falha ao pingar %s: %s", addr, e)
+        except Exception as e:
+            log.debug("[Peer-Healer] Erro no loop: %s", e)
+
+
+# ============================================================
+# Identidade
+# ============================================================
+def _get_identity_password() -> str:
+    log = logging.getLogger("main")
+    pw = (
+        os.environ.get("BRN_NODE_PASSWORD", "").strip()
+        or os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
+    )
+    if pw:
+        return pw
+    local_file = BASE_DIR / ".node_password"
+    if local_file.exists():
+        try:
+            pw = local_file.read_text(encoding="utf-8").strip()
+            if pw:
+                return pw
+        except Exception:
+            pass
+    pw = secrets.token_hex(16)
+    try:
+        local_file.write_text(pw + "\n", encoding="utf-8")
+        try:
+            os.chmod(local_file, 0o600)
+        except Exception:
+            pass
+        log.info("[identity] senha local criada em %s", local_file.name)
+        return pw
+    except Exception as e:
+        log.warning("[identity] não gravei %s: %s", local_file.name, e)
+        return ""
+
+
+def _load_or_create_node_identity():
+    log = logging.getLogger("main")
+    try:
+        from secure_store import load_node_identity, save_node_identity
+        from crypto import Ed25519PrivateKey
+    except Exception as e:
+        raise RuntimeError(f"crypto/secure_store indisponíveis: {e}") from e
+
+    pw_env = (
+        os.environ.get("BRN_NODE_PASSWORD", "").strip()
+        or os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
+    )
+    pw = _get_identity_password()
+    p = BASE_DIR / "node_identity.enc"
+
+    if p.exists():
+        if not pw:
+            raise RuntimeError(f"[identity] {p.name} sem senha resolvível")
+        try:
+            data = load_node_identity(pw, str(p))
+            if not data or not data.get("sk"):
+                raise ValueError("arquivo sem 'sk'")
+            priv = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(data["sk"]))
+            pub = priv.public_key().public_bytes_raw().hex()
+            log.info("[identity] carregada pub=%s…", pub[:16])
+            return priv, pub
+        except Exception as e:
+            if pw_env:
+                raise RuntimeError(
+                    f"[identity] {p.name} não abriu com senha do ambiente: {e}"
+                ) from e
+            backup = p.with_suffix(f".enc.bak.{int(time.time())}")
+            try:
+                p.rename(backup)
+                log.warning("[identity] %s inacessível — backup em %s",
+                            p.name, backup.name)
+            except Exception as e2:
+                raise RuntimeError(
+                    f"[identity] não renomeei {p.name}: {e2}"
+                ) from e2
+
+    if not pw:
+        priv = Ed25519PrivateKey.generate()
+        pub = priv.public_key().public_bytes_raw().hex()
+        log.warning("[identity] VOLÁTIL pub=%s…", pub[:16])
+        return priv, pub
+
+    priv = Ed25519PrivateKey.generate()
+    sk_hex = priv.private_bytes_raw().hex()
+    pub = priv.public_key().public_bytes_raw().hex()
+    try:
+        save_node_identity(
+            {"sk": sk_hex, "pub": pub, "created_at": int(time.time())},
+            pw, str(p),
+        )
+        log.info("[identity] CRIADA pub=%s…", pub[:16])
+    except Exception as e:
+        raise RuntimeError(f"[identity] não salvei {p.name}: {e}") from e
+    return priv, pub
+
+
+def _check_blockchain_version() -> bool:
+    log = logging.getLogger("main")
+    try:
+        import blockchain as _bc
+        ver = getattr(_bc, "__version__", "")
+    except Exception as e:
+        log.error("[version] não importei blockchain: %s", e)
+        return os.environ.get("BRN_STRICT_MULTISIG") != "1"
+
+    ok = ver.startswith("9.4") or (ver >= "9.4.10") or ver.startswith("9.5")
+    if ok:
+        log.info("[version] blockchain.py v%s (multi-sig OK)", ver)
+        return True
+    log.warning("[version] blockchain.py v%s — multi-sig NÃO enforçado",
+                ver or "desconhecida")
+    return os.environ.get("BRN_STRICT_MULTISIG") != "1"
+
+
+# ============================================================
+# Setup componentes
+# ============================================================
+def _setup_trust(chain, node_id_priv, is_origin: bool):
+    try:
+        from trust_network import TrustNetwork
+        trust = TrustNetwork("trust_network.json", is_origin=is_origin,
+                             node_sk=node_id_priv)
+        chain.set_trust_net(trust)
+        return trust
+    except Exception as e:
+        logging.getLogger("main").error("[trust] init falhou: %s", e)
+        return None
+
+
+def _setup_p2p(chain, node_id_priv, p2p_port: int):
+    try:
+        from p2p_unified import P2PManager
+        p2p = P2PManager(chain, node_id_priv=node_id_priv, tcp_port=p2p_port)
+        chain.set_p2p(p2p)
+        p2p.start()
+        return p2p
+    except Exception as e:
+        logging.getLogger("main").error("[p2p] init falhou: %s", e)
+        return None
+
+
+def _setup_sync(chain, p2p):
+    try:
+        from sync_manager import ChainSyncManager
+        sync_mgr = ChainSyncManager(chain, chain.db, p2p)
+        sync_mgr.start_sync_loop()
+        return sync_mgr
+    except Exception as e:
+        logging.getLogger("main").warning("[sync] init falhou: %s", e)
+        return None
+
+
+def _setup_broadcast(chain, p2p):
+    log = logging.getLogger("main")
+    if not p2p:
+        return False
+    try:
+        chain.on_block_mined = p2p.broadcast_block
+        log.info("[P2P] Broadcast ativado")
+        return True
+    except Exception as e:
+        log.warning("[P2P] broadcast falhou: %s", e)
+        return False
+
+
+def _setup_pool(chain, is_origin: bool):
+    if not is_origin:
+        return None
+    try:
+        from mining_pool import PoolManager
+        pool = PoolManager(chain)
+        logging.getLogger("main").info("[pool] PoolManager ativo (origin)")
+        return pool
+    except Exception as e:
+        logging.getLogger("main").warning("[pool] init falhou: %s", e)
+        return None
+
+
+def _wallet_watchdog_loop(chain, p2p, trust, stop_evt: threading.Event,
+                          interval: int = 30):
+    log = logging.getLogger("main")
+    log.info("[watchdog] iniciado (interval=%ds)", interval)
+    detector = IsolationDetector() if _HAS_ISOLATION else None
+    if detector is not None:
+        log.info("[watchdog] isolation_detector ativo")
+
+    while not stop_evt.wait(interval):
+        if detector is not None and p2p is not None:
+            try:
+                peers = p2p.discovery.listar_peers()
+                for addr in peers:
+                    detector.on_peer_seen(addr)
+                alert = detector.check(chain.db.height(), peers)
+                if alert is not None:
+                    log.warning("[ISOLATION] %s: %s",
+                                alert.severity.upper(), alert.reason)
+            except Exception as _e:
+                log.debug("[ISOLATION] check falhou: %s", _e)
+        try:
+            sk = getattr(chain, "_local_validator_sk", None)
+            if sk is None:
+                if not getattr(chain, "_watchdog_sk_warned", False):
+                    chain._watchdog_sk_warned = True
+                    log.warning("[watchdog] SK=None — nó NÃO assina")
+                continue
+            if getattr(chain, "_watchdog_sk_warned", False):
+                chain._watchdog_sk_warned = False
+                log.info("[watchdog] SK detectada pk=%s…", sk.pub_hex[:16])
+            collector = getattr(chain, "_sign_collector", None)
+            if collector is None:
+                if not getattr(chain, "_watchdog_collector_warned", False):
+                    chain._watchdog_collector_warned = True
+                    log.warning("[watchdog] _sign_collector=None")
+                continue
+            chain._watchdog_collector_warned = False
+        except Exception as e:
+            log.warning("[watchdog] loop: %s", e)
+    log.info("[watchdog] encerrado")
+
+
+def _setup_trust_daemon(chain, trust, p2p, password: str, is_origin: bool,
+                        stop_evt: threading.Event, interval: int = 30):
+    log = logging.getLogger("main")
+    if trust is None:
+        return None
+    try:
+        from trust_daemon import start_daemon
+        t = start_daemon(chain, trust, p2p, password, is_origin, stop_evt)
+        log.info("[TrustDaemon] start_daemon ativado")
+        return t
+    except ImportError:
+        pass
+    except Exception as e:
+        log.warning("[TrustDaemon] start_daemon falhou: %s", e)
+
+    def _loop():
+        while not stop_evt.wait(interval):
+            try:
+                sk = getattr(chain, "_local_validator_sk", None)
+                if sk is not None and hasattr(trust, "heartbeat_self"):
+                    try:
+                        trust.heartbeat_self(sk.pub_hex.lower())
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    t = threading.Thread(target=_loop, daemon=True, name="TrustDaemon")
+    t.start()
+    log.info("[TrustDaemon] fallback ativado")
+    return t
+
+
+def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int,
+                      stop_evt: threading.Event = None):
+    log = logging.getLogger("main")
+    try:
+        import server as srv
+    except Exception as e:
+        log.error("[server] import falhou: %s", e)
+        return False
+
+    srv.set_chain(chain)
+
+    # [FIX v13.9.25] Injeta PEER_ID no Flask.
+    # Sem isto, server._BRN_PEER_ID ficava "" e, quando o FastAPI caía
+    # para o fallback Flask, /wallet não redirecionava e /api/peer_id
+    # retornava vazio — operador perdia a GUI no browser.
+    if hasattr(srv, "set_peer_id"):
+        srv.set_peer_id(os.environ.get("BRN_PEER_ID", ""))
+
+    for fn_name, obj in (
+        ("set_p2p_manager", p2p),
+        ("set_pool_manager", pool),
+        ("set_sync_manager", sync_mgr),
+        ("set_trust_network", trust),
+    ):
+        if obj is None:
+            continue
+        fn = getattr(srv, fn_name, None)
+        if fn is None:
+            continue
+        try:
+            fn(obj)
+        except Exception as e:
+            log.error("[server] %s falhou: %s", fn_name, e)
+
+    try:
+        if hasattr(srv, "set_sk_validation_state"):
+            srv.set_sk_validation_state(SK_VALIDATION_STATE)
+            log.info("[server] sk_validation_state injetado")
+        if hasattr(srv, "set_http_sync_state"):
+            srv.set_http_sync_state(HTTP_SYNC_PROGRESS)
+            log.info("[server] http_sync_state injetado")
+    except Exception as e:
+        log.debug("[server] set_state falhou: %s", e)
+
+    if stop_evt is not None and hasattr(srv, "set_sk_validation_state"):
+        def _refresh():
+            while not stop_evt.wait(5):
+                try:
+                    srv.set_sk_validation_state(SK_VALIDATION_STATE)
+                    if hasattr(srv, "set_http_sync_state"):
+                        srv.set_http_sync_state(HTTP_SYNC_PROGRESS)
+                except Exception:
+                    pass
+        threading.Thread(target=_refresh, daemon=True,
+                         name="StateRefresh").start()
+        log.info("[server] state refresh thread iniciada (5s)")
+
+    def _run():
+        try:
+            import uvicorn
+            from server_fastapi import app as fastapi_app
+            log.info("[server] Usando FastAPI + Uvicorn na porta %d", web_port)
+            uvicorn.run(
+                fastapi_app,
+                host=os.environ.get("BRN_WEB_HOST", "127.0.0.1"),
+                port=web_port,
+                log_level="warning",
+                access_log=False,
+            )
+            return
+        except Exception as e:
+            log.error("[server] Uvicorn falhou: %s", e)
+
+        try:
+            srv.app.run(
+                host=os.environ.get("BRN_WEB_HOST", "127.0.0.1"),
+                port=web_port, threaded=True, use_reloader=False,
+            )
+        except Exception as e2:
+            log.error("[server] app.run fallback morreu: %s", e2)
+
+    threading.Thread(target=_run, daemon=True, name="HTTP").start()
+    log.info("[server] HTTP ativo na porta %d", web_port)
+    return True
+
+
+def _start_explorer(chain):
+    try:
+        import explorer as exp
+        if hasattr(exp, "set_chain"):
+            exp.set_chain(chain)
+
+        def _run():
+            exp.app.run(
+                host="0.0.0.0",
+                port=int(os.environ.get("BRN_EXPLORER_PORT", "8080")),
+                threaded=True, use_reloader=False,
+            )
+        threading.Thread(target=_run, daemon=True, name="EXP").start()
+    except Exception as e:
+        logging.getLogger("main").debug("[explorer] não iniciou: %s", e)
+
+
+# ============================================================
+# GUI / wallet
+# ============================================================
+def _candidate_gui_passwords() -> list:
+    cands = []
+    seen = set()
+
+    def _add(src: str, val: str):
+        v = (val or "").strip()
+        if not v or v in seen:
+            return
+        seen.add(v)
+        cands.append((src, v))
+
+    _add("env:BRN_WALLET_SESSION_PASS",
+         os.environ.get("BRN_WALLET_SESSION_PASS", ""))
+    _add("env:BRN_VALIDATOR_SEED", os.environ.get("BRN_VALIDATOR_SEED", ""))
+    _add("env:BRN_NODE_PASSWORD", os.environ.get("BRN_NODE_PASSWORD", ""))
+    p = BASE_DIR / ".node_password"
+    if p.exists():
+        try:
+            _add("file:.node_password", p.read_text(encoding="utf-8").strip())
+        except Exception:
+            pass
+    return cands
+
+
+def _prompt_password_interactive(api, max_attempts: int = 3) -> tuple:
+    try:
+        if not sys.stdin.isatty():
+            return False, "no_stdin", "", "stdin não é TTY"
+    except Exception:
+        return False, "no_stdin", "", "stdin check falhou"
+
+    print("\n" + "=" * 60)
+    print(" 🔐 ABRIR CARTEIRA BRN")
+    print("=" * 60)
+    print(" Carteira salva encontrada em disco.")
+    print(" Digite a senha para abrir (ou ENTER para abrir a GUI vazia).\n")
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            pw = input(f" Senha [{attempt}/{max_attempts}]: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n [cancelado]")
+            return False, "cancelled", "", "cancelado"
+        if not pw:
+            print(" [vazio] — abrindo GUI sem carteira")
+            return False, "empty_input", "", "usuário deixou vazio"
+        try:
+            r = api.unlock_wallet(pw)
+            if r.get("ok"):
+                addr = r.get("address", "")
+                if r.get("sk_installed"):
+                    print(f" ✅ Carteira aberta: {addr}")
+                    SK_VALIDATION_STATE["gui_wallet_source"] = (
+                        f"interactive:{attempt}")
+                    SK_VALIDATION_STATE["address_derived"] = addr
+                    SK_VALIDATION_STATE["address_configured"] = (
+                        addr[:40] if addr else "")
+                    return True, f"interactive:{attempt}", addr, ""
+                else:
+                    print(f" ⚠️  Carteira aberta: {addr}")
+                    print(" ⚠️  MAS SK NÃO instalada no nó (sk_installed=False)")
+                    for w in (r.get("warnings") or []):
+                        print(f"     [WARN] {w}")
+                    for e in (r.get("errors") or []):
+                        print(f"     [ERR]  {e}")
+                    SK_VALIDATION_STATE["gui_wallet_source"] = (
+                        f"interactive:{attempt}:no_sk")
+                    SK_VALIDATION_STATE["address_derived"] = addr
+                    SK_VALIDATION_STATE["address_configured"] = (
+                        addr[:40] if addr else "")
+                    return True, f"interactive:{attempt}:no_sk", addr, "sk_not_installed"
+            else:
+                print(f" ❌ Senha incorreta: {r.get('msg', '?')}")
+        except Exception as e:
+            print(f" ❌ Erro: {e}")
+
+    print(f"\n ❌ Senha incorreta {max_attempts} vezes. Abrindo GUI sem carteira.")
+    SK_VALIDATION_STATE["gui_wallet_source"] = "interactive_failed"
+    return False, "interactive_failed", "", f"{max_attempts} tentativas falharam"
+
+
+def _auto_unlock_gui(api, allow_interactive: bool = True) -> tuple:
+    log = logging.getLogger("main")
+    try:
+        has = api.has_wallet()
+        if not has.get("exists"):
+            log.info("[GUI] nenhuma carteira em disco — GUI abrirá para GERAR nova")
+            SK_VALIDATION_STATE["gui_wallet_source"] = "no_wallet_on_disk"
+            return False, "no_wallet_on_disk", "", "sem carteira em disco"
+    except Exception as e:
+        log.warning("[GUI] has_wallet() falhou: %s", e)
+        return False, "has_wallet_error", "", str(e)
+
+    try:
+        aw = api.get_active_wallet()
+        if aw.get("ok") and aw.get("address"):
+            log.info("[GUI] carteira JÁ desbloqueada: %s…", aw["address"][:32])
+            SK_VALIDATION_STATE["gui_wallet_source"] = "already_unlocked"
+            return True, "already_unlocked", aw["address"], ""
+    except Exception:
+        pass
+
+    cands = _candidate_gui_passwords()
+    for src, pw in cands:
+        try:
+            log.info("[GUI] tentando unlock com %s (len=%d)…", src, len(pw))
+            r = api.unlock_wallet(pw)
+            if r.get("ok"):
+                addr = r.get("address", "")
+                if r.get("sk_installed"):
+                    log.info("[GUI] ✅ carteira ABERTA com %s — address=%s",
+                             src, addr)
+                else:
+                    log.warning(
+                        "[GUI] ⚠️ carteira ABERTA com %s mas SK NÃO instalada "
+                        "(sk_installed=False). Nó NÃO vai assinar. "
+                        "warnings=%s errors=%s",
+                        src, r.get("warnings"), r.get("errors"),
+                    )
+                SK_VALIDATION_STATE["gui_wallet_source"] = (
+                    src if r.get("sk_installed") else f"{src}:no_sk"
+                )
+                SK_VALIDATION_STATE["address_derived"] = addr
+                SK_VALIDATION_STATE["address_configured"] = (
+                    addr[:40] if addr else "")
+                return True, src, addr, (
+                    "" if r.get("sk_installed") else "sk_not_installed"
+                )
+        except Exception as e:
+            log.debug("[GUI] %s exception: %s", src, e)
+
+    if allow_interactive:
+        log.info("[GUI] nenhuma senha do env funcionou (%d tentadas). "
+                 "Pedindo no console...", len(cands))
+        ok, src, addr, err = _prompt_password_interactive(api, max_attempts=3)
+        if ok:
+            log.info("[GUI] ✅ carteira ABERTA via %s — address=%s", src, addr)
+            return True, src, addr, err
+        else:
+            log.warning("[GUI] prompt falhou (%s) — GUI abrirá sem carteira.", src)
+            return False, src, "", err
+
+    log.warning("[GUI] ❌ não consegui abrir a carteira. "
+                "Clique em 'Carregar' ou 'Gerar nova' na GUI.")
+    SK_VALIDATION_STATE["gui_wallet_source"] = "all_passwords_failed"
+    return False, "all_passwords_failed", "", "todas as senhas falharam"
+
+
+def _start_gui(allow_interactive: bool = True) -> bool:
+    try:
+        import webview
+        from app_wallet_v3 import WalletApi
+        log = logging.getLogger("main")
+        api = WalletApi()
+        log.info("[GUI] tentando abrir carteira salva...")
+        ok, source, addr, err = _auto_unlock_gui(
+            api, allow_interactive=allow_interactive)
+        if ok:
+            log.info("[GUI] auto-unlock OK (source=%s) — janela com carteira",
+                     source)
+        elif source == "no_wallet_on_disk":
+            log.info("[GUI] sem carteira — janela abre em modo CRIAÇÃO")
+        else:
+            log.info("[GUI] sem carteira aberta (%s) — janela abre vazia", source)
+
+        web_port = int(
+            os.environ.get("BRN_WEB_PORT")
+            or os.environ.get("PORT")
+            or "5000"
+        )
+        http_url = f"http://127.0.0.1:{web_port}/wallet"
+        url = http_url
+
+        if _HAS_REQUESTS:
+            for _ in range(20):
+                try:
+                    r = _requests.get(http_url, timeout=1)
+                    if r.status_code < 500:
+                        log.info("[gui] servidor HTTP OK (%s) — abrindo via HTTP",
+                                 r.status_code)
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.5)
+            else:
+                log.warning("[gui] servidor HTTP não respondeu em 10s — "
+                            "caindo para file://")
+                wallet_path = BASE_DIR / "index_wallet.html"
+                if not wallet_path.exists():
+                    wallet_path = BASE_DIR / "panel.html"
+                url = wallet_path.as_uri() if wallet_path.exists() else "about:blank"
+        else:
+            wallet_path = BASE_DIR / "index_wallet.html"
+            if not wallet_path.exists():
+                wallet_path = BASE_DIR / "panel.html"
+            url = wallet_path.as_uri() if wallet_path.exists() else "about:blank"
+
+        log.info("[gui] abrindo %s", url)
+        webview.create_window("BRN Wallet", url=url, width=1100, height=780,
+                              js_api=api)
+        webview.start()
+        return True
+    except Exception as e:
+        logging.getLogger("main").warning("[gui] falha: %s", e)
+        return False
+
+
+# ============================================================
+# SK resolution
+# ============================================================
+def _resolve_validator_sk() -> tuple:
+    log = logging.getLogger("main")
+    if not _HAS_WALLET:
+        log.error("[SK] wallet.Wallet indisponível")
+        return "", "", "", "error"
+
+    sk_env = os.environ.get("BRN_VALIDATOR_SK_HEX", "").strip()
+    if sk_env:
+        if len(sk_env) != 64 or any(c not in "0123456789abcdefABCDEF" for c in sk_env):
+            log.warning("[SK] BRN_VALIDATOR_SK_HEX inválida (len=%d) — ignorando",
+                        len(sk_env))
+        else:
+            try:
+                w = _Wallet(private_key_hex=sk_env)
+                log.info("[SK] fonte: env:BRN_VALIDATOR_SK_HEX")
+                return sk_env, w.address, w.pub_hex, "env:sk_hex"
+            except Exception as e:
+                log.warning("[SK] Wallet(sk_env) falhou: %s", e)
+
+    seed = os.environ.get("BRN_VALIDATOR_SEED", "").strip()
+    if seed:
+        try:
+            sk_hex = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+            w = _Wallet(private_key_hex=sk_hex)
+            log.info("[SK] fonte: env:BRN_VALIDATOR_SEED → sha256(seed) = %s…",
+                     sk_hex[:16])
+            return sk_hex, w.address, w.pub_hex, "env:seed"
+        except Exception as e:
+            log.warning("[SK] derivação de seed falhou: %s", e)
+
+    sk_file = BASE_DIR / ".validator_sk"
+    if sk_file.exists():
+        try:
+            content = sk_file.read_text(encoding="utf-8").strip()
+            sk_hex = content.split("|")[0].strip()
+            if len(sk_hex) == 64 and all(c in "0123456789abcdefABCDEF" for c in sk_hex):
+                w = _Wallet(private_key_hex=sk_hex)
+                log.info("[SK] fonte: arquivo %s", sk_file.name)
+                return sk_hex, w.address, w.pub_hex, "file"
+            else:
+                log.warning("[SK] %s corrompido — ignorando", sk_file.name)
+        except Exception as e:
+            log.warning("[SK] leitura de %s falhou: %s", sk_file.name, e)
+
+    try:
+        w = _Wallet()
+        sk_hex = w.priv_hex
+        address = w.address
+        pubkey = w.pub_hex
+        source = "generated:volatile"
+        try:
+            sk_file.write_text(sk_hex + "\n", encoding="utf-8")
+            try:
+                os.chmod(sk_file, 0o600)
+            except Exception:
+                pass
+            source = "generated:file"
+        except Exception as e:
+            log.warning("[SK] não gravei .validator_sk: %s (volátil)", e)
+
+        log.warning("=" * 64)
+        log.warning(" [SK] NOVA CARTEIRA GERADA — GUARDE PARA RECUPERAR")
+        log.warning("=" * 64)
+        log.warning("   address: %s", address)
+        log.warning("   pubkey : %s", pubkey)
+        log.warning("   sk_hex : %s", sk_hex)
+        log.warning("")
+        log.warning("   Para reusar: BRN_VALIDATOR_SEED=<qualquer-senha>")
+        log.warning("   Ou copie a sk_hex para: BRN_VALIDATOR_SK_HEX=%s", sk_hex)
+        log.warning("=" * 64)
+
+        return sk_hex, address, pubkey, source
+    except Exception as e:
+        log.error("[SK] geração falhou: %s", e)
+        return "", "", "", "error"
+
+
+def _ping_origin(timeout: float = 3.0) -> bool:
+    log = logging.getLogger("main")
+    if os.environ.get("BRN_IS_ORIGIN", "0") == "1":
+        return True
+    pool_url = os.environ.get("BRN_POOL_URL", "").strip().rstrip("/")
+    if not pool_url:
+        return False
+    if not _HAS_REQUESTS:
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                f"{pool_url}/api/status",
+                headers={"User-Agent": "brn-main/13.9.25"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status == 200
+        except Exception as e:
+            log.debug("[ORIGIN] urllib ping falhou: %s", e)
+            return False
+    try:
+        r = _requests.get(f"{pool_url}/api/status", timeout=timeout)
+        return r.status_code == 200
+    except Exception as e:
+        log.debug("[ORIGIN] requests ping falhou: %s", e)
+        return False
+
+
+def _install_sk_local_only(chain, sk_hex: str, address: str,
+                           pubkey: str) -> bool:
+    log = logging.getLogger("main")
+    try:
+        chain.set_local_validator_sk(sk_hex)
+        log.info("[SK] instalada localmente (sem propagar) pk=%s…",
+                 pubkey[:16])
+        return True
+    except Exception as e:
+        log.exception("[SK] set_local_validator_sk falhou: %s", e)
+        return False
+
+
+# ============================================================
+# HTTP SYNC
+# ============================================================
+def _try_truncate_chain_in_place(chain, target_height: int, log) -> bool:
+    db = chain.db
+    candidates = [
+        ("remove_blocks_above", (target_height,)),
+        ("truncate_to", (target_height,)),
+        ("prune_above", (target_height,)),
+        ("truncate", (target_height,)),
+        ("reset_to_height", (target_height,)),
+    ]
+    for meth_name, args in candidates:
+        if not hasattr(db, meth_name):
+            continue
+        try:
+            fn = getattr(db, meth_name)
+            result = fn(*args)
+            log.warning("[HTTP-SYNC] truncado via db.%s%s → %r",
+                        meth_name, args, result)
+            try:
+                new_h = int(db.height())
+            except Exception:
+                new_h = -999
+            if new_h <= target_height:
+                log.warning("[HTTP-SYNC] altura após truncate: %d (alvo %d)",
+                            new_h, target_height)
+                return True
+            log.warning("[HTTP-SYNC] db.%s não reduziu a altura (agora %d)",
+                        meth_name, new_h)
+        except Exception as e:
+            log.debug("[HTTP-SYNC] db.%s falhou: %s", meth_name, e)
+
+    log.error("[HTTP-SYNC] ChainDB não expõe método de truncate conhecido")
+    return False
+
+
+def _force_http_sync_loop(chain, pool_url, stop_evt):
+    log = logging.getLogger("main")
+    log.info("[HTTP-SYNC] Thread iniciada (peer=%s)", pool_url)
+
+    try:
+        TRUNCATE_ON_REJECT = os.environ.get(
+            "BRN_HTTP_SYNC_TRUNCATE_ON_REJECT", "0") == "1"
+    except Exception:
+        TRUNCATE_ON_REJECT = False
+
+    try:
+        TRUNCATE_HEIGHT = int(
+            os.environ.get("BRN_HTTP_SYNC_TRUNCATE_HEIGHT", "0"))
+    except (ValueError, TypeError):
+        TRUNCATE_HEIGHT = 0
+
+    try:
+        POLL_INTERVAL = float(
+            os.environ.get("BRN_HTTP_SYNC_POLL_INTERVAL", "60"))
+    except (ValueError, TypeError):
+        POLL_INTERVAL = 60.0
+    POLL_INTERVAL = max(10.0, POLL_INTERVAL)
+
+    time.sleep(15)
+
+    while not stop_evt.is_set():
+        try:
+            try:
+                r = _requests.get(f"{pool_url}/api/status", timeout=10)
+                target_h = int(r.json().get("height", 0) or 0)
+            except Exception as e:
+                log.warning("[HTTP-SYNC] Origin inacessível: %s", e)
+                HTTP_SYNC_PROGRESS["syncing"] = False
+                if stop_evt.wait(POLL_INTERVAL * 0.5):
+                    break
+                continue
+
+            local_h = int(chain.db.height())
+            HTTP_SYNC_PROGRESS["target_height"] = target_h
+            HTTP_SYNC_PROGRESS["local_height"] = local_h
+            HTTP_SYNC_PROGRESS["best_peer"] = pool_url
+            SK_VALIDATION_STATE["local_height"] = local_h
+
+            if target_h <= 0:
+                HTTP_SYNC_PROGRESS["syncing"] = False
+                HTTP_SYNC_PROGRESS["percent"] = 0.0
+                if stop_evt.wait(POLL_INTERVAL):
+                    break
+                continue
+
+            if local_h >= target_h:
+                HTTP_SYNC_PROGRESS["syncing"] = False
+                HTTP_SYNC_PROGRESS["percent"] = 100.0
+                if stop_evt.wait(POLL_INTERVAL):
+                    break
+                continue
+
+            HTTP_SYNC_PROGRESS["syncing"] = True
+            HTTP_SYNC_PROGRESS["percent"] = round(
+                (max(local_h, 0) / max(target_h, 1)) * 100.0, 1)
+
+            log.info("[HTTP-SYNC] iniciando: local=%d target=%d (faltam %d)",
+                     local_h, target_h, target_h - local_h)
+
+            start = max(0, local_h + 1)
+            batch = 100
+            reject_info = None
+
+            while start <= target_h and not stop_evt.is_set():
+                try:
+                    r = _requests.get(
+                        f"{pool_url}/api/blocks?start={start}&limit={batch}",
+                        timeout=30,
+                    )
+                    blocks = r.json().get("blocks", []) or []
+                    if not blocks:
+                        log.warning(
+                            "[HTTP-SYNC] peer retornou vazio em start=%d", start)
+                        break
+
+                    for blk in blocks:
+                        ok, msg = chain.accept_block(blk)
+                        if not ok:
+                            reject_info = {
+                                "height": int(blk.get("height", -1)),
+                                "msg": msg,
+                            }
+                            log.error(
+                                "[HTTP-SYNC] bloco #%s rejeitado: %s",
+                                blk.get("height"), msg)
+                            break
+
+                    if reject_info:
+                        break
+
+                    start += len(blocks)
+                    local_h = int(chain.db.height())
+                    HTTP_SYNC_PROGRESS["local_height"] = local_h
+                    SK_VALIDATION_STATE["local_height"] = local_h
+                    if target_h > 0:
+                        HTTP_SYNC_PROGRESS["percent"] = min(
+                            100.0,
+                            round((max(local_h, 0) / target_h) * 100.0, 1),
+                        )
+                    log.info("[HTTP-SYNC] progresso: %d/%d (%.1f%%)",
+                             local_h, target_h,
+                             HTTP_SYNC_PROGRESS["percent"])
+                except Exception as e:
+                    log.warning("[HTTP-SYNC] erro no lote start=%d: %s",
+                                start, e)
+                    break
+
+            if reject_info:
+                log.error("[HTTP-SYNC] " + "=" * 50)
+                log.error("[HTTP-SYNC] reject em #%s", reject_info.get("height"))
+                log.error("[HTTP-SYNC]   %s", reject_info.get("msg"))
+                log.error("[HTTP-SYNC] Diagnóstico sugerido:")
+                log.error("[HTTP-SYNC]   1. SK local:  python3 app_wallet_v3.py --verify-sk")
+                log.error("[HTTP-SYNC]   2. Trust:     python3 auto_trust_daemon.py --once --dry-run")
+                log.error("[HTTP-SYNC]   3. re-sync:   BRN_HTTP_SYNC_TRUNCATE_ON_REJECT=1")
+                log.error("[HTTP-SYNC]      ou python3 main.py --force-http-resync")
+                log.error("[HTTP-SYNC] " + "=" * 50)
+
+                if TRUNCATE_ON_REJECT:
+                    log.warning("[HTTP-SYNC] TRUNCATE_ON_REJECT=1 → "
+                                "truncando para %d", TRUNCATE_HEIGHT)
+                    if _try_truncate_chain_in_place(chain, TRUNCATE_HEIGHT, log):
+                        log.info("[HTTP-SYNC] truncado, retomando em 5s")
+                        if stop_evt.wait(5):
+                            break
+                        continue
+                    else:
+                        log.error("[HTTP-SYNC] truncate in-place falhou.")
+                        log.error("[HTTP-SYNC] use: python3 main.py --force-http-resync")
+                        HTTP_SYNC_PROGRESS["syncing"] = False
+                        if stop_evt.wait(300):
+                            break
+                        continue
+                else:
+                    HTTP_SYNC_PROGRESS["syncing"] = False
+                    if stop_evt.wait(POLL_INTERVAL * 5):
+                        break
+                    continue
+
+            if stop_evt.wait(POLL_INTERVAL):
+                break
+
+        except Exception as e:
+            log.error("[HTTP-SYNC] erro no loop: %s", e)
+            HTTP_SYNC_PROGRESS["syncing"] = False
+            if stop_evt.wait(30):
+                break
+
+
+# ============================================================
+# AUTO-MINE com 4 gates
+# ============================================================
+def _auto_mine_loop(chain, address: str, pubkey: str, web_port: int,
+                    stop_evt: threading.Event,
+                    fast_sync_until: int = 4084) -> None:
+    log = logging.getLogger("main")
+    log.info("[AUTO-MINE] loop iniciado (fast_sync_until=%d)", fast_sync_until)
+
+    try:
+        MIN_VALIDATORS = max(1, int(os.environ.get(
+            "BRN_MIN_VALIDATORS_FOR_MINING", "1")))
+    except (ValueError, TypeError):
+        MIN_VALIDATORS = 1
+
+    try:
+        TOLERANCE = max(0, int(os.environ.get(
+            "BRN_VALIDATOR_HEIGHT_TOLERANCE", "1")))
+    except (ValueError, TypeError):
+        TOLERANCE = 1
+
+    try:
+        MAX_AGE_S = max(30, int(os.environ.get(
+            "BRN_VALIDATOR_MAX_AGE_S", "300")))
+    except (ValueError, TypeError):
+        MAX_AGE_S = 300
+
+    SK_VALIDATION_STATE["auto_mine_status"] = "starting"
+    if os.environ.get("BRN_IS_ORIGIN", "0") == "1":
+        log.info("[AUTO-MINE] Origin: mineração local pulada (usar pool)")
+        return
+    SK_VALIDATION_STATE["fast_sync_until"] = fast_sync_until
+    SK_VALIDATION_STATE["fast_sync_active"] = False
+
+    pool_url = os.environ.get("BRN_POOL_URL", "").strip()
+    failures = 0
+    currently_running = False
+
+    while not stop_evt.is_set():
+        try:
+            local_h = int(chain.db.height())
+            SK_VALIDATION_STATE["local_height"] = local_h
+            SK_VALIDATION_STATE["fast_sync_active"] = (
+                fast_sync_until > 0 and local_h < fast_sync_until
+            )
+
+            # Gate 1: SK
+            if getattr(chain, "_local_validator_sk", None) is None:
+                SK_VALIDATION_STATE["auto_mine_status"] = "waiting_sk"
+                SK_VALIDATION_STATE["validators_ready"] = False
+                SK_VALIDATION_STATE["validators_reason"] = "SK não instalada"
+                if currently_running:
+                    log.warning("[AUTO-MINE] SK sumiu — parando PoolClient")
+                    try:
+                        _requests.post(
+                            f"http://127.0.0.1:{web_port}/api/pool/stop_local",
+                            json={}, timeout=10)
+                    except Exception:
+                        pass
+                    currently_running = False
+                if stop_evt.wait(10):
+                    break
+                continue
+
+            # Gate 2: altura (Fast-Sync)
+            if fast_sync_until > 0 and local_h < fast_sync_until:
+                origin_synced = False
+                if _HAS_REQUESTS and pool_url:
+                    try:
+                        r = _requests.get(f"{pool_url}/api/status", timeout=3)
+                        remote_h = int(r.json().get("height", 0) or 0)
+                        if remote_h > 0 and local_h >= remote_h - TOLERANCE:
+                            origin_synced = True
+                    except Exception:
+                        pass
+
+                if not origin_synced:
+                    SK_VALIDATION_STATE["auto_mine_status"] = "fast_sync"
+                    SK_VALIDATION_STATE["validators_ready"] = False
+                    SK_VALIDATION_STATE["validators_reason"] = (
+                        f"fast-sync ativo: {local_h}/{fast_sync_until}"
+                    )
+                    if currently_running:
+                        log.warning("[AUTO-MINE] caiu em fast-sync — "
+                                    "parando PoolClient")
+                        try:
+                            _requests.post(
+                                f"http://127.0.0.1:{web_port}/api/pool/stop_local",
+                                json={}, timeout=10)
+                        except Exception:
+                            pass
+                        currently_running = False
+                    if stop_evt.wait(15):
+                        break
+                    continue
+
+            pool_already = False
+            if _HAS_REQUESTS:
+                try:
+                    r = _requests.get(
+                        f"http://127.0.0.1:{web_port}/api/pool/local_status",
+                        timeout=5)
+                    if r.status_code == 200:
+                        data = r.json()
+                        if data.get("running"):
+                            pool_already = True
+                except Exception:
+                    pass
+
+            # Gate 3: Origin
+            origin_online = _ping_origin(timeout=3.0)
+            SK_VALIDATION_STATE["origin_online"] = origin_online
+
+            if not origin_online:
+                SK_VALIDATION_STATE["auto_mine_status"] = "waiting_origin"
+                SK_VALIDATION_STATE["validators_ready"] = False
+                SK_VALIDATION_STATE["validators_reason"] = "Origin offline"
+                if currently_running and pool_already:
+                    log.warning("[AUTO-MINE] Origin offline — parando PoolClient")
+                    try:
+                        _requests.post(
+                            f"http://127.0.0.1:{web_port}/api/pool/stop_local",
+                            json={}, timeout=10)
+                    except Exception:
+                        pass
+                    currently_running = False
+                if failures == 0 or failures % 4 == 0:
+                    log.warning(
+                        "[AUTO-MINE] Origin offline (%s) — aguardando 30s",
+                        pool_url or "(vazio)")
+                failures += 1
+                if stop_evt.wait(30):
+                    break
+                continue
+
+            if _HAS_REQUESTS:
+                try:
+                    r = _requests.get(f"{pool_url}/api/status", timeout=10)
+                    remote_h = int(r.json().get("height", 0) or 0)
+                    if local_h < remote_h - TOLERANCE:
+                        SK_VALIDATION_STATE["auto_mine_status"] = "waiting_sync"
+                        SK_VALIDATION_STATE["validators_ready"] = False
+                        SK_VALIDATION_STATE["validators_reason"] = (
+                            f"atrás do Origin: local={local_h} remote={remote_h}"
+                        )
+                        log.info("[AUTO-MINE] Aguardando sync com Origin: "
+                                 "local=%d / origin=%d", local_h, remote_h)
+                        if currently_running and pool_already:
+                            log.warning("[AUTO-MINE] atrás do Origin — "
+                                        "parando PoolClient")
+                            try:
+                                _requests.post(
+                                    f"http://127.0.0.1:{web_port}/api/pool/stop_local",
+                                    json={}, timeout=10)
+                            except Exception:
+                                pass
+                            currently_running = False
+                        if stop_evt.wait(15):
+                            break
+                        continue
+                except Exception as e:
+                    log.warning("[AUTO-MINE] Erro ao checar Origin: %s", e)
+                    if stop_evt.wait(15):
+                        break
+                    continue
+
+            # Gate 4: validadores
+            ok_val, reason_val, detail_val = _verify_validators_synced(
+                chain,
+                min_validators=MIN_VALIDATORS,
+                tolerance=TOLERANCE,
+                max_age_s=MAX_AGE_S,
+            )
+            SK_VALIDATION_STATE["validators_ready"] = ok_val
+            SK_VALIDATION_STATE["validators_reason"] = reason_val
+            SK_VALIDATION_STATE["validators_detail"] = detail_val
+
+            if not ok_val:
+                SK_VALIDATION_STATE["auto_mine_status"] = "waiting_validators"
+                if currently_running and pool_already:
+                    log.warning("[AUTO-MINE] validadores dessincronizados — "
+                                "parando PoolClient")
+                    try:
+                        _requests.post(
+                            f"http://127.0.0.1:{web_port}/api/pool/stop_local",
+                            json={}, timeout=10)
+                    except Exception:
+                        pass
+                    currently_running = False
+                log.info("[AUTO-MINE] aguardando validadores: %s", reason_val)
+                if stop_evt.wait(30):
+                    break
+                continue
+
+            if pool_already:
+                SK_VALIDATION_STATE["auto_mine_status"] = "running"
+                currently_running = True
+                if stop_evt.wait(30):
+                    break
+                continue
+
+            SK_VALIDATION_STATE["auto_mine_status"] = "starting_pool"
+            log.info("[AUTO-MINE] ✅ 4 gates OK — iniciando PoolClient")
+            log.info("[AUTO-MINE]    altura=%d origin_online=True "
+                     "validators=%d/%d (±%d)",
+                     local_h, len(detail_val.get("synced_peers", [])),
+                     MIN_VALIDATORS, TOLERANCE)
+
+            if not _HAS_REQUESTS:
+                SK_VALIDATION_STATE["auto_mine_status"] = "error_no_requests"
+                if stop_evt.wait(60):
+                    break
+                continue
+
+            try:
+                r = _requests.post(
+                    f"http://127.0.0.1:{web_port}/api/pool/start_local",
+                    json={"address": address, "pubkey": pubkey},
+                    timeout=15,
+                )
+                try:
+                    data = r.json() if r.content else {}
+                except Exception:
+                    data = {"ok": False, "msg": f"HTTP {r.status_code}"}
+
+                if data.get("ok"):
+                    failures = 0
+                    currently_running = True
+                    SK_VALIDATION_STATE["auto_mine_status"] = "running"
+                    log.info("[AUTO-MINE] ✅ PoolClient iniciado (miner_id=%s)",
+                             data.get("miner_id", "?"))
+                else:
+                    failures += 1
+                    SK_VALIDATION_STATE["auto_mine_status"] = (
+                        f"failed:{data.get('msg', '?')[:60]}"
+                    )
+                    log.warning("[AUTO-MINE] PoolClient falhou (%d): %s",
+                                failures, data.get("msg", "?"))
+            except Exception as e:
+                failures += 1
+                SK_VALIDATION_STATE["auto_mine_status"] = (
+                    f"error:{type(e).__name__}"
+                )
+                log.warning("[AUTO-MINE] start_local exception: %s", e)
+
+        except Exception as e:
+            log.exception("[AUTO-MINE] loop exceção: %s", e)
+
+        if stop_evt.wait(30):
+            break
+
+    SK_VALIDATION_STATE["auto_mine_status"] = "stopped"
+    log.info("[AUTO-MINE] loop encerrado")
+
+
+# ============================================================
+# Status reporter
+# ============================================================
+def _status_reporter_loop(chain, stop_evt: threading.Event,
+                          interval: int = 30) -> None:
+    log = logging.getLogger("main")
+    try:
+        interval = max(10, int(os.environ.get(
+            "BRN_STATUS_LOG_INTERVAL", str(interval))))
+    except (ValueError, TypeError):
+        interval = 30
+
+    if stop_evt.wait(5):
+        return
+
+    while not stop_evt.wait(interval):
+        try:
+            h = int(chain.db.height())
+
+            try:
+                peers = chain.db.listar_peers(apenas_ativos=False) or []
+            except Exception:
+                peers = []
+            now = time.time()
+            target_h = h
+            fresh = 0
+            for p in peers:
+                if not isinstance(p, dict):
+                    continue
+                addr = (p.get("address") or "").strip()
+                if not addr:
+                    continue
+                ip = addr.rsplit(":", 1)[0] if ":" in addr else addr
+                if not ip or ip.startswith("127.") or ip == "0.0.0.0":
+                    continue
+                try:
+                    ph = int(p.get("height", 0) or 0)
+                    ls = float(p.get("last_seen", 0) or 0)
+                except (ValueError, TypeError):
+                    continue
+                if ls > 0 and (now - ls) > 300:
+                    continue
+                fresh += 1
+                if ph > target_h:
+                    target_h = ph
+
+            pct = 100.0 if target_h == 0 else min(
+                100.0, round((max(h, 0) / target_h) * 100.0, 1))
+
+            try:
+                ok_val, _reason_val, detail_val = _verify_validators_synced(
+                    chain, min_validators=1, tolerance=1, max_age_s=300)
+                n_synced = len(detail_val.get("synced_peers", []))
+            except Exception:
+                ok_val = False
+                n_synced = 0
+
+            try:
+                fast_until = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "4084"))
+            except (ValueError, TypeError):
+                fast_until = 4084
+
+            if fast_until > 0 and h < fast_until:
+                if h >= 0 and target_h > 0 and h >= target_h - 1:
+                    gate_s = "OK"
+                else:
+                    gate_s = f"fast_sync({h}/{fast_until})"
+            elif getattr(chain, "_local_validator_sk", None) is None:
+                gate_s = "no_sk"
+            elif not ok_val:
+                gate_s = f"val({n_synced}/1)"
+            else:
+                gate_s = "OK"
+
+            sk = getattr(chain, "_local_validator_sk", None)
+            if sk is None:
+                sign_s = "NO"
+                pk_s = "-"
+            else:
+                sign_s = "YES"
+                try:
+                    pk_s = (getattr(sk, "pub_hex", "") or "")[:16]
+                except Exception:
+                    pk_s = "?"
+
+            log.info(
+                "[STATUS %s] h=%d/%d sync=%.0f%% peers=%d val=%s gate=%s sign=%s pk=%s",
+                time.strftime("%H:%M:%S"),
+                h, target_h, pct, fresh,
+                "YES" if ok_val else "NO",
+                gate_s, sign_s, pk_s,
+            )
+        except Exception as e:
+            log.debug("[STATUS] reporter falhou: %s", e)
+
+
+# ============================================================
+# Auto-configure
+# ============================================================
+def _auto_configure(chain, p2p, trust, web_port: int, is_origin: bool,
+                    stop_evt: threading.Event,
+                    force_auto_mine: bool = False,
+                    fast_sync_until: int = 4084) -> None:
+    log = logging.getLogger("main")
+    sk_hex, address, pubkey, source = _resolve_validator_sk()
+
+    SK_VALIDATION_STATE.update({
+        "checked": True, "ok": bool(sk_hex), "source": source,
+        "address_configured": address[:40] if address else "",
+        "address_derived": address,
+        "pubkey_configured": pubkey[:40] if pubkey else "",
+        "pubkey_derived": pubkey,
+        "error": "" if sk_hex else "não foi possível resolver SK",
+    })
+
+    log.info("=" * 64)
+    log.info(" [SK RESOLUTION v13.9.25]")
+    log.info("=" * 64)
+    log.info("  source           : %s", source or "(nenhum)")
+    log.info("  SK_HEX len       : %d", len(sk_hex) if sk_hex else 0)
+    log.info("  ADDRESS          : %s",
+             (address[:40] + "…") if address else "(vazio)")
+    log.info("  PUBKEY           : %s",
+             (pubkey[:40] + "…") if pubkey else "(vazio)")
+
+    if not sk_hex:
+        log.error("  RESULTADO        : ❌ não foi possível resolver SK")
+        log.error("=" * 64)
+        return
+
+    log.info("  RESULTADO        : ✅ SK resolvida")
+    log.info("=" * 64)
+    _install_sk_local_only(chain, sk_hex, address, pubkey)
+
+    log.info("[AUTO-CONFIG] pingando Origin...")
+    origin_online = _ping_origin(timeout=3.0)
+    SK_VALIDATION_STATE["origin_online"] = origin_online
+
+    if origin_online:
+        log.info("[AUTO-CONFIG] Origin ONLINE — propagando SK...")
+        if not _HAS_WI:
+            log.error("[AUTO-CONFIG] wallet_integrator indisponível")
+        else:
+            try:
+                r = _wi.integrate_and_propagate(
+                    chain, sk_hex, address=address, pubkey=pubkey,
+                    p2p=p2p, trust=trust, logger=log,
+                )
+                if r.get("ok"):
+                    log.info(
+                        "[AUTO-CONFIG] ✅ SK propagada (in_trust=%s "
+                        "in_top5=%s propagated=%s)",
+                        r.get("in_trust"), r.get("in_top5"),
+                        r.get("propagated"),
+                    )
+                else:
+                    log.warning("[AUTO-CONFIG] ⚠️ propagate falhou: %s",
+                                r.get("errors") or r.get("msg"))
+            except Exception as e:
+                log.exception(
+                    "[AUTO-CONFIG] integrate_and_propagate falhou: %s", e)
+    else:
+        log.warning("[AUTO-CONFIG] ⚠️ Origin OFFLINE — SK instalada localmente.")
+
+    env_auto_mine = os.environ.get("BRN_AUTO_MINE", "").strip()
+    if env_auto_mine == "1":
+        should_mine = True
+        reason = "BRN_AUTO_MINE=1"
+    elif env_auto_mine == "0":
+        should_mine = False
+        reason = "BRN_AUTO_MINE=0"
+    elif force_auto_mine:
+        should_mine = True
+        reason = "--auto-mine"
+    elif is_origin:
+        should_mine = True
+        reason = "origin (padrão)"
+    else:
+        should_mine = False
+        reason = "cliente + BRN_AUTO_MINE não setado"
+
+    log.info("[AUTO-CONFIG] auto-mine: %s (%s)", should_mine, reason)
+
+    if not should_mine:
+        SK_VALIDATION_STATE["auto_mine_status"] = "disabled"
+        return
+
+    if not address or not pubkey:
+        SK_VALIDATION_STATE["auto_mine_status"] = "error_no_addr"
+        return
+
+    threading.Thread(
+        target=_auto_mine_loop,
+        args=(chain, address, pubkey, web_port, stop_evt, fast_sync_until),
+        daemon=True, name="AutoMine",
+    ).start()
+
+
+def _delayed_auto_configure(chain, p2p, trust, web_port: int, is_origin: bool,
+                            stop_evt: threading.Event,
+                            force_auto_mine: bool = False,
+                            fast_sync_until: int = 4084) -> None:
+    try:
+        time.sleep(3)
+        _auto_configure(
+            chain, p2p, trust, web_port, is_origin, stop_evt,
+            force_auto_mine=force_auto_mine,
+            fast_sync_until=fast_sync_until,
+        )
+    except Exception as e:
+        logging.getLogger("main").exception("[AUTO-CONFIG] falhou: %s", e)
+
+
+def _resolve_config(log) -> dict:
+    cfg = {
+        "bootstrap": "", "bootstrap_source": "(vazio)",
+        "pool_url": "", "pool_url_source": "(vazio)",
+    }
+    env_bootstrap = os.environ.get("BRN_BOOTSTRAP_PEERS", "").strip()
+    if env_bootstrap:
+        cfg["bootstrap"] = env_bootstrap
+        cfg["bootstrap_source"] = "env:BRN_BOOTSTRAP_PEERS"
+    else:
+        json_bootstrap = _read_bootstrap_json()
+        if json_bootstrap:
+            cfg["bootstrap"] = json_bootstrap
+            cfg["bootstrap_source"] = "file:bootstrap_peers.json"
+            os.environ["BRN_BOOTSTRAP_PEERS"] = json_bootstrap
+
+    env_pool = os.environ.get("BRN_POOL_URL", "").strip()
+    if env_pool:
+        cfg["pool_url"] = env_pool
+        cfg["pool_url_source"] = "env:BRN_POOL_URL"
+    else:
+        if cfg["bootstrap"]:
+            first = cfg["bootstrap"].split(",")[0].strip()
+            if ":" in first:
+                host = first.rsplit(":", 1)[0]
+                cfg["pool_url"] = f"http://{host}:5000"
+                cfg["pool_url_source"] = "inferido do bootstrap"
+                os.environ["BRN_POOL_URL"] = cfg["pool_url"]
+    return cfg
+
+
+def _do_force_http_resync(db_path: str, headless: bool = False) -> int:
+    """Renomeia o DB para .bak.TIMESTAMP. Retorna código de saída."""
+    if not os.path.isabs(db_path):
+        db_path = str(BASE_DIR / db_path)
+
+    if not os.path.exists(db_path):
+        print(f"[main] DB não existe: {db_path}")
+        return 0
+
+    backup = f"{db_path}.bak.{int(time.time())}"
+    try:
+        os.rename(db_path, backup)
+    except Exception as e:
+        print(f"[main] falha ao renomear DB: {e}")
+        return 1
+
+    for ext in ("-wal", "-shm"):
+        src = db_path + ext
+        if os.path.exists(src):
+            try:
+                os.rename(src, backup + ext)
+            except Exception as e:
+                print(f"[main] aviso: não renomeei {src}: {e}")
+
+    print(f"[main] DB renomeado: {db_path} → {backup}")
+    print("[main] Agora rode novamente sem --force-http-resync:")
+    print(f"[main]   python3 main.py" + (" --headless" if headless else ""))
+    print("[main] O nó vai re-sincronizar do genesis via HTTP/P2P.")
+    return 0
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def main() -> int:
+    args = parse_args()
+    if args.version:
+        print(f"BRN Node v{VERSION} (build {BUILD_DATE})")
+        return 0
+    if args.skip_verify:
+        print("[main] --skip-verify ativo")
+
+    loaded = _load_env_file()
+
+    # CLI overrides (antes do logging, para que o log já mostre o modo correto)
+    if args.client_mode:
+        os.environ["BRN_IS_ORIGIN"] = "0"
+    if args.origem:
+        os.environ["BRN_IS_ORIGIN"] = "1"
+    if args.web_port is not None:
+        os.environ["BRN_WEB_PORT"] = str(args.web_port)
+    if args.p2p_port is not None:
+        os.environ["BRN_P2P_PORT"] = str(args.p2p_port)
+
+    is_origin = os.environ.get("BRN_IS_ORIGIN", "0") == "1"
+
+    web_port = int(
+        os.environ.get("BRN_WEB_PORT")
+        or os.environ.get("PORT")
+        or "5000"
+    )
+
+    # [FIX v13.9.25] Garante que server.py leia a mesma porta HTTP.
+    # server.py faz BOOTSTRAP_HTTP_PORT = int(os.environ.get("BRN_BOOTSTRAP_HTTP_PORT",
+    #   os.environ.get("BRN_WEB_PORT", "5000"))) no import. No Render
+    # (PORT=10000, sem BRN_WEB_PORT) os notify de bootstrap iam pra :5000.
+    os.environ["BRN_WEB_PORT"] = str(web_port)
+
+    p2p_port = int(os.environ.get("BRN_P2P_PORT", "6001"))
+    db_path = args.db or os.environ.get("BRN_DB", "brn_v2_chain.db")
+
+    if args.force_http_resync:
+        return _do_force_http_resync(db_path, headless=args.headless)
+
+    log = _setup_logging()
+
+    # AUTO-DISCOVERY DEPOIS do logging configurado (v13.9.24).
+    try:
+        import auto_discovery
+        auto_discovery.auto_configure_bootstrap()
+        log.info("[AUTO-DISCOVERY] bootstrap atualizado via Tailscale")
+    except ImportError:
+        log.debug("[AUTO-DISCOVERY] auto_discovery.py não encontrado.")
+    except Exception as e:
+        log.warning("[AUTO-DISCOVERY] falhou: %s", e)
+
+    fast_sync_until = _resolve_fast_sync_until(args)
+    _maybe_enable_fast_sync(fast_sync_until, args)
+    SK_VALIDATION_STATE["fast_sync_until"] = fast_sync_until
+
+    log.info("=" * 64)
+    log.info(" BRN Node v%s (build %s) is_origin=%s",
+             VERSION, BUILD_DATE, is_origin)
+    log.info(" base=%s env_loaded=%d", BASE_DIR, loaded)
+    if fast_sync_until > 0:
+        log.info(" fast_sync_until=%d (mineração só libera após)",
+                 fast_sync_until)
+    log.info("=" * 64)
+
+    cfg = _resolve_config(log)
+    log.info("[CONFIG] BRN_BOOTSTRAP_PEERS: %s (%s)",
+             cfg["bootstrap"] or "(vazio)", cfg["bootstrap_source"])
+    log.info("[CONFIG] BRN_POOL_URL: %s (%s)",
+             cfg["pool_url"] or "(vazio)", cfg["pool_url_source"])
+
+    if not _check_blockchain_version():
+        return 6
+
+    try:
+        import port_guard
+        port_guard.check_brn_ports(checar_explorer=not args.no_explorer)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+
+    try:
+        node_id_priv, node_id_pub = _load_or_create_node_identity()
+        log.info("[identity] pub=%s…", node_id_pub[:16])
+    except RuntimeError as e:
+        log.error(str(e))
+        return 3
+
+    try:
+        PEER_ID = hashlib.sha256(bytes.fromhex(node_id_pub)).hexdigest()[:16]
+    except ValueError:
+        PEER_ID = hashlib.sha256(node_id_pub.encode()).hexdigest()[:16]
+    os.environ["BRN_PEER_ID"] = PEER_ID
+    log.info("[identity] peer_id=%s", PEER_ID)
+
+    try:
+        from blockchain import set_checkpoints, set_checkpoint_priv
+        from checkpoints import load_checkpoints
+        _cps = load_checkpoints()
+        set_checkpoints(_cps)
+        set_checkpoint_priv(node_id_priv)
+        log.info("[INTEGRATION] checkpoint priv injetada (%d carregados)",
+                 len(_cps))
+    except ImportError:
+        log.info("[INTEGRATION] checkpoints.py ausente — checkpoints desligados")
+    except Exception as e:
+        log.warning("[INTEGRATION] checkpoint init falhou: %s", e)
+
+    try:
+        from blockchain import Blockchain
+        chain = Blockchain(db_path, auto_genesis=False)
+        chain.is_origin = is_origin
+        log.info("[chain] aberta height=%d is_origin=%s",
+                 chain.db.height(), is_origin)
+        SK_VALIDATION_STATE["local_height"] = int(chain.db.height())
+        SK_VALIDATION_STATE["fast_sync_active"] = (
+            fast_sync_until > 0 and chain.db.height() < fast_sync_until
+        )
+    except Exception as e:
+        log.error("[chain] fatal: %s", e)
+        return 2
+
+    trust = _setup_trust(chain, node_id_priv, is_origin)
+    if trust is None:
+        log.error("[trust] não carregou")
+        if os.environ.get("BRN_STRICT_MULTISIG") == "1":
+            return 7
+    else:
+        log.info("[trust] carregado (origin=%s)", is_origin)
+
+    log.info("[wallet] boot sem carteira (design v13.9.19) — "
+             "GUI tentará abrir carteira salva")
+
+    p2p = None
+    if not args.no_p2p:
+        p2p = _setup_p2p(chain, node_id_priv, p2p_port)
+        if p2p is not None:
+            log.info("[p2p] iniciado na porta %d", p2p_port)
+
+    sync_mgr = None
+    if p2p:
+        sync_mgr = _setup_sync(chain, p2p)
+        if sync_mgr:
+            log.info("[sync] ChainSyncManager iniciado")
+
+    _stop_bg = threading.Event()
+
+    if not is_origin and cfg["pool_url"] and _HAS_REQUESTS:
+        threading.Thread(
+            target=_force_http_sync_loop,
+            args=(chain, cfg["pool_url"], _stop_bg),
+            daemon=True,
+            name="HttpSyncFallback",
+        ).start()
+        log.info("[HTTP-SYNC] thread iniciada (peer=%s)", cfg["pool_url"])
+
+    if p2p:
+        _setup_broadcast(chain, p2p)
+
+    _setup_trust_daemon(
+        chain, trust, p2p,
+        password=_get_identity_password(),
+        is_origin=is_origin, stop_evt=_stop_bg, interval=30,
+    )
+    threading.Thread(
+        target=_wallet_watchdog_loop,
+        args=(chain, p2p, trust, _stop_bg, 30),
+        daemon=True, name="Wallet-Watchdog",
+    ).start()
+
+    threading.Thread(
+        target=_peer_healer_loop,
+        args=(chain, p2p, _stop_bg, 15),
+        daemon=True, name="Peer-Healer",
+    ).start()
+
+    threading.Thread(
+        target=_status_reporter_loop,
+        args=(chain, _stop_bg, 30),
+        daemon=True, name="StatusReporter",
+    ).start()
+    log.info("[STATUS] reporter iniciado (30s)")
+
+    pool = _setup_pool(chain, is_origin)
+
+    ok_http = _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port,
+                                stop_evt=_stop_bg)
+    if not ok_http:
+        log.error("[server] HTTP não subiu")
+
+    if not args.no_auto_config and not args.no_pool_client:
+        threading.Thread(
+            target=_delayed_auto_configure,
+            args=(chain, p2p, trust, web_port, is_origin, _stop_bg),
+            kwargs={"fast_sync_until": fast_sync_until},
+            daemon=True, name="AutoConfig",
+        ).start()
+        log.info("[AUTO-CONFIG] agendado (3s)")
+    else:
+        log.info("[AUTO-CONFIG] desligado")
+
+    if not args.no_explorer:
+        _start_explorer(chain)
+
+    want_gui = (not args.headless) and (not args.no_gui)
+    if want_gui:
+        allow_interactive = not args.no_interactive
+        log.info("[gui] abrindo (interativo=%s)", allow_interactive)
+        if _start_gui(allow_interactive=allow_interactive):
+            return 0
+    else:
+        if args.no_gui:
+            log.info("[gui] desligada por --no-gui")
+        log.info("=" * 64)
+        log.info(" MODO HEADLESS — consulte /health:")
+        log.info("   GET http://%s:%d/health",
+                 os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
+        log.info("=" * 64)
+
+    def _shutdown(*_):
+        log.info("[shutdown] encerrando...")
+        try:
+            _stop_bg.set()
+        except Exception:
+            pass
+        try:
+            if trust is not None:
+                trust.shutdown()
+        except Exception:
+            pass
+        try:
+            chain.db.close()
+        except Exception:
+            pass
+        try:
+            from secure_store import WalletSession
+            WalletSession().lock()
+        except Exception:
+            pass
+        os._exit(0)
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    log.info("=" * 64)
+    log.info(" NÓ ATIVO — Ctrl+C para encerrar")
+    log.info("   API       : http://%s:%d",
+             os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
+    log.info("   Wallet    : http://%s:%d/wallet/%s",
+             os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port, PEER_ID)
+    log.info("   Wallet(/) : http://%s:%d/wallet  (redireciona pro local)",
+             os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
+    log.info("   Peers     : http://%s:%d/peers",
+             os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
+    log.info("   Health    : http://%s:%d/health",
+             os.environ.get("BRN_WEB_HOST", "127.0.0.1"), web_port)
+    log.info("   P2P       : :%d", p2p_port)
+    log.info("=" * 64)
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        _shutdown()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
