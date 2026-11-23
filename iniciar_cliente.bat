@@ -1,15 +1,16 @@
 @echo off
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
-title BRN Wallet Node v13.9.29
+title BRN Wallet Node v5 (FIX Tee)
+
+echo ============================================================
+echo   INICIANDO BRN NODE - CLIENTE (v5)
+echo ============================================================
+echo.
 
 REM ============================================================
 REM  [0/9] VARIAVEIS DE AMBIENTE
 REM ============================================================
-echo ============================================================
-echo   INICIANDO BRN NODE - CLIENTE (v4.1 - SK auto)
-echo ============================================================
-echo.
 echo [0/9] Carregando configuracoes de rede e senhas...
 
 set "BRN_NETWORK_SECRET=088641fd110a36bcb3a1bd3d497d8cd68287bf10e49eedfc52d1fc0329ef8d12"
@@ -32,25 +33,42 @@ set "BRN_CHECKPOINT_INTERVAL=100"
 set "BRN_ORIGIN_PUBKEY=03c0f4604d5264b5eda409eac8212267bd76ff46973bb14e01a16c290f437e0e6e"
 set "BRN_TCP_TIMEOUT=30.0"
 
+REM --- Bootstrap: Ubuntu (o 100.64.151.67 esta morto) ---
 set "BRN_BOOTSTRAP_PEERS=100.111.253.8:6001"
 set "BRN_POOL_URL=http://100.111.253.8:5000"
 
+REM --- Este no e CLIENTE (nao Origin) ---
 set "BRN_IS_ORIGIN=0"
 set "BRN_POOL_ENABLED=0"
 
+REM --- Senhas (para decifrar current_wallet.enc) ---
 set "BRN_NODE_PASSWORD=senha-forte-windows-2026"
 set "BRN_WALLET_SESSION_PASS=carteira-windows-2026"
 set "BRN_WEB_PASS=web-windows-2026"
 
+REM --- Logging ---
 set "BRN_LOG_LEVEL=DEBUG"
+
+REM --- Auto-wire ---
 set "BRN_AUTO_WIRE=1"
+
+REM --- Multi-sig ---
 set "BRN_STRICT_MULTISIG=0"
+
+REM --- Fast-sync ---
 set "BRN_ASSUME_VALID_UNTIL=0"
 set "BRN_BOOTSTRAP_SKIP_SIGS_UNTIL=4085"
 
+REM --- [v5] CONSENSO ESTRITO A PARTIR DO BLOCO 6000 ---
+set "BRN_CONSENSUS_STRICT_FROM=6000"
+set "BRN_MIN_PEERS_FOR_MINING=3"
+set "BRN_PEER_SYNC_TOLERANCE=2"
+
+REM --- Python unbuffered ---
 set "PYTHONUNBUFFERED=1"
 set "PYTHONIOENCODING=utf-8"
 
+REM --- PBFT off ---
 set "BRN_PBFT_ENABLED=0"
 set "BRN_PBFT_ENFORCE=0"
 
@@ -169,7 +187,7 @@ REM --- Cria .validator_sk se nao existir ---
 if not exist ".validator_sk" (
     echo.
     echo   --- Gerando .validator_sk ---
-    python -c "import os; pw = os.environ.get('BRN_WALLET_SESSION_PASS', 'carteira-windows-2026'); from wallet import Wallet; w = Wallet(); open('.validator_sk','w').write(w.priv_hex); print('  Endereco:', w.address); print('  Pubkey  :', w.pub_hex[:16] + '...'); print('  SK salva em .validator_sk (64 hex chars)')"
+    python -c "from wallet import Wallet; w = Wallet(); open('.validator_sk','w').write(w.priv_hex); print('  Endereco:', w.address); print('  Pubkey  :', w.pub_hex[:16] + '...')"
     if errorlevel 1 (
         echo   [X] Falha ao gerar .validator_sk
         pause
@@ -237,29 +255,23 @@ echo OK.
 echo.
 
 REM ============================================================
-REM  [7/9] GUI OPENER
+REM  [7/9] GUI OPENER (aguarda :5000 responder)
 REM ============================================================
 echo [7/9] GUI opener disparado (aguarda :5000)...
-start "BRN-GUI-Opener" /MIN powershell -NoProfile -WindowStyle Hidden -Command "$deadline=(Get-Date).AddSeconds(120); while((Get-Date) -lt $deadline){try{Invoke-WebRequest 'http://127.0.0.1:5000/health' -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop | Out-Null; Start-Process 'http://127.0.0.1:5000/wallet'; Write-Host '[GUI] wallet aberta'; exit}catch{Start-Sleep -Seconds 2}}; Write-Host '[GUI] timeout'"
+start "BRN-GUI-Opener" /MIN powershell -NoProfile -WindowStyle Hidden -Command "$deadline=(Get-Date).AddSeconds(120); while((Get-Date) -lt $deadline){try{Invoke-WebRequest 'http://127.0.0.1:5000/health' -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop | Out-Null; Start-Process 'http://127.0.0.1:5000/wallet'; Write-Host '[GUI] wallet aberta'; exit}catch{Start-Sleep -Seconds 2}}; Write-Host '[GUI] timeout - abra manualmente http://127.0.0.1:5000/wallet'"
 echo [ok] GUI opener iniciado
 echo.
 
 REM ============================================================
-REM  [8/9] LOG
+REM  [8/9] LOG TAIL (segundo terminal)
 REM ============================================================
-echo [8/9] O que procurar no log:
-echo.
-echo   SUCESSO:
-echo   [auto_wire] trust=TrustNetwork sk=.validator_sk collector=OK
-echo   [watchdog] SK detectada pk=...
-echo.
-echo   FALHA:
-echo   [auto_wire] nenhuma SK encontrada
-echo   [watchdog] SK=None
+echo [8/9] Abrindo terminal de log em tempo real...
+start "BRN-Log-Tail" cmd /k "echo Log: %LOG_FILE% & echo Aguardando arquivo... & :wait & if not exist \"%LOG_FILE%\" (timeout /t 1 >nul & goto wait) & powershell -NoProfile -Command \"Get-Content '%LOG_FILE%' -Wait -Tail 50\""
+echo [ok] terminal de log aberto (outra janela)
 echo.
 
 REM ============================================================
-REM  [9/9] INICIA NO
+REM  [9/9] INICIA NO COM REDIRECIONAMENTO CMD (sem PowerShell Tee)
 REM ============================================================
 echo [9/9] Iniciando no (Ctrl+C para parar)...
 echo ============================================================
@@ -276,7 +288,11 @@ if not errorlevel 1 set "MAIN_ARGS=--skip-verify"
 echo [bat] python main.py %MAIN_ARGS%
 echo.
 
-powershell -NoProfile -Command "python main.py %MAIN_ARGS% 2>&1 | Tee-Object -FilePath '%LOG_FILE%'"
+REM ============================================================
+REM  [FIX CRITICO] Redireciona via cmd /c, NAO via PowerShell
+REM  PowerShell Tee trata stderr como erro fatal e mata o main.py
+REM ============================================================
+cmd /c "python main.py %MAIN_ARGS% > \"%LOG_FILE%\" 2>&1"
 
 echo.
 echo ============================================================
@@ -285,7 +301,7 @@ echo ============================================================
 echo.
 echo Log salvo em: %LOG_FILE%
 echo.
-echo Para ver o log:
+echo Para ver o log completo:
 echo   type "%LOG_FILE%"
 echo.
 pause
