@@ -264,14 +264,20 @@ echo.
 
 REM ============================================================
 REM  [8/9] LOG TAIL (segundo terminal)
+REM  [CORRIGIDO] Sem cmd /k aninhado, sem label :wait, sem \" quebrados.
+REM  PowerShell aguarda o arquivo existir e depois faz tail -f nativo.
 REM ============================================================
 echo [8/9] Abrindo terminal de log em tempo real...
-start "BRN-Log-Tail" cmd /k "echo Log: %LOG_FILE% & echo Aguardando arquivo... & :wait & if not exist \"%LOG_FILE%\" (timeout /t 1 >nul & goto wait) & powershell -NoProfile -Command \"Get-Content '%LOG_FILE%' -Wait -Tail 50\""
+start "BRN-Log-Tail" powershell -NoProfile -Command "while(-not (Test-Path '%LOG_FILE%')){Start-Sleep -Milliseconds 500}; Get-Content -Path '%LOG_FILE%' -Wait -Tail 50"
 echo [ok] terminal de log aberto (outra janela)
 echo.
 
 REM ============================================================
 REM  [9/9] INICIA NO COM REDIRECIONAMENTO CMD (sem PowerShell Tee)
+REM  [CORRIGIDO] Sem `cmd /c "..."` — o redirecionamento e feito
+REM  diretamente pelo proprio .bat. O escape \" nao existe em cmd:
+REM  ele fecha a string e o resto vira argumentos soltos
+REM  (era o bug "A sintaxe do nome do arquivo...").
 REM ============================================================
 echo [9/9] Iniciando no (Ctrl+C para parar)...
 echo ============================================================
@@ -288,15 +294,15 @@ if not errorlevel 1 set "MAIN_ARGS=--skip-verify"
 echo [bat] python main.py %MAIN_ARGS%
 echo.
 
-REM ============================================================
-REM  [FIX CRITICO] Redireciona via cmd /c, NAO via PowerShell
-REM  PowerShell Tee trata stderr como erro fatal e mata o main.py
-REM ============================================================
-cmd /c "python main.py %MAIN_ARGS% > \"%LOG_FILE%\" 2>&1"
+REM [CORRIGIDO] Redirecionamento nativo do cmd.exe (sem cmd /c,
+REM sem \" — aspas normais em volta do path ja protegem espacos).
+REM Captura o ERRORLEVEL imediatamente apos o python sair.
+python main.py %MAIN_ARGS% > "%LOG_FILE%" 2>&1
+set "RC=%ERRORLEVEL%"
 
 echo.
 echo ============================================================
-echo NO ENCERRADO em %TIME%
+echo NO ENCERRADO em %TIME%  (exit=%RC%)
 echo ============================================================
 echo.
 echo Log salvo em: %LOG_FILE%
