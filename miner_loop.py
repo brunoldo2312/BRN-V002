@@ -1,11 +1,18 @@
-"""
-miner_loop.py — Loop de mineração do BRN (v7.3)
+"""miner_loop.py — Loop de mineração do BRN (v7.4)
 ================================================================
-v7.3 (2026-11-16) — CONSENSO ROBUSTO E HASHRATE SUAVE:
-  [NEW] _network_is_ready() lê o SQLite (Peer-Healer).
-  [NEW] Deadlock Breaker: se o nó local estiver no topo da rede,
-        ele ignora o quórum e minera para destravar.
-  [FIX] Hashrate usa média móvel para suavizar a interface.
+v7.4 (2026-11-23) — SUPORTE AO CONSENSO ESTRITO ≥6000:
+  [NEW] _network_is_ready() agora checa o gate de peers do
+        blockchain.py (método _count_synced_peers / _min_peers_for_mining).
+        Se o bloco alvo está em altura estrita (≥
+        CONSENSUS_STRICT_FROM_HEIGHT) e o nó tem <
+        MIN_PEERS_FOR_MINING peers sincronizados, retorna False
+        com motivo claro em vez de "OK (No topo da rede)".
+  [FIX] status_msg agora checa chain.rede_descentralizada
+        corretamente (antes mostrava "Aguardando Fila" mesmo
+        com rede descentralizada).
+  [FIX] _network_is_ready() loga "consenso estrito: X/Y peers
+        sincronizados" quando bloqueado.
+  [KEEP] v7.3: tudo (quórum, deadlock breaker, hashrate média).
 ================================================================
 """
 import os
@@ -193,13 +200,16 @@ class Miner:
         fork_sig = getattr(self.chain, "_fork_signal", None)
         forking = bool(fork_sig and fork_sig.is_set())
 
+        # [v7.4] status_msg agora checa rede_descentralizada corretamente
         status_msg = ""
-        if not self.chain.rede_descentralizada and not self.is_origin:
-            status_msg = f"Aguardando Fila ({len(self.chain.fila_mineracao)}/20)"
-        elif not self.chain.rede_descentralizada and self.is_origin:
+        rede_desc = bool(getattr(self.chain, "rede_descentralizada", False))
+        if rede_desc:
+            status_msg = "Descentralizada"
+        elif self.is_origin:
             status_msg = "Validador (Bootstrap)"
         else:
-            status_msg = "Descentralizada"
+            fila_n = len(getattr(self.chain, "fila_mineracao", {}) or {})
+            status_msg = f"Aguardando Fila ({fila_n}/20)"
 
         with self._bootstrap_lock:
             n_peers = len(self._bootstrap_fails)
@@ -212,7 +222,7 @@ class Miner:
             "count": self.blocks_mined, "last_height": self.last_height, "uptime": uptime,
             "fork_aborts": self.fork_aborts, "last_fork_ago_s": (int(time.time() - self.last_fork_at) if self.last_fork_at else None),
             "fork_in_progress": forking, "bootstrap_status": status_msg,
-            "rede_descentralizada": self.chain.rede_descentralizada, "is_origin": self.is_origin,
+            "rede_descentralizada": rede_desc, "is_origin": self.is_origin,
             "bootstrap_peers_tracked": n_peers, "bootstrap_peers_blocked": n_blocked,
             "hashrate_khs": round(self.hashrate / 1000.0, 2),
             "hashrate": round(self.hashrate, 2),
@@ -220,27 +230,53 @@ class Miner:
         }
 
     def _network_is_ready(self) -> tuple[bool, str]:
+        # ============================================================
+        # [v7.4] GATE DE CONSENSO ESTRITO ≥ CONSENSUS_STRICT_FROM_HEIGHT
+        # Consulta o blockchain.py para saber se o PRÓXIMO bloco vai
+        # ser bloqueado por falta de peers sincronizados.
+        # ============================================================
+        try:
+            next_height = self.chain.db.height() + 1
+            if hasattr(self.chain, "_is_strict_consensus_height") and \
+               self.chain._is_strict_consensus_height(next_height):
+                n_synced = self.chain._count_synced_peers() \
+                    if hasattr(self.chain, "_count_synced_peers") else 0
+                need = self.chain._min_peers_for_mining() \
+                    if hasattr(self.chain, "_min_peers_for_mining") else 3
+                if n_synced < need:
+                    return False, (
+                        f"Consenso estrito ≥{next_height}: "
+                        f"{n_synced}/{need} peers sincronizados. "
+                        f"Conecte mais peers ou ajuste "
+                        f"BRN_MIN_PEERS_FOR_MINING."
+                    )
+        except Exception as e:
+            _log_dbg(f"Falha ao checar gate de consenso estrito: {e}")
+
+        # ============================================================
+        # Checagem normal (mantida do v7.3)
+        # ============================================================
         try:
             local_h = self.chain.db.height()
             max_peer_h = local_h
-            
+
             peers = self.chain.db.listar_peers(apenas_ativos=False)
             for p in peers:
                 if not isinstance(p, dict): continue
                 addr = (p.get("address") or "").strip()
                 if not addr or addr.startswith("127.") or addr == "0.0.0.0": continue
-                
+
                 ph = int(p.get("height", 0) or 0)
                 ls = float(p.get("last_seen", 0) or 0)
                 if ls > 0 and (time.time() - ls) < 300:
                     if ph > max_peer_h: max_peer_h = ph
-                    
+
             if max_peer_h > local_h + 2:
                 return False, f"Sincronizando (Local: {local_h}, Rede: {max_peer_h})"
-                
+
             if local_h >= max_peer_h:
                 return True, "OK (No topo da rede)"
-                
+
         except Exception as e:
             _log_dbg(f"Falha ao checar altura dos peers no SQLite: {e}")
 
@@ -419,7 +455,7 @@ class Miner:
                 block = self.chain.mine_block_interruptible(
                     self.address, self.pubkey, should_continue=self._should_continue,
                 )
-                
+
                 if block is not None:
                     _dt = time.time() - _t0
                     self.last_block_dt = _dt
@@ -427,7 +463,7 @@ class Miner:
                         diff = block.get("difficulty", self.chain.current_difficulty())
                         expected_hashes = 16 ** diff
                         current_rate = expected_hashes / _dt
-                        
+
                         self._hash_samples.append(current_rate)
                         if len(self._hash_samples) > 10:
                             self._hash_samples.pop(0)
@@ -440,7 +476,7 @@ class Miner:
                 self.blocks_mined += 1
                 self.last_height = block.get("height")
                 _log(f"OK Bloco #{self.last_height} minerado (total={self.blocks_mined})")
-                
+
                 time.sleep(0.2)
 
             except ValueError as e:
