@@ -1,27 +1,37 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.6.0 | Data: 22/11/2026
+Versão: 9.7.0 | Data: 23/11/2026
 ================================================================
-v9.6.0 (2026-11-22) — AUTO-WIRE DE CONSENSO:
-  [NEW] __init__ chama _auto_wire() quando BRN_AUTO_WIRE=1 (default).
-        Detecta e injeta automaticamente:
-          - trust_net        (trust_network.json ou BRN_TRUST_NETWORK)
-          - _local_validator_sk (BRN_VALIDATOR_SK_HEX / SEED / .validator_sk /
-                                 current_wallet.enc / current_wallet.json)
-        Torna /api/trust/nodes funcional sem tocar em main.py.
-  [NEW] set_p2p() cria sign_collector automaticamente ao receber o P2P
-        (pede sigs aos peers via p2p.request_block_signature).
-  [NEW] _auto_wire() é idempotente; pode ser chamado quantas vezes quiser.
-  [KEEP] Toda a lógica de v9.5.9 preservada (multi-sig, PBFT hooks,
-         checkpoints, auth_tag, reorg/chain_validator plugados, WAL).
-v9.5.9 (2026-11-15) — ROBUSTEZ DE BANCO DE DADOS:
-  [NEW] Ativação automática do SQLite em WAL mode e busy_timeout=30000
-        no momento da inicialização.
-v9.5.8 (2026-11-12) — FIX BOOTSTRAP MULTI-SIG COM SK LOCAL
+v9.7.0 (2026-11-23) — CONSENSO ESTRITO A PARTIR DO BLOCO 6000:
+  [NEW] CONSENSUS_STRICT_FROM_HEIGHT (default 6000, env
+        BRN_CONSENSUS_STRICT_FROM). A partir dessa altura:
+          - _validate_validators_sig NÃO usa mais NENHUM bypass
+            (bootstrap local, estrangeira, trust_score, skip_until,
+            assume_valid). Só aceita se tiver N assinaturas de
+            pubkeys DISTINTAS no set local.
+          - validate_block não aceita assume_valid em blocos ≥ limite.
+          - mine_block_interruptible retorna None se
+            _count_synced_peers() < _min_peers_for_mining().
+  [NEW] _count_synced_peers(): conta peers com height dentro de
+        ±PEER_SYNC_TOLERANCE da altura local (default ±2).
+  [NEW] _min_peers_for_mining() = MIN_PEERS_FOR_MINING (default 3,
+        env BRN_MIN_PEERS_FOR_MINING).
+  [NEW] _count_external_sigs(): conta assinaturas válidas que NÃO
+        são da _local_validator_sk. Usado para garantir que a rede
+        realmente assinou, não só o nó local.
+  [NEW] Em blocos ≥ CONSENSUS_STRICT_FROM_HEIGHT, _validate_validators_sig
+        exige `external_sigs >= required - 1` (ou seja, se required=3,
+        precisa de ≥2 assinaturas de peers externos — a sua conta como 1).
+  [NEW] Logs claros: "[CONSENSUS] altura X < 6000: usando bypass
+        bootstrap" / "[CONSENSUS] altura X ≥ 6000: consenso ESTRITO".
+  [KEEP] v9.6.0: auto-wire (trust_net, local_validator_sk,
+         sign_collector), set_p2p cria collector automaticamente.
+v9.6.0 (2026-11-22) — AUTO-WIRE DE CONSENSO
+v9.5.9 (2026-11-15) — ROBUSTEZ DE BANCO DE DADOS
 ================================================================
 """
 from __future__ import annotations
 
-__version__ = "9.6.0"
+__version__ = "9.7.0"
 
 import os
 import time
@@ -92,8 +102,28 @@ BRN_STRICT_MULTISIG = os.environ.get("BRN_STRICT_MULTISIG", "0") == "1"
 
 BRN_TRUST_FALLBACK_TO_TOP = os.environ.get("BRN_TRUST_FALLBACK_TO_TOP", "0") == "1"
 
-# [v9.6.0] Feature flag do auto-wire (default ON)
 BRN_AUTO_WIRE = os.environ.get("BRN_AUTO_WIRE", "1") == "1"
+
+# ============================================================
+# [v9.7.0] CONSENSO ESTRITO A PARTIR DO BLOCO 6000
+# ============================================================
+CONSENSUS_STRICT_FROM_HEIGHT = int(
+    os.environ.get("BRN_CONSENSUS_STRICT_FROM", "6000") or "6000"
+)
+MIN_PEERS_FOR_MINING = int(
+    os.environ.get("BRN_MIN_PEERS_FOR_MINING", "3") or "3"
+)
+PEER_SYNC_TOLERANCE = int(
+    os.environ.get("BRN_PEER_SYNC_TOLERANCE", "2") or "2"
+)
+
+if CONSENSUS_STRICT_FROM_HEIGHT > 0:
+    log.warning(
+        "[CONSENSUS] A partir do bloco #%d: "
+        "consenso ESTRITO (sem bypass de multi-sig, "
+        "exige ≥%d peers sincronizados para minerar).",
+        CONSENSUS_STRICT_FROM_HEIGHT, MIN_PEERS_FOR_MINING,
+    )
 
 if BRN_STRICT_MULTISIG:
     BRN_BOOTSTRAP_SKIP_SIGS_UNTIL = 0
@@ -509,10 +539,6 @@ class Blockchain:
                  require_auth_tag=None):
         self.db = ChainDB(db_path)
 
-        # ============================================================
-        # [ROBUSTNESS FIX v9.5.9] Ativa WAL e busy_timeout no SQLite
-        # para evitar travamentos (database is locked) sob alta carga.
-        # ============================================================
         try:
             if hasattr(self.db, 'conn') and self.db.conn is not None:
                 self.db.conn.execute("PRAGMA journal_mode=WAL;")
@@ -521,7 +547,6 @@ class Blockchain:
                 log.info("[DB] SQLite otimizado com WAL mode e 30s de timeout.")
         except Exception as e:
             log.warning(f"[DB] Não foi possível aplicar WAL/timeout no SQLite: {e}")
-        # ============================================================
 
         self.genesis_expected_hash = None
         self.network_secret = network_secret if network_secret is not None else NETWORK_SECRET
@@ -540,16 +565,6 @@ class Blockchain:
         self._local_validator_sk = None
         self._pbft = None
 
-        # ============================================================
-        # [AUTO-WIRE v9.6.0]
-        # Detecta e injeta automaticamente:
-        #   - trust_net (trust_network.json ou BRN_TRUST_NETWORK)
-        #   - _local_validator_sk (SK_HEX / SEED / .validator_sk /
-        #                          current_wallet.enc / current_wallet.json)
-        # Chamado ANTES do bloco de auto_genesis para rodar nos dois
-        # caminhos (auto_genesis=True e False).
-        # Nenhuma exceção escapa — se auto_wire.py não existir, é no-op.
-        # ============================================================
         if BRN_AUTO_WIRE:
             try:
                 from auto_wire import wire_all as _wire
@@ -558,7 +573,6 @@ class Blockchain:
                 log.debug("[auto-wire] auto_wire.py não encontrado — pulando")
             except Exception as _e:
                 log.debug(f"[auto-wire] falhou: {_e}")
-        # ============================================================
 
         fila_salva = self.db.get_meta("fila_mineracao")
         self.fila_mineracao = json.loads(fila_salva) if fila_salva else {}
@@ -585,17 +599,12 @@ class Blockchain:
                  f"({len(getattr(trust, 'nodes', {}))} nós)")
 
     def set_p2p(self, p2p):
-        # ============================================================
-        # [AUTO-WIRE v9.6.0] Cria sign_collector quando P2P é injetado.
-        # O collector pede sigs aos peers via p2p.request_block_signature.
-        # ============================================================
         self.p2p = p2p
         if BRN_AUTO_WIRE and self._sign_collector is None and p2p is not None:
             try:
                 from auto_wire import make_default_collector, wire_all
                 self._sign_collector = make_default_collector(self)
                 log.info("[auto-wire] sign_collector criado após set_p2p")
-                # re-tenta injetar trust/sk se ainda faltar
                 wire_all(self, verbose=True)
             except ImportError:
                 log.debug("[auto-wire] auto_wire.py não encontrado")
@@ -1049,26 +1058,130 @@ class Blockchain:
         log.info(f"[SIG] quorum={VALIDATOR_QUORUM} → {need}/{n} assinaturas")
         return need
 
+    # ============================================================
+    # [v9.7.0] HELPERS DO CONSENSO ESTRITO
+    # ============================================================
+    def _count_synced_peers(self) -> int:
+        """Conta peers com altura local ±PEER_SYNC_TOLERANCE
+        (excluindo loopback e este nó).
+        Usado para gate de mineração a partir do bloco 6000."""
+        try:
+            local_h = int(self.db.height())
+        except Exception:
+            return 0
+        if local_h < 0:
+            return 0
+        try:
+            peers = self.db.listar_peers(apenas_ativos=True) or []
+        except Exception:
+            return 0
+        now = time.time()
+        n = 0
+        for p in peers:
+            if not isinstance(p, dict):
+                continue
+            addr = (p.get("address") or "").strip()
+            if not addr or addr.startswith("127.") or addr == "0.0.0.0":
+                continue
+            try:
+                ph = int(p.get("height", 0) or 0)
+            except (ValueError, TypeError):
+                ph = 0
+            try:
+                ls = float(p.get("last_seen", 0) or 0)
+            except (ValueError, TypeError):
+                ls = 0.0
+            # Ignora peers "stale" (> 5 min sem ping)
+            if ls <= 0 or (now - ls) > 300:
+                continue
+            if abs(ph - local_h) <= PEER_SYNC_TOLERANCE:
+                n += 1
+        return n
+
+    def _min_peers_for_mining(self) -> int:
+        return max(1, int(MIN_PEERS_FOR_MINING))
+
+    def _is_strict_consensus_height(self, height: int) -> bool:
+        try:
+            h = int(height)
+        except Exception:
+            return False
+        return CONSENSUS_STRICT_FROM_HEIGHT > 0 and h >= CONSENSUS_STRICT_FROM_HEIGHT
+
+    def _count_external_sigs(self, block: dict) -> int:
+        """Conta assinaturas válidas de pubkeys DIFERENTES da SK local.
+        Usado para garantir que a rede realmente assinou (não só o nó local)."""
+        try:
+            local_pk = ""
+            if self._local_validator_sk is not None:
+                local_pk = (self._local_validator_sk.pub_hex or "").strip().lower()
+            sigs = block.get("validators_sig") or []
+            if not isinstance(sigs, list):
+                return 0
+            seen = set()
+            n = 0
+            for entry in sigs:
+                if not isinstance(entry, dict):
+                    continue
+                pk = (entry.get("pubkey") or "").strip().lower()
+                sg = (entry.get("signature") or "").strip()
+                if not pk or not sg:
+                    continue
+                if pk == local_pk:
+                    continue
+                if pk in seen:
+                    continue
+                if not verify_block_signature(pk, block, sg):
+                    continue
+                seen.add(pk)
+                n += 1
+            return n
+        except Exception:
+            return 0
+
+    # ============================================================
+    # [_validate_validators_sig] — agora com CONSENSO ESTRITO ≥6000
+    # ============================================================
     def _validate_validators_sig(self, block: dict,
                                   validators: Optional[list] = None) -> tuple:
-        if not BRN_STRICT_MULTISIG and BRN_BOOTSTRAP_SKIP_SIGS_UNTIL > 0:
-            try:
-                _bh = int(block.get("height", -1))
-            except Exception:
-                _bh = -1
-            if 0 < _bh <= BRN_BOOTSTRAP_SKIP_SIGS_UNTIL:
+        try:
+            bh = int(block.get("height", -1))
+        except Exception:
+            bh = -1
+
+        strict = self._is_strict_consensus_height(bh)
+        if strict:
+            # [v9.7.0] A partir de 6000: sem bypass de bootstrap
+            if BRN_BOOTSTRAP_SKIP_SIGS_UNTIL > 0 and 0 < bh <= BRN_BOOTSTRAP_SKIP_SIGS_UNTIL:
                 log.warning(
-                    f"[SIG] EMERGENCIA: bloco #{_bh} aceito SEM multi-sig "
-                    f"(BRN_BOOTSTRAP_SKIP_SIGS_UNTIL="
-                    f"{BRN_BOOTSTRAP_SKIP_SIGS_UNTIL}). "
-                    f"REMOVA essa env e reinicie apos altura > "
-                    f"{BRN_BOOTSTRAP_SKIP_SIGS_UNTIL}."
+                    "[CONSENSUS] altura %d ≥ %d: IGNORANDO "
+                    "BRN_BOOTSTRAP_SKIP_SIGS_UNTIL=%d (consenso estrito)",
+                    bh, CONSENSUS_STRICT_FROM_HEIGHT, BRN_BOOTSTRAP_SKIP_SIGS_UNTIL,
                 )
-                return True, ""
+        else:
+            # [v9.7.0] Antes de 6000: bypass permitido
+            if not BRN_STRICT_MULTISIG and BRN_BOOTSTRAP_SKIP_SIGS_UNTIL > 0:
+                if 0 < bh <= BRN_BOOTSTRAP_SKIP_SIGS_UNTIL:
+                    log.warning(
+                        "[SIG] EMERGENCIA: bloco #%d aceito SEM multi-sig "
+                        "(BRN_BOOTSTRAP_SKIP_SIGS_UNTIL=%d). "
+                        "A partir de #%d bypass NÃO vale mais.",
+                        bh, BRN_BOOTSTRAP_SKIP_SIGS_UNTIL,
+                        CONSENSUS_STRICT_FROM_HEIGHT,
+                    )
+                    return True, ""
 
         if validators is None:
             validators = self._get_active_validators()
         if not validators:
+            if strict:
+                # [v9.7.0] Sem validadores no trust em altura estrita
+                # é bloqueio TOTAL, não bypass.
+                return False, (
+                    f"Bloco #{bh} ≥ {CONSENSUS_STRICT_FROM_HEIGHT}: "
+                    f"lista de validadores vazia — impossível validar "
+                    f"assinaturas. Configure trust_network.json."
+                )
             return True, ""
 
         required = self._required_signatures(validators)
@@ -1108,7 +1221,39 @@ class Blockchain:
         got_foreign = len(foreign_pubkeys)
 
         if got >= required:
+            if strict:
+                # [v9.7.0] Em altura estrita, também exige que pelo menos
+                # `required - 1` assinaturas sejam de OUTROS nós (não só
+                # a SK local). Se você é o único validador no trust, não
+                # passa — a rede precisa de 3 nós reais.
+                n_ext = self._count_external_sigs(block)
+                if n_ext < max(1, required - 1):
+                    return False, (
+                        f"Bloco #{bh} ≥ {CONSENSUS_STRICT_FROM_HEIGHT}: "
+                        f"{required - 1} assinatura(s) externa(s) exigidas, "
+                        f"tem {n_ext}. Único assinante é a SK local — "
+                        f"a rede (≥{MIN_PEERS_FOR_MINING} peers) precisa "
+                        f"assinar também."
+                    )
+                log.info(
+                    "[CONSENSUS] Bloco #%d ≥ %d: %d/%d sigs (%d externa(s)) — OK",
+                    bh, CONSENSUS_STRICT_FROM_HEIGHT,
+                    got, required, n_ext,
+                )
             return True, ""
+
+        if strict:
+            # [v9.7.0] Em altura estrita: SEM bypass estrangeiro,
+            # SEM bootstrap local, SEM trust_score.
+            missing = [p[:12] + "…" for p in validators if p not in verified_pubkeys]
+            return False, (
+                f"[CONSENSO ESTRITO ≥{CONSENSUS_STRICT_FROM_HEIGHT}] "
+                f"Bloco #{bh} precisa de {required}/{len(validators)} "
+                f"assinaturas do set local, tem {got}. "
+                f"Faltam: {', '.join(missing[:5])}. "
+                f"({got_foreign} assinatura(s) estrangeira(s) ignorada(s); "
+                f"trust_validators={n_trust}, bootstrap_local={n_bootstrap_local})."
+            )
 
         if (not BRN_STRICT_MULTISIG and n_trust < 2
                 and got == 0 and got_foreign >= 1):
@@ -1126,7 +1271,8 @@ class Blockchain:
             log.warning(
                 f"[SIG] Bloco #{block_h}: aceito em MODO BOOTSTRAP "
                 f"(trust real tem {n_trust} validador(es), "
-                f"{got_foreign} assinatura(s) estrangeira(s) válida(s))."
+                f"{got_foreign} assinatura(s) estrangeira(s) válida(s)). "
+                f"A partir de #{CONSENSUS_STRICT_FROM_HEIGHT} bypass NÃO vale."
             )
             return True, ""
 
@@ -1152,7 +1298,8 @@ class Blockchain:
                         f"[SIG] Bloco #{block_h}: aceito em MODO "
                         f"BOOTSTRAP LOCAL ({got}/{required} sigs; "
                         f"único assinante é a própria SK local "
-                        f"{local_pk[:16]}…)."
+                        f"{local_pk[:16]}…). A partir de "
+                        f"#{CONSENSUS_STRICT_FROM_HEIGHT} bypass NÃO vale."
                     )
                     return True, ""
 
@@ -1190,7 +1337,8 @@ class Blockchain:
                         f"[SIG] Bloco #{block_h}: aceito em MODO BOOTSTRAP "
                         f"ESTENDIDO ({got}/{required} sigs; assinante "
                         f"{trusted_pubkey[:16]}… com trust_score>="
-                        f"{BOOTSTRAP_TRUST_THRESHOLD:.0f})."
+                        f"{BOOTSTRAP_TRUST_THRESHOLD:.0f}). A partir de "
+                        f"#{CONSENSUS_STRICT_FROM_HEIGHT} bypass NÃO vale."
                     )
                     return True, ""
 
@@ -1225,9 +1373,13 @@ class Blockchain:
             "n_trust": len(trust_v),
             "n_active": len(active_v),
             "n_bootstrap_local": max(0, len(active_v) - len(trust_v)),
+            "n_synced_peers": self._count_synced_peers(),
             "required_sigs": self._required_signatures(active_v),
             "require_all_sigs": REQUIRE_ALL_SIGS,
             "validator_quorum": VALIDATOR_QUORUM,
+            "consensus_strict_from": CONSENSUS_STRICT_FROM_HEIGHT,
+            "min_peers_for_mining": MIN_PEERS_FOR_MINING,
+            "peer_sync_tolerance": PEER_SYNC_TOLERANCE,
             "bootstrap_would_fire": (len(trust_v) < 2),
             "bootstrap_trust_threshold": BOOTSTRAP_TRUST_THRESHOLD,
             "bootstrap_skip_until": BRN_BOOTSTRAP_SKIP_SIGS_UNTIL,
@@ -1256,8 +1408,12 @@ class Blockchain:
             return False, "altura invalida"
 
         h_int = int(block["height"])
-        if (not BRN_STRICT_MULTISIG and BRN_ASSUME_VALID_UNTIL > 0
-                and 0 < h_int <= BRN_ASSUME_VALID_UNTIL):
+
+        # [v9.7.0] assume_valid SÓ vale antes do CONSENSUS_STRICT_FROM_HEIGHT
+        if (not BRN_STRICT_MULTISIG
+                and BRN_ASSUME_VALID_UNTIL > 0
+                and 0 < h_int <= BRN_ASSUME_VALID_UNTIL
+                and not self._is_strict_consensus_height(h_int)):
             try:
                 h_calc = block_hash(
                     block["prev_hash"], block["merkle"], block["timestamp"],
@@ -1516,6 +1672,31 @@ class Blockchain:
         if not miner_pubkey:
             raise ValueError("mine_block_interruptible: miner_pubkey é obrigatória")
 
+        height = self.db.height() + 1
+
+        # ============================================================
+        # [v9.7.0] GATE DE MINERAÇÃO ≥ CONSENSUS_STRICT_FROM_HEIGHT
+        # Exige MIN_PEERS_FOR_MINING peers sincronizados ANTES de
+        # gastar CPU no PoW.
+        # ============================================================
+        if self._is_strict_consensus_height(height):
+            n_synced = self._count_synced_peers()
+            need = self._min_peers_for_mining()
+            if n_synced < need:
+                log.warning(
+                    "[CONSENSUS] Bloco #%d ≥ %d: mineração BLOQUEADA — "
+                    "%d/%d peers sincronizados (tolerância ±%d). "
+                    "Aguarde mais peers ou use BRN_MIN_PEERS_FOR_MINING.",
+                    height, CONSENSUS_STRICT_FROM_HEIGHT,
+                    n_synced, need, PEER_SYNC_TOLERANCE,
+                )
+                return None
+            log.info(
+                "[CONSENSUS] Bloco #%d ≥ %d: %d/%d peers sincronizados — "
+                "mineração liberada (consenso estrito).",
+                height, CONSENSUS_STRICT_FROM_HEIGHT, n_synced, need,
+            )
+
         validators = self._get_active_validators()
         if BRN_STRICT_MULTISIG:
             log.info(
@@ -1524,7 +1705,6 @@ class Blockchain:
                 "ALL" if REQUIRE_ALL_SIGS else VALIDATOR_QUORUM,
             )
 
-        height = self.db.height() + 1
         reward = self.current_reward(height)
         diff = self.current_difficulty()
 
@@ -1660,8 +1840,14 @@ class Blockchain:
             "rede_descentralizada": self.rede_descentralizada,
             "fila_tamanho": len(self.fila_mineracao),
             "validators_active": n_validators,
+            "n_synced_peers": self._count_synced_peers(),
+            "required_sigs": self._required_signatures(
+                self._get_active_validators()),
             "require_all_sigs": REQUIRE_ALL_SIGS,
             "validator_quorum": VALIDATOR_QUORUM,
+            "consensus_strict_from": CONSENSUS_STRICT_FROM_HEIGHT,
+            "min_peers_for_mining": MIN_PEERS_FOR_MINING,
+            "peer_sync_tolerance": PEER_SYNC_TOLERANCE,
             "bootstrap_trust_threshold": BOOTSTRAP_TRUST_THRESHOLD,
             "bootstrap_skip_sigs_until": BRN_BOOTSTRAP_SKIP_SIGS_UNTIL,
             "assume_valid_until": BRN_ASSUME_VALID_UNTIL,
