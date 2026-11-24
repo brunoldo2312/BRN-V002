@@ -340,7 +340,7 @@ def _resolve_fast_sync_until(args) -> int:
         except (ValueError, TypeError):
             pass
     try:
-        return max(0, int(os.environ.get("BRN_FAST_SYNC_UNTIL", "4084")))
+        return max(0, int(os.environ.get("BRN_FAST_SYNC_UNTIL", "20")))
     except (ValueError, TypeError):
         return 4084
 
@@ -1725,7 +1725,7 @@ def _status_reporter_loop(chain, stop_evt: threading.Event,
                 n_synced = 0
 
             try:
-                fast_until = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "4084"))
+                fast_until = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "20"))
             except (ValueError, TypeError):
                 fast_until = 4084
 
@@ -1769,7 +1769,7 @@ def _status_reporter_loop(chain, stop_evt: threading.Event,
 def _auto_configure(chain, p2p, trust, web_port: int, is_origin: bool,
                     stop_evt: threading.Event,
                     force_auto_mine: bool = False,
-                    fast_sync_until: int = 4084) -> None:
+                    fast_sync_until: int = 20) -> None:
     log = logging.getLogger("main")
     sk_hex, address, pubkey, source = _resolve_validator_sk()
 
