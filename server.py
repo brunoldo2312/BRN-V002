@@ -1,75 +1,44 @@
 """server.py — Servidor Web/API do nó BRN
 Versão: 13.9.26
 ================================================================
-Este arquivo expõe a API HTTP (porta 5000) que a GUI (app_wallet_v3)
-e o main.py consomem.
+API HTTP (porta 5000) consumida por:
+  - main.py (injeta chain, p2p, pool, sync, trust)
+  - index_wallet.html (GUI web)
+  - app_wallet_v3.py (bridge pywebview)
+  - explorer.py (porta 8080, faz proxy para cá)
 ================================================================
-v13.9.26 (2026-11-23) — COMPATIBILIDADE COM app_wallet_v3 v3.23 + GUI v3.23:
-  [NEW] GET /api/mine/gate?force=1 — fonte de verdade do gate de
-        mineração. Retorna {mining_allowed, reason, detail{sk_installed,
-        local_pk, validators_ready, validators_reason, fast_sync_active,
-        checks}}. O app_wallet_v3 usa isso em _verify_sk_on_node().
-  [NEW] GET /api/status agora inclui:
-          - mining_allowed, mining_gate_reason
-          - validators_ready, validators_reason
-          - fast_sync_active, fast_sync_until
-          - wallet_sk_installed
-        A UI (index_wallet.html v3.23) e o app_wallet_v3 v3.23
-        dependem desses campos.
-  [NEW] GET /api/consensus/validators — retorna {ok, validators[],
-        required_sigs, all_required, n_trust, n_active, local_pk,
-        local_pk_full, mining_allowed, gate_reason}.
-        O app_wallet_v3 v3.23 tenta esse endpoint primeiro e cai
-        para /api/mine/gate se 404.
-  [NEW] GET /api/block/<height>/signatures — retorna {ok, signatures[],
-        signatures_count, required, all_signed}.
-        Usado pelo app_wallet_v3.get_multi_sig_status().
-  [NEW] GET /api/trust/nodes?limit=N — lista nós do trust_network
-        (public_key, trust_score, is_validator, connected, last_seen,
-        peer_addr).
-  [NEW] GET /api/trust/stats — resumo {total, validators, connected,
-        top_score}.
-  [NEW] POST /api/wallet/set_validator_sk — recebe {sk_hex, address,
-        pubkey}, instala no chain via set_local_validator_sk() e
-        retorna {ok, sk_installed, pubkey, propagated, peers_notified,
-        in_trust, multisig_ready, warnings, errors}.
-  [NEW] GET /api/peers/score — lista peers com trust_score (usado pela
-        GUI antiga).
-  [NEW] GET /api/blocks?start=N&limit=M — paginação de blocos (usado
-        pela GUI/explorer).
-  [NEW] GET /api/latest — últimos 10 blocos (compat com index.html).
-  [NEW] GET /api/block/<height> — bloco individual.
-  [NEW] GET /api/fee-estimate — {low, medium, high, min_relay_fee}.
-  [NEW] GET /api/work — {height, cumulative_work}.
-  [NEW] GET /api/minhas-txs/<address>?limit=N — histórico de txs.
-  [NEW] GET /api/tx-status/<txid> — status da tx.
-  [NEW] GET /api/verificar-recebimento/<addr>/<txid> — confirma se tx
-        chegou no endereço.
-  [NEW] GET /api/nova-carteira (POST) — cria carteira via Wallet().
-        Opcionalmente instala SK automaticamente no nó.
-  [NEW] GET /api/portfolio/<address> — saldo + KYC.
-  [NEW] GET /api/saldo/<address> — alias para balance.
-  [NEW] POST /api/transfer, /api/send, /api/enviar — envio de BRN.
-  [NEW] POST /api/miner/start, /api/miner/stop, /api/miner/status.
+v13.9.26 (2026-11-23) — COMPATÍVEL COM app_wallet_v3 v3.23 + GUI v3.23:
+  [NEW] GET /api/mine/gate?force=1
+  [NEW] /api/status inclui mining_allowed, validators_ready,
+        mining_gate_reason, validators_reason, fast_sync_active,
+        wallet_sk_installed
+  [NEW] GET /api/consensus/validators
+  [NEW] GET /api/block/<h>/signatures
+  [NEW] GET /api/trust/nodes, /api/trust/stats
+  [NEW] POST /api/wallet/set_validator_sk
+  [NEW] GET /api/blocks, /api/latest, /api/block/<h>
+  [NEW] GET /api/fee-estimate, /api/work
+  [NEW] GET /api/minhas-txs/<addr>, /api/tx-status/<txid>,
+        /api/verificar-recebimento/<addr>/<txid>
+  [NEW] POST /api/nova-carteira (com SK auto-install)
+  [NEW] GET /api/portfolio/<addr>, /api/saldo/<addr>
+  [NEW] POST /api/transfer, /api/send, /api/enviar
+  [NEW] POST /api/miner/start, /api/miner/stop, GET /api/miner/status
   [NEW] POST /api/pool/start_local, /api/pool/stop_local,
-        GET /api/pool/local_status.
-  [NEW] GET /api/sync/status — status detalhado de sync.
-  [NEW] Rota /wallet/<peer_id> via Flask (fallback se FastAPI não
-        estiver montado).
-  [KEEP] Compatibilidade total com main.py, FastAPI bridge e
-         app_wallet_v3.
+        GET /api/pool/local_status
+  [NEW] GET /api/sync/status
+  [NEW] /wallet/<peer_id> via Flask (fallback)
+  [KEEP] Compatibilidade com main.py e FastAPI bridge
 ================================================================
 """
 from __future__ import annotations
 
-import io as _io
 import json
 import logging
 import os
 import threading
 import time
 from decimal import Decimal, ROUND_DOWN
-from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -83,6 +52,7 @@ CURRENT_WALLET_FILE = str(BASE_DIR / "current_wallet.json")
 WALLETS_FILE = str(BASE_DIR / "user_wallets.json")
 TXT_HISTORY_LIMIT_DEFAULT = 200
 TXT_HISTORY_LIMIT_MAX = 500
+MIN_RELAY_FEE = 1000
 
 # ============================================================
 # ESTADO GLOBAL (injetado pelo main.py)
@@ -168,7 +138,6 @@ def _get_trust_network():
 
 
 def _get_pool_client_local():
-    """Retorna PoolClient se estiver rodando (usado pelo pool/local_status)."""
     try:
         from miner_pool_client import get_pool_client
         return get_pool_client()
@@ -180,7 +149,6 @@ def _get_pool_client_local():
 # Helpers de gate de mineração
 # ============================================================
 def _build_gate_detail() -> dict:
-    """Monta o detail completo do gate de mineração. Lê do chain + state."""
     chain = _get_chain()
     h = -1
     if chain is not None:
@@ -189,9 +157,9 @@ def _build_gate_detail() -> dict:
         except Exception:
             pass
 
-    # SK instalada?
     sk_installed = False
     local_pk = ""
+    active = []
     if chain is not None:
         sk = getattr(chain, "_local_validator_sk", None)
         if sk is not None:
@@ -200,39 +168,33 @@ def _build_gate_detail() -> dict:
                 local_pk = getattr(sk, "pub_hex", "") or ""
             except Exception:
                 pass
-
-    # Trust
-    trust = _get_trust_network()
-    n_trust = 0
-    n_active = 0
-    validators_ready = False
-    validators_reason = ""
-    if chain is not None:
         try:
-            active = chain._get_active_validators()
-            n_active = len(active)
+            active = list(chain._get_active_validators() or [])
         except Exception:
             active = []
-        try:
-            tv = chain._get_trust_validators()
-            n_trust = len(tv)
-        except Exception:
-            tv = []
-        if n_active > 0:
-            validators_ready = True
-            validators_reason = f"{n_active} validador(es) ativo(s)"
-        else:
-            validators_reason = (
-                "trust_network vazio — bootstrap bypass ativo"
-                if n_trust == 0 else
-                f"{n_trust} no trust mas 0 conectados"
-            )
 
-    # Fast-sync
+    n_active = len(active)
+    n_trust = 0
+    if chain is not None:
+        try:
+            n_trust = len(chain._get_trust_validators() or [])
+        except Exception:
+            n_trust = 0
+
+    if n_active > 0:
+        validators_ready = True
+        validators_reason = f"{n_active} validador(es) ativo(s)"
+    else:
+        validators_reason = (
+            "trust_network vazio — bootstrap bypass ativo"
+            if n_trust == 0 else
+            f"{n_trust} no trust mas 0 conectados"
+        )
+        validators_ready = False
+
     fast_sync_until = int(os.environ.get("BRN_FAST_SYNC_UNTIL", "0") or "0")
     fast_sync_active = bool(fast_sync_until > 0 and h < fast_sync_until)
 
-    # Pool client local
     pc = _get_pool_client_local()
     pool_client_running = False
     if pc is not None:
@@ -243,7 +205,8 @@ def _build_gate_detail() -> dict:
 
     checks = {
         "height": {"ok": h >= 0, "current": h, "required": 0},
-        "sk": {"ok": sk_installed, "local_pk": (local_pk[:16] + "...") if local_pk else ""},
+        "sk": {"ok": sk_installed,
+               "local_pk": (local_pk[:16] + "...") if local_pk else ""},
         "validators": {
             "ok": validators_ready,
             "reason": validators_reason,
@@ -266,7 +229,7 @@ def _build_gate_detail() -> dict:
         "validators_detail": {
             "n_active": n_active,
             "n_trust": n_trust,
-            "active": list(active) if 'active' in dir() else [],
+            "active": active,
         },
         "checks": checks,
         "pool_client_running": pool_client_running,
@@ -274,7 +237,6 @@ def _build_gate_detail() -> dict:
 
 
 def _compute_mining_allowed() -> tuple:
-    """Retorna (allowed: bool, reason: str, detail: dict)."""
     detail = _build_gate_detail()
 
     if detail["fast_sync_active"]:
@@ -306,6 +268,22 @@ def health():
         except Exception:
             pass
 
+    active = []
+    required = 0
+    local_pk = ""
+    if _chain is not None:
+        try:
+            active = list(_chain._get_active_validators() or [])
+            required = int(_chain._required_signatures(active))
+        except Exception:
+            pass
+        sk = getattr(_chain, "_local_validator_sk", None)
+        if sk is not None:
+            try:
+                local_pk = getattr(sk, "pub_hex", "") or ""
+            except Exception:
+                pass
+
     return jsonify({
         "ok": True,
         "height": h,
@@ -315,11 +293,11 @@ def health():
         "sync_injected": _sync_manager is not None,
         "wallet_sk_installed": chain_sk,
         "validators": {
-            "n_trust": 0,
-            "n_active": 0,
-            "required_sigs": 0,
-            "bootstrap_would_fire": False,
-            "local_pk": "",
+            "n_trust": len(active),
+            "n_active": len(active),
+            "required_sigs": required,
+            "bootstrap_would_fire": len(active) < 2,
+            "local_pk": (local_pk[:16] + "...") if local_pk else "",
         },
         "version": "13.9.26",
     })
@@ -345,7 +323,6 @@ def api_status():
             except Exception:
                 pass
 
-        # Gate + campos extras
         allowed, reason, detail = _compute_mining_allowed()
 
         return jsonify({
@@ -356,14 +333,14 @@ def api_status():
             "peers": n_peers,
             "reward": _chain.current_reward(max(h, 1)),
             "difficulty": _chain.current_difficulty(),
-            "mempool": _chain.db.mempool_count() if hasattr(_chain.db, "mempool_count") else 0,
-            "utxos": _chain.db.count_utxos() if hasattr(_chain.db, "count_utxos") else 0,
+            "mempool": _chain.db.mempool_count()
+                if hasattr(_chain.db, "mempool_count") else 0,
+            "utxos": _chain.db.count_utxos()
+                if hasattr(_chain.db, "count_utxos") else 0,
             "peer_id": _BRN_PEER_ID,
             "fila_tamanho": len(getattr(_chain, "fila_mineracao", {}) or {}),
-            "rede_descentralizada": bool(getattr(_chain, "rede_descentralizada", False)),
-            # ============================================================
-            # [v13.9.26] Campos do gate de mineração (vistos pela GUI)
-            # ============================================================
+            "rede_descentralizada": bool(
+                getattr(_chain, "rede_descentralizada", False)),
             "mining_allowed": allowed,
             "mining_gate_reason": reason,
             "validators_ready": detail["validators_ready"],
@@ -382,38 +359,9 @@ def api_status():
 # ============================================================
 @app.route("/api/mine/gate", methods=["GET"])
 def api_mine_gate():
-    """
-    Fonte de verdade do gate de mineração.
-
-    Query params:
-      force=1  → ignora cache (sempre recalcula)
-
-    Retorna:
-      {
-        ok: bool,
-        mining_allowed: bool,
-        reason: str,             # ok | no_sk | validators_not_synced | fast_sync_below_N
-        detail: {
-          current_height: int,
-          sk_installed: bool,
-          local_pk: str,         # truncado
-          local_pk_full: str,    # completo (para o app_wallet_v3 comparar)
-          validators_ready: bool,
-          validators_reason: str,
-          fast_sync_active: bool,
-          fast_sync_until: int,
-          checks: {...},
-        }
-      }
-    """
     try:
-        # O parâmetro force é lido mas o cálculo é sempre fresco
-        # (não há cache aqui; o cache é feito dentro do _build_gate_detail
-        # via env vars, mas o _check_mining_gates do main.py é o que cacheia)
         force = request.args.get("force", "0") in ("1", "true", "True")
-
         allowed, reason, detail = _compute_mining_allowed()
-
         return jsonify({
             "ok": True,
             "mining_allowed": allowed,
@@ -428,29 +376,10 @@ def api_mine_gate():
 
 
 # ============================================================
-# [3] CONSENSO — validadores + assinaturas do bloco
+# [3] CONSENSO
 # ============================================================
 @app.route("/api/consensus/validators", methods=["GET"])
 def api_consensus_validators():
-    """
-    Lista validadores ativos + requerimentos de assinatura.
-
-    Retorna:
-      {
-        ok: bool,
-        validators: list[str],        # pubkeys hex completos
-        required_sigs: int,
-        all_required: bool,
-        n_trust: int,
-        n_active: int,
-        local_pk: str,                # truncado
-        local_pk_full: str,           # completo
-        local_pk_installed: bool,
-        bootstrap_would_fire: bool,
-        mining_allowed: bool,
-        gate_reason: str,
-      }
-    """
     if _chain is None:
         return jsonify({"ok": False, "msg": "chain nao injetada",
                         "validators": [], "required_sigs": 0,
@@ -505,8 +434,10 @@ def api_consensus_validators():
             "bootstrap_would_fire": bootstrap_would_fire,
             "mining_allowed": allowed,
             "gate_reason": reason,
-            "require_all_sigs": bool(os.environ.get("BRN_REQUIRE_ALL_SIGS", "1") == "1"),
-            "validator_quorum": float(os.environ.get("BRN_VALIDATOR_QUORUM", "0.67")),
+            "require_all_sigs": bool(
+                os.environ.get("BRN_REQUIRE_ALL_SIGS", "1") == "1"),
+            "validator_quorum": float(
+                os.environ.get("BRN_VALIDATOR_QUORUM", "0.67")),
         })
     except Exception as e:
         log.exception("api_consensus_validators falhou")
@@ -517,21 +448,6 @@ def api_consensus_validators():
 
 @app.route("/api/block/<int:height>/signatures", methods=["GET"])
 def api_block_signatures(height: int):
-    """
-    Retorna as assinaturas do bloco <height>.
-
-    Retorna:
-      {
-        ok: bool,
-        height: int,
-        signatures: [{"pubkey": str, "signature": str}],
-        signatures_count: int,
-        required: int,
-        all_signed: bool,
-        local_pk: str,           # truncado
-        local_pk_full: str,      # completo
-      }
-    """
     if _chain is None:
         return jsonify({"ok": False, "msg": "chain nao injetada",
                         "signatures": [], "signatures_count": 0}), 503
@@ -539,7 +455,8 @@ def api_block_signatures(height: int):
     try:
         blk = _chain.db.get_block(int(height))
         if not blk:
-            return jsonify({"ok": False, "msg": f"bloco #{height} nao encontrado",
+            return jsonify({"ok": False,
+                            "msg": f"bloco #{height} nao encontrado",
                             "signatures": [], "signatures_count": 0}), 404
 
         sigs = blk.get("validators_sig") or []
@@ -583,7 +500,6 @@ def api_block_signatures(height: int):
 # ============================================================
 @app.route("/api/trust/nodes", methods=["GET"])
 def api_trust_nodes():
-    """Lista nós do trust_network."""
     try:
         limit = int(request.args.get("limit", "100"))
     except (ValueError, TypeError):
@@ -626,7 +542,6 @@ def api_trust_nodes():
 
 @app.route("/api/trust/stats", methods=["GET"])
 def api_trust_stats():
-    """Resumo do trust_network."""
     trust = _get_trust_network()
     if trust is None or not hasattr(trust, "nodes"):
         return jsonify({"ok": True, "total": 0, "validators": 0,
@@ -654,15 +569,10 @@ def api_trust_stats():
 
 
 # ============================================================
-# [5] WALLET — instalar SK no nó (chamado pelo app_wallet_v3)
+# [5] WALLET — instalar SK no nó
 # ============================================================
 @app.route("/api/wallet/set_validator_sk", methods=["POST"])
 def api_wallet_set_validator_sk():
-    """
-    Instala SK no nó. Chamado pelo app_wallet_v3._sync_sk_to_chain().
-
-    Body: {sk_hex, address, pubkey}
-    """
     if _chain is None:
         return jsonify({"ok": False, "msg": "chain nao injetada",
                         "sk_installed": False}), 503
@@ -693,7 +603,6 @@ def api_wallet_set_validator_sk():
             return jsonify({"ok": False, "msg": f"SK inválida: {e}",
                             "sk_installed": False}), 400
 
-        # Tenta via wallet_integrator primeiro (propaga pra peers)
         propagated = False
         peers_notified = 0
         warnings = []
@@ -717,17 +626,14 @@ def api_wallet_set_validator_sk():
         except Exception as e:
             warnings.append(f"wallet_integrator exception: {e}")
 
-        # Fallback direto: seta no chain
         try:
             _chain.set_local_validator_sk(wobj)
         except Exception as e:
             errors.append(f"set_local_validator_sk: {e}")
 
-        # Confirma que está no chain
         sk_now = getattr(_chain, "_local_validator_sk", None)
         sk_installed = sk_now is not None
 
-        # Verifica se está no trust
         in_trust = False
         multisig_ready = False
         try:
@@ -761,7 +667,6 @@ def api_wallet_set_validator_sk():
 # ============================================================
 @app.route("/api/nova-carteira", methods=["POST"])
 def api_nova_carteira():
-    """Cria carteira nova e (opcionalmente) instala SK no nó."""
     try:
         from wallet import Wallet
         w = Wallet()
@@ -773,7 +678,6 @@ def api_nova_carteira():
             "warning": "Guarde a chave privada em local seguro.",
         }
 
-        # Tenta salvar current_wallet.enc
         try:
             pw = (os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
                   or os.environ.get("BRN_NODE_PASSWORD", "").strip())
@@ -790,7 +694,6 @@ def api_nova_carteira():
             data["wallet_saved"] = False
             data["wallet_saved_error"] = str(e)
 
-        # Instala SK no nó
         try:
             if _chain is not None:
                 _chain.set_local_validator_sk(w)
@@ -880,4 +783,735 @@ def api_minhas_txs(address: str):
                 if inp.get("txid") == "0" * 64:
                     continue
                 try:
-                    u = _chain.db.get
+                    u = _chain.db.get_utxo(inp.get("txid"), int(inp.get("vout", 0)))
+                    if u and u.get("address") == address:
+                        inputs_from_addr += int(u.get("amount", 0) or 0)
+                except Exception:
+                    pass
+
+            if inputs_from_addr > 0 and outputs_to_addr > 0:
+                direction = "self"
+                amount = 0
+            elif outputs_to_addr > 0:
+                direction = "received"
+                amount = outputs_to_addr
+            else:
+                direction = "sent"
+                amount = max(0, inputs_from_addr - outputs_to_addr)
+
+            if is_mempool or block_height is None:
+                status = "pending"
+                confirmations = 0
+            else:
+                status = "confirmed"
+                confirmations = max(0, current_height - block_height)
+
+            transactions.append({
+                "txid": tx.get("txid", ""),
+                "direction": direction,
+                "amount": amount,
+                "status": status,
+                "block_height": block_height,
+                "confirmations": confirmations,
+                "timestamp": int(tx.get("timestamp", 0) or 0),
+            })
+
+        return jsonify({
+            "ok": True,
+            "address": address,
+            "count": len(transactions),
+            "limit": limit,
+            "transactions": transactions,
+        })
+    except Exception as e:
+        log.exception("api_minhas_txs falhou")
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/tx-status/<txid>", methods=["GET"])
+def api_tx_status(txid: str):
+    if _chain is None:
+        return jsonify({"ok": False, "msg": "chain nao injetada"}), 503
+    try:
+        tx = None
+        height = None
+        if hasattr(_chain.db, "get_tx_by_txid"):
+            tx, height = _chain.db.get_tx_by_txid(txid)
+        if tx is not None and height is not None and height >= 0:
+            h = _chain.db.height()
+            return jsonify({
+                "ok": True,
+                "txid": txid,
+                "status": "confirmed",
+                "block_height": height,
+                "confirmations": max(0, h - height),
+                "timestamp": int(tx.get("timestamp", 0) or 0),
+            })
+        mem = None
+        if hasattr(_chain.db, "get_mempool_tx"):
+            mem = _chain.db.get_mempool_tx(txid)
+        if mem is not None:
+            return jsonify({
+                "ok": True,
+                "txid": txid,
+                "status": "pending",
+                "block_height": None,
+                "confirmations": 0,
+                "timestamp": int(mem.get("timestamp", 0) or 0),
+            })
+        return jsonify({
+            "ok": True,
+            "txid": txid,
+            "status": "not_found",
+            "block_height": None,
+            "confirmations": 0,
+            "timestamp": 0,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/verificar-recebimento/<address>/<txid>", methods=["GET"])
+def api_verificar_recebimento(address: str, txid: str):
+    if _chain is None:
+        return jsonify({"ok": False, "msg": "chain nao injetada"}), 503
+    try:
+        from wallet import WalletManager
+        if not WalletManager.validate_address(address):
+            return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
+    except Exception:
+        pass
+
+    try:
+        tx = None
+        height = None
+        if hasattr(_chain.db, "get_tx_by_txid"):
+            tx, height = _chain.db.get_tx_by_txid(txid)
+        if tx is None:
+            mem = None
+            if hasattr(_chain.db, "get_mempool_tx"):
+                mem = _chain.db.get_mempool_tx(txid)
+            if mem is not None:
+                return jsonify({
+                    "ok": True,
+                    "chegou": False,
+                    "status": "pending",
+                    "valor": 0,
+                    "confirmacoes": 0,
+                    "block_height": None,
+                    "msg": "Transacao na mempool, aguardando mineracao.",
+                })
+            return jsonify({
+                "ok": True,
+                "chegou": False,
+                "status": "not_found",
+                "valor": 0,
+                "confirmacoes": 0,
+                "block_height": None,
+                "msg": "TX nao encontrada.",
+            })
+
+        received = 0
+        for o in (tx.get("outputs") or []):
+            if o.get("address") == address:
+                received += int(o.get("amount", 0) or 0)
+
+        h = _chain.db.height()
+        confs = max(0, h - height) if height is not None else 0
+
+        if received <= 0:
+            return jsonify({
+                "ok": True,
+                "chegou": False,
+                "status": "confirmed",
+                "valor": 0,
+                "confirmacoes": confs,
+                "block_height": height,
+                "msg": f"TX confirmada no bloco #{height}, mas sem valor para {address[:16]}…",
+            })
+
+        return jsonify({
+            "ok": True,
+            "chegou": True,
+            "status": "confirmed",
+            "valor": received,
+            "confirmacoes": confs,
+            "block_height": height,
+            "msg": f"Confirmado no bloco #{height} com {confs} confirmacoes.",
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+# ============================================================
+# [7] TRANSFERIR
+# ============================================================
+@app.route("/api/transfer", methods=["POST"])
+@app.route("/api/send", methods=["POST"])
+@app.route("/api/enviar", methods=["POST"])
+def api_transfer():
+    if _chain is None:
+        return jsonify({"ok": False, "msg": "chain nao injetada"}), 503
+    try:
+        data = request.get_json(silent=True) or {}
+        sender = (data.get("from") or "").strip()
+        to = (data.get("to") or "").strip()
+        amount_raw = data.get("amount")
+        sk = (request.headers.get("X-BRN-Sk", "")
+              or data.get("private_key", "")
+              or data.get("sk", ""))
+        pk_payload = (data.get("pubkey", "")
+                      or data.get("public_key", "")
+                      or data.get("miner_pubkey", ""))
+
+        from wallet import Wallet as _W
+        from wallet import WalletManager
+
+        if not WalletManager.validate_address(sender):
+            return jsonify({"ok": False, "msg": "Endereco 'from' invalido."}), 400
+        if not WalletManager.validate_address(to):
+            return jsonify({"ok": False, "msg": "Endereco 'to' invalido."}), 400
+        if sender == to:
+            return jsonify({"ok": False, "msg": "Nao pode enviar para si mesmo."}), 400
+
+        try:
+            amount_dec = Decimal(str(amount_raw).replace(",", ".")).quantize(
+                Decimal("0.00000001"), rounding=ROUND_DOWN)
+            amount_sats = int(amount_dec * Decimal(10 ** 8))
+        except Exception:
+            return jsonify({"ok": False, "msg": "Valor invalido."}), 400
+
+        if amount_sats <= 0:
+            return jsonify({"ok": False, "msg": "Valor deve ser > 0."}), 400
+
+        try:
+            w = _W(private_key_hex=sk)
+            if w.address != sender:
+                raise ValueError("chave privada não corresponde ao from")
+        except Exception:
+            return jsonify({"ok": False, "msg": "Chave privada invalida."}), 400
+
+        FEE = int(MIN_RELAY_FEE)
+        with _chain.db.lock if hasattr(_chain.db, "lock") else _noop_cm():
+            utxos = _chain.db.get_utxos(sender)
+            utxos.sort(key=lambda u: int(u.get("amount", 0) or 0), reverse=True)
+            total = 0
+            escolhidos = []
+            for u in utxos:
+                escolhidos.append(u)
+                total += int(u.get("amount", 0) or 0)
+                if total >= amount_sats + FEE:
+                    break
+
+            if total < amount_sats + FEE:
+                return jsonify({
+                    "ok": False,
+                    "msg": f"Saldo insuficiente: tem {total/1e8:.8f} BRN, "
+                           f"precisa {(amount_sats+FEE)/1e8:.8f} BRN.",
+                }), 400
+
+            troco = total - amount_sats - FEE
+            outputs = [{"address": to, "amount": amount_sats, "pubkey": ""}]
+            if troco > 0:
+                outputs.append({
+                    "address": sender,
+                    "amount": troco,
+                    "pubkey": w.pub_hex,
+                })
+
+            inputs = [{
+                "txid": u["txid"],
+                "vout": int(u["vout"]),
+                "pubkey": w.pub_hex,
+                "signature": "",
+            } for u in escolhidos]
+
+            nonce = _chain.db.get_nonce_for_pubkey(w.pub_hex)
+            tx = {
+                "txid": "",
+                "inputs": inputs,
+                "outputs": outputs,
+                "timestamp": int(time.time()),
+                "locktime": 0,
+                "nonce": nonce,
+            }
+
+            try:
+                from blockchain import signing_hash as _sh, txid as _calc
+                h = _sh(tx)
+                for inp in tx["inputs"]:
+                    inp["signature"] = w.sign(h)
+                tx["txid"] = _calc(tx)
+            except Exception as e:
+                return jsonify({"ok": False,
+                                "msg": f"Falha ao assinar tx: {e}"}), 500
+
+            ok, msg = _chain.submit_tx(tx)
+            if not ok:
+                return jsonify({"ok": False, "msg": msg}), 400
+
+            # Broadcast via P2P
+            p2p = _get_p2p_manager()
+            if p2p is not None and hasattr(p2p, "broadcast_tx"):
+                try:
+                    p2p.broadcast_tx(tx)
+                except Exception as e:
+                    log.warning("broadcast_tx falhou: %s", e)
+
+            return jsonify({
+                "ok": True,
+                "txid": tx["txid"],
+                "msg": f"Aceita na mempool ({amount_dec} BRN).",
+                "amount_brn": float(amount_dec),
+                "fee_sats": FEE,
+            })
+    except Exception as e:
+        log.exception("api_transfer falhou")
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+class _NoopCM:
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+def _noop_cm():
+    return _NoopCM()
+
+
+# ============================================================
+# [8] MINER
+# ============================================================
+@app.route("/api/miner/start", methods=["POST"])
+def api_miner_start():
+    if _chain is None:
+        return jsonify({"ok": False, "msg": "chain nao injetada"}), 503
+    try:
+        allowed, reason, detail = _compute_mining_allowed()
+        if not allowed:
+            return jsonify({
+                "ok": False,
+                "msg": f"Mineração bloqueada: {reason}",
+                "mining_allowed": False,
+                "gate": {"reason": reason, "detail": detail},
+            }), 409
+
+        data = request.get_json(silent=True) or {}
+        addr = (data.get("validator_address")
+                or data.get("address")
+                or "").strip()
+        pubkey = (data.get("miner_pubkey")
+                  or data.get("pubkey")
+                  or data.get("public_key")
+                  or "").strip()
+
+        if not addr:
+            return jsonify({"ok": False, "msg": "Endereco obrigatorio."}), 400
+        if not pubkey:
+            return jsonify({"ok": False, "msg": "Pubkey obrigatoria."}), 400
+
+        try:
+            from wallet import WalletManager
+            if not WalletManager.validate_address(addr):
+                return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
+        except Exception:
+            pass
+
+        _chain.adicionar_na_fila(addr, pubkey)
+        try:
+            _chain.db.set_meta("miner_address", addr)
+        except Exception:
+            pass
+
+        from miner_loop import get_miner
+        m = get_miner(_chain)
+        is_origin_val = bool(getattr(_chain, "is_origin", False))
+        try:
+            ok, msg = m.start(addr, pubkey, is_origin=is_origin_val)
+        except TypeError:
+            ok, msg = m.start(addr, pubkey)
+
+        if not ok:
+            st = m.status() if hasattr(m, "status") else {}
+            return jsonify({"ok": False, "msg": msg, **st}), 400
+
+        st = m.status() if hasattr(m, "status") else {}
+        st["rede_descentralizada"] = bool(
+            getattr(_chain, "rede_descentralizada", False))
+        st["fila_tamanho"] = len(getattr(_chain, "fila_mineracao", {}) or {})
+        return jsonify({"ok": True, "msg": "Minerador iniciado.", **st})
+    except Exception as e:
+        log.exception("api_miner_start falhou")
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/miner/status", methods=["GET"])
+def api_miner_status():
+    if _chain is None:
+        return jsonify({"running": False, "error": "chain nao injetada"}), 200
+    try:
+        from miner_loop import get_miner
+        m = get_miner(_chain)
+        st = m.status() if hasattr(m, "status") else {}
+        active = 0
+        trust = _get_trust_network()
+        if trust is not None:
+            try:
+                active = len(trust.get_top_validators(count=5))
+            except Exception:
+                pass
+        return jsonify({
+            **st,
+            "height": _chain.db.height(),
+            "difficulty": _chain.current_difficulty(),
+            "validators_active": active,
+            "signatures_required": active,
+            "signatures_collected": st.get("signatures_collected", 0),
+            "rede_descentralizada": bool(
+                getattr(_chain, "rede_descentralizada", False)),
+            "fila_tamanho": len(getattr(_chain, "fila_mineracao", {}) or {}),
+        })
+    except Exception as e:
+        return jsonify({"running": False, "error": str(e)}), 200
+
+
+@app.route("/api/miner/stop", methods=["POST"])
+def api_miner_stop():
+    if _chain is None:
+        return jsonify({"ok": False, "msg": "chain nao injetada"}), 503
+    try:
+        from miner_loop import get_miner
+        m = get_miner(_chain)
+        ok, msg = m.stop()
+        st = m.status() if hasattr(m, "status") else {}
+        return jsonify({"ok": ok, "msg": msg, **st})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+# ============================================================
+# [9] POOL
+# ============================================================
+@app.route("/api/pool/local_status", methods=["GET"])
+def api_pool_local_status():
+    pc = _get_pool_client_local()
+    if pc is None:
+        return jsonify({"ok": False, "running": False,
+                        "msg": "PoolClient nao injetado"}), 200
+    try:
+        st = pc.status() if hasattr(pc, "status") else {}
+        return jsonify({"ok": True, **st})
+    except Exception as e:
+        return jsonify({"ok": False, "running": False, "msg": str(e)}), 200
+
+
+@app.route("/api/pool/start_local", methods=["POST"])
+def api_pool_start_local():
+    if _chain is None:
+        return jsonify({"ok": False, "msg": "chain nao injetada"}), 503
+    try:
+        allowed, reason, detail = _compute_mining_allowed()
+        if not allowed:
+            return jsonify({
+                "ok": False,
+                "msg": f"Mineração bloqueada: {reason}",
+                "mining_allowed": False,
+                "gate": {"reason": reason, "detail": detail},
+            }), 409
+
+        data = request.get_json(silent=True) or {}
+        addr = (data.get("address") or "").strip()
+        pubkey = (data.get("pubkey") or "").strip()
+        if not addr or not pubkey:
+            return jsonify({"ok": False,
+                            "msg": "address e pubkey obrigatorios"}), 400
+
+        pc = _get_pool_client_local()
+        if pc is None:
+            try:
+                from miner_pool_client import PoolClient
+            except ImportError as e:
+                return jsonify({"ok": False,
+                                "msg": f"PoolClient indisponivel: {e}"}), 503
+
+            pool_url = (os.environ.get("BRN_POOL_URL", "") or "").strip()
+            if not pool_url:
+                pool_url = "http://127.0.0.1:5000"
+            try:
+                pc = PoolClient(address=addr, pubkey=pubkey, pool_url=pool_url)
+            except TypeError:
+                pc = PoolClient(addr, pubkey, pool_url=pool_url)
+
+            try:
+                from miner_pool_client import set_pool_client as _set_pc
+                _set_pc(pc)
+            except Exception:
+                pass
+
+        # Inicia
+        start_fn = None
+        for name in ("start_mining", "start"):
+            if hasattr(pc, name):
+                start_fn = getattr(pc, name)
+                break
+        if start_fn is None:
+            return jsonify({"ok": False,
+                            "msg": "PoolClient sem metodo de inicio"}), 500
+
+        try:
+            ok, msg = start_fn()
+        except TypeError:
+            ok, msg = start_fn(addr, pubkey)
+
+        st = pc.status() if hasattr(pc, "status") else {}
+        return jsonify({"ok": bool(ok), "msg": msg, **st})
+    except Exception as e:
+        log.exception("api_pool_start_local falhou")
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/pool/stop_local", methods=["POST"])
+def api_pool_stop_local():
+    pc = _get_pool_client_local()
+    if pc is None:
+        return jsonify({"ok": False, "msg": "PoolClient nao injetado"}), 503
+    try:
+        stop_fn = None
+        for name in ("stop_mining", "stop", "disconnect"):
+            if hasattr(pc, name):
+                stop_fn = getattr(pc, name)
+                break
+        if stop_fn is None:
+            return jsonify({"ok": False,
+                            "msg": "PoolClient sem metodo de parada"}), 500
+        try:
+            ok, msg = stop_fn()
+        except TypeError:
+            r = stop_fn()
+            ok = True if r is None else bool(r)
+            msg = "parado"
+        st = pc.status() if hasattr(pc, "status") else {}
+        return jsonify({"ok": bool(ok), "msg": msg, **st})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+# ============================================================
+# [10] BLOCOS (explorer, GUI)
+# ============================================================
+@app.route("/api/blocks", methods=["GET"])
+def api_blocks():
+    if _chain is None:
+        return jsonify({"ok": False, "msg": "chain nao injetada"}), 503
+    try:
+        try:
+            start = int(request.args.get("start", "0"))
+        except (ValueError, TypeError):
+            start = 0
+        try:
+            limit = int(request.args.get("limit", "20"))
+        except (ValueError, TypeError):
+            limit = 20
+        limit = max(1, min(limit, 500))
+
+        if hasattr(_chain.db, "get_blocks_range"):
+            blocks = _chain.db.get_blocks_range(start, start + limit)
+        elif hasattr(_chain.db, "list_blocks"):
+            blocks = _chain.db.list_blocks(start, limit)
+        else:
+            blocks = []
+
+        return jsonify({"ok": True, "blocks": blocks,
+                        "start": start, "limit": limit})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e), "blocks": []}), 500
+
+
+@app.route("/api/latest", methods=["GET"])
+def api_latest():
+    if _chain is None:
+        return jsonify([])
+    try:
+        h = _chain.db.height()
+        if h < 0:
+            return jsonify([])
+        start = max(0, h - 9)
+        if hasattr(_chain.db, "get_blocks_range"):
+            blocks = _chain.db.get_blocks_range(start, h + 1)
+        elif hasattr(_chain.db, "list_blocks"):
+            blocks = _chain.db.list_blocks(start, 10)
+        else:
+            blocks = []
+        return jsonify(blocks)
+    except Exception:
+        return jsonify([])
+
+
+@app.route("/api/block/<int:height>", methods=["GET"])
+def api_block(height: int):
+    if _chain is None:
+        return jsonify({"ok": False, "msg": "chain nao injetada"}), 503
+    try:
+        blk = _chain.db.get_block(int(height))
+        if not blk:
+            return jsonify({"ok": False,
+                            "msg": f"Bloco #{height} nao encontrado"}), 404
+        return jsonify(blk)
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/fee-estimate", methods=["GET"])
+def api_fee_estimate():
+    if _chain is None:
+        return jsonify({"success": False, "error": "chain nao injetada"}), 503
+    try:
+        if hasattr(_chain, "estimate_fee"):
+            low = int(_chain.estimate_fee("low"))
+            medium = int(_chain.estimate_fee("medium"))
+            high = int(_chain.estimate_fee("high"))
+        else:
+            low = medium = high = MIN_RELAY_FEE
+        return jsonify({
+            "success": True,
+            "low": low, "medium": medium, "high": high,
+            "min_relay_fee": MIN_RELAY_FEE,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/work", methods=["GET"])
+def api_work():
+    if _chain is None:
+        return jsonify({"ok": False, "msg": "chain nao injetada"}), 503
+    try:
+        h = _chain.db.height()
+        work = 0
+        if hasattr(_chain, "cumulative_work"):
+            work = int(_chain.cumulative_work())
+        return jsonify({
+            "ok": True,
+            "height": h,
+            "cumulative_work": work,
+            "difficulty": _chain.current_difficulty(),
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+# ============================================================
+# [11] SYNC
+# ============================================================
+@app.route("/api/sync-info", methods=["GET"])
+def api_sync_info():
+    state = dict(_http_sync_state) if _http_sync_state else {}
+    h = -1
+    if _chain is not None:
+        try:
+            h = _chain.db.height()
+        except Exception:
+            pass
+    state.update({
+        "sk_installed": _sk_validation_state.get("ok", False),
+        "validators_ready": _sk_validation_state.get("validators_ready", False),
+        "auto_mine_status": _sk_validation_state.get("auto_mine_status", "idle"),
+        "height": h,
+        "bridge": {
+            "wif_configured": bool(os.environ.get("BRN_BTC_WIF")),
+            "receive_address": os.environ.get("BRN_BTC_RECEIVE_ADDRESS", ""),
+            "network": os.environ.get("BRN_BTC_NETWORK", "testnet"),
+        },
+    })
+    return jsonify(state)
+
+
+@app.route("/api/sync/status", methods=["GET"])
+def api_sync_status():
+    if _chain is None:
+        return jsonify({"ok": False, "msg": "chain nao injetada"}), 503
+    try:
+        h = _chain.db.height()
+        sync = _get_sync_manager()
+        if sync is not None and hasattr(sync, "get_status"):
+            data = sync.get_status()
+            return jsonify({
+                "ok": True,
+                "synced": bool(data.get("synced", True)),
+                "syncing": bool(data.get("syncing", False)),
+                "forking": bool(data.get("forking", False)),
+                "progress": float(data.get("progress", 100.0)),
+                "local_height": h,
+                "target_height": int(data.get("target_height", h)),
+                "blocos_faltando": max(0, int(data.get("target_height", h)) - h),
+                "eta_legivel": data.get("eta_legivel", ""),
+                "active_peer": data.get("active_peer"),
+                "last_error": data.get("last_error", ""),
+            })
+        return jsonify({
+            "ok": True, "synced": True, "syncing": False, "forking": False,
+            "progress": 100.0, "local_height": h, "target_height": h,
+            "blocos_faltando": 0, "eta_legivel": "sincronizado",
+            "last_error": "",
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+# ============================================================
+# [12] WALLET GUI
+# ============================================================
+@app.route("/wallet", methods=["GET"])
+def serve_wallet_root():
+    wallet_path = os.path.join(os.path.dirname(__file__), "index_wallet.html")
+    if os.path.exists(wallet_path):
+        return send_file(wallet_path)
+    return jsonify({
+        "ok": False,
+        "msg": "index_wallet.html nao encontrado.",
+        "peer_id": _BRN_PEER_ID,
+    }), 404
+
+
+@app.route("/wallet/<peer_id>", methods=["GET"])
+def serve_wallet_peer(peer_id: str):
+    if _BRN_PEER_ID and peer_id != _BRN_PEER_ID:
+        return jsonify({
+            "ok": False,
+            "msg": f"peer_id {peer_id} nao e deste no (e {_BRN_PEER_ID})",
+        }), 404
+
+    wallet_path = os.path.join(os.path.dirname(__file__), "index_wallet.html")
+    if not os.path.exists(wallet_path):
+        return jsonify({
+            "ok": False,
+            "msg": "index_wallet.html nao encontrado.",
+        }), 404
+
+    try:
+        with open(wallet_path, "r", encoding="utf-8") as f:
+            html = f.read()
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+    if 'name="brn-peer-id"' not in html:
+        html = html.replace(
+            "</head>",
+            f'<meta name="brn-peer-id" content="{peer_id}">\n</head>',
+            1,
+        )
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+# ============================================================
+# [13] RUN standalone (debug)
+# ============================================================
+def run_server(host="0.0.0.0", port=5000):
+    app.run(host=host, port=port, threaded=True, use_reloader=False)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    print("[server] Rodando em modo standalone (debug).")
+    print("[server] Use main.py em producao.")
+    run_server()
