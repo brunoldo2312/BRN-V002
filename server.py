@@ -1,34 +1,14 @@
 """server.py — Servidor Web/API do nó BRN
-Versão: 13.9.26
+Versão: 13.9.27
 ================================================================
-API HTTP (porta 5000) consumida por:
-  - main.py (injeta chain, p2p, pool, sync, trust)
-  - index_wallet.html (GUI web)
-  - app_wallet_v3.py (bridge pywebview)
-  - explorer.py (porta 8080, faz proxy para cá)
-================================================================
-v13.9.26 (2026-11-23) — COMPATÍVEL COM app_wallet_v3 v3.23 + GUI v3.23:
-  [NEW] GET /api/mine/gate?force=1
-  [NEW] /api/status inclui mining_allowed, validators_ready,
-        mining_gate_reason, validators_reason, fast_sync_active,
-        wallet_sk_installed
-  [NEW] GET /api/consensus/validators
-  [NEW] GET /api/block/<h>/signatures
-  [NEW] GET /api/trust/nodes, /api/trust/stats
-  [NEW] POST /api/wallet/set_validator_sk
-  [NEW] GET /api/blocks, /api/latest, /api/block/<h>
-  [NEW] GET /api/fee-estimate, /api/work
-  [NEW] GET /api/minhas-txs/<addr>, /api/tx-status/<txid>,
-        /api/verificar-recebimento/<addr>/<txid>
-  [NEW] POST /api/nova-carteira (com SK auto-install)
-  [NEW] GET /api/portfolio/<addr>, /api/saldo/<addr>
-  [NEW] POST /api/transfer, /api/send, /api/enviar
-  [NEW] POST /api/miner/start, /api/miner/stop, GET /api/miner/status
-  [NEW] POST /api/pool/start_local, /api/pool/stop_local,
-        GET /api/pool/local_status
-  [NEW] GET /api/sync/status
-  [NEW] /wallet/<peer_id> via Flask (fallback)
-  [KEEP] Compatibilidade com main.py e FastAPI bridge
+v13.9.27 (2026-11-24) — DESCOBERTA DE PEER MAIS ALTO + SYNC FORÇADO:
+  [NEW] GET /api/peers — lista peers ordenados por altura DESC.
+  [NEW] GET /api/sync/peer-max — pergunta via P2P a altura de cada peer.
+  [NEW] POST /api/sync/force — força sync com o peer mais alto.
+  [NEW] POST /api/sync/auto — descobre peer mais alto e dispara sync.
+  [NEW] GET /api/sync/status melhorado com max_peer_height e peer_mais_alto.
+  [KEEP] v13.9.26: /api/mine/gate, /api/consensus/validators,
+         /api/block/<h>/signatures, /api/trust/nodes, etc.
 ================================================================
 """
 from __future__ import annotations
@@ -55,7 +35,7 @@ TXT_HISTORY_LIMIT_MAX = 500
 MIN_RELAY_FEE = 1000
 
 # ============================================================
-# ESTADO GLOBAL (injetado pelo main.py)
+# ESTADO GLOBAL
 # ============================================================
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -68,8 +48,12 @@ _trust_network = None
 _sk_validation_state: Dict[str, Any] = {}
 _http_sync_state: Dict[str, Any] = {}
 _BRN_PEER_ID = ""
+_last_force_sync: Dict[str, Any] = {"ts": 0.0, "peer": None, "ok": False}
 
 
+# ============================================================
+# INJEÇÃO
+# ============================================================
 def set_chain(chain) -> None:
     global _chain
     _chain = chain
@@ -114,7 +98,9 @@ def set_sk_validation_state(state: dict) -> None:
 
 def set_http_sync_state(state: dict) -> None:
     global _http_sync_state
-    _http_sync_state = state or {}
+    state = state or {}
+    state["last_force_sync"] = _last_force_sync
+    _http_sync_state = state
 
 
 def _get_chain():
@@ -146,7 +132,7 @@ def _get_pool_client_local():
 
 
 # ============================================================
-# Helpers de gate de mineração
+# Helpers de gate
 # ============================================================
 def _build_gate_detail() -> dict:
     chain = _get_chain()
@@ -238,15 +224,196 @@ def _build_gate_detail() -> dict:
 
 def _compute_mining_allowed() -> tuple:
     detail = _build_gate_detail()
-
     if detail["fast_sync_active"]:
         return False, f"fast_sync_below_{detail['fast_sync_until']}", detail
     if not detail["sk_installed"]:
         return False, "no_sk", detail
     if not detail["validators_ready"]:
         return False, "validators_not_synced", detail
-
     return True, "ok", detail
+
+
+# ============================================================
+# Helpers de sync
+# ============================================================
+def _list_peers_from_db() -> List[Dict[str, Any]]:
+    """Lê peers do SQLite, normaliza e ordena por altura DESC."""
+    if _chain is None or not hasattr(_chain.db, "listar_peers"):
+        return []
+    try:
+        raw = _chain.db.listar_peers(apenas_ativos=False) or []
+    except Exception as e:
+        log.warning("_list_peers_from_db falhou: %s", e)
+        return []
+
+    peers = []
+    now = time.time()
+    for p in raw:
+        if not isinstance(p, dict):
+            continue
+        addr = (p.get("address") or "").strip()
+        if not addr:
+            continue
+        ip = addr.rsplit(":", 1)[0] if ":" in addr else addr
+        try:
+            ph = int(p.get("height", 0) or 0)
+        except (ValueError, TypeError):
+            ph = 0
+        try:
+            ls = float(p.get("last_seen", 0) or 0)
+        except (ValueError, TypeError):
+            ls = 0.0
+        age = int(now - ls) if ls > 0 else -1
+        peers.append({
+            "address": addr,
+            "ip": ip,
+            "height": ph,
+            "last_seen": int(ls) if ls > 0 else 0,
+            "age_s": age,
+            "active": (age >= 0 and age < 300),
+            "node_id": p.get("node_id", ""),
+            "version": p.get("version", ""),
+            "public_key": p.get("public_key", ""),
+        })
+    peers.sort(key=lambda x: x["height"], reverse=True)
+    return peers
+
+
+def _probe_peer_height(peer_addr: str, timeout: float = 2.0) -> Optional[int]:
+    """Pergunta a um peer via P2P qual é a altura dele."""
+    try:
+        from p2p_unified import P2PClient
+    except ImportError:
+        return None
+    try:
+        ip, port_s = peer_addr.rsplit(":", 1)
+        port = int(port_s)
+    except Exception:
+        return None
+    try:
+        resp, _ = P2PClient.get_chain_height(ip, port, timeout=timeout)
+        if resp and isinstance(resp, dict):
+            try:
+                return int(resp.get("height", 0) or 0)
+            except (ValueError, TypeError):
+                return None
+    except Exception:
+        return None
+    return None
+
+
+def _find_highest_peer(probe_p2p: bool = True,
+                      timeout_per_peer: float = 2.0) -> Dict[str, Any]:
+    """
+    Retorna o peer com maior altura. Se probe_p2p=True, pergunta
+    a altura em tempo real via P2P (mais confiável); senão usa o DB.
+    """
+    local_h = -1
+    if _chain is not None:
+        try:
+            local_h = int(_chain.db.height())
+        except Exception:
+            local_h = -1
+
+    peers = _list_peers_from_db()
+    best = None
+    best_h = -1
+
+    for p in peers:
+        addr = p["address"]
+        if p["ip"].startswith("127.") or addr == "0.0.0.0:0":
+            continue
+        height_used = p["height"]
+        probed_ok = False
+        if probe_p2p:
+            probed = _probe_peer_height(addr, timeout=timeout_per_peer)
+            if probed is not None:
+                height_used = probed
+                probed_ok = True
+        if height_used > best_h:
+            best_h = height_used
+            best = {
+                "address": addr,
+                "ip": p["ip"],
+                "height": height_used,
+                "height_db": p["height"],
+                "probed_ok": probed_ok,
+                "active": p["active"],
+            }
+
+    return {
+        "ok": best is not None,
+        "local_height": local_h,
+        "max_peer_height": best_h,
+        "peer_mais_alto": best,
+        "delta": (best_h - local_h) if (best is not None and local_h >= 0) else None,
+        "peers_total": len(peers),
+    }
+
+
+def _do_force_sync(peer_addr: Optional[str] = None,
+                   auto: bool = True) -> Dict[str, Any]:
+    """Força sync com um peer (ou descobre o mais alto se auto=True)."""
+    global _last_force_sync
+
+    p2p = _get_p2p_manager()
+    if p2p is None:
+        return {"ok": False, "msg": "p2p nao injetado", "peer": None}
+    if _chain is None:
+        return {"ok": False, "msg": "chain nao injetada", "peer": None}
+
+    chosen = peer_addr
+    if not chosen and auto:
+        found = _find_highest_peer(probe_p2p=True)
+        if not found.get("ok") or not found.get("peer_mais_alto"):
+            return {"ok": False, "msg": "nenhum peer disponivel",
+                    "peer": None, "found": found}
+        chosen = found["peer_mais_alto"]["address"]
+        if found.get("delta") is not None and found["delta"] <= 0:
+            _last_force_sync = {"ts": time.time(), "peer": chosen,
+                                "ok": True, "msg": "local ja e o mais alto"}
+            return {"ok": True, "msg": "local ja e o mais alto",
+                    "peer": chosen, "found": found}
+
+    if not chosen:
+        return {"ok": False, "msg": "peer nao informado e auto=False",
+                "peer": None}
+
+    try:
+        ip, port_s = chosen.rsplit(":", 1)
+        port = int(port_s)
+    except Exception:
+        return {"ok": False, "msg": f"peer invalido: {chosen}", "peer": None}
+
+    result = {"ok": False, "msg": "sync falhou", "peer": chosen}
+    try:
+        if hasattr(p2p, "sync_with_peer"):
+            r = p2p.sync_with_peer(ip, port)
+            if isinstance(r, tuple) and len(r) >= 1:
+                result["sync_result"] = str(r[0])
+                result["sync_msg"] = str(r[1]) if len(r) > 1 else ""
+                result["ok"] = str(r[0]).lower() in ("ok", "ok_blocks", "up_to_date")
+            elif isinstance(r, dict):
+                result.update(r)
+                result.setdefault("ok", True)
+            else:
+                result["ok"] = True
+        elif hasattr(p2p, "_sync_with_retry"):
+            threading.Thread(
+                target=p2p._sync_with_retry, args=(ip, port),
+                daemon=True, name=f"ForceSync-{ip}"
+            ).start()
+            result["ok"] = True
+            result["msg"] = "sync disparado em background"
+        else:
+            result["msg"] = "p2p sem metodo de sync (sync_with_peer/_sync_with_retry)"
+    except Exception as e:
+        result["ok"] = False
+        result["msg"] = f"excecao: {e}"
+
+    _last_force_sync = {"ts": time.time(), "peer": chosen,
+                        "ok": result["ok"], "msg": result["msg"]}
+    return result
 
 
 # ============================================================
@@ -299,7 +466,7 @@ def health():
             "bootstrap_would_fire": len(active) < 2,
             "local_pk": (local_pk[:16] + "...") if local_pk else "",
         },
-        "version": "13.9.26",
+        "version": "13.9.27",
     })
 
 
@@ -355,7 +522,7 @@ def api_status():
 
 
 # ============================================================
-# [2] GATE DE MINERAÇÃO (fonte de verdade do app_wallet_v3)
+# [2] GATE DE MINERAÇÃO
 # ============================================================
 @app.route("/api/mine/gate", methods=["GET"])
 def api_mine_gate():
@@ -569,7 +736,7 @@ def api_trust_stats():
 
 
 # ============================================================
-# [5] WALLET — instalar SK no nó
+# [5] WALLET — SK
 # ============================================================
 @app.route("/api/wallet/set_validator_sk", methods=["POST"])
 def api_wallet_set_validator_sk():
@@ -663,7 +830,7 @@ def api_wallet_set_validator_sk():
 
 
 # ============================================================
-# [6] CARTEIRA — criar, portfolio, saldo, histórico
+# [6] CARTEIRA
 # ============================================================
 @app.route("/api/nova-carteira", methods=["POST"])
 def api_nova_carteira():
@@ -946,6 +1113,15 @@ def api_verificar_recebimento(address: str, txid: str):
 # ============================================================
 # [7] TRANSFERIR
 # ============================================================
+class _NoopCM:
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+def _noop_cm():
+    return _NoopCM()
+
+
 @app.route("/api/transfer", methods=["POST"])
 @app.route("/api/send", methods=["POST"])
 @app.route("/api/enviar", methods=["POST"])
@@ -992,7 +1168,8 @@ def api_transfer():
             return jsonify({"ok": False, "msg": "Chave privada invalida."}), 400
 
         FEE = int(MIN_RELAY_FEE)
-        with _chain.db.lock if hasattr(_chain.db, "lock") else _noop_cm():
+        lock = _chain.db.lock if hasattr(_chain.db, "lock") else _noop_cm()
+        with lock:
             utxos = _chain.db.get_utxos(sender)
             utxos.sort(key=lambda u: int(u.get("amount", 0) or 0), reverse=True)
             total = 0
@@ -1050,7 +1227,6 @@ def api_transfer():
             if not ok:
                 return jsonify({"ok": False, "msg": msg}), 400
 
-            # Broadcast via P2P
             p2p = _get_p2p_manager()
             if p2p is not None and hasattr(p2p, "broadcast_tx"):
                 try:
@@ -1068,15 +1244,6 @@ def api_transfer():
     except Exception as e:
         log.exception("api_transfer falhou")
         return jsonify({"ok": False, "msg": str(e)}), 500
-
-
-class _NoopCM:
-    def __enter__(self): return self
-    def __exit__(self, *a): return False
-
-
-def _noop_cm():
-    return _NoopCM()
 
 
 # ============================================================
@@ -1248,7 +1415,6 @@ def api_pool_start_local():
             except Exception:
                 pass
 
-        # Inicia
         start_fn = None
         for name in ("start_mining", "start"):
             if hasattr(pc, name):
@@ -1297,7 +1463,7 @@ def api_pool_stop_local():
 
 
 # ============================================================
-# [10] BLOCOS (explorer, GUI)
+# [10] BLOCOS
 # ============================================================
 @app.route("/api/blocks", methods=["GET"])
 def api_blocks():
@@ -1401,8 +1567,48 @@ def api_work():
 
 
 # ============================================================
-# [11] SYNC
+# [11] PEERS + SYNC
 # ============================================================
+@app.route("/api/peers", methods=["GET"])
+def api_peers():
+    if _chain is None:
+        return jsonify({"ok": False, "msg": "chain nao injetada",
+                        "peers": [], "count": 0}), 503
+    try:
+        try:
+            limit = int(request.args.get("limit", "100"))
+        except (ValueError, TypeError):
+            limit = 100
+        limit = max(1, min(limit, 500))
+
+        peers = _list_peers_from_db()
+        local_h = -1
+        try:
+            local_h = int(_chain.db.height())
+        except Exception:
+            pass
+
+        max_peer_h = max((p["height"] for p in peers), default=0)
+        best_peer = peers[0] if peers else None
+
+        return jsonify({
+            "ok": True,
+            "peers": peers[:limit],
+            "count": len(peers),
+            "active": sum(1 for p in peers if p["active"]),
+            "local_height": local_h,
+            "max_peer_height": max_peer_h,
+            "peer_mais_alto": (
+                {"address": best_peer["address"],
+                 "height": best_peer["height"]}
+                if best_peer else None
+            ),
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e),
+                        "peers": [], "count": 0}), 500
+
+
 @app.route("/api/sync-info", methods=["GET"])
 def api_sync_info():
     state = dict(_http_sync_state) if _http_sync_state else {}
@@ -1433,6 +1639,10 @@ def api_sync_status():
     try:
         h = _chain.db.height()
         sync = _get_sync_manager()
+        peers = _list_peers_from_db()
+        max_peer_h = max((p["height"] for p in peers), default=h)
+        best_peer = peers[0] if peers else None
+
         if sync is not None and hasattr(sync, "get_status"):
             data = sync.get_status()
             return jsonify({
@@ -1443,18 +1653,74 @@ def api_sync_status():
                 "progress": float(data.get("progress", 100.0)),
                 "local_height": h,
                 "target_height": int(data.get("target_height", h)),
+                "max_peer_height": max_peer_h,
+                "peer_mais_alto": (
+                    {"address": best_peer["address"],
+                     "height": best_peer["height"]}
+                    if best_peer else None
+                ),
                 "blocos_faltando": max(0, int(data.get("target_height", h)) - h),
                 "eta_legivel": data.get("eta_legivel", ""),
                 "active_peer": data.get("active_peer"),
                 "last_error": data.get("last_error", ""),
+                "sync_running": True,
+                "last_force_sync": _last_force_sync,
             })
         return jsonify({
             "ok": True, "synced": True, "syncing": False, "forking": False,
             "progress": 100.0, "local_height": h, "target_height": h,
+            "max_peer_height": max_peer_h,
+            "peer_mais_alto": (
+                {"address": best_peer["address"],
+                 "height": best_peer["height"]}
+                if best_peer else None
+            ),
             "blocos_faltando": 0, "eta_legivel": "sincronizado",
             "last_error": "",
+            "sync_running": False,
+            "last_force_sync": _last_force_sync,
         })
     except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/sync/peer-max", methods=["GET"])
+def api_sync_peer_max():
+    """Pergunta a cada peer conhecido (via P2P) qual é a altura dele."""
+    try:
+        probe = request.args.get("probe", "1") in ("1", "true", "True")
+        timeout = float(request.args.get("timeout", "2.0"))
+    except (ValueError, TypeError):
+        probe, timeout = True, 2.0
+    try:
+        found = _find_highest_peer(probe_p2p=probe, timeout_per_peer=timeout)
+        return jsonify({"ok": True, **found})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/sync/force", methods=["POST"])
+def api_sync_force():
+    """Força sync com um peer (ou descobre o mais alto se auto=True)."""
+    data = request.get_json(silent=True) or {}
+    peer = (data.get("peer") or request.args.get("peer") or "").strip() or None
+    auto = bool(data.get("auto", True))
+    try:
+        r = _do_force_sync(peer_addr=peer, auto=auto)
+        return jsonify(r), (200 if r.get("ok") else 400)
+    except Exception as e:
+        log.exception("api_sync_force falhou")
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/sync/auto", methods=["POST"])
+def api_sync_auto():
+    """Descobre peer mais alto e dispara sync."""
+    try:
+        r = _do_force_sync(peer_addr=None, auto=True)
+        return jsonify(r), (200 if r.get("ok") else 400)
+    except Exception as e:
+        log.exception("api_sync_auto falhou")
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
@@ -1504,7 +1770,7 @@ def serve_wallet_peer(peer_id: str):
 
 
 # ============================================================
-# [13] RUN standalone (debug)
+# [13] RUN standalone
 # ============================================================
 def run_server(host="0.0.0.0", port=5000):
     app.run(host=host, port=port, threaded=True, use_reloader=False)
