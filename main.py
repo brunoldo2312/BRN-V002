@@ -184,22 +184,10 @@ def _read_bootstrap_json() -> str:
 
 
 # ============================================================
-# LOGGING À PROVA DE FALHAS (v13.9.26)
+# LOGGING À PROVA DE FALHAS
 # ============================================================
 def _setup_logging(level: str = "INFO") -> logging.Logger:
-    """Configura logging global. SEMPRE retorna um Logger válido.
-
-    Contrato (v13.9.26):
-      - SEMPRE instala handlers no ROOT logger (stderr + arquivo em logs/).
-        Sem isto, qualquer `logging.getLogger("blockchain").warning(...)`
-        emitido ANTES do `brn_logger` ser importado cai no lastResort e
-        perde timestamp — e qualquer `.info()`/`.error()` é dropado.
-      - Se o brn_logger existir, ele é aplicado por cima. Se falhar,
-        ignoramos e seguimos com o root configurado.
-      - Idempotente: chamadas repetidas não duplicam handlers.
-      - Instala `sys.excepthook` para capturar tracebacks de saída
-        silenciosa (SystemExit/exception não tratada no `main`).
-    """
+    """Configura logging global. SEMPRE retorna um Logger válido."""
     _level = getattr(logging, str(level).upper(), logging.INFO)
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -212,7 +200,6 @@ def _setup_logging(level: str = "INFO") -> logging.Logger:
     except Exception:
         pass
 
-    # Idempotência: detecta handlers nossos já instalados
     _already = False
     try:
         for h in root.handlers:
@@ -223,7 +210,7 @@ def _setup_logging(level: str = "INFO") -> logging.Logger:
         _already = False
 
     if not _already:
-        # 1) stderr — visível no .bat / PowerShell mesmo sem Tee-Object
+        # 1) stderr — visível no terminal
         try:
             sh = logging.StreamHandler(sys.stderr)
             sh.setFormatter(fmt)
@@ -260,7 +247,7 @@ def _setup_logging(level: str = "INFO") -> logging.Logger:
             except Exception:
                 pass
 
-    # 3) brn_logger por cima (opcional, não crítico)
+    # 3) brn_logger por cima (opcional)
     lg = None
     try:
         from brn_logger import setup_logger, get_logger
@@ -272,13 +259,11 @@ def _setup_logging(level: str = "INFO") -> logging.Logger:
     if lg is None:
         lg = logging.getLogger("main")
     try:
-        # Garante que os logs do "main" cheguem ao root (que tem os handlers)
         lg.propagate = True
     except Exception:
         pass
 
-    # 4) excepthook global — captura SystemExit e exceções não tratadas
-    #    Sem isto, um `return 2/3/6/7` do main() some sem deixar rastro.
+    # 4) excepthook global
     try:
         _install_excepthook(lg)
     except Exception:
@@ -288,8 +273,6 @@ def _setup_logging(level: str = "INFO") -> logging.Logger:
 
 
 def _install_excepthook(logger: logging.Logger) -> None:
-    """Instala sys.excepthook que loga qualquer exceção não tratada
-    (com traceback completo) e também SystemExit != 0."""
     if getattr(sys, "_brn_excepthook_installed", False):
         return
 
@@ -364,11 +347,6 @@ def _resolve_fast_sync_until(args) -> int:
 
 def _maybe_enable_fast_sync(fast_sync_until: int, args) -> None:
     log = logging.getLogger("main")
-
-    # [FIX v13.9.25] Sempre propagar BRN_FAST_SYNC_UNTIL pro server.py.
-    # server.py lê no IMPORT em _MIN_FAST_SYNC_UNTIL; sem isto,
-    # --no-fast-sync / --fast-sync-until 0 deixava main.py liberado
-    # mas /api/mine/gate retornava 409 "fast_sync_below_4084" para sempre.
     os.environ["BRN_FAST_SYNC_UNTIL"] = str(fast_sync_until)
 
     no_fast_sync = getattr(args, "no_fast_sync", False)
@@ -496,10 +474,6 @@ def _verify_validators_synced(chain, min_validators: int = 1,
 # PEER HEALER
 # ============================================================
 def _peer_healer_loop(chain, p2p, stop_evt: threading.Event, interval: int = 15):
-    """
-    Thread que pinga os peers via P2P e atualiza a altura real no SQLite.
-    Destrava o Mining Gate sem precisar de scripts externos.
-    """
     log = logging.getLogger("main")
     log.info("[Peer-Healer] iniciado (interval=%ds)", interval)
 
@@ -819,12 +793,13 @@ def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int,
         log.error("[server] import falhou: %s", e)
         return False
 
-    srv.set_chain(chain)
+    # [FIX] O server.py pode não ter set_chain dependendo da versão.
+    if hasattr(srv, "set_chain"):
+        srv.set_chain(chain)
+    else:
+        srv.chain = chain
+        log.info("[server] set_chain ausente — usando srv.chain = chain")
 
-    # [FIX v13.9.25] Injeta PEER_ID no Flask.
-    # Sem isto, server._BRN_PEER_ID ficava "" e, quando o FastAPI caía
-    # para o fallback Flask, /wallet não redirecionava e /api/peer_id
-    # retornava vazio — operador perdia a GUI no browser.
     if hasattr(srv, "set_peer_id"):
         srv.set_peer_id(os.environ.get("BRN_PEER_ID", ""))
 
@@ -838,6 +813,9 @@ def _start_web_server(chain, p2p, pool, sync_mgr, trust, web_port: int,
             continue
         fn = getattr(srv, fn_name, None)
         if fn is None:
+            # Fallback: tenta injetar como variável global
+            setattr(srv, fn_name.replace("set_", "").replace("_manager", ""), obj)
+            log.debug("[server] %s ausente — usando fallback de atributo", fn_name)
             continue
         try:
             fn(obj)
@@ -1995,10 +1973,6 @@ def main() -> int:
         or "5000"
     )
 
-    # [FIX v13.9.25] Garante que server.py leia a mesma porta HTTP.
-    # server.py faz BOOTSTRAP_HTTP_PORT = int(os.environ.get("BRN_BOOTSTRAP_HTTP_PORT",
-    #   os.environ.get("BRN_WEB_PORT", "5000"))) no import. No Render
-    # (PORT=10000, sem BRN_WEB_PORT) os notify de bootstrap iam pra :5000.
     os.environ["BRN_WEB_PORT"] = str(web_port)
 
     p2p_port = int(os.environ.get("BRN_P2P_PORT", "6001"))
@@ -2009,7 +1983,6 @@ def main() -> int:
 
     log = _setup_logging()
 
-    # AUTO-DISCOVERY DEPOIS do logging configurado (v13.9.24).
     try:
         import auto_discovery
         auto_discovery.auto_configure_bootstrap()
