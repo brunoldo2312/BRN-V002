@@ -1,5 +1,24 @@
 # db.py — Banco de Dados SQLite para o Nó BRN
-# Versão: 9.8.2 | Data: 2026-11-18
+# Versão: 9.9.0 | Data: 2026-11-27
+# ============================================================
+# v9.9.0 (2026-11-27) — P0-1 + P0-4 (relatório de escalabilidade):
+#   [NEW] apply_block_atomic(block): UMA transação SQLite por bloco.
+#         Antes, accept_block fazia add_block + N×apply_tx +
+#         N×remove_mempool, gerando ~3N commits curtos (~1.500 em
+#         bloco cheio). Agora: BEGIN IMMEDIATE -> bloco -> todas as
+#         txs -> mempool -> tx_index -> COMMIT. Rollback desfaz tudo.
+#   [NEW] Pragmas P0-4 em TODA conexão:
+#           cache_size=-64000, mmap_size=268435456,
+#           temp_store=MEMORY, wal_autocheckpoint=1000,
+#           journal_size_limit=67108864, synchronous=NORMAL.
+#   [NEW] Conexões de leitura tentam mode=ro (URI) com fallback.
+#   [NEW] Índices: mempool(added_at), tx_index(height), utxos(height).
+#   [KEEP] 100% da API v9.8.2: apply_tx/add_block/save_block/
+#          remove_mempool individuais continuam funcionando (usados
+#          por mine_block e por código legado).
+#   [KEEP] _ConnAdapter, _FakeCursor, WAL, migração por inspeção,
+#          peers.score, bootstrap_peers, mining_gate, sync_status,
+#          L2 escrows, contracts, truncate_to, peers helpers.
 # ============================================================
 # v9.8.2 (2026-11-18) — FIX CRÍTICO: ORDEM DE CRIAÇÃO DOS ÍNDICES
 #   [FIX] _create_tables NÃO cria mais idx_peers_score. Em DB antigo
@@ -49,7 +68,7 @@ import logging
 
 logger = logging.getLogger("db")
 
-__version__ = "9.8.2"
+__version__ = "9.9.0"
 
 
 # ------------------------------------------------------------
@@ -117,13 +136,54 @@ class Database:
             return str(base_dir / db_path)
         return str(base_dir / os.environ.get("BRN_DB", "brn_v2_chain.db"))
 
+    # ============================================================
+    # [P0-4] Conexão com pragmas + mode=ro para leitura
+    # ============================================================
     @contextmanager
     def _get_connection(self, write: bool = False):
-        conn = sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None)
+        """Abre uma conexão SQLite com os pragmas P0-4.
+
+        Leitura: tenta mode=ro (URI). Se o arquivo ainda não existir ou
+        o SQLite recusar (ex.: WAL ativo e -wal ainda vazio em alguns
+        builds), cai no modo normal sem quebrar chamadores.
+        Escrita: modo normal + BEGIN IMMEDIATE explícito.
+        """
+        conn = None
+        if not write:
+            try:
+                uri = f"file:{Path(self.db_path).as_posix()}?mode=ro"
+                conn = sqlite3.connect(uri, uri=True, timeout=30.0,
+                                       isolation_level=None)
+                # Verifica se o modo ro foi de fato aplicado; se o SQLite
+                # abriu RW (fallback interno), segue normal.
+                conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+            except Exception:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                conn = None
+        if conn is None:
+            conn = sqlite3.connect(self.db_path, timeout=30.0,
+                                   isolation_level=None)
+
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL;")
-        conn.execute("PRAGMA busy_timeout = 30000;")
-        conn.execute("PRAGMA foreign_keys = ON;")
+
+        # [P0-4] Pragmas de sessão
+        try:
+            conn.execute("PRAGMA journal_mode = WAL;")
+            conn.execute("PRAGMA busy_timeout = 30000;")
+            conn.execute("PRAGMA foreign_keys = ON;")
+            conn.execute("PRAGMA synchronous = NORMAL;")
+            conn.execute("PRAGMA cache_size = -64000;")          # ~64 MB
+            conn.execute("PRAGMA mmap_size = 268435456;")        # 256 MB
+            conn.execute("PRAGMA temp_store = MEMORY;")
+            conn.execute("PRAGMA wal_autocheckpoint = 1000;")
+            conn.execute("PRAGMA journal_size_limit = 67108864;")  # 64 MB
+        except Exception as e:
+            logger.debug("[DB] pragma falhou (%s): %s", "ro" if not write else "rw", e)
+
         try:
             if write:
                 conn.execute("BEGIN IMMEDIATE;")
@@ -138,7 +198,10 @@ class Database:
                     pass
             raise
         finally:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def _vacuum(self):
         """VACUUM tem que rodar SEM transação aberta."""
@@ -352,6 +415,11 @@ class Database:
         falhar (DB de schema muito antigo sem alguma coluna), só loga
         warning e continua. Diferente de _create_tables, que precisa
         suceder tudo, os índices são otimização — não bloqueiam boot.
+
+        [v9.9.0 - P0-4] Adicionados índices que faltavam:
+          - mempool(added_at): a montagem do bloco faz ORDER BY added_at
+          - tx_index(height): truncate_to e reorg escaneiam por altura
+          - utxos(height): reorg/prune usam DELETE ... WHERE height > ?
         """
         indexes = [
             "CREATE INDEX IF NOT EXISTS idx_peers_height ON peers(height);",
@@ -359,6 +427,9 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_peers_score ON peers(score DESC);",
             "CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash);",
             "CREATE INDEX IF NOT EXISTS idx_utxos_address ON utxos(address);",
+            "CREATE INDEX IF NOT EXISTS idx_utxos_height ON utxos(height);",
+            "CREATE INDEX IF NOT EXISTS idx_tx_index_height ON tx_index(height);",
+            "CREATE INDEX IF NOT EXISTS idx_mempool_added_at ON mempool(added_at);",
             "CREATE INDEX IF NOT EXISTS idx_l2_status ON l2_escrows(status);",
             "CREATE INDEX IF NOT EXISTS idx_l2_buyer ON l2_escrows(buyer);",
         ]
@@ -486,6 +557,117 @@ class Database:
 
     def get_chain_height(self) -> int:
         return self.height()
+
+    # ============================================================
+    # [P0-1] apply_block_atomic — UMA transação por bloco
+    # ============================================================
+    def apply_block_atomic(self, block: dict) -> None:
+        """Aplica o bloco inteiro numa ÚNICA transação SQLite.
+
+        Substitui a sequência antiga em blockchain.py::accept_block:
+            add_block(block)                      # 1 commit
+            for tx: apply_tx(tx, h, coinbase=...) # N commits
+                    remove_mempool(tx['txid'])    # N commits
+
+        por:
+            BEGIN IMMEDIATE
+              INSERT blocks                (1)
+              INSERT tx_index / DELETE utxos / INSERT utxos / nonces (por tx)
+              DELETE mempool (por tx não-coinbase)
+            COMMIT                          (1)
+
+        Rollback desfaz tudo se algo falhar — fecha a janela em que o
+        bloco estava gravado mas as txs não tinham sido aplicadas.
+
+        Preserva EXATAMENTE a semântica do apply_tx individual:
+          - Não-coinbase: apaga UTXOs gastos e incrementa nonce do
+            pubkey do input.
+          - Sempre: INSERT OR REPLACE de UTXOs criados.
+          - Sempre: UPSERT em tx_index.
+          - Não-coinbase: remove da mempool.
+
+        O bloco NÃO é salvo em `save_block`; é inserido direto com
+        `data = json.dumps(block)` (mesmo formato de `save_block(dict)`).
+        """
+        height = int(block["height"])
+        data_v = json.dumps(block, ensure_ascii=False)
+        txs = block.get("transactions") or []
+
+        with self._write_lock, self._get_connection(write=True) as conn:
+            # 1) Bloco
+            conn.execute("""
+                INSERT INTO blocks
+                (height, hash, prev_hash, timestamp, nonce, merkle,
+                 difficulty, cumulative_work, data)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(height) DO UPDATE SET
+                    hash=excluded.hash, prev_hash=excluded.prev_hash,
+                    timestamp=excluded.timestamp, nonce=excluded.nonce,
+                    merkle=excluded.merkle, difficulty=excluded.difficulty,
+                    cumulative_work=excluded.cumulative_work,
+                    data=excluded.data
+            """, (
+                height,
+                block.get("hash", ""),
+                block.get("prev_hash", ""),
+                float(block.get("timestamp", 0) or 0),
+                int(block.get("nonce", 0) or 0),
+                block.get("merkle", ""),
+                int(block.get("difficulty", 1) or 1),
+                int(block.get("cumulative_work", 0) or 0),
+                data_v,
+            ))
+
+            # 2) Cada tx
+            for i, tx in enumerate(txs):
+                coinbase = (i == 0)
+                txid = tx.get("txid", "")
+
+                # 2a) tx_index (sempre)
+                if txid:
+                    conn.execute(
+                        "INSERT INTO tx_index (txid, height) VALUES (?, ?) "
+                        "ON CONFLICT(txid) DO UPDATE SET height = excluded.height",
+                        (txid, height),
+                    )
+
+                # 2b) Consome UTXOs + incrementa nonces (não-coinbase)
+                if not coinbase:
+                    for inp in (tx.get("inputs") or []):
+                        conn.execute(
+                            "DELETE FROM utxos WHERE txid = ? AND vout = ?",
+                            (inp.get("txid", ""), int(inp.get("vout", 0))),
+                        )
+                        pk = inp.get("pubkey", "")
+                        if pk:
+                            conn.execute(
+                                "INSERT INTO nonces (pubkey, nonce) VALUES (?, 1) "
+                                "ON CONFLICT(pubkey) DO UPDATE SET nonce = nonce + 1",
+                                (pk,),
+                            )
+
+                # 2c) Cria UTXOs das saídas (sempre)
+                for vout, out in enumerate(tx.get("outputs") or []):
+                    conn.execute("""
+                        INSERT INTO utxos (txid, vout, address, amount, pubkey, height)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(txid, vout) DO UPDATE SET
+                            address=excluded.address, amount=excluded.amount,
+                            pubkey=excluded.pubkey, height=excluded.height
+                    """, (
+                        txid, vout,
+                        out.get("address", ""),
+                        int(out.get("amount", 0) or 0),
+                        out.get("pubkey", "") or "",
+                        height,
+                    ))
+
+                # 2d) Remove da mempool (não-coinbase)
+                if not coinbase and txid:
+                    conn.execute("DELETE FROM mempool WHERE txid = ?", (txid,))
+
+        logger.debug("[DB] apply_block_atomic #%d: %d tx numa transação",
+                     height, len(txs))
 
     # ============================================================
     # UTXO / NONCE / TX INDEX — usado por validate_tx / apply_tx
@@ -655,7 +837,11 @@ class Database:
         return False
 
     def apply_tx(self, tx: dict, height: int, coinbase: bool = False) -> None:
-        """Aplica tx: gasta inputs, cria outputs, registra tx_index, avança nonce."""
+        """Aplica tx: gasta inputs, cria outputs, registra tx_index, avança nonce.
+
+        [KEEP] Mantido para mine_block e código legado. Para blocos
+        completos, prefira apply_block_atomic().
+        """
         txid = tx.get("txid", "")
         with self._write_lock, self._get_connection(write=True) as conn:
             if txid:
@@ -1198,6 +1384,16 @@ class Database:
         return self.truncate_to(target_height)
 
     def close(self):
+        # [v9.9.0 - P0-4] PRAGMA optimize antes de fechar para que o
+        # SQLite consolide estatísticas (equivalente a ANALYZE parcial).
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=5.0)
+            try:
+                conn.execute("PRAGMA optimize;")
+            finally:
+                conn.close()
+        except Exception:
+            pass
         Database._instance = None
         self._initialized = False
         logger.info("[DB] instância fechada")
