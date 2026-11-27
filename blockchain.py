@@ -1,6 +1,21 @@
 """blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.7.0 | Data: 23/11/2026
+Versão: 9.7.1 | Data: 27/11/2026
 ================================================================
+v9.7.1 (2026-11-27) — P0-1 (relatório de escalabilidade):
+  [NEW] accept_block usa self.db.apply_block_atomic(block) — UMA
+        transação SQLite por bloco. Antes: add_block + N×apply_tx +
+        N×remove_mempool geravam ~3N commits curtos (~1.500 em bloco
+        cheio). Agora: BEGIN IMMEDIATE → bloco → todas as txs →
+        mempool → tx_index → COMMIT. Rollback desfaz tudo.
+  [NEW] Fallback automático: se db.py < 9.9.0 (sem
+        apply_block_atomic), accept_block usa o loop antigo. Permite
+        atualizar blockchain.py antes do db.py sem quebrar.
+  [NEW] Contratos (deploy/call) são aplicados DEPOIS do commit do
+        bloco (são side-effects fora do DB de UTXO; reconstruíveis em
+        reorg).
+  [KEEP] 100% do v9.7.0: consenso estrito ≥6000, _count_synced_peers,
+         _min_peers_for_mining, _count_external_sigs, auto-wire,
+         PBFT opcional, checkpoints, quórum REQUIRE_ALL_SIGS.
 v9.7.0 (2026-11-23) — CONSENSO ESTRITO A PARTIR DO BLOCO 6000:
   [NEW] CONSENSUS_STRICT_FROM_HEIGHT (default 6000, env
         BRN_CONSENSUS_STRICT_FROM). A partir dessa altura:
@@ -31,7 +46,7 @@ v9.5.9 (2026-11-15) — ROBUSTEZ DE BANCO DE DADOS
 """
 from __future__ import annotations
 
-__version__ = "9.7.0"
+__version__ = "9.7.1"
 
 import os
 import time
@@ -1518,8 +1533,22 @@ class Blockchain:
 
         return True, "ok"
 
+    # ============================================================
+    # [v9.7.1 / P0-1] accept_block com apply_block_atomic
+    # ============================================================
     def accept_block(self, block: dict,
                      validators: Optional[list] = None) -> tuple:
+        """Valida, grava e aplica o bloco.
+
+        [v9.7.1] Usa self.db.apply_block_atomic(block) quando
+        disponível (db.py ≥ 9.9.0): UMA transação SQLite para o bloco
+        inteiro. Fallback para o loop antigo (add_block + apply_tx +
+        remove_mempool) em db.py < 9.9.0.
+
+        Contratos (deploy/call) são aplicados DEPOIS do commit do
+        bloco — são side-effects fora do DB de UTXO e podem ser
+        reconstruídos em caso de reorg.
+        """
         prev = self.db.get_block_by_hash(block["prev_hash"])
         ok, msg = self.validate_block(block, prev, validators=validators)
         if not ok:
@@ -1532,10 +1561,20 @@ class Blockchain:
         except Exception:
             pass
 
+        # [P0-1] Aplicação atômica do bloco
         try:
-            self.db.add_block(block)
+            if hasattr(self.db, "apply_block_atomic"):
+                self.db.apply_block_atomic(block)
+            else:
+                # Fallback db.py < 9.9.0 (loop antigo, ~3N commits)
+                self.db.add_block(block)
+                for i, t in enumerate(block["transactions"]):
+                    coinbase = (i == 0)
+                    self.db.apply_tx(t, block["height"], coinbase=coinbase)
+                    if i > 0:
+                        self.db.remove_mempool(t["txid"])
         except Exception as e:
-            return False, f"Erro ao gravar bloco #{block['height']}: {e}"
+            return False, f"Erro ao aplicar bloco #{block['height']}: {e}"
 
         if self.trust_net is not None and block["height"] > 0:
             try:
@@ -1560,19 +1599,20 @@ class Blockchain:
             _create_auto_checkpoint(block)
 
         _maybe_sign_checkpoint(block)
+
+        # Contratos: side-effects fora do DB de UTXO (aplicados após
+        # o commit do bloco; podem ser reconstruídos em reorg).
         for i, t in enumerate(block["transactions"]):
-            coinbase = (i == 0)
-            self.db.apply_tx(t, block["height"], coinbase=coinbase)
-            if i > 0:
-                self.db.remove_mempool(t["txid"])
-            if not coinbase:
-                tx_data = t.get("data") or {}
-                if (isinstance(tx_data, dict)
-                        and tx_data.get("type") in ("deploy", "call")):
-                    try:
-                        self._apply_contract_tx(t)
-                    except Exception as e:
-                        print(f"[CONTRACT] tx {t['txid'][:16]}... falhou: {e}")
+            if i == 0:
+                continue
+            tx_data = t.get("data") or {}
+            if (isinstance(tx_data, dict)
+                    and tx_data.get("type") in ("deploy", "call")):
+                try:
+                    self._apply_contract_tx(t)
+                except Exception as e:
+                    print(f"[CONTRACT] tx {t['txid'][:16]}... falhou: {e}")
+
         return True, block["hash"]
 
     def _attach_auth_tag(self, block: dict) -> dict:
